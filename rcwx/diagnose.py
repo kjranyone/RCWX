@@ -21,6 +21,24 @@ def check_audio_devices():
         print()
 
         devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+
+        # Build hostapi name mapping
+        hostapi_names = {}
+        for i, hostapi in enumerate(hostapis):
+            name = hostapi["name"]
+            # Simplify names
+            if "WASAPI" in name:
+                hostapi_names[i] = "WASAPI"
+            elif "ASIO" in name:
+                hostapi_names[i] = "ASIO"
+            elif "DirectSound" in name:
+                hostapi_names[i] = "DirectSound"
+            elif "MME" in name:
+                hostapi_names[i] = "MME"
+            else:
+                hostapi_names[i] = name
+
         input_devices = []
         output_devices = []
 
@@ -33,8 +51,9 @@ def check_audio_devices():
         print("=== Input Devices (Microphone) ===")
         for i, dev in input_devices:
             default = " (DEFAULT)" if i == sd.default.device[0] else ""
+            hostapi = hostapi_names.get(dev["hostapi"], "Unknown")
             print(f"  [{i}] {dev['name']}{default}")
-            print(f"      Channels: {dev['max_input_channels']}, Sample Rate: {dev['default_samplerate']:.0f}Hz")
+            print(f"      Driver: {hostapi}, Channels: {dev['max_input_channels']}, Sample Rate: {dev['default_samplerate']:.0f}Hz")
 
             # Check for potential loopback devices
             name_lower = dev["name"].lower()
@@ -46,8 +65,9 @@ def check_audio_devices():
         print("=== Output Devices (Speaker/Headphones) ===")
         for i, dev in output_devices:
             default = " (DEFAULT)" if i == sd.default.device[1] else ""
+            hostapi = hostapi_names.get(dev["hostapi"], "Unknown")
             print(f"  [{i}] {dev['name']}{default}")
-            print(f"      Channels: {dev['max_output_channels']}, Sample Rate: {dev['default_samplerate']:.0f}Hz")
+            print(f"      Driver: {hostapi}, Channels: {dev['max_output_channels']}, Sample Rate: {dev['default_samplerate']:.0f}Hz")
         print()
 
         # Check if input and output are on the same interface

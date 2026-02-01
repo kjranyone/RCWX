@@ -37,9 +37,11 @@ class AudioInput(AudioStreamBase):
         channels: int = 1,
         blocksize: int = 1024,
         callback: Optional[Callable[[NDArray[np.float32]], None]] = None,
+        channel_selection: str = "average",
     ):
         super().__init__(device, sample_rate, channels, blocksize)
         self._callback = callback
+        self._channel_selection = channel_selection  # "left", "right", "average"
 
     def _audio_callback(
         self,
@@ -53,7 +55,19 @@ class AudioInput(AudioStreamBase):
             logger.warning(f"Input stream status: {status}")
 
         if self._callback is not None:
-            audio = indata[:, 0].astype(np.float32)
+            # Convert to mono based on channel selection
+            if indata.ndim > 1 and indata.shape[1] > 1:
+                # Stereo input
+                if self._channel_selection == "left":
+                    audio = indata[:, 0].astype(np.float32)
+                elif self._channel_selection == "right":
+                    audio = indata[:, 1].astype(np.float32)
+                else:  # "average"
+                    audio = np.mean(indata, axis=1).astype(np.float32)
+            else:
+                # Mono input
+                audio = indata[:, 0].astype(np.float32) if indata.ndim > 1 else indata.astype(np.float32)
+
             self._callback(audio)
 
     def set_callback(self, callback: Callable[[NDArray[np.float32]], None]) -> None:
@@ -61,8 +75,8 @@ class AudioInput(AudioStreamBase):
         self._callback = callback
 
 
-def list_input_devices(wasapi_only: bool = True) -> list[dict]:
-    """List available audio input devices."""
+def list_input_devices(wasapi_only: bool = False) -> list[dict]:
+    """List available audio input devices (all drivers by default)."""
     return list_devices("input", wasapi_only)
 
 

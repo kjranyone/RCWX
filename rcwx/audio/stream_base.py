@@ -268,37 +268,54 @@ class AudioStreamError(Exception):
     pass
 
 
-def list_devices(stream_type: str, wasapi_only: bool = True) -> list[dict]:
+def list_devices(stream_type: str, wasapi_only: bool = False) -> list[dict]:
     """
     List available audio devices.
 
     Args:
         stream_type: "input" or "output"
-        wasapi_only: If True, only show WASAPI devices
+        wasapi_only: If True, only show WASAPI devices (default: False)
 
     Returns:
-        List of device info dictionaries
+        List of device info dictionaries with hostapi_name
     """
     devices = []
     channel_key = f"max_{stream_type}_channels"
 
+    # Build hostapi index -> name mapping
+    hostapi_names = {}
     wasapi_hostapi = None
-    if wasapi_only:
-        for i, hostapi in enumerate(sd.query_hostapis()):
-            if "WASAPI" in hostapi["name"]:
-                wasapi_hostapi = i
-                break
+    for i, hostapi in enumerate(sd.query_hostapis()):
+        hostapi_names[i] = hostapi["name"]
+        if "WASAPI" in hostapi["name"]:
+            wasapi_hostapi = i
 
     for i, dev in enumerate(sd.query_devices()):
         if dev[channel_key] > 0:
             if wasapi_only and wasapi_hostapi is not None:
                 if dev["hostapi"] != wasapi_hostapi:
                     continue
+
+            # Get hostapi name (WASAPI, ASIO, MME, etc.)
+            hostapi_idx = dev["hostapi"]
+            hostapi_name = hostapi_names.get(hostapi_idx, "Unknown")
+
+            # Simplify hostapi name (e.g., "Windows WASAPI" -> "WASAPI")
+            if "WASAPI" in hostapi_name:
+                hostapi_name = "WASAPI"
+            elif "ASIO" in hostapi_name:
+                hostapi_name = "ASIO"
+            elif "DirectSound" in hostapi_name:
+                hostapi_name = "DirectSound"
+            elif "MME" in hostapi_name:
+                hostapi_name = "MME"
+
             devices.append({
                 "index": i,
                 "name": dev["name"],
                 "channels": dev[channel_key],
                 "sample_rate": dev["default_samplerate"],
+                "hostapi_name": hostapi_name,
             })
     return devices
 

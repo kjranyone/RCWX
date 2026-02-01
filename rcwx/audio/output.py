@@ -68,8 +68,8 @@ class AudioOutput(AudioStreamBase):
         self._callback = callback
 
 
-def list_output_devices(wasapi_only: bool = True) -> list[dict]:
-    """List available audio output devices."""
+def list_output_devices(wasapi_only: bool = False) -> list[dict]:
+    """List available audio output devices (all drivers by default)."""
     return list_devices("output", wasapi_only)
 
 
