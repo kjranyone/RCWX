@@ -32,18 +32,21 @@ uv run rcwx diagnose
 uv run rcwx
 ```
 
-**初回起動時のデフォルト設定** (低レイテンシ最適化):
+**初回起動時のデフォルト設定** (超低レイテンシ最適化):
 - F0方式: **FCPE** (低レイテンシ、100ms min) ← デフォルト
   - RMVPEに変更可能 (高品質、320ms min)
 - Voice Gate: expand (推奨)
 - Feature Cache: 有効 (デフォルト)
 - SOLA: 有効 (デフォルト)
-- チャンクサイズ: **150ms** (FCPE最適化) ← デフォルト
-  - RMVPEの場合は350msに自動調整
+- **チャンクサイズ: 100ms** (超低レイテンシ、FCPE公式最小値) ← デフォルト
+  - RMVPEの場合は350msに変更推奨
+- **Buffer Margin: 0.3** (タイトバッファ) ← デフォルト
+- **Parallel Extraction: 有効** (10-20%高速化) ← デフォルト
+- **torch.compile: 無効** (Windows XPU安定性優先) ← デフォルト
 
 **レイテンシ目標**:
-- FCPE: 80-120ms (デフォルト)
-- RMVPE: 150-250ms (高品質モード)
+- FCPE: **200-250ms** (デフォルト、実測値)
+- RMVPE: 400-500ms (高品質モード)
 
 ## Architecture
 
@@ -162,11 +165,12 @@ explicit = true
 | `mic_sample_rate` | 48000 | マイク入力レート |
 | `input_sample_rate` | 16000 | 処理レート (HuBERT/RMVPE用) |
 | `output_sample_rate` | 48000 | 出力レート |
-| `chunk_sec` | 0.35 | チャンクサイズ (RMVPE: >=0.32, FCPE: >=0.10) |
-| `f0_method` | rmvpe | F0抽出方法 (rmvpe/fcpe) |
+| `chunk_sec` | 0.10 | チャンクサイズ (FCPE公式最小値: 0.10, RMVPE: >=0.32) |
+| `f0_method` | fcpe | F0抽出方法 (fcpe=低レイテンシ, rmvpe=高品質) |
 | `max_queue_size` | 8 | キュー最大サイズ |
 | `prebuffer_chunks` | 1 | 出力開始前のプリバッファ |
-| `buffer_margin` | 0.5 | バッファマージン (0.5=tight, 1.0=relaxed) |
+| `buffer_margin` | 0.3 | バッファマージン (0.3=tight, 0.5=balanced, 1.0=relaxed) |
+| `use_parallel_extraction` | true | 並列HuBERT+F0抽出 (10-20%高速化) |
 | `input_gain_db` | 0.0 | 入力ゲイン (dB) |
 | `index_rate` | 0.0 | FAISSインデックス率 (0=無効, 0.5=バランス, 1=インデックスのみ) |
 | `denoise_enabled` | false | ノイズキャンセリング有効化 |
@@ -178,7 +182,7 @@ explicit = true
 | `extra_sec` | 0.0 | 追加カット範囲 |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
 | `lookahead_sec` | 0.0 | 先読み (レイテンシ増加!) |
-| `use_sola` | true | SOLA (最適クロスフェード位置探索) |
+| `use_sola` | false | SOLA (最適クロスフェード位置探索) ⚠️ w-okadaチャンキングと非互換のため無効 |
 
 ## CLI Commands
 
@@ -323,6 +327,25 @@ uv run python -c "from rcwx.models.fcpe import is_fcpe_available; print(is_fcpe_
 - 最小チャンクサイズ 100ms (RMVPE: 320ms)
 - より低いレイテンシ (80-150ms)
 - F0品質はRMVPEよりやや劣る
+
+### 6. SOLA (既知の問題 - デフォルトで無効化済み)
+
+**症状**: SOLA有効時に出力音声が入力の40-50%の長さになる
+
+**原因**:
+- SOLA実装がRVC WebUI方式のオーバーラップチャンキングを前提
+- w-okada方式のコンテキストチャンキングと非互換
+- 各チャンクからsola_buffer (2400サンプル @ 48kHz) を削除
+- 52チャンク × 2400 = 124,800サンプル = 2.6秒の音声ロス
+
+**対策**:
+- **デフォルトで無効化済み** (`use_sola=false`)
+- 単純なクロスフェードで十分な品質
+- SOLA有効化は推奨しない（出力が短くなる）
+
+**将来の修正**:
+- w-okada方式に対応したSOLA実装
+- またはRVC WebUI方式チャンキングへの移行
 
 ## Audio Device Setup
 
@@ -779,7 +802,10 @@ changer.output_buffer.set_max_latency(max_output)
 - `lookahead_sec`: 右側の先読み (レイテンシ増加、通常0で十分)
 - `crossfade_sec`: チャンク境界のクロスフェード長 (0.05s)
 - `extra_sec`: 追加カット (エッジアーティファクト除去用、通常0)
-- `use_sola`: 最適クロスフェード位置の自動探索 (RVC WebUI方式)
+- `use_sola`: 最適クロスフェード位置の自動探索
+  - **デフォルト: false** (w-okadaチャンキングと非互換のため無効化)
+  - RVC WebUI方式のオーバーラップチャンキングが必要
+  - 有効化すると出力が40-50%短くなるバグあり
 
 **利点**:
 - エッジ効果軽減: コンテキストにより端での処理が安定
@@ -932,11 +958,11 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 | `output_device_name` | None | 出力デバイス名 (自動検出) |
 | `sample_rate` | 16000 | 処理サンプルレート |
 | `output_sample_rate` | 48000 | 出力サンプルレート |
-| `chunk_sec` | 0.35 | チャンクサイズ (秒) |
+| `chunk_sec` | 0.10 | チャンクサイズ (秒、FCPE公式最小値) |
 | `crossfade_sec` | 0.05 | クロスフェード長 (秒) |
 | `input_gain_db` | 0.0 | 入力ゲイン (dB) |
 | `prebuffer_chunks` | 1 | プリバッファチャンク数 |
-| `buffer_margin` | 0.5 | バッファマージン |
+| `buffer_margin` | 0.3 | バッファマージン (タイト) |
 
 ### InferenceConfig
 
@@ -944,10 +970,11 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 |-----------|-----------|------|
 | `pitch_shift` | 0 | ピッチシフト (半音) |
 | `use_f0` | true | F0使用 |
-| `f0_method` | rmvpe | F0抽出方法 (rmvpe/fcpe) |
+| `f0_method` | fcpe | F0抽出方法 (fcpe=低レイテンシ, rmvpe=高品質) |
 | `use_index` | false | FAISSインデックス使用 |
 | `index_ratio` | 0.5 | インデックス比率 |
-| `use_compile` | true | torch.compile使用 |
+| `use_compile` | false | torch.compile使用 (Windows XPU: 安定性のため無効) |
+| `use_parallel_extraction` | true | 並列HuBERT+F0抽出 (10-20%高速化) |
 | `voice_gate_mode` | expand | ボイスゲートモード |
 | `energy_threshold` | 0.05 | エネルギー閾値 |
 | `use_feature_cache` | true | 特徴キャッシング |
@@ -955,7 +982,7 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 | `lookahead_sec` | 0.0 | 先読み長 |
 | `extra_sec` | 0.0 | 追加カット |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
-| `use_sola` | true | SOLA使用 |
+| `use_sola` | false | SOLA使用 (デフォルト無効) |
 
 ### DenoiseConfig (InferenceConfig内)
 

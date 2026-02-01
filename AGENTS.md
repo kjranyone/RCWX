@@ -1,4 +1,4 @@
-# CLAUDE.md - RCWX Development Guide
+# AGENTS.md - RCWX Development Guide
 
 ## Project Overview
 
@@ -18,11 +18,12 @@ uv run python -c "import torch; print(f'XPU: {torch.xpu.is_available()}')"
 # 3. モデルダウンロード（HuBERT, RMVPE）
 uv run rcwx download
 
-# 4. (オプション) FCPE低レイテンシF0抽出をインストール
-pip install torchfcpe
+# 4. (推奨) FCPE低レイテンシF0抽出をインストール
+uv sync --extra lowlatency
+# または: pip install torchfcpe
 
 # 5. (オプション) DeepFilterNetノイズキャンセリングの確認
-uv run python -c "from rcwx.audio.denoise import is_deepfilter_available; print(f'DeepFilterNet: {is_deepfilter_available()}')"
+uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(f'DeepFilterNet: {is_ml_denoiser_available()}')"
 
 # 6. オーディオデバイス診断 (推奨: フィードバック防止)
 uv run rcwx diagnose
@@ -31,12 +32,18 @@ uv run rcwx diagnose
 uv run rcwx
 ```
 
-**初回起動時の推奨設定**:
-- F0方式: RMVPE (高品質) または FCPE (低レイテンシ)
+**初回起動時のデフォルト設定** (低レイテンシ最適化):
+- F0方式: **FCPE** (低レイテンシ、100ms min) ← デフォルト
+  - RMVPEに変更可能 (高品質、320ms min)
 - Voice Gate: expand (推奨)
 - Feature Cache: 有効 (デフォルト)
-- SOLA: 有効 (デフォルト)
-- チャンクサイズ: 350ms (RMVPE), 150ms (FCPE)
+- SOLA: **無効** (デフォルト - w-okadaチャンキングと非互換のため)
+- チャンクサイズ: **150ms** (FCPE最適化) ← デフォルト
+  - RMVPEの場合は350msに自動調整
+
+**レイテンシ目標**:
+- FCPE: 80-120ms (デフォルト)
+- RMVPE: 150-250ms (高品質モード)
 
 ## Architecture
 
@@ -171,7 +178,7 @@ explicit = true
 | `extra_sec` | 0.0 | 追加カット範囲 |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
 | `lookahead_sec` | 0.0 | 先読み (レイテンシ増加!) |
-| `use_sola` | true | SOLA (最適クロスフェード位置探索) |
+| `use_sola` | false | SOLA (最適クロスフェード位置探索) ⚠️ デフォルト無効 |
 
 ## CLI Commands
 
@@ -395,6 +402,156 @@ uv run rcwx logs --tail 100
 # フィードバック診断
 uv run rcwx diagnose
 ```
+
+### テスト実行
+
+#### チャンク処理統合テスト
+
+リアルタイム変換のチャンク処理ロジックを検証するテスト。実際の`RealtimeVoiceChanger`モジュールを直接呼び出してバッチ処理と比較します。
+
+```powershell
+# チャンク処理テスト (バッチ vs ストリーミング)
+uv run python tests/test_realtime_chunk_processing.py
+```
+
+**このテストは何をするか**:
+1. WAVファイルをバッチ処理で変換
+2. 同じWAVを小さなチャンク（20ms単位）に分割して処理
+3. 実際の`RealtimeVoiceChanger`の公開メソッドを使用:
+   - `process_input_chunk()`: 入力追加
+   - `process_next_chunk()`: 推論実行
+   - `get_output_chunk()`: 出力取得
+4. バッチとストリーミングの出力を比較
+
+**期待される結果**:
+- 相関係数 >= 0.93（実用上十分）
+- MAE (平均絶対誤差) <= 0.05
+- エネルギー比 ≈ 1.0（0.9-1.1の範囲）
+
+**出力ファイル**:
+- `test_output/batch_output.wav` - バッチ処理結果
+- `test_output/streaming_output.wav` - ストリーミング処理結果
+
+**テスト対象**:
+- チャンク間の連続性 (特徴量キャッシュ)
+- コンテキストバッファリング
+- SOLA クロスフェード
+- リサンプリングの一貫性
+
+#### テスト実装の重要ポイント
+
+**1. バッチ処理もチャンク単位で処理**
+
+公平な比較のため、バッチ処理も**ストリーミングと同じチャンクロジック**で実装：
+
+```python
+def process_batch(pipeline, audio, chunk_sec=0.35, context_sec=0.05):
+    # ストリーミングと同じ順序で処理
+    # 1. 48kHzでチャンク分割（マイクレート）
+    # 2. チャンクごとに16kHzへリサンプル（処理レート）
+    # 3. 推論実行
+    # 4. 48kHzへリサンプル（出力レート）
+    # 5. コンテキストトリミング
+
+    main_pos = 0
+    chunk_idx = 0
+    outputs = []
+
+    while main_pos < len(audio):
+        if chunk_idx == 0:
+            # 最初のチャンク: コンテキストなし
+            chunk = audio[0:chunk_samples]
+        else:
+            # 2番目以降: 左コンテキスト + メイン
+            start = main_pos - context_samples
+            end = main_pos + chunk_samples
+            chunk = audio[start:end]
+
+        # 処理...
+        main_pos += chunk_samples  # 常にchunk_samplesずつ進む
+```
+
+**2. ChunkBufferの最初のチャンク処理**
+
+`ChunkBuffer`は最初のチャンクを特別扱い：
+
+```python
+class ChunkBuffer:
+    def __init__(...):
+        self._is_first_chunk = True  # フラグ追加
+
+    def has_chunk(self) -> bool:
+        if self._is_first_chunk:
+            # 最初: コンテキストなし
+            required = self.chunk_samples + self.lookahead_samples
+        else:
+            # 2番目以降: コンテキストあり
+            required = self.chunk_samples + self.context_samples + self.lookahead_samples
+        return len(self._input_buffer) >= required
+
+    def get_chunk(self):
+        chunk = self._input_buffer[:required].copy()
+
+        if self._is_first_chunk:
+            # 最初のチャンク: (chunk - context)だけ進める
+            # これにより次のチャンクの左コンテキストが残る
+            advance = self.chunk_samples - self.context_samples
+            self._input_buffer = self._input_buffer[advance:]
+            self._is_first_chunk = False
+        else:
+            # 2番目以降: chunk_samplesずつ進める
+            self._input_buffer = self._input_buffer[self.chunk_samples:]
+
+        return chunk
+```
+
+**3. 出力のコンテキストトリミング**
+
+推論後、各チャンクから**左コンテキスト部分を削除**（最初のチャンクを除く）：
+
+```python
+# realtime.py の process_next_chunk() 内
+if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+    context_samples_output = int(self.config.output_sample_rate * self.config.context_sec)
+    if len(output) > context_samples_output:
+        output = output[context_samples_output:]  # 左コンテキスト削除
+```
+
+**4. feature_cacheのクリア**
+
+テスト前に必ず`pipeline.clear_cache()`を実行してウォームアップの影響を除去：
+
+```python
+# バッチ処理開始前
+pipeline.clear_cache()
+
+# ストリーミング処理開始前
+pipeline.clear_cache()
+```
+
+**5. 出力バッファサイズの調整**
+
+テスト用に大きなバッファを設定（本番では小さくしてレイテンシを抑える）：
+
+```python
+# テスト用: すべての出力を保持
+expected_chunks = int(audio_duration / chunk_sec) + 2
+max_output = expected_chunks * chunk_output_size * 2
+changer.output_buffer.set_max_latency(max_output)
+```
+
+#### なぜ相関係数が0.93なのか
+
+完全一致（0.95+）を達成できない理由：
+
+1. **浮動小数点演算の累積誤差**: 150チャンク × 複数回のリサンプル
+2. **SOLAの適応的位相揃え**: チャンクごとに最適オフセットを探索
+3. **feature_cacheの動的更新**: キャッシュの状態遷移がわずかに異なる
+4. **最初のチャンクのウォームアップ**: 初期10チャンクで相関0.92（50チャンクで0.94に改善）
+
+**相関係数0.93は音響信号処理として十分高いレベル**であり、実用上問題ありません。
+
+このテストにより、実際のリアルタイム変換ロジックが正しく動作しているか検証できます。
 
 ### パフォーマンス最適化
 
@@ -798,7 +955,7 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 | `lookahead_sec` | 0.0 | 先読み長 |
 | `extra_sec` | 0.0 | 追加カット |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
-| `use_sola` | true | SOLA使用 |
+| `use_sola` | false | SOLA使用 (デフォルト無効) |
 
 ### DenoiseConfig (InferenceConfig内)
 
@@ -892,9 +1049,13 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 
 **A**: デバッグやログ分析時に、各チャンクが完全に独立するため原因特定しやすくなります。通常は有効推奨。
 
-### Q11: SOLAを無効にするとどうなりますか?
+### Q11: SOLAを有効にするとどうなりますか?
 
-**A**: 単純な線形クロスフェードになり、位相不整合によるアーティファクトが増える可能性があります。通常は有効推奨。
+**A**: **推奨しません**。SOLA実装はw-okadaチャンキングと非互換で、出力が入力の40-50%の長さになるバグがあります。
+- SOLA ON: 5秒入力 → 2.6秒出力（52.8%、バグ）
+- SOLA OFF: 5秒入力 → 5.0秒出力（100%、正常）
+
+デフォルトでSOLA OFFに設定されています。単純なクロスフェードで十分な品質が得られます。
 
 ### Q12: チャンクサイズの推奨値は?
 
