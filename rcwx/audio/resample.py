@@ -11,6 +11,7 @@ def resample(
     audio: NDArray[np.float32],
     orig_sr: int,
     target_sr: int,
+    method: str = "poly",
 ) -> NDArray[np.float32]:
     """
     Resample audio to target sample rate.
@@ -19,6 +20,9 @@ def resample(
         audio: Input audio array (1D)
         orig_sr: Original sample rate
         target_sr: Target sample rate
+        method: Resampling method
+            - "poly": scipy polyphase (high quality, slow)
+            - "linear": linear interpolation (fast, lower quality)
 
     Returns:
         Resampled audio array
@@ -26,11 +30,18 @@ def resample(
     if orig_sr == target_sr:
         return audio
 
-    # Find GCD for efficient resampling
-    from math import gcd
+    if method == "linear":
+        # Fast linear interpolation (good enough for real-time)
+        ratio = target_sr / orig_sr
+        target_len = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, target_len)
+        return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+    else:
+        # High-quality polyphase resampling (default)
+        from math import gcd
 
-    g = gcd(orig_sr, target_sr)
-    up = target_sr // g
-    down = orig_sr // g
+        g = gcd(orig_sr, target_sr)
+        up = target_sr // g
+        down = orig_sr // g
 
-    return resample_poly(audio, up, down).astype(np.float32)
+        return resample_poly(audio, up, down).astype(np.float32)

@@ -106,6 +106,12 @@ class FCPE:
         if f0.dim() == 3:
             f0 = f0.squeeze(-1)
 
+        # Safety: Replace NaN/Inf with 0 (unvoiced)
+        # FCPE can sometimes output NaN values for certain audio conditions
+        if torch.any(torch.isnan(f0)) or torch.any(torch.isinf(f0)):
+            logger.warning(f"FCPE output contains NaN/Inf values, replacing with 0 (unvoiced)")
+            f0 = torch.where(torch.isnan(f0) | torch.isinf(f0), torch.zeros_like(f0), f0)
+
         return f0.to(self.dtype)
 
     def to(self, device: str) -> "FCPE":

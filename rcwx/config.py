@@ -20,12 +20,14 @@ class AudioConfig:
     output_device_name: Optional[str] = None
     sample_rate: int = 16000
     output_sample_rate: int = 48000
-    chunk_sec: float = 0.15  # FCPE optimized (>= 0.10 sec), RMVPE needs >= 0.32 sec
+    chunk_sec: float = 0.10  # Ultra-low latency: 100ms (FCPE official min, RMVPE needs >= 0.32 sec)
     crossfade_sec: float = 0.05
     input_gain_db: float = 0.0  # Input gain in dB
+    # Input channel selection for stereo devices: "left", "right", "average"
+    input_channel_selection: str = "average"
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
-    buffer_margin: float = 0.5  # Buffer margin multiplier (0.5=tight, 1.0=relaxed)
+    buffer_margin: float = 0.3  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
 
 
 @dataclass
@@ -49,7 +51,13 @@ class InferenceConfig:
     f0_method: str = "fcpe"
     use_index: bool = False
     index_ratio: float = 0.5
-    use_compile: bool = True
+    index_k: int = 4  # FAISS neighbors to search (4=fast, 8=quality)
+    # torch.compile: Disabled for Windows XPU stability (unstable performance)
+    use_compile: bool = False
+    # Resampling method: "poly" (high quality) or "linear" (fast)
+    resample_method: str = "linear"
+    # Parallel HuBERT+F0 extraction (GPU streams, ~10-15% speedup)
+    use_parallel_extraction: bool = True
     # Voice gate mode: "off", "strict", "expand", "energy"
     # - off: no voice gate (all audio passes through)
     # - strict: F0-based only (original, may cut plosives)

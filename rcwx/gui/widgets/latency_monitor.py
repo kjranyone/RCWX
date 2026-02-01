@@ -80,6 +80,19 @@ class LatencyMonitor(ctk.CTkFrame):
         self.sep4 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
         self.sep4.grid(row=0, column=7, padx=5, pady=5)
 
+        # Buffer warning label
+        self.buffer_warning_label = ctk.CTkLabel(
+            self,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self.buffer_warning_label.grid(row=0, column=8, padx=10, pady=5)
+
+        # Separator
+        self.sep5 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
+        self.sep5.grid(row=0, column=9, padx=5, pady=5)
+
         # Status indicator
         self.status_indicator = ctk.CTkLabel(
             self,
@@ -87,10 +100,10 @@ class LatencyMonitor(ctk.CTkFrame):
             font=ctk.CTkFont(size=14),
             text_color="gray",
         )
-        self.status_indicator.grid(row=0, column=8, padx=10, pady=5, sticky="e")
+        self.status_indicator.grid(row=0, column=10, padx=10, pady=5, sticky="e")
 
         # Configure grid
-        self.grid_columnconfigure(8, weight=1)
+        self.grid_columnconfigure(10, weight=1)
 
     def set_device(self, name: str) -> None:
         """Set the device name."""
@@ -104,8 +117,29 @@ class LatencyMonitor(ctk.CTkFrame):
         self.latency_label.configure(text=f"レイテンシ: {stats.latency_ms:.0f}ms")
         self.inference_label.configure(text=f"推論: {stats.inference_ms:.0f}ms")
 
-        # Update status color based on latency
-        if stats.latency_ms < 150:
+        # Update buffer warning display
+        if stats.buffer_underruns > 0 or stats.buffer_overruns > 0:
+            warning_parts = []
+            if stats.buffer_underruns > 0:
+                warning_parts.append(f"⚠ UNDER:{stats.buffer_underruns}")
+            if stats.buffer_overruns > 0:
+                warning_parts.append(f"DROP:{stats.buffer_overruns}")
+
+            self.buffer_warning_label.configure(
+                text=" ".join(warning_parts),
+                text_color="#ff3333"
+            )
+            # Hide separator when warning is shown
+            self.sep5.grid_remove()
+        else:
+            self.buffer_warning_label.configure(text="")
+            # Show separator when no warning
+            self.sep5.grid()
+
+        # Update status color based on latency and buffer issues
+        if stats.buffer_underruns > 0 or stats.buffer_overruns > 0:
+            color = "#ff3333"  # Red - buffer issues
+        elif stats.latency_ms < 150:
             color = "#00ff00"  # Green
         elif stats.latency_ms < 250:
             color = "#ffff00"  # Yellow
@@ -122,12 +156,16 @@ class LatencyMonitor(ctk.CTkFrame):
             self.status_indicator.configure(text="●", text_color="gray")
             self.latency_label.configure(text="レイテンシ: --ms")
             self.inference_label.configure(text="推論: --ms")
+            self.buffer_warning_label.configure(text="")
+            self.sep5.grid()  # Show separator when stopped
 
     def set_loading(self) -> None:
         """Set loading status."""
         self.status_indicator.configure(text="◐", text_color="#ffff00")
         self.latency_label.configure(text="レイテンシ: 読込中...")
         self.inference_label.configure(text="推論: --ms")
+        self.buffer_warning_label.configure(text="")
+        self.sep5.grid()  # Show separator when loading
 
     def set_index_status(self, loaded: bool, index_rate: float = 0.0) -> None:
         """Set the index status.

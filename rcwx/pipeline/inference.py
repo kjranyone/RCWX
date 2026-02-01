@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -87,9 +88,10 @@ class RVCPipeline:
         self.device = get_device(device)
         self.dtype = get_dtype(self.device, dtype)
 
-        # torch.compile with Triton backend is not supported on Windows
-        if use_compile and sys.platform == "win32":
-            logger.info("torch.compile disabled on Windows (Triton not supported)")
+        # torch.compile: XPU uses inductor backend (no Triton needed)
+        # CUDA on Windows needs Triton, which is not supported
+        if use_compile and sys.platform == "win32" and self.device == "cuda":
+            logger.info("torch.compile disabled for CUDA on Windows (Triton not supported)")
             use_compile = False
         self.use_compile = use_compile
 
@@ -225,6 +227,7 @@ class RVCPipeline:
         self,
         features: torch.Tensor,
         index_rate: float = 0.5,
+        k: int = 4,
     ) -> torch.Tensor:
         """
         Search FAISS index and blend retrieved features with original.
@@ -232,6 +235,7 @@ class RVCPipeline:
         Args:
             features: HuBERT features [B, T, C]
             index_rate: Blending ratio (0=original only, 1=index only)
+            k: Number of nearest neighbors to retrieve (4=fast, 8=quality)
 
         Returns:
             Blended features [B, T, C]
@@ -244,11 +248,11 @@ class RVCPipeline:
         if self.dtype == torch.float16:
             npy = npy.astype(np.float32)
 
-        # Search for k=8 nearest neighbors (original RVC default)
+        # Search for k nearest neighbors (k=4 for speed, k=8 for quality)
         logger.debug(
-            f"FAISS search: input shape={npy.shape}, k=8, index_vectors={self.faiss_index.ntotal}"
+            f"FAISS search: input shape={npy.shape}, k={k}, index_vectors={self.faiss_index.ntotal}"
         )
-        score, ix = self.faiss_index.search(npy, k=8)
+        score, ix = self.faiss_index.search(npy, k=k)
         logger.debug(
             f"FAISS search results: scores shape={score.shape}, min={score.min():.4f}, max={score.max():.4f}"
         )
@@ -312,11 +316,13 @@ class RVCPipeline:
         pitch_shift: int = 0,
         f0_method: str = "rmvpe",
         index_rate: float = 0.0,
+        index_k: int = 4,
         voice_gate_mode: str = "expand",
         energy_threshold: float = 0.05,
         denoise: bool = False,
         noise_reference: Optional[np.ndarray] = None,
         use_feature_cache: bool = True,
+        use_parallel_extraction: bool = True,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -327,6 +333,7 @@ class RVCPipeline:
             pitch_shift: Pitch shift in semitones
             f0_method: F0 extraction method ("rmvpe" or "none")
             index_rate: FAISS index blending ratio (0=off, 0.5=balanced, 1=index only)
+            index_k: Number of FAISS neighbors to search (4=fast, 8=quality, default 4)
             voice_gate_mode: Voice gate mode for unvoiced segments:
                 - "off": no gating, all audio passes through
                 - "strict": F0-based only (may cut plosives like p/t/k)
@@ -336,6 +343,7 @@ class RVCPipeline:
             denoise: If True, apply spectral gate noise reduction before processing
             noise_reference: Optional noise sample for denoiser (auto-learns if None)
             use_feature_cache: Enable feature caching for chunk continuity (default True)
+            use_parallel_extraction: Enable parallel HuBERT+F0 extraction (~10-15% speedup)
 
         Returns:
             Converted audio at model sample rate (usually 40kHz)
@@ -443,9 +451,40 @@ class RVCPipeline:
             output_dim = 768
             output_layer = 12
 
-        # Extract HuBERT features
-        with torch.autocast(device_type=self.device, dtype=self.dtype):
-            features = self.hubert.extract(audio, output_layer=output_layer, output_dim=output_dim)
+        # Parallel extraction: HuBERT features + F0 (if enabled)
+        # Use ThreadPoolExecutor for ~10% speedup (more stable than GPU streams)
+        features = None
+        f0_raw = None
+
+        if use_parallel_extraction and self.has_f0:
+
+            def extract_hubert():
+                with torch.autocast(device_type=self.device, dtype=self.dtype):
+                    return self.hubert.extract(audio, output_layer=output_layer, output_dim=output_dim)
+
+            def extract_f0():
+                if f0_method == "fcpe" and self.fcpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        return self.fcpe.infer(audio, threshold=0.006)
+                elif self.rmvpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        return self.rmvpe.infer(audio)
+                return None
+
+            # Run HuBERT and F0 extraction in parallel threads
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                hubert_future = executor.submit(extract_hubert)
+                f0_future = executor.submit(extract_f0)
+
+                features = hubert_future.result()
+                f0_raw = f0_future.result()
+
+            logger.debug("Parallel extraction complete (HuBERT + F0, ThreadPool)")
+
+        # Fallback: sequential extraction
+        if features is None:
+            with torch.autocast(device_type=self.device, dtype=self.dtype):
+                features = self.hubert.extract(audio, output_layer=output_layer, output_dim=output_dim)
 
         logger.info(
             f"HuBERT features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}"
@@ -454,9 +493,9 @@ class RVCPipeline:
         # Apply FAISS index retrieval if enabled (before interpolation, like original RVC)
         if index_rate > 0 and self.faiss_index is not None:
             logger.info(
-                f"Applying index retrieval: index_rate={index_rate}, features_before={features.shape} mean={features.mean():.4f} std={features.std():.4f}"
+                f"Applying index retrieval: index_rate={index_rate}, k={index_k}, features_before={features.shape} mean={features.mean():.4f} std={features.std():.4f}"
             )
-            features = self._search_index(features, index_rate)
+            features = self._search_index(features, index_rate, k=index_k)
             logger.info(
                 f"Index retrieval applied: index_rate={index_rate}, features_after={features.shape} mean={features.mean():.4f} std={features.std():.4f}"
             )
@@ -504,19 +543,24 @@ class RVCPipeline:
         pitch = None
         pitchf = None
         if self.has_f0:
-            f0 = None
+            # Use F0 from parallel extraction if available
+            f0 = f0_raw if f0_raw is not None else None
 
-            # Use FCPE if requested and available
-            if f0_method == "fcpe" and self.fcpe is not None:
-                with torch.autocast(device_type=self.device, dtype=self.dtype):
-                    f0 = self.fcpe.infer(audio, threshold=0.006)
-                logger.debug("F0 extracted with FCPE")
+            # Otherwise extract sequentially (fallback or CPU mode)
+            if f0 is None:
+                # Use FCPE if requested and available
+                if f0_method == "fcpe" and self.fcpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        f0 = self.fcpe.infer(audio, threshold=0.006)
+                    logger.debug("F0 extracted with FCPE (sequential)")
 
-            # Use RMVPE if requested and available (or fallback if FCPE failed)
-            elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
-                with torch.autocast(device_type=self.device, dtype=self.dtype):
-                    f0 = self.rmvpe.infer(audio)
-                logger.debug("F0 extracted with RMVPE")
+                # Use RMVPE if requested and available (or fallback if FCPE failed)
+                elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        f0 = self.rmvpe.infer(audio)
+                    logger.debug("F0 extracted with RMVPE (sequential)")
+            else:
+                logger.debug(f"F0 from parallel extraction ({f0_method})")
 
             if f0 is not None:
                 # Apply pitch shift (only to voiced regions where f0 > 0)

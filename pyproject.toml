@@ -7,6 +7,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.7",
     "torchaudio>=2.7",
+    "pytorch-triton-xpu>=3.5.0",  # XPU Triton for torch.compile on Windows
     "sounddevice>=0.4.6",
     "numpy>=1.24",
     "scipy>=1.10",
@@ -34,18 +35,18 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv]
-# Resolve only for Windows (XPU Triton is Linux-only)
+# Resolve only for Windows
 environments = ["sys_platform == 'win32'"]
 
-# Exclude triton-xpu from resolution (Windows doesn't need it)
+# triton-xpu is Linux-only, but pytorch-triton-xpu works on Windows
 override-dependencies = [
     "triton-xpu; sys_platform == 'linux'",
-    "pytorch-triton-xpu; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-xpu" }
 torchaudio = { index = "pytorch-xpu" }
+pytorch-triton-xpu = { index = "pytorch-xpu" }
 
 [[tool.uv.index]]
 name = "pytorch-xpu"

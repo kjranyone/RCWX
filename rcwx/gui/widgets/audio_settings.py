@@ -581,24 +581,22 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
                 # Start loopback output stream if enabled
                 if enable_loopback:
-                    if self.output_device is None:
-                        logger.warning(f"Loopback requested but output_device is None, skipping loopback")
-                    else:
-                        logger.info(f"Starting loopback output: device={self.output_device}, sr={try_sr}Hz, blocksize={blocksize}")
-                        try:
-                            self._monitor_output_stream = sd.OutputStream(
-                                device=self.output_device,
-                                channels=1,  # Mono output
-                                samplerate=try_sr,
-                                blocksize=blocksize,
-                                dtype=np.float32,
-                                callback=output_callback,
-                            )
-                            self._monitor_output_stream.start()
-                            logger.info(f"Loopback output started successfully")
-                        except Exception as e:
-                            logger.error(f"Failed to start loopback output: {e}", exc_info=True)
-                            # Continue without loopback
+                    device_name = "default" if self.output_device is None else str(self.output_device)
+                    logger.info(f"Starting loopback output: device={device_name}, sr={try_sr}Hz, blocksize={blocksize}")
+                    try:
+                        self._monitor_output_stream = sd.OutputStream(
+                            device=self.output_device,  # None is OK - uses system default
+                            channels=1,  # Mono output
+                            samplerate=try_sr,
+                            blocksize=blocksize,
+                            dtype=np.float32,
+                            callback=output_callback,
+                        )
+                        self._monitor_output_stream.start()
+                        logger.info(f"Loopback output started successfully on {device_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to start loopback output: {e}", exc_info=True)
+                        # Continue without loopback
 
                 if try_sr != self.input_sample_rate:
                     # Update the detected sample rate for future use
