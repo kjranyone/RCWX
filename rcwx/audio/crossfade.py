@@ -35,13 +35,17 @@ class SOLAState:
         # Estimate zero-crossing interval (assume ~100Hz fundamental for voice)
         zc = sample_rate // 100  # ~480 samples at 48kHz
 
-        sola_buffer_frame = min(crossfade_samples, 4 * zc)
-        sola_search_frame = zc
+        # Use the requested crossfade_samples directly (no 4*zc limitation)
+        # For w-okada mode, we need full context length for crossfading
+        sola_buffer_frame = crossfade_samples
+        # Use 2x zero-crossing interval (20ms @ 40kHz)
+        # Balance between search range and avoiding false matches
+        sola_search_frame = zc * 2
 
-        # Sin^2 fade windows (as used in RVC)
+        # Hann (raised cosine) fade windows - smooth and well-tested
         t = np.linspace(0.0, 1.0, sola_buffer_frame, dtype=np.float32)
-        fade_in = np.sin(0.5 * np.pi * t) ** 2
-        fade_out = 1 - fade_in
+        fade_in = 0.5 * (1.0 - np.cos(np.pi * t))
+        fade_out = 1.0 - fade_in
 
         return SOLAState(
             sola_buffer=None,
@@ -58,7 +62,7 @@ class CrossfadeResult:
 
     audio: NDArray[np.float32]
     sola_offset: int = 0
-    sola_correlation: float = 0.0
+    correlation: float = 0.0  # Renamed from sola_correlation for consistency
 
 
 def flush_sola_buffer(state: SOLAState) -> NDArray[np.float32]:
@@ -138,61 +142,60 @@ def apply_sola_crossfade(
                 return CrossfadeResult(audio=infer_wav[:-sola_buffer_frame].copy())
         return CrossfadeResult(audio=infer_wav.copy())
 
-    # w-okada mode: different processing strategy
+    # w-okada mode: Enhanced with SOLA crossfading for smooth chunk boundaries
+    # Uses left context for phase-aligned crossfading with previous buffer
     if wokada_mode:
         # In w-okada mode, infer_wav = [context | main]
-        # We crossfade the saved buffer with the context region,
-        # then trim the context and return [main]
+        # Use context for crossfading with previous buffer, then trim it
 
-        # Use context_samples if provided, otherwise fall back to sola_buffer_frame
-        trim_samples = context_samples if context_samples > 0 else sola_buffer_frame
+        trim_samples = context_samples if context_samples > 0 else 0
 
-        # Not enough samples for SOLA search
-        if len(infer_wav) < sola_buffer_frame + sola_search_frame:
-            # Fallback: simple crossfade at the beginning
-            result = infer_wav.copy()
-            if len(result) >= sola_buffer_frame and len(result) > trim_samples:
-                result[:sola_buffer_frame] = (
-                    state.sola_buffer * state.fade_out_window +
-                    result[:sola_buffer_frame] * state.fade_in_window
-                )
-                # Save new buffer from end (but keep it in output)
-                state.sola_buffer = result[-sola_buffer_frame:].copy()
-                # Trim fixed context from beginning
-                return CrossfadeResult(audio=result[trim_samples:])
+        # Not enough samples for crossfading
+        if len(infer_wav) < trim_samples + sola_buffer_frame:
+            # Fallback: simple trim without crossfade
+            if trim_samples > 0 and len(infer_wav) > trim_samples:
+                result = infer_wav[trim_samples:].copy()
+                # Save buffer from end for next chunk
+                if len(result) > sola_buffer_frame:
+                    state.sola_buffer = result[-sola_buffer_frame:].copy()
+                return CrossfadeResult(audio=result, sola_offset=0, correlation=0.0)
             else:
-                state.sola_buffer = None
-                return CrossfadeResult(audio=result)
+                return CrossfadeResult(audio=infer_wav.copy(), sola_offset=0, correlation=0.0)
 
-        # Find optimal offset in the LEFT part (context) for crossfading
-        sola_offset = _find_sola_offset(
+        # SOLA crossfade: use left context for offset search
+        # Context region: first (trim_samples + sola_search_frame) samples
+        context_region = infer_wav[: trim_samples + sola_search_frame]
+
+        # Find optimal offset within context region
+        sola_offset, correlation = _find_sola_offset(
             state.sola_buffer,
-            infer_wav,
-            sola_search_frame,
+            context_region,
+            min(sola_search_frame, trim_samples),  # Search within context
+            state.fade_in_window,
+            state.fade_out_window,
         )
 
-        # Crossfade at the found offset
+        # Apply crossfade at the found offset
         result = infer_wav.copy()
         crossfade_start = sola_offset
         crossfade_end = crossfade_start + sola_buffer_frame
 
-        if crossfade_end <= len(result) and len(result) > trim_samples:
-            # Apply crossfade
+        if crossfade_end <= len(result):
+            # Blend previous buffer with current audio at optimal position
             result[crossfade_start:crossfade_end] = (
-                state.sola_buffer * state.fade_out_window +
-                result[crossfade_start:crossfade_end] * state.fade_in_window
+                state.sola_buffer * state.fade_out_window
+                + result[crossfade_start:crossfade_end] * state.fade_in_window
             )
 
-            # Save new buffer from end (but keep it in output)
+        # Trim context from the beginning
+        if trim_samples > 0 and len(result) > trim_samples:
+            result = result[trim_samples:]
+
+        # Save buffer from end for next chunk
+        if len(result) > sola_buffer_frame:
             state.sola_buffer = result[-sola_buffer_frame:].copy()
 
-            # Trim FIXED context size from the beginning (not variable based on offset)
-            # This ensures consistent output length regardless of offset
-            return CrossfadeResult(audio=result[trim_samples:], sola_offset=sola_offset)
-        else:
-            # Not enough room for crossfade, fallback
-            state.sola_buffer = None
-            return CrossfadeResult(audio=result, sola_offset=sola_offset)
+        return CrossfadeResult(audio=result, sola_offset=sola_offset, correlation=correlation)
 
     # RVC WebUI mode (original implementation)
     else:
@@ -202,90 +205,180 @@ def apply_sola_crossfade(
             if len(infer_wav) >= sola_buffer_frame:
                 result = infer_wav.copy()
                 result[:sola_buffer_frame] = (
-                    state.sola_buffer * state.fade_out_window +
-                    result[:sola_buffer_frame] * state.fade_in_window
+                    state.sola_buffer * state.fade_out_window
+                    + result[:sola_buffer_frame] * state.fade_in_window
                 )
                 state.sola_buffer = result[-sola_buffer_frame:].copy()
             else:
                 result = infer_wav.copy()
                 state.sola_buffer = None
-            return CrossfadeResult(audio=result)
+            return CrossfadeResult(audio=result, sola_offset=0, correlation=0.0)
 
-        # Find optimal offset using correlation
-        sola_offset = _find_sola_offset(
+        # Find optimal offset using multi-candidate evaluation
+        sola_offset, correlation = _find_sola_offset(
             state.sola_buffer,
             infer_wav,
             sola_search_frame,
+            state.fade_in_window,
+            state.fade_out_window,
         )
 
-        # Shift infer_wav by offset (RVC style)
-        result = infer_wav[sola_offset:].copy()
+        # FIXED: Apply offset ONLY to crossfade region, not entire chunk
+        # This maintains fixed output length and matches batch processing behavior
+        result = infer_wav.copy()
 
         # Apply crossfade in-place
-        if len(result) >= 2 * sola_buffer_frame:
-            # Crossfade the beginning with previous buffer
-            result[:sola_buffer_frame] = (
-                state.sola_buffer * state.fade_out_window +
-                result[:sola_buffer_frame] * state.fade_in_window
+        if len(result) >= 2 * sola_buffer_frame and len(result) >= sola_offset + sola_buffer_frame:
+            # Extract crossfade region at optimal offset position
+            crossfade_region = result[sola_offset : sola_offset + sola_buffer_frame].copy()
+
+            # Crossfade previous buffer with current chunk at offset position
+            blended = (
+                state.sola_buffer * state.fade_out_window
+                + crossfade_region * state.fade_in_window
             )
+
+            # Place blended region at the beginning of output
+            result[:sola_buffer_frame] = blended
+
             # Save new buffer (tail of current result)
             state.sola_buffer = result[-sola_buffer_frame:].copy()
-            # Output WITHOUT tail (tail will appear via crossfade in next chunk)
-            return CrossfadeResult(audio=result[:-sola_buffer_frame], sola_offset=sola_offset)
+
+            # Output WITHOUT tail (fixed length, matches batch processing)
+            return CrossfadeResult(audio=result[:-sola_buffer_frame], sola_offset=sola_offset, correlation=correlation)
         elif len(result) >= sola_buffer_frame:
             # Short result: crossfade but can't save buffer
             result[:sola_buffer_frame] = (
-                state.sola_buffer * state.fade_out_window +
-                result[:sola_buffer_frame] * state.fade_in_window
+                state.sola_buffer * state.fade_out_window
+                + result[:sola_buffer_frame] * state.fade_in_window
             )
             state.sola_buffer = None
-            return CrossfadeResult(audio=result, sola_offset=sola_offset)
+            return CrossfadeResult(audio=result, sola_offset=sola_offset, correlation=correlation)
         else:
             state.sola_buffer = None
-            return CrossfadeResult(audio=result, sola_offset=sola_offset)
+            return CrossfadeResult(audio=result, sola_offset=sola_offset, correlation=correlation)
 
 
 def _find_sola_offset(
     sola_buffer: NDArray[np.float32],
     infer_wav: NDArray[np.float32],
     sola_search_frame: int,
-) -> int:
+    fade_in_window: NDArray[np.float32] | None = None,
+    fade_out_window: NDArray[np.float32] | None = None,
+) -> tuple[int, float]:
     """
-    Find optimal SOLA offset using normalized cross-correlation.
+    Find optimal SOLA offset using multi-candidate evaluation.
+
+    Evaluates multiple high-scoring candidates by actually applying crossfade
+    and measuring smoothness (gradient continuity) at boundaries.
 
     Args:
         sola_buffer: Previous chunk's tail
         infer_wav: Current inference output
         sola_search_frame: Search range in samples
+        fade_in_window: Fade-in window for crossfade evaluation
+        fade_out_window: Fade-out window for crossfade evaluation
 
     Returns:
-        Optimal offset for alignment
+        Tuple of (optimal offset, best correlation coefficient)
     """
     sola_buffer_frame = len(sola_buffer)
 
     if len(infer_wav) < sola_buffer_frame + sola_search_frame:
-        return 0
+        return 0, 0.0
 
     # Search region of current output
-    search_region = infer_wav[:sola_buffer_frame + sola_search_frame]
+    search_region = infer_wav[: sola_buffer_frame + sola_search_frame]
 
-    # Compute correlation using sliding window
-    best_offset = 0
-    best_corr = -np.inf
+    # Pre-compute buffer statistics
+    sola_centered = sola_buffer - np.mean(sola_buffer)
+    sola_rms = np.sqrt(np.mean(sola_buffer**2)) + 1e-8
+
+    # First pass: compute scores for all candidates
+    candidates = []
 
     for offset in range(sola_search_frame + 1):
-        window = search_region[offset:offset + sola_buffer_frame]
+        window = search_region[offset : offset + sola_buffer_frame]
 
         if len(window) != sola_buffer_frame:
             continue
 
-        # Normalized correlation
-        nom = np.sum(sola_buffer * window)
-        den = np.sqrt(np.sum(window ** 2) + 1e-8)
+        # Proper normalized cross-correlation
+        window_centered = window - np.mean(window)
+
+        nom = np.sum(sola_centered * window_centered)
+        den = np.sqrt(np.sum(sola_centered**2) * np.sum(window_centered**2)) + 1e-8
 
         corr = nom / den
-        if corr > best_corr:
-            best_corr = corr
-            best_offset = offset
 
-    return best_offset
+        # Energy (RMS) matching score
+        window_rms = np.sqrt(np.mean(window**2)) + 1e-8
+        energy_ratio = min(sola_rms, window_rms) / max(sola_rms, window_rms)
+
+        # Combined score
+        score = corr * (0.7 + 0.3 * energy_ratio)
+
+        candidates.append((offset, corr, score))
+
+    if not candidates:
+        return 0, 0.0
+
+    # Sort by score and take top 5 candidates
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    top_candidates = candidates[:5]
+
+    # If windows not provided, return best by score
+    if fade_in_window is None or fade_out_window is None:
+        best_offset, best_corr, _ = top_candidates[0]
+        return best_offset, best_corr
+
+    # Second pass: evaluate phase continuity for top candidates
+    best_offset = top_candidates[0][0]
+    best_corr = top_candidates[0][1]
+    best_smoothness = np.inf
+
+    for offset, corr, _ in top_candidates:
+        # Apply crossfade
+        window = search_region[offset : offset + sola_buffer_frame]
+        blended = sola_buffer * fade_out_window + window * fade_in_window
+
+        # Measure phase continuity at crossfade boundaries
+        # 1. Gradient continuity at crossfade start
+        if len(sola_buffer) > 1:
+            # Gradient before crossfade (last few samples of previous buffer)
+            pre_grad = sola_buffer[-1] - sola_buffer[-2]
+            # Gradient at start of crossfade
+            start_grad = blended[0] - sola_buffer[-1]
+            # Gradient change (phase discontinuity measure)
+            start_disc = abs(start_grad - pre_grad)
+        else:
+            start_disc = 0.0
+
+        # 2. Gradient continuity at crossfade end
+        remaining = search_region[offset + sola_buffer_frame : offset + sola_buffer_frame + 2]
+        if len(remaining) >= 2:
+            # Gradient at end of crossfade
+            end_grad = blended[-1] - blended[-2]
+            # Gradient after crossfade
+            post_grad = remaining[0] - blended[-1]
+            # Gradient change
+            end_disc = abs(post_grad - end_grad)
+        else:
+            end_disc = 0.0
+
+        # 3. Maximum absolute gradient within crossfade (avoid sharp jumps)
+        internal_grad = np.max(np.abs(np.diff(blended)))
+
+        # 4. Standard deviation of gradient (prefer consistent slope)
+        grad_std = np.std(np.diff(blended))
+
+        # Combined smoothness score (lower is better)
+        # Prioritize boundary continuity over internal smoothness
+        smoothness = 10.0 * start_disc + 10.0 * end_disc + 1.0 * internal_grad + 0.5 * grad_std
+
+        if smoothness < best_smoothness:
+            best_smoothness = smoothness
+            best_offset = offset
+            best_corr = corr
+
+    return best_offset, best_corr

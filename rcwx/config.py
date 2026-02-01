@@ -85,12 +85,18 @@ class InferenceConfig:
     # Extra discard: additional samples to remove beyond context
     extra_sec: float = 0.0
 
+    # Chunking mode: "wokada" (context-based), "rvc_webui" (overlap-based), "hybrid" (RVC hop + w-okada context)
+    chunking_mode: str = "wokada"
+
     # Crossfade length for SOLA blending (50ms is sufficient)
     crossfade_sec: float = 0.05
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
     # Uses RVC-style correlation-based phase alignment
     use_sola: bool = True
+
+    # Chunking mode: "wokada" (context-based, default) or "rvc_webui" (overlap-based, perfect continuity)
+    chunking_mode: str = "wokada"
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 

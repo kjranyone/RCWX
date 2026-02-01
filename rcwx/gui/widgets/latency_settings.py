@@ -21,6 +21,7 @@ class LatencyPreset:
     lookahead_sec: float
     crossfade_sec: float
     use_sola: bool
+    chunking_mode: str = "wokada"  # "wokada" or "rvc_webui"
 
 
 # Predefined latency presets
@@ -88,6 +89,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.lookahead_sec = preset.lookahead_sec
         self.crossfade_sec = preset.crossfade_sec
         self.use_sola = preset.use_sola
+        self.chunking_mode = preset.chunking_mode
 
         self._setup_ui()
 
@@ -101,9 +103,44 @@ class LatencySettingsFrame(ctk.CTkFrame):
         )
         header.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(5, 2))
 
-        # Mode selection (radio buttons)
+        # Chunking mode selection
+        chunking_label = ctk.CTkLabel(
+            self,
+            text="チャンキング方式",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        chunking_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
+
+        # Description label
+        chunking_desc = ctk.CTkLabel(
+            self,
+            text="w-okada: 低レイテンシ | RVC WebUI: 完全連続 | hybrid: RVC hop + w-okada context",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        )
+        chunking_desc.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=0)
+
+        self.chunking_mode_var = ctk.StringVar(value=self.chunking_mode)
+        self.chunking_mode_selector = ctk.CTkSegmentedButton(
+            self,
+            values=["wokada", "rvc_webui", "hybrid"],
+            variable=self.chunking_mode_var,
+            command=self._on_chunking_mode_change,
+        )
+        self.chunking_mode_selector.grid(
+            row=3, column=0, columnspan=2, padx=10, pady=(2, 5), sticky="ew"
+        )
+
+        # Preset selection (radio buttons)
+        preset_label = ctk.CTkLabel(
+            self,
+            text="プリセット",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        preset_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
+
         self.mode_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.mode_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=2, sticky="ew")
+        self.mode_frame.grid(row=5, column=0, columnspan=2, padx=10, pady=2, sticky="ew")
 
         self.mode_var = ctk.StringVar(value="balanced")
 
@@ -125,7 +162,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             variable=self.advanced_var,
             command=self._toggle_advanced,
         )
-        self.advanced_toggle.grid(row=2, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="w")
+        self.advanced_toggle.grid(row=6, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="w")
 
         # Advanced settings frame (hidden by default)
         self.advanced_frame = ctk.CTkFrame(self)
@@ -154,7 +191,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
         frame = ctk.CTkFrame(parent, fg_color="transparent")
         frame.grid(row=row + 1, column=0, padx=10, pady=(0, 2), sticky="ew")
 
-        slider = ctk.CTkSlider(frame, from_=from_, to=to, number_of_steps=steps, width=180, command=command)
+        slider = ctk.CTkSlider(
+            frame, from_=from_, to=to, number_of_steps=steps, width=180, command=command
+        )
         slider.set(value)
         slider.grid(row=0, column=0, padx=(0, 10))
 
@@ -168,28 +207,71 @@ class LatencySettingsFrame(ctk.CTkFrame):
         frame = self.advanced_frame
 
         self.chunk_slider, self.chunk_value = self._create_slider_row(
-            frame, "チャンクサイズ", 0, 100, 600, 50,
-            self.chunk_sec * 1000, f"{int(self.chunk_sec * 1000)}ms", self._on_chunk_change,
+            frame,
+            "チャンクサイズ",
+            0,
+            100,
+            600,
+            50,
+            self.chunk_sec * 1000,
+            f"{int(self.chunk_sec * 1000)}ms",
+            self._on_chunk_change,
         )
         self.prebuf_slider, self.prebuf_value = self._create_slider_row(
-            frame, "プリバッファ", 2, 0, 3, 3,
-            self.prebuffer_chunks, f"{self.prebuffer_chunks}チャンク", self._on_prebuf_change, 70,
+            frame,
+            "プリバッファ",
+            2,
+            0,
+            3,
+            3,
+            self.prebuffer_chunks,
+            f"{self.prebuffer_chunks}チャンク",
+            self._on_prebuf_change,
+            70,
         )
         self.margin_slider, self.margin_value = self._create_slider_row(
-            frame, "バッファマージン", 4, 0.3, 2.0, 17,
-            self.buffer_margin, f"{self.buffer_margin:.1f}x", self._on_margin_change,
+            frame,
+            "バッファマージン",
+            4,
+            0.3,
+            2.0,
+            17,
+            self.buffer_margin,
+            f"{self.buffer_margin:.1f}x",
+            self._on_margin_change,
         )
         self.context_slider, self.context_value = self._create_slider_row(
-            frame, "コンテキスト", 6, 0, 100, 20,
-            self.context_sec * 1000, f"{int(self.context_sec * 1000)}ms", self._on_context_change,
+            frame,
+            "コンテキスト",
+            6,
+            0,
+            100,
+            20,
+            self.context_sec * 1000,
+            f"{int(self.context_sec * 1000)}ms",
+            self._on_context_change,
         )
         self.crossfade_slider, self.crossfade_value = self._create_slider_row(
-            frame, "クロスフェード", 8, 0, 100, 20,
-            self.crossfade_sec * 1000, f"{int(self.crossfade_sec * 1000)}ms", self._on_crossfade_change,
+            frame,
+            "クロスフェード",
+            8,
+            0,
+            100,
+            20,
+            self.crossfade_sec * 1000,
+            f"{int(self.crossfade_sec * 1000)}ms",
+            self._on_crossfade_change,
         )
         self.lookahead_slider, self.lookahead_value = self._create_slider_row(
-            frame, "右コンテキスト (+遅延)", 10, 0, 100, 20,
-            self.lookahead_sec * 1000, f"{int(self.lookahead_sec * 1000)}ms", self._on_lookahead_change,
+            frame,
+            "右コンテキスト (+遅延)",
+            10,
+            0,
+            100,
+            20,
+            self.lookahead_sec * 1000,
+            f"{int(self.lookahead_sec * 1000)}ms",
+            self._on_lookahead_change,
         )
 
         # SOLA checkbox
@@ -217,9 +299,16 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def _toggle_advanced(self) -> None:
         """Toggle advanced settings visibility."""
         if self.advanced_var.get():
-            self.advanced_frame.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 3), sticky="ew")
+            self.advanced_frame.grid(
+                row=6, column=0, columnspan=2, padx=10, pady=(0, 3), sticky="ew"
+            )
         else:
             self.advanced_frame.grid_forget()
+
+    def _on_chunking_mode_change(self, value: str) -> None:
+        """Handle chunking mode change."""
+        self.chunking_mode = value
+        self._notify_change()
 
     def _on_mode_change(self) -> None:
         """Handle mode selection change."""
@@ -235,6 +324,10 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.lookahead_sec = preset.lookahead_sec
         self.crossfade_sec = preset.crossfade_sec
         self.use_sola = preset.use_sola
+        self.chunking_mode = preset.chunking_mode
+
+        # Update chunking mode UI
+        self.chunking_mode_var.set(self.chunking_mode)
 
         # Update sliders if advanced is visible
         if self.advanced_var.get():
@@ -326,6 +419,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             "lookahead_sec": self.lookahead_sec,
             "crossfade_sec": self.crossfade_sec,
             "use_sola": self.use_sola,
+            "chunking_mode": self.chunking_mode,
         }
 
     def set_preset(self, preset_name: str) -> None:
@@ -343,6 +437,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         lookahead_sec: float,
         crossfade_sec: float,
         use_sola: bool = True,
+        chunking_mode: str = "wokada",
     ) -> None:
         """Set individual values directly (for restoring saved settings)."""
         self.chunk_sec = chunk_sec
@@ -352,6 +447,10 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.lookahead_sec = lookahead_sec
         self.crossfade_sec = crossfade_sec
         self.use_sola = use_sola
+        self.chunking_mode = chunking_mode
+
+        # Update chunking mode UI
+        self.chunking_mode_var.set(chunking_mode)
 
         # Update sliders
         self.chunk_slider.set(chunk_sec * 1000)

@@ -67,31 +67,36 @@ class ChunkBuffer:
         self._input_buffer = np.concatenate([self._input_buffer, audio])
 
     def has_chunk(self) -> bool:
-        """Check if a full chunk is available for processing."""
-        # First chunk: no left context, only main + lookahead
-        # Subsequent chunks: left context + main + lookahead
-        if self._is_first_chunk:
-            required = self.chunk_samples + self.lookahead_samples
-        else:
-            required = self.chunk_samples + self.context_samples + self.lookahead_samples
+        """Check if a full chunk is available for processing.
+
+        Hybrid mode optimization: Always use the larger requirement (subsequent chunks)
+        to ensure early chunks have enough data. This prevents the issue where
+        the first block has too little data for the second chunk.
+        """
+        # Use subsequent chunk requirement for all chunks to ensure consistency
+        # This is slightly wasteful for first chunk but ensures all chunks process
+        required = self.chunk_samples + self.context_samples + self.lookahead_samples
         return len(self._input_buffer) >= required
 
     def get_chunk(self) -> NDArray[np.float32] | None:
         """
-        Get a chunk for processing (with left and right context).
+        Get a chunk for processing (w-okada style).
 
         Returns:
-            Audio chunk: [left_context | main | right_context]
-            Or None if not enough samples
+            Audio chunk for inference
+            First chunk: [main] (no left context)
+            Subsequent chunks: [context | main] (context from previous chunk)
 
         Note:
-            First chunk has no left context: [main | right_context]
-            Subsequent chunks: [left_context | main | right_context]
+            Always advances by chunk_samples (uniform progression)
+            w-okada style: extraConvertSize (context) is processed but trimmed from output
         """
         # Determine required samples based on whether this is first chunk
         if self._is_first_chunk:
+            # First chunk: just main (+ optional lookahead)
             required = self.chunk_samples + self.lookahead_samples
         else:
+            # Subsequent chunks: context + main (+ optional lookahead)
             required = self.chunk_samples + self.context_samples + self.lookahead_samples
 
         if len(self._input_buffer) < required:
@@ -100,18 +105,13 @@ class ChunkBuffer:
         # Extract chunk
         chunk = self._input_buffer[:required].copy()
 
-        # Remove processed samples
-        # Keep context samples from the END of this chunk for next chunk's left context
+        # Always advance by chunk_samples (w-okada style: uniform progression)
+        # This is the key difference from overlap-based chunking
+        self._input_buffer = self._input_buffer[self.chunk_samples :]
+
+        # Update flag after first chunk processed
         if self._is_first_chunk:
-            # First chunk: advance by (chunk_samples - context_samples)
-            # This leaves the last context_samples as left context for next chunk
-            advance = self.chunk_samples - self.context_samples
-            self._input_buffer = self._input_buffer[advance:]
             self._is_first_chunk = False
-        else:
-            # Subsequent chunks: advance by chunk_samples
-            # This naturally keeps the overlap correct
-            self._input_buffer = self._input_buffer[self.chunk_samples:]
 
         return chunk
 
@@ -224,7 +224,7 @@ class OutputBuffer:
                 # Apply fade-out to available samples to prevent click
                 if self.fade_samples > 0 and available > self.fade_samples:
                     fade_out = np.linspace(1, 0, self.fade_samples, dtype=np.float32)
-                    self._buffer[-self.fade_samples:] *= fade_out
+                    self._buffer[-self.fade_samples :] *= fade_out
                 result[:available] = self._buffer
                 self._buffer = np.array([], dtype=np.float32)
             self._last_was_underrun = True

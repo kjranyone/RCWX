@@ -95,6 +95,7 @@ class RealtimeController:
                 buffer_margin=latency["buffer_margin"],
                 context_sec=latency["context_sec"],
                 crossfade_sec=latency["crossfade_sec"],
+                chunking_mode=latency["chunking_mode"],
                 # Pitch settings
                 pitch_shift=self.app.pitch_control.pitch,
                 use_f0=self.app.pitch_control.use_f0,

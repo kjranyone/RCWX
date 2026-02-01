@@ -835,6 +835,7 @@ class RCWXApp(ctk.CTk):
             lookahead_sec=self.config.inference.lookahead_sec,
             crossfade_sec=self.config.inference.crossfade_sec,
             use_sola=self.config.inference.use_sola,
+            chunking_mode=getattr(self.config.inference, "chunking_mode", "wokada"),
         )
 
     def _on_audio_settings_changed(self) -> None:
@@ -852,7 +853,25 @@ class RCWXApp(ctk.CTk):
         if hasattr(self, "latency_settings") and self.realtime_controller.voice_changer:
             settings = self.latency_settings.get_settings()
             logger.debug(f"Latency settings changed: {settings}")
-            # Apply real-time settings
+
+            # Check if chunking mode changed (requires restart)
+            current_mode = self.realtime_controller.voice_changer.config.chunking_mode
+            new_mode = settings["chunking_mode"]
+
+            if current_mode != new_mode:
+                # Chunking mode changed - need to restart
+                logger.info(f"Chunking mode changed: {current_mode} -> {new_mode}, restarting...")
+                was_running = self._is_running
+
+                if was_running:
+                    # Stop current voice changer
+                    self.realtime_controller.stop()
+
+                    # Wait a moment for cleanup
+                    self.after(100, self._restart_after_mode_change)
+                return
+
+            # Apply real-time settings (for non-mode changes)
             self.realtime_controller.voice_changer.set_chunk_sec(settings["chunk_sec"])
             self.realtime_controller.voice_changer.set_prebuffer_chunks(settings["prebuffer_chunks"])
             self.realtime_controller.voice_changer.set_buffer_margin(settings["buffer_margin"])
@@ -860,6 +879,12 @@ class RCWXApp(ctk.CTk):
             self.realtime_controller.voice_changer.set_lookahead(settings["lookahead_sec"])
             self.realtime_controller.voice_changer.set_crossfade(settings["crossfade_sec"])
             self.realtime_controller.voice_changer.set_sola(settings["use_sola"])
+
+    def _restart_after_mode_change(self) -> None:
+        """Restart voice changer after mode change."""
+        if not self._is_running:
+            # Restart with new settings
+            self.realtime_controller.start()
 
     def _save_config(self) -> None:
         """Save all config settings immediately."""
@@ -890,6 +915,7 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.lookahead_sec = latency["lookahead_sec"]
                 self.config.inference.crossfade_sec = latency["crossfade_sec"]
                 self.config.inference.use_sola = latency["use_sola"]
+                self.config.inference.chunking_mode = latency.get("chunking_mode", "wokada")
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()

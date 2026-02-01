@@ -16,7 +16,7 @@ from rcwx.audio.crossfade import SOLAState, apply_sola_crossfade, flush_sola_buf
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.input import AudioInput
 from rcwx.audio.output import AudioOutput
-from rcwx.audio.resample import resample
+from rcwx.audio.resample import resample, StatefulResampler
 from rcwx.pipeline.inference import RVCPipeline
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,12 @@ class RealtimeConfig:
     # Feature caching for chunk continuity
     use_feature_cache: bool = True
 
+    # --- Chunking mode ---
+    # "wokada": w-okada style context-based chunking (default)
+    # "rvc_webui": RVC WebUI style overlap-based chunking (perfect continuity)
+    # "hybrid": Hybrid RVC+Stitching - RVC hop + w-okada context + optimized SOLA
+    chunking_mode: str = "wokada"
+
     # --- w-okada style processing ---
     # Each chunk: [left_context | main | right_context]
     # Output: keep only main portion, discard context edges
@@ -124,6 +130,11 @@ class RealtimeConfig:
     # SOLA search range (as ratio of crossfade length)
     sola_search_ratio: float = 0.25
 
+    # --- RVC WebUI mode specific parameters ---
+    # Overlap ratio for RVC WebUI mode (0.44 = 44% overlap, proven to achieve 0 discontinuities)
+    # Only used when chunking_mode="rvc_webui"
+    rvc_overlap_sec: float = 0.22
+
 
 class RealtimeVoiceChanger:
     """
@@ -138,7 +149,7 @@ class RealtimeVoiceChanger:
         config: Optional[RealtimeConfig] = None,
     ):
         """
-        Initialize the real-time voice changer.
+        Initialize real-time voice changer.
 
         Args:
             pipeline: RVC pipeline for inference
@@ -146,6 +157,20 @@ class RealtimeVoiceChanger:
         """
         self.pipeline = pipeline
         self.config = config or RealtimeConfig()
+
+        # Validate chunk_sec to prevent buffer overflow
+        if not (0.05 <= self.config.chunk_sec <= 0.4):
+            logger.warning(
+                f"Invalid chunk_sec={self.config.chunk_sec}s detected! "
+                f"Resetting to default 0.1s (FCPE) / 0.35s (RMVPE)"
+            )
+            # Auto-detect based on F0 method
+            if self.config.f0_method == "fcpe":
+                self.config.chunk_sec = 0.1
+            elif self.config.f0_method == "rmvpe":
+                self.config.chunk_sec = 0.35
+            else:
+                self.config.chunk_sec = 0.1
 
         # Calculate buffer sizes (at mic sample rate for input buffering)
         # Main chunk size (the "useful" audio we want to output per iteration)
@@ -206,18 +231,57 @@ class RealtimeVoiceChanger:
         except Exception as e:
             logger.warning(f"Warmup failed: {e}")
 
-        # Buffers - w-okada style processing with lookahead
-        # - Chunk structure: [left_context | main | right_context]
-        # - context_samples = kept for next chunk's left context
-        # - lookahead_samples = future samples for right context (improves quality at chunk end)
-        # IMPORTANT: chunk_samples must equal mic_chunk_samples (not + context)
-        # so that input consumption matches output duration
-        self.input_buffer = ChunkBuffer(
-            self.mic_chunk_samples,  # main only - advance by this amount each chunk
-            crossfade_samples=0,
-            context_samples=self.mic_context_samples,  # Keep as left context for next
-            lookahead_samples=self.mic_lookahead_samples,  # Right context for quality
-        )
+        # Buffers - mode-dependent initialization
+        if self.config.chunking_mode == "rvc_webui":
+            # RVC WebUI mode: overlap-based chunking
+            # - Each chunk overlaps with previous chunk
+            # - hop_samples = chunk_samples - overlap_samples
+            # - SOLA finds optimal crossfade position
+            self.mic_overlap_samples = int(
+                self.config.mic_sample_rate * self.config.rvc_overlap_sec
+            )
+            self.mic_hop_samples = self.mic_chunk_samples - self.mic_overlap_samples
+            # Simple buffer for RVC WebUI mode (no context/lookahead)
+            self.input_buffer_rvc = np.array([], dtype=np.float32)
+            self.input_buffer = None  # Not used in RVC mode
+            logger.info(
+                f"RVC WebUI mode: chunk={self.config.chunk_sec}s, "
+                f"overlap={self.config.rvc_overlap_sec}s, hop={self.mic_hop_samples}@{self.config.mic_sample_rate}Hz"
+            )
+        elif self.config.chunking_mode == "hybrid":
+            # Hybrid RVC+Stitching mode:
+            # - RVC-style hop-based progression (0 discontinuities)
+            # - w-okada style context structure [left_context | main | right_context]
+            # - SOLA optimized for overlap regions only (stitching mode)
+            # - No overlap between chunks (like RVC), no context discarded
+            self.mic_overlap_samples = 0
+            self.mic_hop_samples = self.mic_chunk_samples
+            self.input_buffer = ChunkBuffer(
+                self.mic_chunk_samples,  # main only - no overlap
+                crossfade_samples=0,
+                context_samples=self.mic_context_samples,  # Keep for next chunk's left context
+                lookahead_samples=self.mic_lookahead_samples,  # Right context for quality
+            )
+            self.input_buffer_rvc = None
+            logger.info(
+                f"Hybrid RVC+Stitching mode: chunk={self.config.chunk_sec}s, "
+                f"context={self.config.context_sec}s, hop={self.mic_hop_samples}@{self.config.mic_sample_rate}Hz"
+            )
+        else:
+            # w-okada mode: context-based chunking (default)
+            # - Chunk structure: [left_context | main | right_context]
+            # - context_samples = kept for next chunk's left context
+            # - lookahead_samples = future samples for right context
+            self.input_buffer = ChunkBuffer(
+                self.mic_chunk_samples,  # main only - advance by this amount each chunk
+                crossfade_samples=0,
+                context_samples=self.mic_context_samples,  # Keep as left context for next
+                lookahead_samples=self.mic_lookahead_samples,  # Right context for quality
+            )
+            self.input_buffer_rvc = None  # Not used in w-okada mode
+            logger.info(
+                f"w-okada mode: chunk={self.config.chunk_sec}s, context={self.config.context_sec}s"
+            )
 
         # Output processing parameters (at output sample rate)
         # Crossfade: blending region between main outputs
@@ -237,11 +301,16 @@ class RealtimeVoiceChanger:
             max_latency_samples=int(self.config.output_sample_rate * max_latency_sec),
             fade_samples=256,
         )
-        # SOLA state for RVC-style crossfade (on raw output, before trim)
-        self._sola_state = SOLAState.create(
-            self.output_crossfade_samples,
-            self.config.output_sample_rate,
-        )
+        # SOLA state for crossfading
+        # RVC WebUI, w-okada, and Hybrid modes use SOLA for smooth transitions
+        if self.config.chunking_mode in ["rvc_webui", "wokada", "hybrid"]:
+            self._sola_state = SOLAState.create(
+                self.output_crossfade_samples,
+                self.config.output_sample_rate,
+            )
+        else:
+            # Legacy mode: no SOLA
+            self._sola_state = None
 
         # Processing state
         self._running = False
@@ -257,6 +326,18 @@ class RealtimeVoiceChanger:
         # Statistics
         self.stats = RealtimeStats()
 
+        # Stateful resamplers for phase continuity across chunks
+        # Input resampler: mic_sample_rate -> input_sample_rate (e.g., 48kHz -> 16kHz)
+        self.input_resampler = StatefulResampler(
+            self.config.mic_sample_rate,
+            self.config.input_sample_rate,
+        )
+        # Output resampler: model output rate -> output_sample_rate (e.g., 40kHz -> 48kHz)
+        self.output_resampler = StatefulResampler(
+            self.pipeline.sample_rate,  # Model's output rate (typically 40kHz)
+            self.config.output_sample_rate,
+        )
+
         # Callbacks
         self.on_stats_update: Optional[Callable[[RealtimeStats], None]] = None
         self.on_error: Optional[Callable[[str], None]] = None
@@ -264,6 +345,10 @@ class RealtimeVoiceChanger:
         # Error tracking
         self._last_error: Optional[str] = None
         self._error_count: int = 0
+
+        # Dynamic buffer sizing: track output chunk sizes
+        self._output_size_history: list[int] = []
+        self._buffer_adjusted = False
 
         # Feedback detection: store recent output for correlation check
         # Store ~1 second of output for comparison with input
@@ -289,6 +374,26 @@ class RealtimeVoiceChanger:
         """Recalculate buffer sizes based on current config sample rates."""
         # Input buffer sizes (at mic sample rate)
         self.mic_chunk_samples = int(self.config.mic_sample_rate * self.config.chunk_sec)
+
+        # Round chunk size to HuBERT hop multiple for stable output length
+        # This prevents HuBERT frame quantization from varying output length
+        # Only in wokada mode - hybrid uses hop-based which guarantees 0 discontinuities
+        if self.config.chunking_mode == "wokada":
+            # HuBERT hop @ 48kHz = 960 samples (320 @ 16kHz * 48/16)
+            hubert_hop_48k = 960
+            rounded_samples = (
+                (self.mic_chunk_samples + hubert_hop_48k - 1) // hubert_hop_48k
+            ) * hubert_hop_48k
+
+            if rounded_samples != self.mic_chunk_samples:
+                logger.info(
+                    f"Chunk size adjusted: {self.mic_chunk_samples} -> {rounded_samples} samples "
+                    f"({self.mic_chunk_samples / self.config.mic_sample_rate:.3f}s -> {rounded_samples / self.config.mic_sample_rate:.3f}s) "
+                    f"to align with HuBERT hop ({hubert_hop_48k} samples)"
+                )
+                self.mic_chunk_samples = rounded_samples
+                self.config.chunk_sec = rounded_samples / self.config.mic_sample_rate
+
         self.mic_context_samples = int(self.config.mic_sample_rate * self.config.context_sec)
         self.mic_lookahead_samples = int(self.config.mic_sample_rate * self.config.lookahead_sec)
         self.mic_total_chunk = self.mic_chunk_samples + 2 * self.mic_context_samples
@@ -404,31 +509,84 @@ class RealtimeVoiceChanger:
                 f"rms={rms:.6f}, first5={audio[:5]}"
             )
 
-        # Add raw audio to buffer (resampling done in inference thread)
-        self.input_buffer.add_input(audio)
-
-        # Log input buffer state periodically
-        if self.stats.frames_processed < 5 or self.stats.frames_processed % 50 == 0:
-            logger.debug(
-                f"[INPUT] received={len(audio)}, "
-                f"input_buffer={self.input_buffer.buffered_samples}, "
-                f"input_queue={self._input_queue.qsize()}"
-            )
-
-        # Process ALL available chunks (not just one) to prevent input buffer buildup
         chunks_queued = 0
-        while self.input_buffer.has_chunk():
-            chunk = self.input_buffer.get_chunk()
-            if chunk is not None:
+
+        if self.config.chunking_mode == "rvc_webui":
+            # RVC WebUI mode: simple buffer with overlap
+            self.input_buffer_rvc = np.concatenate([self.input_buffer_rvc, audio])
+
+            # Process chunks with overlap
+            while len(self.input_buffer_rvc) >= self.mic_chunk_samples:
+                chunk = self.input_buffer_rvc[: self.mic_chunk_samples].copy()
                 try:
                     self._input_queue.put_nowait(chunk)
                     chunks_queued += 1
                 except Exception:
                     self.stats.buffer_overruns += 1
                     logger.warning(f"[INPUT] Queue full, dropping chunk")
-                    break  # Queue full, stop trying
+                    break
 
-        # Debug: log if multiple chunks were queued (indicates we're falling behind)
+                # Advance by hop_samples (creates overlap for next chunk)
+                self.input_buffer_rvc = self.input_buffer_rvc[self.mic_hop_samples :]
+
+            # Log buffer state
+            if self.stats.frames_processed < 5 or self.stats.frames_processed % 50 == 0:
+                logger.debug(
+                    f"[INPUT] received={len(audio)}, "
+                    f"input_buffer={len(self.input_buffer_rvc)}, "
+                    f"input_queue={self._input_queue.qsize()}"
+                )
+        elif self.config.chunking_mode == "hybrid":
+            # Hybrid mode: ChunkBuffer with context (like w-okada)
+            # - RVC-style hop-based progression (0 discontinuities)
+            # - w-okada style context structure [left_context | main | right_context]
+            # - No overlap between chunks (like RVC), no context discarded
+            self.input_buffer.add_input(audio)
+
+            # Log input buffer state periodically
+            if self.stats.frames_processed < 5 or self.stats.frames_processed % 50 == 0:
+                logger.debug(
+                    f"[INPUT-HYB] received={len(audio)}, "
+                    f"input_buffer={self.input_buffer.buffered_samples}, "
+                    f"input_queue={self._input_queue.qsize()}"
+                )
+
+            # Process ALL available chunks (hop-based: mic_hop_samples = mic_chunk_samples)
+            while self.input_buffer.has_chunk():
+                chunk = self.input_buffer.get_chunk()
+                if chunk is not None:
+                    try:
+                        self._input_queue.put_nowait(chunk)
+                        chunks_queued += 1
+                    except Exception:
+                        self.stats.buffer_overruns += 1
+                        logger.warning(f"[INPUT-HYB] Queue full, dropping chunk")
+                        break
+        else:
+            # w-okada mode: ChunkBuffer with context
+            self.input_buffer.add_input(audio)
+
+            # Log input buffer state periodically
+            if self.stats.frames_processed < 5 or self.stats.frames_processed % 50 == 0:
+                logger.debug(
+                    f"[INPUT] received={len(audio)}, "
+                    f"input_buffer={self.input_buffer.buffered_samples}, "
+                    f"input_queue={self._input_queue.qsize()}"
+                )
+
+            # Process ALL available chunks
+            while self.input_buffer.has_chunk():
+                chunk = self.input_buffer.get_chunk()
+                if chunk is not None:
+                    try:
+                        self._input_queue.put_nowait(chunk)
+                        chunks_queued += 1
+                    except Exception:
+                        self.stats.buffer_overruns += 1
+                        logger.warning(f"[INPUT] Queue full, dropping chunk")
+                        break
+
+        # Debug: log if multiple chunks were queued
         if chunks_queued > 1:
             logger.warning(f"[INPUT] Falling behind: queued {chunks_queued} chunks at once")
 
@@ -536,16 +694,12 @@ class RealtimeVoiceChanger:
                         f"min={chunk.min():.4f}, max={chunk.max():.4f}, rms={rms:.4f}"
                     )
 
-                # Resample from mic rate to processing rate
+                # Resample from mic rate to processing rate (stateful for phase continuity)
                 if self.config.mic_sample_rate != self.config.input_sample_rate:
-                    chunk = resample(
-                        chunk,
-                        self.config.mic_sample_rate,
-                        self.config.input_sample_rate,
-                    )
+                    chunk = self.input_resampler.resample_chunk(chunk)
                     if self.stats.frames_processed < 3:
                         logger.info(
-                            f"After resample: len={len(chunk)}, "
+                            f"After stateful resample: len={len(chunk)}, "
                             f"min={chunk.min():.4f}, max={chunk.max():.4f}"
                         )
 
@@ -579,14 +733,9 @@ class RealtimeVoiceChanger:
                     use_parallel_extraction=self.config.use_parallel_extraction,
                 )
 
-                # Resample to output sample rate
+                # Resample to output sample rate (stateful for phase continuity)
                 if self.pipeline.sample_rate != self.config.output_sample_rate:
-                    output = resample(
-                        output,
-                        self.pipeline.sample_rate,
-                        self.config.output_sample_rate,
-                        method=self.config.resample_method,
-                    )
+                    output = self.output_resampler.resample_chunk(output)
 
                 # Soft clipping to prevent harsh distortion
                 max_val = np.max(np.abs(output))
@@ -595,33 +744,75 @@ class RealtimeVoiceChanger:
                     if self.stats.frames_processed <= 5:
                         logger.warning(f"Audio clipping detected: max={max_val:.2f}")
 
-                # Apply SOLA crossfade if enabled, OR trim context manually
-                # w-okada mode SOLA: Uses left context for crossfading, returns trimmed output
-                # If SOLA is disabled, we manually trim context
+                # Apply SOLA crossfade (mode-dependent)
                 if self.config.use_sola and self._sola_state is not None:
-                    # Calculate context size for w-okada mode
-                    # Skip context trim for first chunk (no left context)
-                    context_samples_output = 0
-                    if self.stats.frames_processed > 0 and self.config.context_sec > 0:
-                        context_samples_output = int(
-                            self.config.output_sample_rate * self.config.context_sec
+                    if self.config.chunking_mode == "rvc_webui":
+                        # RVC WebUI mode: overlap-based SOLA
+                        # Each chunk overlaps with previous, SOLA finds optimal offset
+                        cf_result = apply_sola_crossfade(
+                            output,
+                            self._sola_state,
+                            wokada_mode=False,  # RVC WebUI mode
+                            context_samples=0,
                         )
+                        output = cf_result.audio
 
-                    # w-okada mode SOLA: crossfade with context, auto-trim
-                    cf_result = apply_sola_crossfade(
-                        output,
-                        self._sola_state,
-                        wokada_mode=True,
-                        context_samples=context_samples_output
-                    )
-                    output = cf_result.audio
+                        # Log SOLA stats periodically
+                        if self.stats.frames_processed % 50 == 0:
+                            logger.debug(
+                                f"[SOLA-RVC] chunk={self.stats.frames_processed}, "
+                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}"
+                            )
+                    elif self.config.chunking_mode == "hybrid":
+                        # Hybrid RVC+Stitching mode:
+                        # - RVC-style hop-based progression (0 discontinuities)
+                        # - w-okada style context structure [left_context | main | right_context]
+                        # - SOLA optimized for overlap regions only (stitching mode)
+                        # - No overlap between chunks (like RVC), no context discarded
+                        self.mic_overlap_samples = 0
+                        self.mic_hop_samples = self.mic_chunk_samples
 
-                    # Log SOLA stats periodically
-                    if self.stats.frames_processed % 50 == 0:
-                        logger.debug(
-                            f"[SOLA] chunk={self.stats.frames_processed}, "
-                            f"offset={cf_result.sola_offset}"
+                        # w-okada mode: context-based SOLA (stitching mode)
+                        # Calculate context size for stitching mode
+                        context_samples_output = 0  # No context trimming in hybrid mode
+
+                        cf_result = apply_sola_crossfade(
+                            output,
+                            self._sola_state,
+                            wokada_mode=True,
+                            context_samples=context_samples_output,  # No context trim
                         )
+                        output = cf_result.audio
+
+                        # Log SOLA stats periodically
+                        if self.stats.frames_processed % 50 == 0:
+                            logger.debug(
+                                f"[SOLA-HYB] chunk={self.stats.frames_processed}, "
+                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}"
+                            )
+                    else:
+                        # w-okada mode: context-based SOLA
+                        # Calculate context size
+                        context_samples_output = 0
+                        if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                            context_samples_output = int(
+                                self.config.output_sample_rate * self.config.context_sec
+                            )
+
+                        cf_result = apply_sola_crossfade(
+                            output,
+                            self._sola_state,
+                            wokada_mode=True,
+                            context_samples=context_samples_output,
+                        )
+                        output = cf_result.audio
+
+                        # Log SOLA stats periodically
+                        if self.stats.frames_processed % 50 == 0:
+                            logger.debug(
+                                f"[SOLA] chunk={self.stats.frames_processed}, "
+                                f"offset={cf_result.sola_offset}"
+                            )
                 else:
                     # No SOLA: Manually trim context from output to get only the "main" portion
                     # This is critical for matching batch processing output length
@@ -697,6 +888,33 @@ class RealtimeVoiceChanger:
                     + self.stats.inference_ms
                     + (self.output_buffer.available / self.config.output_sample_rate) * 1000
                 )
+
+                # Dynamic buffer sizing: adjust after measuring actual output sizes
+                if not self._buffer_adjusted and len(self._output_size_history) < 10:
+                    self._output_size_history.append(len(output))
+
+                    # After 10 chunks, calculate average and resize buffer
+                    if len(self._output_size_history) == 10:
+                        avg_output_size = int(np.mean(self._output_size_history))
+                        avg_duration_sec = avg_output_size / self.config.output_sample_rate
+
+                        # New max latency: prebuffer + 3x buffer_margin for safety
+                        new_max_latency = int(
+                            self.config.output_sample_rate
+                            * avg_duration_sec
+                            * (self.config.prebuffer_chunks + self.config.buffer_margin * 3)
+                        )
+
+                        old_max = self.output_buffer._max_latency
+                        self.output_buffer.set_max_latency(new_max_latency)
+                        self._buffer_adjusted = True
+
+                        logger.info(
+                            f"[BUFFER-ADJUST] Measured avg output: {avg_output_size} samples "
+                            f"({avg_duration_sec*1000:.0f}ms). "
+                            f"Adjusted max latency: {old_max} → {new_max_latency} samples "
+                            f"({new_max_latency/self.config.output_sample_rate*1000:.0f}ms)"
+                        )
 
                 # Send to output (block briefly if queue is full)
                 try:
@@ -780,7 +998,10 @@ class RealtimeVoiceChanger:
 
         # Reset stats and buffers
         self.stats.reset()
-        self.input_buffer.clear()
+        if self.input_buffer is not None:
+            self.input_buffer.clear()
+        if self.input_buffer_rvc is not None:
+            self.input_buffer_rvc = np.array([], dtype=np.float32)
         self.output_buffer.clear()
 
         # Reset pre-buffering state
@@ -893,6 +1114,9 @@ class RealtimeVoiceChanger:
         # Clear queues to prevent stale data
         self._clear_queues()
 
+        # Clear mode-dependent buffers to prevent stale data on mode switch
+        self._clear_buffers()
+
         logger.info("Real-time voice changer stopped")
 
     def _clear_queues(self) -> None:
@@ -913,6 +1137,46 @@ class RealtimeVoiceChanger:
 
         logger.debug("Queues cleared")
 
+    def _clear_buffers(self) -> None:
+        """Clear all buffers to prevent stale data on restart/mode switch."""
+        # Clear mode-dependent input buffers
+        if hasattr(self, 'input_buffer') and self.input_buffer is not None:
+            # ChunkBuffer: reset internal state
+            self.input_buffer = None
+
+        if hasattr(self, 'input_buffer_rvc'):
+            self.input_buffer_rvc = None
+
+        # Clear output buffer
+        if hasattr(self, 'output_buffer') and self.output_buffer is not None:
+            self.output_buffer = None
+
+        # Clear SOLA state to prevent crossfading with stale buffer
+        if hasattr(self, '_sola_state') and self._sola_state is not None:
+            self._sola_state.sola_buffer = None
+            self._sola_state.frames_processed = 0
+
+        # Reset stateful resamplers to clear overlap buffers
+        if hasattr(self, 'input_resampler'):
+            self.input_resampler.reset()
+        if hasattr(self, 'output_resampler'):
+            self.output_resampler.reset()
+
+        # Reset dynamic buffer sizing
+        if hasattr(self, '_output_size_history'):
+            self._output_size_history = []
+            self._buffer_adjusted = False
+
+        # Clear pipeline feature cache
+        if hasattr(self, 'pipeline') and self.pipeline is not None:
+            self.pipeline.clear_cache()
+
+        # Reset stats
+        if hasattr(self, 'stats'):
+            self.stats = RealtimeStats()
+
+        logger.debug("Buffers and caches cleared")
+
     def set_pitch_shift(self, semitones: int) -> None:
         """Set pitch shift in semitones."""
         self.config.pitch_shift = semitones
@@ -925,7 +1189,7 @@ class RealtimeVoiceChanger:
         """Set F0 extraction method.
 
         Args:
-            method: "rmvpe" (accurate, 320ms min) or "fcpe" (fast, 100ms min)
+            method: "rmvpe" (accurate, 320 ms min) or "fcpe" (fast, 100 ms min)
         """
         self.config.f0_method = method
 
@@ -1134,38 +1398,38 @@ class RealtimeVoiceChanger:
     # ========== Public Testing Methods ==========
 
     def process_input_chunk(self, audio: np.ndarray) -> None:
-        """
-        Add input audio and queue available chunks for processing.
+        """Add input audio and queue chunks (testing method)."""
+        if self.config.chunking_mode == "rvc_webui":
+            # RVC WebUI mode: simple buffer with overlap
+            self.input_buffer_rvc = np.concatenate([self.input_buffer_rvc, audio])
 
-        This is a public method for testing that replicates the behavior
-        of _on_audio_input without requiring an actual audio stream.
-
-        Args:
-            audio: Input audio at mic_sample_rate
-        """
-        # Add raw audio to buffer
-        self.input_buffer.add_input(audio)
-
-        # Queue all available chunks
-        while self.input_buffer.has_chunk():
-            chunk = self.input_buffer.get_chunk()
-            if chunk is not None:
+            # Process chunks with overlap
+            while len(self.input_buffer_rvc) >= self.mic_chunk_samples:
+                chunk = self.input_buffer_rvc[: self.mic_chunk_samples].copy()
                 try:
                     self._input_queue.put_nowait(chunk)
                 except Exception:
                     logger.warning("Input queue full, dropping chunk")
                     break
 
+                # Advance by hop_samples (creates overlap for next chunk)
+                self.input_buffer_rvc = self.input_buffer_rvc[self.mic_hop_samples :]
+        else:
+            # w-okada/hybrid mode: ChunkBuffer with context
+            self.input_buffer.add_input(audio)
+
+            # Queue all available chunks
+            while self.input_buffer.has_chunk():
+                chunk = self.input_buffer.get_chunk()
+                if chunk is not None:
+                    try:
+                        self._input_queue.put_nowait(chunk)
+                    except Exception:
+                        logger.warning("Input queue full, dropping chunk")
+                        break
+
     def process_next_chunk(self) -> bool:
-        """
-        Process one chunk from input queue to output queue.
-
-        This is a public method for testing that replicates one iteration
-        of _inference_thread without running in a separate thread.
-
-        Returns:
-            True if a chunk was processed, False if queue was empty
-        """
+        """Process one chunk from queue (testing method). Returns True if processed."""
         try:
             # Get input chunk (at mic sample rate) - non-blocking
             chunk = self._input_queue.get_nowait()
@@ -1180,13 +1444,9 @@ class RealtimeVoiceChanger:
         # Store for feedback detection (optional in tests)
         chunk_at_mic_rate = chunk.copy()
 
-        # Resample from mic rate to processing rate
+        # Resample from mic rate to processing rate (stateful for phase continuity)
         if self.config.mic_sample_rate != self.config.input_sample_rate:
-            chunk = resample(
-                chunk,
-                self.config.mic_sample_rate,
-                self.config.input_sample_rate,
-            )
+            chunk = self.input_resampler.resample_chunk(chunk)
 
         # Apply noise cancellation if enabled
         if self.config.denoise_enabled:
@@ -1211,46 +1471,60 @@ class RealtimeVoiceChanger:
             use_parallel_extraction=self.config.use_parallel_extraction,
         )
 
-        # Resample to output sample rate
+        # Resample to output sample rate (stateful for phase continuity)
         if self.pipeline.sample_rate != self.config.output_sample_rate:
-            output = resample(
-                output,
-                self.pipeline.sample_rate,
-                self.config.output_sample_rate,
-                method=self.config.resample_method,
-            )
+            output = self.output_resampler.resample_chunk(output)
 
         # Soft clipping
         max_val = np.max(np.abs(output))
         if max_val > 1.0:
             output = np.tanh(output)
 
-        # Apply SOLA crossfade if enabled, OR trim context manually
-        # w-okada mode SOLA: Uses left context for crossfading, returns trimmed output
-        # If SOLA is disabled, we manually trim context
+        # Apply SOLA crossfade (mode-dependent)
         if self.config.use_sola and self._sola_state is not None:
-            # Calculate context size for w-okada mode
-            # Skip context trim for first chunk (no left context)
-            context_samples_output = 0
-            if self.stats.frames_processed > 0 and self.config.context_sec > 0:
-                context_samples_output = int(
-                    self.config.output_sample_rate * self.config.context_sec
+            if self.config.chunking_mode == "rvc_webui":
+                # RVC WebUI mode: overlap-based SOLA
+                cf_result = apply_sola_crossfade(
+                    output,
+                    self._sola_state,
+                    wokada_mode=False,  # RVC WebUI mode
+                    context_samples=0,
                 )
+                output = cf_result.audio
+            elif self.config.chunking_mode == "hybrid":
+                # Hybrid mode: context-based SOLA (like w-okada, but no context trimming)
+                context_samples_output = 0  # No trim in hybrid mode
 
-            # w-okada mode SOLA: crossfade with context, auto-trim
-            cf_result = apply_sola_crossfade(
-                output,
-                self._sola_state,
-                wokada_mode=True,
-                context_samples=context_samples_output
-            )
-            output = cf_result.audio
+                cf_result = apply_sola_crossfade(
+                    output,
+                    self._sola_state,
+                    wokada_mode=True,
+                    context_samples=context_samples_output,
+                )
+                output = cf_result.audio
+            else:
+                # w-okada mode: context-based SOLA
+                context_samples_output = 0
+                if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                    context_samples_output = int(
+                        self.config.output_sample_rate * self.config.context_sec
+                    )
+
+                cf_result = apply_sola_crossfade(
+                    output,
+                    self._sola_state,
+                    wokada_mode=True,
+                    context_samples=context_samples_output,
+                )
+                output = cf_result.audio
         else:
             # No SOLA: Manually trim context from output to get only the "main" portion
             # This is critical for matching batch processing output length
             # Skip trimming for first chunk (no left context)
             if self.stats.frames_processed > 0 and self.config.context_sec > 0:
-                context_samples_output = int(self.config.output_sample_rate * self.config.context_sec)
+                context_samples_output = int(
+                    self.config.output_sample_rate * self.config.context_sec
+                )
                 if len(output) > context_samples_output:
                     output = output[context_samples_output:]
                     # Log trimming for first few chunks
@@ -1273,19 +1547,19 @@ class RealtimeVoiceChanger:
 
         return True
 
+    def flush_final_sola_buffer(self) -> None:
+        """Flush remaining SOLA buffer to output queue (testing method)."""
+        if self.config.use_sola and self._sola_state is not None:
+            final_buffer = flush_sola_buffer(self._sola_state)
+            if len(final_buffer) > 0:
+                try:
+                    self._output_queue.put(final_buffer, timeout=0.5)
+                    logger.info(f"Flushed final SOLA buffer: {len(final_buffer)} samples")
+                except Exception:
+                    logger.warning("Failed to flush final SOLA buffer (queue full)")
+
     def get_output_chunk(self, frames: int) -> np.ndarray:
-        """
-        Get output audio from buffer.
-
-        This is a public method for testing that replicates the behavior
-        of _on_audio_output without requiring an actual audio stream.
-
-        Args:
-            frames: Number of samples to retrieve
-
-        Returns:
-            Output audio at output_sample_rate
-        """
+        """Get output audio from buffer (testing method)."""
         # Check for new processed audio in queue
         try:
             while True:

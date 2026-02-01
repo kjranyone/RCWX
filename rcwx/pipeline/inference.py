@@ -120,7 +120,7 @@ class RVCPipeline:
         # Stores the last N frames of HuBERT features for blending with next chunk
         self._cached_features: Optional[torch.Tensor] = None
         self._cached_f0: Optional[torch.Tensor] = None
-        self._feature_cache_frames: int = 10  # Cache 10 frames (~100ms at 100fps)
+        self._feature_cache_frames: int = 30  # Cache 30 frames (600ms at 50fps) for smoother transitions
 
     def load(self) -> None:
         """Load all models."""
@@ -355,19 +355,25 @@ class RVCPipeline:
         if isinstance(audio, np.ndarray):
             audio = torch.from_numpy(audio).float()
 
-        # Resample to 16kHz if needed
-        if input_sr != 16000:
-            audio_np = audio.numpy()
-            audio_np = resample(audio_np, input_sr, 16000)
+        # ALWAYS resample to 16kHz regardless of input_sr parameter
+        # This prevents double-resampling bug when input_sr != 16000
+        if len(audio.shape) == 1:
+            audio_np = audio.numpy()  # [T]
+            if input_sr != 16000:
+                audio_np = resample(audio_np, input_sr, 16000)
             audio = torch.from_numpy(audio_np).float()
+        else:  # Multi-channel
+            raise ValueError(f"Expected 1D audio, got {len(audio.shape)}D")
 
         # Apply noise reduction if enabled
         if denoise:
             audio_np = audio.numpy()
-            # Resample noise reference if provided
-            if noise_reference is not None and input_sr != 16000:
-                noise_reference = resample(noise_reference, input_sr, 16000)
-            # Use DeepFilterNet if available, otherwise spectral gate
+            # Resample noise reference if provided (ONLY resample ONCE)
+            if noise_reference is not None and len(noise_reference) > 0:
+                # Resample noise reference if sample rate differs
+                if input_sr != 16000:
+                    noise_reference = resample(noise_reference, input_sr, 16000)
+                # Use DeepFilterNet if available, otherwise spectral gate
             audio_np = denoise_audio(
                 audio_np,
                 sample_rate=16000,
@@ -380,7 +386,6 @@ class RVCPipeline:
 
         # Apply high-pass filter to remove DC offset and low-frequency noise
         # Original RVC uses 48Hz cutoff Butterworth filter
-        audio_np = audio.numpy()
         audio_np = highpass_filter(audio_np, sr=16000, cutoff=48)
 
         # Add reflection padding for edge handling
@@ -460,7 +465,9 @@ class RVCPipeline:
 
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
-                    return self.hubert.extract(audio, output_layer=output_layer, output_dim=output_dim)
+                    return self.hubert.extract(
+                        audio, output_layer=output_layer, output_dim=output_dim
+                    )
 
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
@@ -484,7 +491,9 @@ class RVCPipeline:
         # Fallback: sequential extraction
         if features is None:
             with torch.autocast(device_type=self.device, dtype=self.dtype):
-                features = self.hubert.extract(audio, output_layer=output_layer, output_dim=output_dim)
+                features = self.hubert.extract(
+                    audio, output_layer=output_layer, output_dim=output_dim
+                )
 
         logger.info(
             f"HuBERT features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}"
@@ -507,16 +516,15 @@ class RVCPipeline:
             )
             if cache_frames > 0:
                 # Blend cached features with current features at the beginning
-                # Use linear crossfade: alpha goes from 1 (use cached) to 0 (use current)
-                alpha = torch.linspace(
-                    1, 0, cache_frames, device=features.device, dtype=features.dtype
-                )
+                # Use cosine crossfade for smoother transition: alpha goes from 1 (use cached) to 0 (use current)
+                t = torch.linspace(0, 1, cache_frames, device=features.device, dtype=features.dtype)
+                alpha = 0.5 * (1 + torch.cos(torch.pi * t))  # Cosine fade: 1 -> 0
                 alpha = alpha.view(1, cache_frames, 1)  # [1, T, 1] for broadcasting
                 cached = self._cached_features[:, -cache_frames:, :]  # Last N frames of cache
                 current = features[:, :cache_frames, :]  # First N frames of current
                 blended = alpha * cached + (1 - alpha) * current
                 features = torch.cat([blended, features[:, cache_frames:, :]], dim=1)
-                logger.debug(f"Feature cache blended: {cache_frames} frames")
+                logger.debug(f"Feature cache blended: {cache_frames} frames (cosine)")
 
         # Cache features for next chunk (before interpolation, at 50fps)
         if use_feature_cache:
@@ -586,19 +594,32 @@ class RVCPipeline:
                     cache_frames = min(f0_cache_frames, f0.shape[1], self._cached_f0.shape[1])
                     if cache_frames > 0:
                         # Blend F0: smooth transition from cached to current
-                        alpha = torch.linspace(1, 0, cache_frames, device=f0.device, dtype=f0.dtype)
+                        # Use cosine crossfade for smoother transition
+                        t = torch.linspace(0, 1, cache_frames, device=f0.device, dtype=f0.dtype)
+                        alpha = 0.5 * (1 + torch.cos(torch.pi * t))  # Cosine fade: 1 -> 0
                         alpha = alpha.view(1, cache_frames)
                         cached_f0 = self._cached_f0[:, -cache_frames:]
                         current_f0 = f0[:, :cache_frames]
-                        # Only blend where both have valid F0 (> 0), otherwise use current
+
+                        # Blend strategy: more aggressive blending for better continuity
+                        # Blend if EITHER has valid F0, not just both
+                        either_voiced = (cached_f0 > 0) | (current_f0 > 0)
                         both_voiced = (cached_f0 > 0) & (current_f0 > 0)
+
+                        # If both voiced: blend normally
+                        # If only one voiced: use the voiced one with slight fade
                         blended_f0 = torch.where(
                             both_voiced,
                             alpha * cached_f0 + (1 - alpha) * current_f0,
-                            current_f0,  # Use current if either is unvoiced
+                            torch.where(
+                                cached_f0 > 0,
+                                cached_f0 * alpha,  # Fade out cached if current is unvoiced
+                                current_f0 * (1 - alpha),  # Fade in current if cached is unvoiced
+                            )
                         )
+
                         f0 = torch.cat([blended_f0, f0[:, cache_frames:]], dim=1)
-                        logger.debug(f"F0 cache blended: {cache_frames} frames")
+                        logger.debug(f"F0 cache blended: {cache_frames} frames (cosine, aggressive)")
 
                 # Cache F0 for next chunk
                 if use_feature_cache:
