@@ -12,7 +12,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from rcwx.audio.buffer import ChunkBuffer, OutputBuffer
-from rcwx.audio.crossfade import SOLAState, apply_sola_crossfade
+from rcwx.audio.crossfade import SOLAState, apply_sola_crossfade, flush_sola_buffer
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.input import AudioInput
 from rcwx.audio.output import AudioOutput
@@ -52,24 +52,39 @@ class RealtimeConfig:
     output_device: Optional[int] = None
     # Microphone capture rate (native device rate for better compatibility)
     mic_sample_rate: int = 48000
+    # Input/output channels (1=mono, 2=stereo) - auto-detected from device
+    input_channels: int = 1
+    output_channels: int = 1
+    # Channel selection for stereo input: "left", "right", "average"
+    input_channel_selection: str = "average"
     # Internal processing rate (HuBERT/F0 models expect 16kHz)
     input_sample_rate: int = 16000
     output_sample_rate: int = 48000
-    # Note: FCPE requires >= 0.10 sec, RMVPE requires >= 0.32 sec
-    chunk_sec: float = 0.15
+    # Optimized: 100ms for ultra-low latency with FCPE (official minimum)
+    # FCPE: 100-150ms (stable RTF ~0.5x, latency ~250-350ms)
+    # RMVPE: 250-350ms (stable RTF 0.54x, latency ~530ms)
+    chunk_sec: float = 0.10
     pitch_shift: int = 0
     use_f0: bool = True
-    # F0 extraction method: "fcpe" (fast, 100ms min) or "rmvpe" (accurate, 320ms min)
+    # F0 extraction method:
+    # - "fcpe" (fast, low-latency, ~385ms total latency)
+    # - "rmvpe" (high-quality, higher-latency, ~530ms total latency)
     f0_method: str = "fcpe"
     max_queue_size: int = 8
     # Number of chunks to pre-buffer before starting output (1 = minimal latency)
     prebuffer_chunks: int = 1
-    # Buffer margin multiplier for max_latency calculation (0.5 = tight, 1.0 = relaxed)
-    buffer_margin: float = 0.5
+    # Buffer margin multiplier for max_latency calculation (0.3 = tight, 0.5 = balanced, 1.0 = relaxed)
+    buffer_margin: float = 0.3
     # Input gain in dB
     input_gain_db: float = 0.0
     # FAISS index rate (0=disabled, 0.5=balanced, 1=index only)
     index_rate: float = 0.0
+    # FAISS neighbors to search (4=fast, 8=quality)
+    index_k: int = 4
+    # Resampling method ("poly"=quality, "linear"=fast)
+    resample_method: str = "linear"
+    # Parallel HuBERT+F0 extraction (GPU streams, ~10-15% speedup)
+    use_parallel_extraction: bool = True
     # Noise cancellation
     denoise_enabled: bool = False
     denoise_method: str = "auto"  # auto, deepfilter, spectral
@@ -103,7 +118,10 @@ class RealtimeConfig:
     lookahead_sec: float = 0.0
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
-    use_sola: bool = True
+    # DISABLED BY DEFAULT: SOLA implementation is incompatible with w-okada chunking
+    # SOLA removes buffer from each chunk, causing 40-50% output length reduction
+    # Use simple crossfade instead (acceptable quality for most use cases)
+    use_sola: bool = False
 
     # SOLA search range (as ratio of crossfade length)
     sola_search_ratio: float = 0.25
@@ -556,9 +574,11 @@ class RealtimeVoiceChanger:
                     pitch_shift=self.config.pitch_shift,
                     f0_method=self.config.f0_method if self.config.use_f0 else "none",
                     index_rate=self.config.index_rate,
+                    index_k=self.config.index_k,
                     voice_gate_mode=self.config.voice_gate_mode,
                     energy_threshold=self.config.energy_threshold,
                     use_feature_cache=self.config.use_feature_cache,
+                    use_parallel_extraction=self.config.use_parallel_extraction,
                 )
 
                 # Resample to output sample rate
@@ -567,22 +587,8 @@ class RealtimeVoiceChanger:
                         output,
                         self.pipeline.sample_rate,
                         self.config.output_sample_rate,
+                        method=self.config.resample_method,
                     )
-
-                # Trim context from output to get only the "main" portion
-                # This is critical for matching batch processing output length
-                # Skip trimming for first chunk (no left context)
-                if self.stats.frames_processed > 0 and self.config.context_sec > 0:
-                    context_samples_output = int(
-                        self.config.output_sample_rate * self.config.context_sec
-                    )
-                    if len(output) > context_samples_output:
-                        output = output[context_samples_output:]
-                        # Log trimming for first few chunks
-                        if self.stats.frames_processed < 5:
-                            logger.info(
-                                f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
-                            )
 
                 # Soft clipping to prevent harsh distortion
                 max_val = np.max(np.abs(output))
@@ -591,8 +597,12 @@ class RealtimeVoiceChanger:
                     if self.stats.frames_processed <= 5:
                         logger.warning(f"Audio clipping detected: max={max_val:.2f}")
 
-                # Apply SOLA crossfade if enabled
+                # Apply SOLA crossfade if enabled, OR trim context manually
+                # CRITICAL: SOLA expects overlapping chunks (with context intact)
+                # If SOLA is enabled, it handles the overlap internally
+                # If SOLA is disabled, we need to trim context manually
                 if self.config.use_sola and self._sola_state is not None:
+                    # SOLA mode: Don't trim context, let SOLA handle overlap
                     cf_result = apply_sola_crossfade(output, self._sola_state)
                     output = cf_result.audio
 
@@ -602,6 +612,21 @@ class RealtimeVoiceChanger:
                             f"[SOLA] chunk={self.stats.frames_processed}, "
                             f"offset={cf_result.sola_offset}"
                         )
+                else:
+                    # No SOLA: Manually trim context from output to get only the "main" portion
+                    # This is critical for matching batch processing output length
+                    # Skip trimming for first chunk (no left context)
+                    if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                        context_samples_output = int(
+                            self.config.output_sample_rate * self.config.context_sec
+                        )
+                        if len(output) > context_samples_output:
+                            output = output[context_samples_output:]
+                            # Log trimming for first few chunks
+                            if self.stats.frames_processed < 5:
+                                logger.info(
+                                    f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
+                                )
 
                 # Debug: log output audio signature to detect feedback
                 if self.stats.frames_processed < 20:
@@ -698,6 +723,16 @@ class RealtimeVoiceChanger:
                         self.on_error(user_msg)
                 continue
 
+        # Flush remaining SOLA buffer before exiting
+        if self.config.use_sola and self._sola_state is not None:
+            final_buffer = flush_sola_buffer(self._sola_state)
+            if len(final_buffer) > 0:
+                try:
+                    self._output_queue.put(final_buffer, timeout=0.5)
+                    logger.info(f"Flushed final SOLA buffer: {len(final_buffer)} samples")
+                except Exception:
+                    logger.warning("Failed to flush final SOLA buffer (queue full)")
+
         logger.info("Inference thread stopped")
 
     def start(self) -> None:
@@ -793,8 +828,10 @@ class RealtimeVoiceChanger:
         self.audio_input = AudioInput(
             device=self.config.input_device,
             sample_rate=self.config.mic_sample_rate,
+            channels=self.config.input_channels,
             blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
             callback=self._on_audio_input,
+            channel_selection=self.config.input_channel_selection,
         )
         self.audio_input.start()
 
@@ -1143,9 +1180,11 @@ class RealtimeVoiceChanger:
             pitch_shift=self.config.pitch_shift,
             f0_method=self.config.f0_method if self.config.use_f0 else "none",
             index_rate=self.config.index_rate,
+            index_k=self.config.index_k,
             voice_gate_mode=self.config.voice_gate_mode,
             energy_threshold=self.config.energy_threshold,
             use_feature_cache=self.config.use_feature_cache,
+            use_parallel_extraction=self.config.use_parallel_extraction,
         )
 
         # Resample to output sample rate
@@ -1154,6 +1193,7 @@ class RealtimeVoiceChanger:
                 output,
                 self.pipeline.sample_rate,
                 self.config.output_sample_rate,
+                method=self.config.resample_method,
             )
 
         # Trim context from output to get only the "main" portion

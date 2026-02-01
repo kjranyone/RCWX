@@ -61,6 +61,26 @@ class CrossfadeResult:
     sola_correlation: float = 0.0
 
 
+def flush_sola_buffer(state: SOLAState) -> NDArray[np.float32]:
+    """
+    Flush remaining SOLA buffer at the end of processing.
+
+    This outputs the final buffer that was saved from the last chunk.
+    Should be called after all chunks have been processed.
+
+    Args:
+        state: SOLA state
+
+    Returns:
+        Remaining buffer audio, or empty array if no buffer
+    """
+    if state.sola_buffer is not None:
+        buffer = state.sola_buffer.copy()
+        state.sola_buffer = None
+        return buffer
+    return np.array([], dtype=np.float32)
+
+
 def apply_sola_crossfade(
     infer_wav: NDArray[np.float32],
     state: SOLAState,
@@ -75,6 +95,7 @@ def apply_sola_crossfade(
     Flow:
     - Chunk 0: output[:-buffer], save buffer
     - Chunk N: crossfade(buffer, chunk), output[:-buffer], save new buffer
+    - Final: call flush_sola_buffer() to output remaining buffer
     - Boundary: chunk[N-1] ends at result[-buffer-1], chunk[N] starts with
                 crossfade of result[-buffer], which are adjacent samples.
 
