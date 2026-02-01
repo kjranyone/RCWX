@@ -488,7 +488,35 @@ class RCWXApp(ctk.CTk):
         saved_channel = self.config.audio.input_channel_selection
         self.audio_settings.channel_var.set(saved_channel)
 
-        # Restore saved device selections
+        # Restore saved API filters and devices
+        # Important: Set API filter first without triggering device reset
+        if hasattr(self.config.audio, 'input_hostapi_filter'):
+            # Set filter directly and update device list only
+            self.audio_settings._input_hostapi_filter = self.config.audio.input_hostapi_filter
+            self.audio_settings.input_api_var.set(self.config.audio.input_hostapi_filter)
+            self.audio_settings._input_devices = self.audio_settings._filter_devices_by_hostapi(
+                self.audio_settings._all_input_devices, self.config.audio.input_hostapi_filter
+            )
+            # Update dropdown without resetting selection
+            input_names = ["デフォルト"] + [
+                self.audio_settings._format_device_name(d) for d in self.audio_settings._input_devices
+            ]
+            self.audio_settings.input_dropdown.configure(values=input_names)
+
+        if hasattr(self.config.audio, 'output_hostapi_filter'):
+            # Set filter directly and update device list only
+            self.audio_settings._output_hostapi_filter = self.config.audio.output_hostapi_filter
+            self.audio_settings.output_api_var.set(self.config.audio.output_hostapi_filter)
+            self.audio_settings._output_devices = self.audio_settings._filter_devices_by_hostapi(
+                self.audio_settings._all_output_devices, self.config.audio.output_hostapi_filter
+            )
+            # Update dropdown without resetting selection
+            output_names = ["デフォルト"] + [
+                self.audio_settings._format_device_name(d) for d in self.audio_settings._output_devices
+            ]
+            self.audio_settings.output_dropdown.configure(values=output_names)
+
+        # Now restore saved device selections (after API filters are set)
         if self.config.audio.input_device_name:
             self.audio_settings.set_input_device(self.config.audio.input_device_name)
         if self.config.audio.output_device_name:
@@ -864,6 +892,8 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.use_sola = latency["use_sola"]
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
+            self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()
+            self.config.audio.output_hostapi_filter = self.audio_settings.output_api_var.get()
             self.config.audio.input_device_name = self.audio_settings.get_input_device_name()
             self.config.audio.output_device_name = self.audio_settings.get_output_device_name()
             self.config.save()

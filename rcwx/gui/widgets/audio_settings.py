@@ -101,8 +101,12 @@ class AudioSettingsFrame(ctk.CTkFrame):
     def _extract_device_name(self, formatted_name: str) -> str:
         """Extract original device name from formatted name."""
         # Remove driver and channel info suffix like "(WASAPI, ステレオ)", etc.
+        # Only remove if it contains a known host API name or channel info
         import re
-        return re.sub(r'\s*\([^)]+\)$', '', formatted_name)
+        # Match patterns like "(WASAPI, ステレオ)", "(ASIO, モノラル)", "(MME, 2ch)", etc.
+        # These always have a comma separating hostapi and channel info
+        pattern = r'\s*\((WASAPI|ASIO|MME|DirectSound|WDM-KS|Unknown),\s*[^)]+\)$'
+        return re.sub(pattern, '', formatted_name)
 
     def _setup_ui(self) -> None:
         """Setup the UI components."""
@@ -235,6 +239,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
             self.monitor_frame,
             text="ループバック出力",
             variable=self.loopback_var,
+            command=self._on_loopback_toggle,
         )
         self.loopback_check.grid(row=0, column=1)
 
@@ -469,6 +474,92 @@ class AudioSettingsFrame(ctk.CTkFrame):
         else:
             self._start_monitor()
 
+    def _on_loopback_toggle(self) -> None:
+        """Handle loopback checkbox toggle during monitoring."""
+        if not self._monitoring:
+            return  # Not monitoring, nothing to do
+
+        import sounddevice as sd
+
+        enable_loopback = self.loopback_var.get()
+        logger.info(f"Loopback toggle: enable={enable_loopback}")
+
+        if enable_loopback:
+            # Start loopback output
+            if self._monitor_queue is None:
+                import queue
+                self._monitor_queue = queue.Queue(maxsize=10)
+
+            if self._monitor_output_stream is None and self._monitor_stream is not None:
+                try:
+                    # Get current monitoring parameters
+                    sr = self._monitor_stream.samplerate
+                    blocksize = self._monitor_stream.blocksize
+
+                    # Create output callback (same as in _start_monitor)
+                    output_callback_count = [0]
+
+                    def output_callback(outdata, frames, time_info, status):
+                        output_callback_count[0] += 1
+                        if output_callback_count[0] <= 3:
+                            logger.info(f"Output callback #{output_callback_count[0]}: queue_size={self._monitor_queue.qsize() if self._monitor_queue else 'None'}, frames={frames}")
+
+                        if self._monitor_queue is None:
+                            outdata.fill(0)
+                            return
+                        try:
+                            audio = self._monitor_queue.get_nowait()
+                            if output_callback_count[0] <= 3:
+                                logger.info(f"  Got audio from queue: len={len(audio)}")
+                            if len(audio) < len(outdata):
+                                padded = np.zeros(len(outdata), dtype=np.float32)
+                                padded[:len(audio)] = audio
+                                audio = padded
+                            elif len(audio) > len(outdata):
+                                audio = audio[:len(outdata)]
+                            outdata[:] = audio.reshape(-1, 1)
+                        except Exception:
+                            if output_callback_count[0] <= 3:
+                                logger.info(f"  Queue empty, outputting silence")
+                            outdata.fill(0)
+
+                    device_name = "default" if self.output_device is None else str(self.output_device)
+                    logger.info(f"Starting loopback output: device={device_name}, sr={sr}Hz, blocksize={blocksize}")
+
+                    self._monitor_output_stream = sd.OutputStream(
+                        device=self.output_device,
+                        channels=1,
+                        samplerate=sr,
+                        blocksize=blocksize,
+                        dtype=np.float32,
+                        callback=output_callback,
+                    )
+                    self._monitor_output_stream.start()
+                    logger.info(f"Loopback output started successfully on {device_name}")
+                except Exception as e:
+                    logger.error(f"Failed to start loopback output: {e}", exc_info=True)
+        else:
+            # Stop loopback output
+            if self._monitor_output_stream is not None:
+                try:
+                    self._monitor_output_stream.stop()
+                    self._monitor_output_stream.close()
+                    logger.info("Loopback output stopped")
+                except Exception as e:
+                    logger.warning(f"Error stopping loopback output: {e}")
+                finally:
+                    self._monitor_output_stream = None
+
+            # Clear queue
+            if self._monitor_queue is not None:
+                import queue
+                while not self._monitor_queue.empty():
+                    try:
+                        self._monitor_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self._monitor_queue = None
+
     def _start_monitor(self) -> None:
         """Start input level monitoring."""
         import sounddevice as sd
@@ -694,39 +785,65 @@ class AudioSettingsFrame(ctk.CTkFrame):
     def get_input_device_name(self) -> str:
         """Get the currently selected input device name (original, not formatted)."""
         formatted_name = self.input_var.get()
+        # "デフォルト" is a special value, return as-is
+        if formatted_name == "デフォルト":
+            return formatted_name
         return self._extract_device_name(formatted_name)
 
     def get_output_device_name(self) -> str:
         """Get the currently selected output device name (original, not formatted)."""
         formatted_name = self.output_var.get()
+        # "デフォルト" is a special value, return as-is
+        if formatted_name == "デフォルト":
+            return formatted_name
         return self._extract_device_name(formatted_name)
 
     def set_input_device(self, name: str) -> None:
         """Set input device by name (for restoring saved settings)."""
+        logger.info(f"Restoring input device: '{name}'")
+
+        # "デフォルト" is a special value, set directly
+        if name == "デフォルト":
+            self.input_var.set("デフォルト")
+            return
+
         # Extract original device name (in case formatted name was saved)
         original_name = self._extract_device_name(name)
+        logger.info(f"Extracted device name: '{original_name}'")
+        logger.info(f"Available devices: {[d['name'] for d in self._input_devices]}")
 
         # Find device and use formatted name for GUI
         for device in self._input_devices:
             if device["name"] == original_name:
                 formatted_name = self._format_device_name(device)
+                logger.info(f"Found device, setting to: '{formatted_name}'")
                 self.input_var.set(formatted_name)
                 # _on_input_change will be called via trace
                 return
         # If not found, keep default
-        logger.warning(f"Input device '{original_name}' (from '{name}') not found, using default")
+        logger.warning(f"Input device '{original_name}' (from '{name}') not found in {len(self._input_devices)} devices, using default")
 
     def set_output_device(self, name: str) -> None:
         """Set output device by name (for restoring saved settings)."""
+        logger.info(f"Restoring output device: '{name}'")
+
+        # "デフォルト" is a special value, set directly
+        if name == "デフォルト":
+            self.output_var.set("デフォルト")
+            return
+
         # Extract original device name (in case formatted name was saved)
         original_name = self._extract_device_name(name)
+        logger.info(f"Extracted device name: '{original_name}'")
+        logger.info(f"Available devices: {[d['name'] for d in self._output_devices]}")
 
         # Find device and use formatted name for GUI
         for device in self._output_devices:
             if device["name"] == original_name:
                 formatted_name = self._format_device_name(device)
+                logger.info(f"Found device, setting to: '{formatted_name}'")
                 self.output_var.set(formatted_name)
                 # _on_output_change will be called via trace
                 return
         # If not found, keep default
-        logger.warning(f"Output device '{original_name}' (from '{name}') not found, using default")
+        logger.warning(f"Output device '{original_name}' (from '{name}') not found in {len(self._output_devices)} devices, using default")

@@ -31,6 +31,7 @@ class AudioTestManager:
             app: Reference to main application
         """
         self.app = app
+        self._test_running = False  # Flag to prevent concurrent tests
 
     def run_test(self) -> None:
         """
@@ -40,9 +41,17 @@ class AudioTestManager:
         created from the main thread. Running sd.rec() or sd.play() in a
         separate thread causes "Invalid sample rate" or WDM-KS errors.
         """
+        # Prevent concurrent tests
+        if self._test_running:
+            logger.warning("Audio test already running, ignoring duplicate call")
+            return
+
         if self.app._is_running:
             self.app.test_status.configure(text="変換中は使用できません", text_color="orange")
             return
+
+        # Set flag before disabling button to prevent race condition
+        self._test_running = True
 
         # Disable button during test
         self.app.test_btn.configure(state="disabled")
@@ -228,4 +237,5 @@ class AudioTestManager:
                 self.app.test_status.configure(text=f"エラー: {short_msg}", text_color="red")
 
         finally:
+            self._test_running = False
             self.app.test_btn.configure(state="normal")

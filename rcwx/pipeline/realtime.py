@@ -796,17 +796,10 @@ class RealtimeVoiceChanger:
         self._output_history_pos = 0
         self._feedback_warning_shown = False
 
-        # Clear queues
-        while not self._input_queue.empty():
-            try:
-                self._input_queue.get_nowait()
-            except Empty:
-                break
-        while not self._output_queue.empty():
-            try:
-                self._output_queue.get_nowait()
-            except Empty:
-                break
+        # Clear queues and reset pre-buffering state
+        self._clear_queues()
+        self._chunks_ready = 0
+        self._output_started = False
 
         # Start inference thread
         self._running = True
@@ -897,7 +890,28 @@ class RealtimeVoiceChanger:
             self._thread.join(timeout=2.0)
             self._thread = None
 
+        # Clear queues to prevent stale data
+        self._clear_queues()
+
         logger.info("Real-time voice changer stopped")
+
+    def _clear_queues(self) -> None:
+        """Clear input and output queues."""
+        # Drain input queue
+        while not self._input_queue.empty():
+            try:
+                self._input_queue.get_nowait()
+            except Empty:
+                break
+
+        # Drain output queue
+        while not self._output_queue.empty():
+            try:
+                self._output_queue.get_nowait()
+            except Empty:
+                break
+
+        logger.debug("Queues cleared")
 
     def set_pitch_shift(self, semitones: int) -> None:
         """Set pitch shift in semitones."""

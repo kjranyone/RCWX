@@ -18,6 +18,8 @@ class AudioConfig:
 
     input_device_name: Optional[str] = None  # Device name (more stable than index)
     output_device_name: Optional[str] = None
+    input_hostapi_filter: str = "WASAPI"  # Host API filter for input devices
+    output_hostapi_filter: str = "WASAPI"  # Host API filter for output devices
     sample_rate: int = 16000
     output_sample_rate: int = 48000
     chunk_sec: float = 0.10  # Ultra-low latency: 100ms (FCPE official min, RMVPE needs >= 0.32 sec)
