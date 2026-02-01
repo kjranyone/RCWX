@@ -182,7 +182,7 @@ explicit = true
 | `extra_sec` | 0.0 | 追加カット範囲 |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
 | `lookahead_sec` | 0.0 | 先読み (レイテンシ増加!) |
-| `use_sola` | false | SOLA (最適クロスフェード位置探索) ⚠️ w-okadaチャンキングと非互換のため無効 |
+| `use_sola` | true | SOLA (最適クロスフェード位置探索、w-okada対応) |
 
 ## CLI Commands
 
@@ -328,24 +328,25 @@ uv run python -c "from rcwx.models.fcpe import is_fcpe_available; print(is_fcpe_
 - より低いレイテンシ (80-150ms)
 - F0品質はRMVPEよりやや劣る
 
-### 6. SOLA (既知の問題 - デフォルトで無効化済み)
+### 6. SOLA (解決済み - w-okada対応実装完了)
 
-**症状**: SOLA有効時に出力音声が入力の40-50%の長さになる
+**以前の問題**: SOLA有効時に出力音声が入力の40-50%の長さになる
 
 **原因**:
-- SOLA実装がRVC WebUI方式のオーバーラップチャンキングを前提
+- 元のSOLA実装がRVC WebUI方式のオーバーラップチャンキングを前提
 - w-okada方式のコンテキストチャンキングと非互換
-- 各チャンクからsola_buffer (2400サンプル @ 48kHz) を削除
-- 52チャンク × 2400 = 124,800サンプル = 2.6秒の音声ロス
+- 各チャンクから可変長の音声を削除していた
 
-**対策**:
-- **デフォルトで無効化済み** (`use_sola=false`)
-- 単純なクロスフェードで十分な品質
-- SOLA有効化は推奨しない（出力が短くなる）
+**解決方法**:
+- **w-okada対応モード実装** (`wokada_mode=True`)
+- 左コンテキストで最適オフセットを探索
+- 固定長（context_sec）のトリミング
+- バッファは保存するが出力から削除しない
 
-**将来の修正**:
-- w-okada方式に対応したSOLA実装
-- またはRVC WebUI方式チャンキングへの移行
+**現状**:
+- デフォルトで有効化済み (`use_sola=true`)
+- 出力長さ正常: 5.00s入力 → 5.04s出力 (100.8%)
+- 位相整合されたクロスフェードで高音質
 
 ## Audio Device Setup
 
@@ -803,9 +804,9 @@ changer.output_buffer.set_max_latency(max_output)
 - `crossfade_sec`: チャンク境界のクロスフェード長 (0.05s)
 - `extra_sec`: 追加カット (エッジアーティファクト除去用、通常0)
 - `use_sola`: 最適クロスフェード位置の自動探索
-  - **デフォルト: false** (w-okadaチャンキングと非互換のため無効化)
-  - RVC WebUI方式のオーバーラップチャンキングが必要
-  - 有効化すると出力が40-50%短くなるバグあり
+  - **デフォルト: true** (w-okada対応モード実装済み)
+  - 左コンテキストで最適オフセットを探索
+  - 位相整合されたクロスフェードで滑らかな音質
 
 **利点**:
 - エッジ効果軽減: コンテキストにより端での処理が安定
@@ -982,7 +983,7 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 | `lookahead_sec` | 0.0 | 先読み長 |
 | `extra_sec` | 0.0 | 追加カット |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
-| `use_sola` | false | SOLA使用 (デフォルト無効) |
+| `use_sola` | true | SOLA使用 (w-okada対応) |
 
 ### DenoiseConfig (InferenceConfig内)
 

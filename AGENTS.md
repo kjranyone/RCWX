@@ -37,7 +37,7 @@ uv run rcwx
   - RMVPEに変更可能 (高品質、320ms min)
 - Voice Gate: expand (推奨)
 - Feature Cache: 有効 (デフォルト)
-- SOLA: **無効** (デフォルト - w-okadaチャンキングと非互換のため)
+- SOLA: 有効 (デフォルト、w-okada対応実装済み)
 - チャンクサイズ: **150ms** (FCPE最適化) ← デフォルト
   - RMVPEの場合は350msに自動調整
 
@@ -178,7 +178,7 @@ explicit = true
 | `extra_sec` | 0.0 | 追加カット範囲 |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
 | `lookahead_sec` | 0.0 | 先読み (レイテンシ増加!) |
-| `use_sola` | false | SOLA (最適クロスフェード位置探索) ⚠️ デフォルト無効 |
+| `use_sola` | true | SOLA (最適クロスフェード位置探索、w-okada対応) |
 
 ## CLI Commands
 
@@ -955,7 +955,7 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 | `lookahead_sec` | 0.0 | 先読み長 |
 | `extra_sec` | 0.0 | 追加カット |
 | `crossfade_sec` | 0.05 | クロスフェード長 |
-| `use_sola` | false | SOLA使用 (デフォルト無効) |
+| `use_sola` | true | SOLA使用 (w-okada対応) |
 
 ### DenoiseConfig (InferenceConfig内)
 
@@ -1049,13 +1049,15 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 
 **A**: デバッグやログ分析時に、各チャンクが完全に独立するため原因特定しやすくなります。通常は有効推奨。
 
-### Q11: SOLAを有効にするとどうなりますか?
+### Q11: SOLAを無効にするとどうなりますか?
 
-**A**: **推奨しません**。SOLA実装はw-okadaチャンキングと非互換で、出力が入力の40-50%の長さになるバグがあります。
-- SOLA ON: 5秒入力 → 2.6秒出力（52.8%、バグ）
-- SOLA OFF: 5秒入力 → 5.0秒出力（100%、正常）
+**A**: SOLAを無効にすると単純な線形クロスフェードになります。通常はSOLA ON（デフォルト）を推奨します。
+- **SOLA ON** (w-okada対応): 位相整合された滑らかなクロスフェード、高音質
+- **SOLA OFF**: 単純な線形クロスフェード、わずかに位相不整合の可能性
 
-デフォルトでSOLA OFFに設定されています。単純なクロスフェードで十分な品質が得られます。
+w-okada対応SOLA実装により、出力長さも正しくなりました：
+- SOLA ON: 5.00s入力 → 5.04s出力（100.8%、正常）✓
+- SOLA OFF: 5.00s入力 → 5.00s出力（100.0%、正常）✓
 
 ### Q12: チャンクサイズの推奨値は?
 
