@@ -393,6 +393,29 @@ Discord/OBS:
 注意: VoiceMeeter内でループバック設定を確認
 ```
 
+#### パターン4: ASIO対応デバイス使用（プロオーディオ）
+
+```
+RCWX:
+  入力: TOPPING Pro USB Audio Device (ASIO)
+  出力: TOPPING Pro USB Audio Device (ASIO)
+
+利点:
+  - 超低レイテンシ（ASIOドライバ）
+  - 高品質オーディオ
+  - 多チャンネル対応
+
+注意:
+  - sounddevice 0.5.1以降で自動的にASIOサポートが有効化されます
+  - GUIのデバイス選択で "(ASIO, ステレオ)" などと表示されます
+  - ASIOは排他モードで動作する場合があります
+```
+
+**ASIO対応について**:
+RCWXはsounddevice 0.5.1以降の機能により、**ASIOドライバを自動的にサポート**します。起動時に環境変数 `SD_ENABLE_ASIO=1` が設定され、ASIOデバイスがデバイスリストに表示されます。
+
+参考: [sounddevice ASIO support](https://python-sounddevice.readthedocs.io/en/latest/installation.html)
+
 ### デバイス診断
 
 ```powershell

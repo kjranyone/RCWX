@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
+# Enable ASIO support in sounddevice (must be set before importing sounddevice)
+# See: https://python-sounddevice.readthedocs.io/en/latest/installation.html
+os.environ["SD_ENABLE_ASIO"] = "1"
+
 import argparse
 import logging
 import sys

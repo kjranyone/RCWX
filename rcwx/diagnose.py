@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Enable ASIO support in sounddevice (must be set before importing sounddevice)
+os.environ["SD_ENABLE_ASIO"] = "1"
 
 
 def check_audio_devices():
