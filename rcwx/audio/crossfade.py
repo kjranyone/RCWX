@@ -84,24 +84,39 @@ def flush_sola_buffer(state: SOLAState) -> NDArray[np.float32]:
 def apply_sola_crossfade(
     infer_wav: NDArray[np.float32],
     state: SOLAState,
+    wokada_mode: bool = True,
+    context_samples: int = 0,
 ) -> CrossfadeResult:
     """
-    Apply RVC-style SOLA crossfade.
+    Apply SOLA crossfade for smooth chunk boundaries.
 
-    Based on RVC WebUI implementation. Each chunk outputs its main portion
-    WITHOUT the tail (sola_buffer region). The tail is saved and crossfaded
-    with the beginning of the next chunk, ensuring smooth boundaries.
+    Two modes supported:
+    1. RVC WebUI mode (wokada_mode=False): Original implementation
+       - Removes buffer from end of each chunk
+       - Requires overlapping input chunks
+       - Can cause audio loss with non-overlapping chunks
 
-    Flow:
+    2. w-okada mode (wokada_mode=True): Adapted for context-based chunking
+       - Uses LEFT context for crossfading with previous buffer
+       - Keeps full output (no tail removal)
+       - Compatible with w-okada style processing
+       - **Default and recommended**
+
+    Flow (w-okada mode):
+    - Chunk 0: [main0] -> output [main0], save buffer from end
+    - Chunk 1: [context1 | main1] -> crossfade buffer with context1,
+               trim context1, output [main1], save new buffer from end
+
+    Flow (RVC WebUI mode):
     - Chunk 0: output[:-buffer], save buffer
     - Chunk N: crossfade(buffer, chunk), output[:-buffer], save new buffer
     - Final: call flush_sola_buffer() to output remaining buffer
-    - Boundary: chunk[N-1] ends at result[-buffer-1], chunk[N] starts with
-                crossfade of result[-buffer], which are adjacent samples.
 
     Args:
-        infer_wav: Current inference output
+        infer_wav: Current inference output (includes context in w-okada mode)
         state: SOLA state (modified in place)
+        wokada_mode: Use w-okada compatible mode (default: True)
+        context_samples: Context size in samples (required for w-okada mode)
 
     Returns:
         CrossfadeResult with processed audio
@@ -111,60 +126,123 @@ def apply_sola_crossfade(
     sola_buffer_frame = state.sola_buffer_frame
     sola_search_frame = state.sola_search_frame
 
-    # First chunk: save buffer, output WITHOUT buffer
+    # First chunk: save buffer from end
     if state.sola_buffer is None:
         if len(infer_wav) > sola_buffer_frame:
             state.sola_buffer = infer_wav[-sola_buffer_frame:].copy()
-            return CrossfadeResult(audio=infer_wav[:-sola_buffer_frame].copy())
+            if wokada_mode:
+                # w-okada mode: return full output (keep the tail)
+                return CrossfadeResult(audio=infer_wav.copy())
+            else:
+                # RVC WebUI mode: remove tail
+                return CrossfadeResult(audio=infer_wav[:-sola_buffer_frame].copy())
         return CrossfadeResult(audio=infer_wav.copy())
 
-    # Not enough samples for SOLA search
-    if len(infer_wav) < sola_buffer_frame + sola_search_frame:
-        # Fallback: simple crossfade without offset search
-        if len(infer_wav) >= sola_buffer_frame:
+    # w-okada mode: different processing strategy
+    if wokada_mode:
+        # In w-okada mode, infer_wav = [context | main]
+        # We crossfade the saved buffer with the context region,
+        # then trim the context and return [main]
+
+        # Use context_samples if provided, otherwise fall back to sola_buffer_frame
+        trim_samples = context_samples if context_samples > 0 else sola_buffer_frame
+
+        # Not enough samples for SOLA search
+        if len(infer_wav) < sola_buffer_frame + sola_search_frame:
+            # Fallback: simple crossfade at the beginning
             result = infer_wav.copy()
+            if len(result) >= sola_buffer_frame and len(result) > trim_samples:
+                result[:sola_buffer_frame] = (
+                    state.sola_buffer * state.fade_out_window +
+                    result[:sola_buffer_frame] * state.fade_in_window
+                )
+                # Save new buffer from end (but keep it in output)
+                state.sola_buffer = result[-sola_buffer_frame:].copy()
+                # Trim fixed context from beginning
+                return CrossfadeResult(audio=result[trim_samples:])
+            else:
+                state.sola_buffer = None
+                return CrossfadeResult(audio=result)
+
+        # Find optimal offset in the LEFT part (context) for crossfading
+        sola_offset = _find_sola_offset(
+            state.sola_buffer,
+            infer_wav,
+            sola_search_frame,
+        )
+
+        # Crossfade at the found offset
+        result = infer_wav.copy()
+        crossfade_start = sola_offset
+        crossfade_end = crossfade_start + sola_buffer_frame
+
+        if crossfade_end <= len(result) and len(result) > trim_samples:
+            # Apply crossfade
+            result[crossfade_start:crossfade_end] = (
+                state.sola_buffer * state.fade_out_window +
+                result[crossfade_start:crossfade_end] * state.fade_in_window
+            )
+
+            # Save new buffer from end (but keep it in output)
+            state.sola_buffer = result[-sola_buffer_frame:].copy()
+
+            # Trim FIXED context size from the beginning (not variable based on offset)
+            # This ensures consistent output length regardless of offset
+            return CrossfadeResult(audio=result[trim_samples:], sola_offset=sola_offset)
+        else:
+            # Not enough room for crossfade, fallback
+            state.sola_buffer = None
+            return CrossfadeResult(audio=result, sola_offset=sola_offset)
+
+    # RVC WebUI mode (original implementation)
+    else:
+        # Not enough samples for SOLA search
+        if len(infer_wav) < sola_buffer_frame + sola_search_frame:
+            # Fallback: simple crossfade without offset search
+            if len(infer_wav) >= sola_buffer_frame:
+                result = infer_wav.copy()
+                result[:sola_buffer_frame] = (
+                    state.sola_buffer * state.fade_out_window +
+                    result[:sola_buffer_frame] * state.fade_in_window
+                )
+                state.sola_buffer = result[-sola_buffer_frame:].copy()
+            else:
+                result = infer_wav.copy()
+                state.sola_buffer = None
+            return CrossfadeResult(audio=result)
+
+        # Find optimal offset using correlation
+        sola_offset = _find_sola_offset(
+            state.sola_buffer,
+            infer_wav,
+            sola_search_frame,
+        )
+
+        # Shift infer_wav by offset (RVC style)
+        result = infer_wav[sola_offset:].copy()
+
+        # Apply crossfade in-place
+        if len(result) >= 2 * sola_buffer_frame:
+            # Crossfade the beginning with previous buffer
             result[:sola_buffer_frame] = (
                 state.sola_buffer * state.fade_out_window +
                 result[:sola_buffer_frame] * state.fade_in_window
             )
+            # Save new buffer (tail of current result)
             state.sola_buffer = result[-sola_buffer_frame:].copy()
-        else:
-            result = infer_wav.copy()
+            # Output WITHOUT tail (tail will appear via crossfade in next chunk)
+            return CrossfadeResult(audio=result[:-sola_buffer_frame], sola_offset=sola_offset)
+        elif len(result) >= sola_buffer_frame:
+            # Short result: crossfade but can't save buffer
+            result[:sola_buffer_frame] = (
+                state.sola_buffer * state.fade_out_window +
+                result[:sola_buffer_frame] * state.fade_in_window
+            )
             state.sola_buffer = None
-        return CrossfadeResult(audio=result)
-
-    # Find optimal offset using correlation
-    sola_offset = _find_sola_offset(
-        state.sola_buffer,
-        infer_wav,
-        sola_search_frame,
-    )
-
-    # Shift infer_wav by offset (RVC style)
-    result = infer_wav[sola_offset:].copy()
-
-    # Apply crossfade in-place
-    if len(result) >= 2 * sola_buffer_frame:
-        # Crossfade the beginning with previous buffer
-        result[:sola_buffer_frame] = (
-            state.sola_buffer * state.fade_out_window +
-            result[:sola_buffer_frame] * state.fade_in_window
-        )
-        # Save new buffer (tail of current result)
-        state.sola_buffer = result[-sola_buffer_frame:].copy()
-        # Output WITHOUT tail (tail will appear via crossfade in next chunk)
-        return CrossfadeResult(audio=result[:-sola_buffer_frame], sola_offset=sola_offset)
-    elif len(result) >= sola_buffer_frame:
-        # Short result: crossfade but can't save buffer
-        result[:sola_buffer_frame] = (
-            state.sola_buffer * state.fade_out_window +
-            result[:sola_buffer_frame] * state.fade_in_window
-        )
-        state.sola_buffer = None
-        return CrossfadeResult(audio=result, sola_offset=sola_offset)
-    else:
-        state.sola_buffer = None
-        return CrossfadeResult(audio=result, sola_offset=sola_offset)
+            return CrossfadeResult(audio=result, sola_offset=sola_offset)
+        else:
+            state.sola_buffer = None
+            return CrossfadeResult(audio=result, sola_offset=sola_offset)
 
 
 def _find_sola_offset(

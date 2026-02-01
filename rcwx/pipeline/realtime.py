@@ -118,10 +118,8 @@ class RealtimeConfig:
     lookahead_sec: float = 0.0
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
-    # DISABLED BY DEFAULT: SOLA implementation is incompatible with w-okada chunking
-    # SOLA removes buffer from each chunk, causing 40-50% output length reduction
-    # Use simple crossfade instead (acceptable quality for most use cases)
-    use_sola: bool = False
+    # w-okada compatible mode: uses left context for crossfading
+    use_sola: bool = True
 
     # SOLA search range (as ratio of crossfade length)
     sola_search_ratio: float = 0.25
@@ -598,12 +596,24 @@ class RealtimeVoiceChanger:
                         logger.warning(f"Audio clipping detected: max={max_val:.2f}")
 
                 # Apply SOLA crossfade if enabled, OR trim context manually
-                # CRITICAL: SOLA expects overlapping chunks (with context intact)
-                # If SOLA is enabled, it handles the overlap internally
-                # If SOLA is disabled, we need to trim context manually
+                # w-okada mode SOLA: Uses left context for crossfading, returns trimmed output
+                # If SOLA is disabled, we manually trim context
                 if self.config.use_sola and self._sola_state is not None:
-                    # SOLA mode: Don't trim context, let SOLA handle overlap
-                    cf_result = apply_sola_crossfade(output, self._sola_state)
+                    # Calculate context size for w-okada mode
+                    # Skip context trim for first chunk (no left context)
+                    context_samples_output = 0
+                    if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                        context_samples_output = int(
+                            self.config.output_sample_rate * self.config.context_sec
+                        )
+
+                    # w-okada mode SOLA: crossfade with context, auto-trim
+                    cf_result = apply_sola_crossfade(
+                        output,
+                        self._sola_state,
+                        wokada_mode=True,
+                        context_samples=context_samples_output
+                    )
                     output = cf_result.audio
 
                     # Log SOLA stats periodically
@@ -1196,28 +1206,44 @@ class RealtimeVoiceChanger:
                 method=self.config.resample_method,
             )
 
-        # Trim context from output to get only the "main" portion
-        # This is critical for matching batch processing output length
-        # Skip trimming for first chunk (no left context)
-        if self.stats.frames_processed > 0 and self.config.context_sec > 0:
-            context_samples_output = int(self.config.output_sample_rate * self.config.context_sec)
-            if len(output) > context_samples_output:
-                output = output[context_samples_output:]
-                # Log trimming for first few chunks
-                if self.stats.frames_processed < 5:
-                    logger.info(
-                        f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
-                    )
-
         # Soft clipping
         max_val = np.max(np.abs(output))
         if max_val > 1.0:
             output = np.tanh(output)
 
-        # Apply SOLA crossfade if enabled
+        # Apply SOLA crossfade if enabled, OR trim context manually
+        # w-okada mode SOLA: Uses left context for crossfading, returns trimmed output
+        # If SOLA is disabled, we manually trim context
         if self.config.use_sola and self._sola_state is not None:
-            cf_result = apply_sola_crossfade(output, self._sola_state)
+            # Calculate context size for w-okada mode
+            # Skip context trim for first chunk (no left context)
+            context_samples_output = 0
+            if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                context_samples_output = int(
+                    self.config.output_sample_rate * self.config.context_sec
+                )
+
+            # w-okada mode SOLA: crossfade with context, auto-trim
+            cf_result = apply_sola_crossfade(
+                output,
+                self._sola_state,
+                wokada_mode=True,
+                context_samples=context_samples_output
+            )
             output = cf_result.audio
+        else:
+            # No SOLA: Manually trim context from output to get only the "main" portion
+            # This is critical for matching batch processing output length
+            # Skip trimming for first chunk (no left context)
+            if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                context_samples_output = int(self.config.output_sample_rate * self.config.context_sec)
+                if len(output) > context_samples_output:
+                    output = output[context_samples_output:]
+                    # Log trimming for first few chunks
+                    if self.stats.frames_processed < 5:
+                        logger.info(
+                            f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
+                        )
 
         # Store output history for feedback detection
         self._store_output_history(output)
