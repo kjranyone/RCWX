@@ -116,11 +116,8 @@ class RVCPipeline:
         self.sample_rate: int = 40000
         self._loaded: bool = False
 
-        # Feature cache for chunk continuity
-        # Stores the last N frames of HuBERT features for blending with next chunk
-        self._cached_features: Optional[torch.Tensor] = None
-        self._cached_f0: Optional[torch.Tensor] = None
-        self._feature_cache_frames: int = 5  # Cache 5 frames (100ms at 50fps) - reduced for better batch matching
+        # w-okada style: No feature caching
+        # Features are recomputed each time from audio buffer for consistency
 
     def load(self) -> None:
         """Load all models."""
@@ -314,8 +311,8 @@ class RVCPipeline:
 
         Call this when starting a new audio stream or after a long pause.
         """
-        self._cached_features = None
-        self._cached_f0 = None
+        # w-okada style: No feature cache to clear
+        pass
 
     @torch.no_grad()
     def infer(
@@ -523,26 +520,8 @@ class RVCPipeline:
                 f"Index retrieval applied: index_rate={index_rate}, features_after={features.shape} mean={features.mean():.4f} std={features.std():.4f}"
             )
 
-        # Apply feature cache blending for chunk continuity
-        if use_feature_cache and self._cached_features is not None:
-            cache_frames = min(
-                self._feature_cache_frames, features.shape[1], self._cached_features.shape[1]
-            )
-            if cache_frames > 0:
-                # Blend cached features with current features at the beginning
-                # Use cosine crossfade for smoother transition: alpha goes from 1 (use cached) to 0 (use current)
-                t = torch.linspace(0, 1, cache_frames, device=features.device, dtype=features.dtype)
-                alpha = 0.5 * (1 + torch.cos(torch.pi * t))  # Cosine fade: 1 -> 0
-                alpha = alpha.view(1, cache_frames, 1)  # [1, T, 1] for broadcasting
-                cached = self._cached_features[:, -cache_frames:, :]  # Last N frames of cache
-                current = features[:, :cache_frames, :]  # First N frames of current
-                blended = alpha * cached + (1 - alpha) * current
-                features = torch.cat([blended, features[:, cache_frames:, :]], dim=1)
-                logger.debug(f"Feature cache blended: {cache_frames} frames (cosine)")
-
-        # Cache features for next chunk (before interpolation, at 50fps)
-        if use_feature_cache:
-            self._cached_features = features[:, -self._feature_cache_frames :, :].clone()
+        # w-okada style: No feature cache blending
+        # Features are computed fresh each time for consistency
 
         # Interpolate features to match synthesizer expectation
         # RVC uses bilinear (linear) interpolation for 2x upscale
@@ -600,44 +579,8 @@ class RVCPipeline:
                         align_corners=False,
                     ).squeeze(1)
 
-                # Apply F0 cache blending for chunk continuity
-                f0_cache_frames = (
-                    self._feature_cache_frames * 2
-                )  # 2x because features were interpolated
-                if use_feature_cache and self._cached_f0 is not None:
-                    cache_frames = min(f0_cache_frames, f0.shape[1], self._cached_f0.shape[1])
-                    if cache_frames > 0:
-                        # Blend F0: smooth transition from cached to current
-                        # Use cosine crossfade for smoother transition
-                        t = torch.linspace(0, 1, cache_frames, device=f0.device, dtype=f0.dtype)
-                        alpha = 0.5 * (1 + torch.cos(torch.pi * t))  # Cosine fade: 1 -> 0
-                        alpha = alpha.view(1, cache_frames)
-                        cached_f0 = self._cached_f0[:, -cache_frames:]
-                        current_f0 = f0[:, :cache_frames]
-
-                        # Blend strategy: more aggressive blending for better continuity
-                        # Blend if EITHER has valid F0, not just both
-                        either_voiced = (cached_f0 > 0) | (current_f0 > 0)
-                        both_voiced = (cached_f0 > 0) & (current_f0 > 0)
-
-                        # If both voiced: blend normally
-                        # If only one voiced: use the voiced one with slight fade
-                        blended_f0 = torch.where(
-                            both_voiced,
-                            alpha * cached_f0 + (1 - alpha) * current_f0,
-                            torch.where(
-                                cached_f0 > 0,
-                                cached_f0 * alpha,  # Fade out cached if current is unvoiced
-                                current_f0 * (1 - alpha),  # Fade in current if cached is unvoiced
-                            )
-                        )
-
-                        f0 = torch.cat([blended_f0, f0[:, cache_frames:]], dim=1)
-                        logger.debug(f"F0 cache blended: {cache_frames} frames (cosine, aggressive)")
-
-                # Cache F0 for next chunk
-                if use_feature_cache:
-                    self._cached_f0 = f0[:, -f0_cache_frames:].clone()
+                # w-okada style: No F0 cache blending
+                # F0 is computed fresh each time for consistency
 
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
