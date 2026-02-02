@@ -402,8 +402,9 @@ class RVCPipeline:
         original_length = len(audio_np)
         hubert_hop = 320
 
-        # Base padding (50ms each side = 1600 total)
-        base_pad = int(16000 * 0.05)  # 800 samples
+        # Base padding: 50ms (800 samples) for batch processing
+        # Chunk processing uses reduced padding (1 HuBERT hop) below
+        base_pad = int(16000 * 0.05)  # 800 samples (50ms @ 16kHz)
 
         # For chunk processing, use minimal padding to avoid excessive padding artifacts
         # Optimal: 1 HuBERT hop (320 samples = 20ms) for batch/chunk consistency
