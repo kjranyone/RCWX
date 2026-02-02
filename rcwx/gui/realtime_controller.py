@@ -114,10 +114,11 @@ class RealtimeController:
                 use_sola=latency["use_sola"],
             )
 
-            # Create voice changer
+            # Create voice changer with warmup progress callback
             self.voice_changer = RealtimeVoiceChanger(
                 self.app.pipeline,
                 config=rt_config,
+                on_warmup_progress=self._on_warmup_progress,
             )
             self.voice_changer.on_stats_update = self._on_stats_update
             self.voice_changer.on_error = self._on_inference_error
@@ -134,6 +135,11 @@ class RealtimeController:
         except Exception as e:
             logger.error(f"Failed to start voice changer: {e}")
             self._on_start_error(str(e))
+
+    def _on_warmup_progress(self, current: int, total: int, message: str) -> None:
+        """Called during warmup to show progress."""
+        self.app.start_btn.configure(text=f"⏳ {message}")
+        self.app.update_idletasks()  # Force UI update
 
     def _on_started(self) -> None:
         """Called when voice changer starts successfully."""

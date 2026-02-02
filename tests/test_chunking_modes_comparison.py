@@ -570,7 +570,7 @@ def main():
         if not args.model and config.last_model_path:
             args.model = Path(config.last_model_path)
         if not args.audio:
-            args.audio = Path("sample_data/seki.wav")
+            args.audio = Path("sample_data/kakita.wav")
 
     if not args.model or not args.model.exists():
         logger.error(f"Model not found: {args.model}")

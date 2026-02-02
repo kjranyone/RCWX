@@ -152,21 +152,46 @@ class AudioTestManager:
                 self.app.test_status.configure(text="🔄 変換中...", text_color="#66b3ff")
                 self.app.update_idletasks()
 
+                # Run conversion in background thread to avoid UI freeze
+                import threading
                 import torch
 
-                audio_tensor = torch.from_numpy(audio).float()
-                audio_converted = self.app.pipeline.infer(
-                    audio_tensor,
-                    pitch_shift=self.app.pitch_control.pitch,
-                    f0_method=self.app.pitch_control.f0_method,
-                    index_rate=self.app._get_index_rate(),
-                    voice_gate_mode=self.app.voice_gate_mode_var.get(),
-                    energy_threshold=self.app.energy_threshold_slider.get(),
-                    use_feature_cache=False,  # Single test, no chunk continuity needed
-                )
+                conversion_result = {"audio": None, "error": None, "model_sr": None}
+                conversion_done = threading.Event()
+
+                def convert_thread():
+                    try:
+                        audio_tensor = torch.from_numpy(audio).float()
+                        converted = self.app.pipeline.infer(
+                            audio_tensor,
+                            pitch_shift=self.app.pitch_control.pitch,
+                            f0_method=self.app.pitch_control.f0_method,
+                            index_rate=self.app._get_index_rate(),
+                            voice_gate_mode=self.app.voice_gate_mode_var.get(),
+                            energy_threshold=self.app.energy_threshold_slider.get(),
+                            use_feature_cache=False,
+                        )
+                        conversion_result["audio"] = converted
+                        conversion_result["model_sr"] = self.app.pipeline.sample_rate
+                    except Exception as e:
+                        conversion_result["error"] = str(e)
+                    finally:
+                        conversion_done.set()
+
+                thread = threading.Thread(target=convert_thread, daemon=True)
+                thread.start()
+
+                # Wait with UI updates
+                while not conversion_done.wait(timeout=0.1):
+                    self.app.update_idletasks()
+
+                if conversion_result["error"]:
+                    raise RuntimeError(conversion_result["error"])
+
+                audio_converted = conversion_result["audio"]
+                model_sr = conversion_result["model_sr"]
 
                 # Save converted output at model rate
-                model_sr = self.app.pipeline.sample_rate
                 wavfile.write(debug_dir / "03_output_model.wav", model_sr, audio_converted)
                 logger.info(f"Saved: debug_audio/03_output_model.wav ({model_sr}Hz)")
 

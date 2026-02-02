@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import numpy as np
 from numpy.typing import NDArray
+
+logger = logging.getLogger(__name__)
 
 
 class ChunkBuffer:
@@ -39,6 +42,11 @@ class ChunkBuffer:
         self.crossfade_samples = crossfade_samples
         self.context_samples = context_samples
         self.lookahead_samples = lookahead_samples
+
+        logger.info(
+            f"[ChunkBuffer] INIT: chunk={chunk_samples}, crossfade={crossfade_samples}, "
+            f"context={context_samples}, lookahead={lookahead_samples}"
+        )
 
         # Input buffer for accumulating samples
         self._input_buffer: NDArray[np.float32] = np.array([], dtype=np.float32)
@@ -119,8 +127,18 @@ class ChunkBuffer:
                     reflection
                 ])
             chunk = np.concatenate([reflection, main_chunk])
+            logger.info(
+                f"[ChunkBuffer] First chunk WITH context: required={required}, main={len(main_chunk)}, "
+                f"reflection={len(reflection)}, total={len(chunk)}"
+            )
         else:
             chunk = self._input_buffer[:required].copy()
+            if self._is_first_chunk:
+                # First chunk but context_samples=0
+                logger.info(
+                    f"[ChunkBuffer] First chunk NO context: context_samples={self.context_samples}, "
+                    f"required={required}, total={len(chunk)}"
+                )
 
         # Always advance by chunk_samples (w-okada style: uniform progression)
         # This is the key difference from overlap-based chunking

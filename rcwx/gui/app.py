@@ -867,8 +867,9 @@ class RCWXApp(ctk.CTk):
                     # Stop current voice changer
                     self.realtime_controller.stop()
 
-                    # Wait a moment for cleanup
-                    self.after(100, self._restart_after_mode_change)
+                    # Wait for audio streams to fully stop (500ms is safer)
+                    # Then restart with new settings
+                    self.after(500, self._restart_after_mode_change)
                 return
 
             # Apply real-time settings (for non-mode changes)
@@ -883,6 +884,10 @@ class RCWXApp(ctk.CTk):
     def _restart_after_mode_change(self) -> None:
         """Restart voice changer after mode change."""
         if not self._is_running:
+            # Ensure queues are cleared before restart
+            if self.realtime_controller.voice_changer:
+                self.realtime_controller.voice_changer._clear_queues()
+                self.realtime_controller.voice_changer._clear_buffers()
             # Restart with new settings
             self.realtime_controller.start()
 
