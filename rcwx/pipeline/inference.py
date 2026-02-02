@@ -811,6 +811,8 @@ class RVCPipeline:
         elif length_diff < 0 and abs(length_diff) > 100:
             # Output too short - resample to stretch to expected length
             # This maintains timing alignment between chunks
+            # Note: While this introduces slight phase errors, it's necessary for
+            # maintaining consistent chunk timing in streaming mode
             output = resample(output, len(output), expected_output_samples)
             logger.debug(
                 f"Resampled output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
