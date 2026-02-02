@@ -566,7 +566,7 @@ class RVCPipeline:
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
 
-            if f0 is not None:
+            if f0 is not None and f0.numel() > 0:  # Check for non-empty F0
                 # Apply pitch shift (only to voiced regions where f0 > 0)
                 if pitch_shift != 0:
                     f0 = torch.where(f0 > 0, f0 * (2 ** (pitch_shift / 12)), f0)
@@ -617,7 +617,16 @@ class RVCPipeline:
 
                 # Store voiced mask for gating (will be used after synthesis)
                 voiced_mask_for_gate = voiced_mask.float()  # [B, T]
-            else:
+            elif f0 is not None and f0.numel() == 0:
+                # F0 extraction returned empty array (input too short)
+                logger.warning(
+                    f"F0 extraction returned empty array (input too short: {len(audio)/16000:.3f}s). "
+                    f"Minimum recommended: FCPE=0.10s, RMVPE=0.32s. Falling back to unvoiced."
+                )
+                f0 = None  # Fall through to unvoiced handling
+
+            if f0 is None:
+                # No F0 available - use pitch=1 (unvoiced marker per RVC convention)
                 # No F0 model available - use pitch=1 (unvoiced marker per RVC convention)
                 pitch = torch.ones(
                     features.shape[0], features.shape[1], dtype=torch.long, device=self.device
@@ -635,13 +644,25 @@ class RVCPipeline:
         synth_pad_frames = 0
         if features.shape[1] < MIN_SYNTH_FEATURE_FRAMES:
             synth_pad_frames = MIN_SYNTH_FEATURE_FRAMES - features.shape[1]
-            # Reflection pad to avoid edge artifacts
             pad_left = synth_pad_frames // 2
             pad_right = synth_pad_frames - pad_left
+
+            # Choose padding mode based on input size
+            # reflect mode requires padding < input size, use replicate for very short inputs
+            current_size = features.shape[1]
+            if max(pad_left, pad_right) >= current_size:
+                pad_mode = "replicate"  # Edge replication for very short inputs
+                logger.warning(
+                    f"Input too short ({current_size} frames) for reflection padding ({pad_left}+{pad_right}). "
+                    f"Using replicate mode. Consider increasing chunk_sec to >= 0.15s"
+                )
+            else:
+                pad_mode = "reflect"  # Preferred for normal inputs
+
             features = torch.nn.functional.pad(
                 features.permute(0, 2, 1),  # [B, T, C] -> [B, C, T]
                 (pad_left, pad_right),
-                mode="reflect",
+                mode=pad_mode,
             ).permute(0, 2, 1)  # [B, C, T] -> [B, T, C]
             # Update feature lengths
             feature_lengths = torch.tensor(
@@ -649,9 +670,9 @@ class RVCPipeline:
             )
             # Pad pitch/pitchf if present
             if pitch is not None:
-                pitch = torch.nn.functional.pad(pitch, (pad_left, pad_right), mode="reflect")
+                pitch = torch.nn.functional.pad(pitch, (pad_left, pad_right), mode=pad_mode)
             if pitchf is not None:
-                pitchf = torch.nn.functional.pad(pitchf, (pad_left, pad_right), mode="reflect")
+                pitchf = torch.nn.functional.pad(pitchf, (pad_left, pad_right), mode=pad_mode)
             logger.info(
                 f"Padded short input: {features.shape[1] - synth_pad_frames} -> {features.shape[1]} frames (min={MIN_SYNTH_FEATURE_FRAMES})"
             )
@@ -808,11 +829,10 @@ class RVCPipeline:
             # Output too long - trim from end
             output = output[:expected_output_samples]
             logger.debug(f"Trimmed {length_diff} extra samples from end")
-        elif length_diff < 0 and abs(length_diff) > 100:
+        elif length_diff < 0 and abs(length_diff) > 100 and not allow_short_input:
             # Output too short - resample to stretch to expected length
-            # This maintains timing alignment between chunks
-            # Note: While this introduces slight phase errors, it's necessary for
-            # maintaining consistent chunk timing in streaming mode
+            # ONLY for batch processing (allow_short_input=False)
+            # For chunk processing, accept the actual length to avoid phase discontinuities
             output = resample(output, len(output), expected_output_samples)
             logger.debug(
                 f"Resampled output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
