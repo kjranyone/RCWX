@@ -38,9 +38,9 @@ class SOLAState:
         # Use the requested crossfade_samples directly (no 4*zc limitation)
         # For w-okada mode, we need full context length for crossfading
         sola_buffer_frame = crossfade_samples
-        # Use 5x zero-crossing interval (50ms @ 48kHz)
-        # Larger search range improves phase alignment and quality
-        sola_search_frame = zc * 5
+        # Use 3x zero-crossing interval (30ms @ 48kHz)
+        # Balanced search range for phase alignment
+        sola_search_frame = zc * 3
 
         # Hann (raised cosine) fade windows - smooth and well-tested
         t = np.linspace(0.0, 1.0, sola_buffer_frame, dtype=np.float32)

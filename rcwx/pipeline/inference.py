@@ -120,7 +120,7 @@ class RVCPipeline:
         # Stores the last N frames of HuBERT features for blending with next chunk
         self._cached_features: Optional[torch.Tensor] = None
         self._cached_f0: Optional[torch.Tensor] = None
-        self._feature_cache_frames: int = 10  # Cache 10 frames (200ms at 50fps) - optimal for chunk continuity
+        self._feature_cache_frames: int = 5  # Cache 5 frames (100ms at 50fps) - reduced for better batch matching
 
     def load(self) -> None:
         """Load all models."""

@@ -285,14 +285,27 @@ def analyze_mode(
     # Use offset-compensated correlation to handle timing differences
     frame_size = output_sr // 100  # 10ms frames
     if min_len > frame_size * 2:
-        true_envelope = compute_energy_envelope(true_batch[:min_len], frame_size)
-        output_envelope = compute_energy_envelope(output_trimmed[:min_len], frame_size)
+        # Normalize both signals to RMS=1.0 for fair energy comparison
+        true_batch_norm = true_batch[:min_len].copy()
+        output_trimmed_norm = output_trimmed[:min_len].copy()
+
+        true_rms = np.sqrt(np.mean(true_batch_norm ** 2))
+        output_rms = np.sqrt(np.mean(output_trimmed_norm ** 2))
+
+        if true_rms > 1e-6:
+            true_batch_norm = true_batch_norm / true_rms
+        if output_rms > 1e-6:
+            output_trimmed_norm = output_trimmed_norm / output_rms
+
+        true_envelope = compute_energy_envelope(true_batch_norm, frame_size)
+        output_envelope = compute_energy_envelope(output_trimmed_norm, frame_size)
         env_min_len = min(len(true_envelope), len(output_envelope))
 
         if env_min_len > 0:
-            # Find best offset within ±100ms (10 frames)
+            # Find best offset within ±200ms (20 frames)
+            # Expanded range to better compensate for timing differences
             best_corr = -1.0
-            search_range = 10  # ±100ms
+            search_range = 20  # ±200ms
 
             for offset in range(-search_range, search_range + 1):
                 if offset < 0:

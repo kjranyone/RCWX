@@ -89,11 +89,12 @@ class StatefulResampler:
         self.up = target_sr // g
         self.down = orig_sr // g
 
-        # Overlap size: default to 10x down factor (covers filter transient)
+        # Overlap size: default to 20x down factor (improved filter transient coverage)
         # scipy.signal.resample_poly uses a Kaiser window with beta=5.0
         # Filter length ≈ 2 * down * 10 samples (empirical)
+        # Increased from 10x to 20x for better phase continuity
         if overlap_samples is None:
-            overlap_samples = 10 * self.down
+            overlap_samples = 20 * self.down
         self.overlap_samples = overlap_samples
 
         # Overlap buffer: stores tail of previous chunk
