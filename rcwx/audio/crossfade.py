@@ -42,7 +42,7 @@ class SOLAState:
         # Optimal search range (40ms+ increases latency without quality gain)
         sola_search_frame = zc * 3
 
-        # Hann (raised cosine) fade windows - smooth and well-tested
+        # Hann (raised cosine) fade windows - optimal for smooth audio transitions
         t = np.linspace(0.0, 1.0, sola_buffer_frame, dtype=np.float32)
         fade_in = 0.5 * (1.0 - np.cos(np.pi * t))
         fade_out = 1.0 - fade_in
@@ -323,9 +323,10 @@ def _find_sola_offset(
     if not candidates:
         return 0, 0.0
 
-    # Sort by score and take top 5 candidates
+    # Sort by score and take top 10 candidates for thorough evaluation
+    # More candidates increases chance of finding optimal phase alignment
     candidates.sort(key=lambda x: x[2], reverse=True)
-    top_candidates = candidates[:5]
+    top_candidates = candidates[:10]
 
     # If windows not provided, return best by score
     if fade_in_window is None or fade_out_window is None:
@@ -372,9 +373,16 @@ def _find_sola_offset(
         # 4. Standard deviation of gradient (prefer consistent slope)
         grad_std = np.std(np.diff(blended))
 
+        # 5. Curvature (2nd derivative) - prefer smooth curves over sharp bends
+        # Second derivative measures rate of change of slope
+        if len(blended) > 2:
+            curvature = np.max(np.abs(np.diff(np.diff(blended))))
+        else:
+            curvature = 0.0
+
         # Combined smoothness score (lower is better)
-        # Balanced weighting: both boundary continuity and internal smoothness matter
-        smoothness = 8.0 * start_disc + 8.0 * end_disc + 2.0 * internal_grad + 1.0 * grad_std
+        # Prioritize boundary continuity, then internal smoothness and curvature
+        smoothness = 8.0 * start_disc + 8.0 * end_disc + 2.0 * internal_grad + 1.0 * grad_std + 0.5 * curvature
 
         if smoothness < best_smoothness:
             best_smoothness = smoothness
