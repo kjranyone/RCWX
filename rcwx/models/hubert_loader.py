@@ -162,6 +162,7 @@ class HuBERTLoader:
         nn.init.xavier_uniform_(self.final_proj.weight)
         nn.init.zeros_(self.final_proj.bias)
         self.final_proj.to(self.device).to(self.dtype)
+        self.final_proj.eval()  # Set to evaluation mode
 
         for param in self.model.parameters():
             param.requires_grad = False
@@ -221,6 +222,7 @@ class HuBERTLoader:
             nn.init.zeros_(self.final_proj.bias)
 
         self.final_proj.to(self.device).to(self.dtype)
+        self.final_proj.eval()  # Set to evaluation mode
 
         for param in self.model.parameters():
             param.requires_grad = False

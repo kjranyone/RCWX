@@ -127,6 +127,15 @@ class RVCPipeline:
         if self._loaded:
             return
 
+        # Set deterministic behavior for reproducible inference
+        torch.manual_seed(0)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(0)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.manual_seed_all(0)
+
         logger.info(f"Loading RVC pipeline on {self.device} with {self.dtype}")
 
         # Load synthesizer first to detect model type
@@ -323,6 +332,7 @@ class RVCPipeline:
         noise_reference: Optional[np.ndarray] = None,
         use_feature_cache: bool = True,
         use_parallel_extraction: bool = True,
+        allow_short_input: bool = False,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -395,28 +405,33 @@ class RVCPipeline:
         original_length = len(audio_np)
         hubert_hop = 320
 
-        # Calculate minimum input samples needed for MIN_SYNTH_FEATURE_FRAMES features
-        # MIN_SYNTH_FEATURE_FRAMES is at 100fps, HuBERT produces 50fps, so /2
-        # HuBERT produces approximately (samples / hop) - 1 frames due to its internal handling,
-        # so we add 2 extra hops to ensure we get enough frames
-        min_hubert_frames = MIN_SYNTH_FEATURE_FRAMES // 2  # 32 frames
-        min_input_samples = (min_hubert_frames + 2) * hubert_hop  # 10880 samples (with buffer)
-
         # Base padding (50ms each side = 1600 total)
         base_pad = int(16000 * 0.05)  # 800 samples
 
-        # Check if we need extra padding to meet minimum
-        total_with_base = base_pad + original_length + base_pad
-        if total_with_base < min_input_samples:
-            # Need more padding - distribute evenly
-            extra_needed = min_input_samples - total_with_base
-            extra_per_side = (extra_needed + 1) // 2
-            t_pad = base_pad + extra_per_side
-            logger.info(
-                f"Short input: increased padding from {base_pad} to {t_pad} samples per side"
-            )
-        else:
+        # For chunk processing, use minimal padding to avoid excessive padding artifacts
+        logger.info(f"Padding check: allow_short_input={allow_short_input}, original_length={original_length}")
+        if allow_short_input:
             t_pad = base_pad
+        else:
+            # Calculate minimum input samples needed for MIN_SYNTH_FEATURE_FRAMES features
+            # MIN_SYNTH_FEATURE_FRAMES is at 100fps, HuBERT produces 50fps, so /2
+            # HuBERT produces approximately (samples / hop) - 1 frames due to its internal handling,
+            # so we add 2 extra hops to ensure we get enough frames
+            min_hubert_frames = MIN_SYNTH_FEATURE_FRAMES // 2  # 32 frames
+            min_input_samples = (min_hubert_frames + 2) * hubert_hop  # 10880 samples (with buffer)
+
+            # Check if we need extra padding to meet minimum
+            total_with_base = base_pad + original_length + base_pad
+            if total_with_base < min_input_samples:
+                # Need more padding - distribute evenly
+                extra_needed = min_input_samples - total_with_base
+                extra_per_side = (extra_needed + 1) // 2
+                t_pad = base_pad + extra_per_side
+                logger.info(
+                    f"Short input: increased padding from {base_pad} to {t_pad} samples per side"
+                )
+            else:
+                t_pad = base_pad
 
         t_pad_tgt = int(t_pad * self.sample_rate / 16000)  # Output padding samples (proportional)
 

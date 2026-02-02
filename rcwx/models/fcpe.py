@@ -62,6 +62,7 @@ class FCPE:
         # Load bundled model
         logger.info(f"Loading FCPE model on {device}")
         self.model = spawn_bundled_infer_model(device=device)
+        self.model.eval()  # Set to evaluation mode for deterministic inference
         logger.info("FCPE model loaded")
 
     @torch.no_grad()

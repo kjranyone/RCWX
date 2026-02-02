@@ -731,6 +731,7 @@ class RealtimeVoiceChanger:
                     energy_threshold=self.config.energy_threshold,
                     use_feature_cache=self.config.use_feature_cache,
                     use_parallel_extraction=self.config.use_parallel_extraction,
+                    allow_short_input=True,  # Allow short chunks for low latency
                 )
 
                 # Resample to output sample rate (stateful for phase continuity)
