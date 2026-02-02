@@ -406,8 +406,10 @@ class RVCPipeline:
         base_pad = int(16000 * 0.05)  # 800 samples
 
         # For chunk processing, use minimal padding to avoid excessive padding artifacts
+        # Optimal: 1 HuBERT hop (320 samples = 20ms) for batch/chunk consistency
+        # This reduces padding accumulation at chunk boundaries while maintaining edge quality
         if allow_short_input:
-            t_pad = base_pad
+            t_pad = hubert_hop  # 320 samples (20ms @ 16kHz, 1 HuBERT hop) - optimal
         else:
             # Calculate minimum input samples needed for MIN_SYNTH_FEATURE_FRAMES features
             # MIN_SYNTH_FEATURE_FRAMES is at 100fps, HuBERT produces 50fps, so /2
