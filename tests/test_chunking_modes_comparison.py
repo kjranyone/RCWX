@@ -141,9 +141,9 @@ def process_streaming_mode(
     output_sr: int = 48000,
     pitch_shift: int = 0,
     chunk_sec: float = 0.35,  # Optimal value
-    context_sec: float = 0.12,  # Optimal value (125ms+ degrades quality)
-    crossfade_sec: float = 0.12,  # Optimal value (125ms+ degrades quality)
-    overlap_sec: float = 0.24,  # Optimal for rvc_webui mode (0.25 degrades)
+    context_sec: float = 0.119,  # Optimal (118/120 showed no significant improvement)
+    crossfade_sec: float = 0.119,  # Optimal (118/120 showed no significant improvement)
+    overlap_sec: float = 0.24,  # Optimal for rvc_webui mode
 ) -> tuple[np.ndarray, int, float]:
     """
     Process audio using specified chunking mode.
