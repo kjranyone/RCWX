@@ -39,7 +39,7 @@ class SOLAState:
         # For w-okada mode, we need full context length for crossfading
         sola_buffer_frame = crossfade_samples
         # Use 3x zero-crossing interval (30ms @ 48kHz)
-        # Balanced search range for phase alignment
+        # Optimal search range (40ms+ increases latency without quality gain)
         sola_search_frame = zc * 3
 
         # Hann (raised cosine) fade windows - smooth and well-tested
