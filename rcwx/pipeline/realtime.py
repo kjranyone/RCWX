@@ -398,13 +398,35 @@ class RealtimeVoiceChanger:
         self.mic_lookahead_samples = int(self.config.mic_sample_rate * self.config.lookahead_sec)
         self.mic_total_chunk = self.mic_chunk_samples + 2 * self.mic_context_samples
 
-        # Reconfigure input buffer
-        self.input_buffer = ChunkBuffer(
-            self.mic_chunk_samples,
-            crossfade_samples=0,
-            context_samples=self.mic_context_samples,
-            lookahead_samples=self.mic_lookahead_samples,
-        )
+        # Mode-specific buffer initialization
+        if self.config.chunking_mode == "rvc_webui":
+            # RVC WebUI mode: overlap-based chunking
+            self.mic_overlap_samples = int(
+                self.config.mic_sample_rate * self.config.rvc_overlap_sec
+            )
+            self.mic_hop_samples = self.mic_chunk_samples - self.mic_overlap_samples
+            self.input_buffer_rvc = np.array([], dtype=np.float32)
+            self.input_buffer = None
+        elif self.config.chunking_mode == "hybrid":
+            # Hybrid mode: no overlap
+            self.mic_overlap_samples = 0
+            self.mic_hop_samples = self.mic_chunk_samples
+            self.input_buffer = ChunkBuffer(
+                self.mic_chunk_samples,
+                crossfade_samples=0,
+                context_samples=self.mic_context_samples,
+                lookahead_samples=self.mic_lookahead_samples,
+            )
+            self.input_buffer_rvc = None
+        else:
+            # w-okada mode (default)
+            self.input_buffer = ChunkBuffer(
+                self.mic_chunk_samples,
+                crossfade_samples=0,
+                context_samples=self.mic_context_samples,
+                lookahead_samples=self.mic_lookahead_samples,
+            )
+            self.input_buffer_rvc = None
 
         # Output processing parameters (at output sample rate)
         self.output_crossfade_samples = int(
@@ -750,38 +772,71 @@ class RealtimeVoiceChanger:
                     if self.config.chunking_mode == "rvc_webui":
                         # RVC WebUI mode: overlap-based SOLA
                         # Each chunk overlaps with previous, SOLA finds optimal offset
+                        pre_sola_len = len(output)
                         cf_result = apply_sola_crossfade(
                             output,
                             self._sola_state,
                             wokada_mode=False,  # RVC WebUI mode
                             context_samples=0,
                         )
+                        post_sola_len = len(cf_result.audio)
                         output = cf_result.audio
+
+                        # CRITICAL FIX: Trim output to hop_samples to maintain correct length
+                        # Input advances by hop_samples, so output should match
+                        # hop_sec = mic_hop_samples / mic_sr
+                        # output_hop_samples = output_sr * hop_sec
+                        hop_sec = self.mic_hop_samples / self.config.mic_sample_rate
+                        output_hop_samples = int(self.config.output_sample_rate * hop_sec)
+
+                        # First chunk: output full chunk minus overlap
+                        # Subsequent chunks: output hop_samples worth
+                        pre_trim_len = len(output)
+                        if self.stats.frames_processed == 0:
+                            # First chunk: keep chunk - overlap worth of audio
+                            first_chunk_sec = (
+                                self.config.chunk_sec - self.config.rvc_overlap_sec
+                            )
+                            first_chunk_samples = int(
+                                self.config.output_sample_rate * first_chunk_sec
+                            )
+                            if len(output) > first_chunk_samples:
+                                output = output[:first_chunk_samples]
+                        else:
+                            # Subsequent chunks: keep hop_samples worth
+                            if len(output) > output_hop_samples:
+                                output = output[:output_hop_samples]
+
+                        # Log SOLA stats for debugging
+                        if self.stats.frames_processed < 5:
+                            logger.info(
+                                f"[SOLA-RVC-DBG] chunk={self.stats.frames_processed}, "
+                                f"pre_sola={pre_sola_len}, post_sola={post_sola_len}, "
+                                f"pre_trim={pre_trim_len}, post_trim={len(output)}, "
+                                f"hop_samples={output_hop_samples}, mic_hop={self.mic_hop_samples}"
+                            )
 
                         # Log SOLA stats periodically
                         if self.stats.frames_processed % 50 == 0:
                             logger.debug(
                                 f"[SOLA-RVC] chunk={self.stats.frames_processed}, "
-                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}"
+                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}, "
+                                f"out_len={len(output)}"
                             )
                     elif self.config.chunking_mode == "hybrid":
-                        # Hybrid RVC+Stitching mode:
-                        # - RVC-style hop-based progression (0 discontinuities)
-                        # - w-okada style context structure [left_context | main | right_context]
-                        # - SOLA optimized for overlap regions only (stitching mode)
-                        # - No overlap between chunks (like RVC), no context discarded
-                        self.mic_overlap_samples = 0
-                        self.mic_hop_samples = self.mic_chunk_samples
-
-                        # w-okada mode: context-based SOLA (stitching mode)
-                        # Calculate context size for stitching mode
-                        context_samples_output = 0  # No context trimming in hybrid mode
+                        # Hybrid mode: RVC-style hop + w-okada context structure
+                        # Context is used for quality but trimmed from output to maintain length
+                        context_samples_output = 0
+                        if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                            context_samples_output = int(
+                                self.config.output_sample_rate * self.config.context_sec
+                            )
 
                         cf_result = apply_sola_crossfade(
                             output,
                             self._sola_state,
                             wokada_mode=True,
-                            context_samples=context_samples_output,  # No context trim
+                            context_samples=context_samples_output,
                         )
                         output = cf_result.audio
 
@@ -1492,9 +1547,33 @@ class RealtimeVoiceChanger:
                     context_samples=0,
                 )
                 output = cf_result.audio
+
+                # CRITICAL FIX: Trim output to hop_samples to maintain correct length
+                hop_sec = self.mic_hop_samples / self.config.mic_sample_rate
+                output_hop_samples = int(self.config.output_sample_rate * hop_sec)
+
+                if self.stats.frames_processed == 0:
+                    # First chunk: keep chunk - overlap worth of audio
+                    first_chunk_sec = (
+                        self.config.chunk_sec - self.config.rvc_overlap_sec
+                    )
+                    first_chunk_samples = int(
+                        self.config.output_sample_rate * first_chunk_sec
+                    )
+                    if len(output) > first_chunk_samples:
+                        output = output[:first_chunk_samples]
+                else:
+                    # Subsequent chunks: keep hop_samples worth
+                    if len(output) > output_hop_samples:
+                        output = output[:output_hop_samples]
             elif self.config.chunking_mode == "hybrid":
-                # Hybrid mode: context-based SOLA (like w-okada, but no context trimming)
-                context_samples_output = 0  # No trim in hybrid mode
+                # Hybrid mode: RVC-style hop + w-okada context structure
+                # Context is used for quality but trimmed from output to maintain length
+                context_samples_output = 0
+                if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                    context_samples_output = int(
+                        self.config.output_sample_rate * self.config.context_sec
+                    )
 
                 cf_result = apply_sola_crossfade(
                     output,
