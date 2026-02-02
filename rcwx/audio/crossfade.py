@@ -38,9 +38,9 @@ class SOLAState:
         # Use the requested crossfade_samples directly (no 4*zc limitation)
         # For w-okada mode, we need full context length for crossfading
         sola_buffer_frame = crossfade_samples
-        # Use 3x zero-crossing interval (30ms @ 48kHz)
-        # Larger search range improves phase alignment
-        sola_search_frame = zc * 3
+        # Use 5x zero-crossing interval (50ms @ 48kHz)
+        # Larger search range improves phase alignment and quality
+        sola_search_frame = zc * 5
 
         # Hann (raised cosine) fade windows - smooth and well-tested
         t = np.linspace(0.0, 1.0, sola_buffer_frame, dtype=np.float32)
@@ -315,8 +315,8 @@ def _find_sola_offset(
         window_rms = np.sqrt(np.mean(window**2)) + 1e-8
         energy_ratio = min(sola_rms, window_rms) / max(sola_rms, window_rms)
 
-        # Combined score
-        score = corr * (0.7 + 0.3 * energy_ratio)
+        # Combined score (increased energy ratio weight for better pattern matching)
+        score = corr * (0.6 + 0.4 * energy_ratio)
 
         candidates.append((offset, corr, score))
 
@@ -373,8 +373,8 @@ def _find_sola_offset(
         grad_std = np.std(np.diff(blended))
 
         # Combined smoothness score (lower is better)
-        # Prioritize boundary continuity over internal smoothness
-        smoothness = 10.0 * start_disc + 10.0 * end_disc + 1.0 * internal_grad + 0.5 * grad_std
+        # Balanced weighting: both boundary continuity and internal smoothness matter
+        smoothness = 8.0 * start_disc + 8.0 * end_disc + 2.0 * internal_grad + 1.0 * grad_std
 
         if smoothness < best_smoothness:
             best_smoothness = smoothness
