@@ -181,6 +181,7 @@ def process_streaming_mode(
         index_rate=0.0,
         voice_gate_mode="off",
         use_feature_cache=False,  # Match true batch processing (no cache)
+        use_adaptive_parameters=False,  # Disable adaptive parameters (causes degradation)
     )
 
     changer = RealtimeVoiceChanger(pipeline, config=rt_config)

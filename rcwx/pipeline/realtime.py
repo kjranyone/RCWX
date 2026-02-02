@@ -11,6 +11,7 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from rcwx.audio.analysis import AdaptiveParameterCalculator
 from rcwx.audio.buffer import ChunkBuffer, OutputBuffer
 from rcwx.audio.crossfade import SOLAState, apply_sola_crossfade, flush_sola_buffer
 from rcwx.audio.denoise import denoise as denoise_audio
@@ -129,6 +130,11 @@ class RealtimeConfig:
 
     # SOLA search range (as ratio of crossfade length)
     sola_search_ratio: float = 0.25
+
+    # --- Adaptive parameter adjustment ---
+    # Enable adaptive adjustment of crossfade/context/SOLA based on audio characteristics
+    # This analyzes energy, spectral flux, and pitch stability to optimize parameters per chunk
+    use_adaptive_parameters: bool = False
 
     # --- RVC WebUI mode specific parameters ---
     # Overlap ratio for RVC WebUI mode (0.44 = 44% overlap, proven to achieve 0 discontinuities)
@@ -371,6 +377,18 @@ class RealtimeVoiceChanger:
         else:
             self._fade_in = np.array([], dtype=np.float32)
             self._fade_out = np.array([], dtype=np.float32)
+
+        # Adaptive parameter calculator
+        if self.config.use_adaptive_parameters:
+            self.adaptive_calc = AdaptiveParameterCalculator(
+                sample_rate=self.config.mic_sample_rate,
+                base_crossfade_sec=self.config.crossfade_sec,
+                base_context_sec=self.config.context_sec,
+                base_sola_search_ms=30.0,  # 30ms base SOLA search
+            )
+            logger.info("Adaptive parameter adjustment enabled")
+        else:
+            self.adaptive_calc = None
 
     def _recalculate_buffers(self) -> None:
         """Recalculate buffer sizes based on current config sample rates."""
@@ -794,10 +812,21 @@ class RealtimeVoiceChanger:
                         logger.warning(f"Audio clipping detected: max={max_val:.2f}")
 
                 # Apply SOLA crossfade (mode-dependent)
+                # Debug: Log SOLA conditions (first 3 chunks only)
+                if self.stats.frames_processed < 3:
+                    logger.info(
+                        f"[SOLA-DEBUG] chunk={self.stats.frames_processed}, "
+                        f"use_sola={self.config.use_sola}, "
+                        f"sola_state_exists={self._sola_state is not None}, "
+                        f"chunking_mode={self.config.chunking_mode}"
+                    )
+
                 if self.config.use_sola and self._sola_state is not None:
                     if self.config.chunking_mode == "rvc_webui":
                         # RVC WebUI mode: overlap-based SOLA
                         # Each chunk overlaps with previous, SOLA finds optimal offset
+                        if self.stats.frames_processed < 3:
+                            logger.info(f"[RVC-WEBUI-BLOCK] Entering rvc_webui mode block")
                         pre_sola_len = len(output)
                         cf_result = apply_sola_crossfade(
                             output,
@@ -852,6 +881,8 @@ class RealtimeVoiceChanger:
                     elif self.config.chunking_mode == "hybrid":
                         # Hybrid mode: RVC-style hop + w-okada context structure
                         # Context is used for quality but trimmed from output to maintain length
+                        if self.stats.frames_processed < 3:
+                            logger.info(f"[HYBRID-BLOCK] Entering hybrid mode block")
                         context_samples_output = 0
                         if self.stats.frames_processed > 0 and self.config.context_sec > 0:
                             context_samples_output = int(
@@ -874,20 +905,105 @@ class RealtimeVoiceChanger:
                             )
                     else:
                         # w-okada mode: context-based SOLA
+                        if self.stats.frames_processed < 3:
+                            logger.info(f"[WOKADA-BLOCK] Entering w-okada mode block")
+
+                        # Debug: check if adaptive calc exists
+                        if self.stats.frames_processed < 3:
+                            logger.info(f"[DEBUG] adaptive_calc exists: {self.adaptive_calc is not None}")
+
+                        # Adaptive parameter adjustment
+                        if self.adaptive_calc is not None:
+                            # Analyze audio characteristics (use input chunk at mic rate)
+                            adaptive_params = self.adaptive_calc.analyze_and_adjust(
+                                chunk_at_mic_rate,
+                                f0=None,  # F0 not available at this stage
+                            )
+
+                            # Use adaptive crossfade size
+                            adaptive_crossfade_samples = int(
+                                self.config.output_sample_rate * adaptive_params['crossfade_sec']
+                            )
+
+                            # Create temporary SOLA state with adaptive parameters
+                            adaptive_sola_state = SOLAState.create(
+                                adaptive_crossfade_samples,
+                                self.config.output_sample_rate,
+                            )
+                            # Resize sola_buffer if necessary
+                            if self._sola_state.sola_buffer is not None:
+                                old_size = len(self._sola_state.sola_buffer)
+                                new_size = adaptive_crossfade_samples
+
+                                if old_size == new_size:
+                                    # Same size, direct copy
+                                    adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer.copy()
+                                elif old_size < new_size:
+                                    # Pad with zeros on the right
+                                    adaptive_sola_state.sola_buffer = np.pad(
+                                        self._sola_state.sola_buffer,
+                                        (0, new_size - old_size),
+                                        mode='constant'
+                                    )
+                                else:
+                                    # Trim from the left (keep most recent audio)
+                                    adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
+
+                                adaptive_sola_state.frames_processed = self._sola_state.frames_processed
+
+                            sola_state_to_use = adaptive_sola_state
+                            context_sec_to_use = adaptive_params['context_sec']
+
+                            # Log adaptive parameters occasionally
+                            if self.stats.frames_processed < 10 or self.stats.frames_processed % 20 == 0:
+                                logger.info(
+                                    f"[ADAPTIVE] chunk={self.stats.frames_processed}, "
+                                    f"energy={adaptive_params['energy']:.3f}, "
+                                    f"flux={adaptive_params['flux']:.3f}, "
+                                    f"crossfade={adaptive_params['crossfade_sec']:.3f}s, "
+                                    f"context={adaptive_params['context_sec']:.3f}s"
+                                )
+                        else:
+                            # Use fixed parameters
+                            sola_state_to_use = self._sola_state
+                            context_sec_to_use = self.config.context_sec
+
                         # Calculate context size
                         context_samples_output = 0
-                        if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                        if self.stats.frames_processed > 0 and context_sec_to_use > 0:
                             context_samples_output = int(
-                                self.config.output_sample_rate * self.config.context_sec
+                                self.config.output_sample_rate * context_sec_to_use
                             )
 
                         cf_result = apply_sola_crossfade(
                             output,
-                            self._sola_state,
+                            sola_state_to_use,
                             wokada_mode=True,
                             context_samples=context_samples_output,
                         )
                         output = cf_result.audio
+
+                        # Update main SOLA state buffer if using adaptive
+                        if self.adaptive_calc is not None and sola_state_to_use.sola_buffer is not None:
+                            # Resize back to main SOLA state size if necessary
+                            adaptive_size = len(sola_state_to_use.sola_buffer)
+                            main_size = self._sola_state.sola_buffer_frame
+
+                            if adaptive_size == main_size:
+                                # Same size, direct copy
+                                self._sola_state.sola_buffer = sola_state_to_use.sola_buffer.copy()
+                            elif adaptive_size < main_size:
+                                # Pad with zeros on the right
+                                self._sola_state.sola_buffer = np.pad(
+                                    sola_state_to_use.sola_buffer,
+                                    (0, main_size - adaptive_size),
+                                    mode='constant'
+                                )
+                            else:
+                                # Trim from the left (keep most recent audio)
+                                self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
+
+                            self._sola_state.frames_processed = sola_state_to_use.frames_processed
 
                         # Log SOLA stats periodically
                         if self.stats.frames_processed % 50 == 0:
@@ -1611,19 +1727,98 @@ class RealtimeVoiceChanger:
                 output = cf_result.audio
             else:
                 # w-okada mode: context-based SOLA
+
+                # Adaptive parameter adjustment
+                sola_state_to_use = self._sola_state
+                context_sec_to_use = self.config.context_sec
+
+                if self.adaptive_calc is not None:
+                    # Analyze audio characteristics (use input chunk at mic rate)
+                    adaptive_params = self.adaptive_calc.analyze_and_adjust(
+                        chunk_at_mic_rate,
+                        f0=None,  # F0 not available at this stage
+                    )
+
+                    # Log adaptive parameters for debugging
+                    if self.stats.frames_processed < 5:
+                        logger.info(
+                            f"[ADAPTIVE-TEST] chunk={self.stats.frames_processed}, "
+                            f"energy={adaptive_params['energy']:.4f}, "
+                            f"flux={adaptive_params['flux']:.4f}, "
+                            f"stability={adaptive_params['stability']:.4f}, "
+                            f"crossfade_sec={adaptive_params['crossfade_sec']:.4f}, "
+                            f"context_sec={adaptive_params['context_sec']:.4f}, "
+                            f"sola_search_ms={adaptive_params['sola_search_ms']:.2f}"
+                        )
+
+                    # Use adaptive crossfade size
+                    adaptive_crossfade_samples = int(
+                        self.config.output_sample_rate * adaptive_params['crossfade_sec']
+                    )
+                    adaptive_sola_state = SOLAState.create(
+                        adaptive_crossfade_samples,
+                        self.config.output_sample_rate,
+                    )
+
+                    # Resize sola_buffer if necessary
+                    if self._sola_state.sola_buffer is not None:
+                        old_size = len(self._sola_state.sola_buffer)
+                        new_size = adaptive_crossfade_samples
+
+                        if old_size == new_size:
+                            # Same size, direct copy
+                            adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer.copy()
+                        elif old_size < new_size:
+                            # Pad with zeros on the right
+                            adaptive_sola_state.sola_buffer = np.pad(
+                                self._sola_state.sola_buffer,
+                                (0, new_size - old_size),
+                                mode='constant'
+                            )
+                        else:
+                            # Trim from the left (keep most recent audio)
+                            adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
+
+                        adaptive_sola_state.frames_processed = self._sola_state.frames_processed
+
+                    sola_state_to_use = adaptive_sola_state
+                    context_sec_to_use = adaptive_params['context_sec']
+
                 context_samples_output = 0
-                if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                if self.stats.frames_processed > 0 and context_sec_to_use > 0:
                     context_samples_output = int(
-                        self.config.output_sample_rate * self.config.context_sec
+                        self.config.output_sample_rate * context_sec_to_use
                     )
 
                 cf_result = apply_sola_crossfade(
                     output,
-                    self._sola_state,
+                    sola_state_to_use,
                     wokada_mode=True,
                     context_samples=context_samples_output,
                 )
                 output = cf_result.audio
+
+                # Update main SOLA state from adaptive state
+                if self.adaptive_calc is not None and sola_state_to_use.sola_buffer is not None:
+                    # Resize back to main SOLA state size if necessary
+                    adaptive_size = len(sola_state_to_use.sola_buffer)
+                    main_size = self._sola_state.sola_buffer_frame
+
+                    if adaptive_size == main_size:
+                        # Same size, direct copy
+                        self._sola_state.sola_buffer = sola_state_to_use.sola_buffer.copy()
+                    elif adaptive_size < main_size:
+                        # Pad with zeros on the right
+                        self._sola_state.sola_buffer = np.pad(
+                            sola_state_to_use.sola_buffer,
+                            (0, main_size - adaptive_size),
+                            mode='constant'
+                        )
+                    else:
+                        # Trim from the left (keep most recent audio)
+                        self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
+
+                    self._sola_state.frames_processed = sola_state_to_use.frames_processed
         else:
             # No SOLA: Manually trim context from output to get only the "main" portion
             # This is critical for matching batch processing output length
