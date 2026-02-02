@@ -23,7 +23,7 @@ from scipy.io import wavfile
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from rcwx.audio.resample import resample
+from rcwx.audio.resample import resample, StatefulResampler
 from rcwx.config import RCWXConfig
 from rcwx.pipeline.inference import RVCPipeline
 from rcwx.pipeline.realtime import RealtimeConfig, RealtimeVoiceChanger
@@ -104,11 +104,16 @@ def process_true_batch(
     output_sr: int = 48000,
     pitch_shift: int = 0,
 ) -> np.ndarray:
-    """Process entire audio in one batch (gold standard)."""
+    """Process entire audio in one batch (gold standard).
+
+    Uses StatefulResampler (treating entire audio as one chunk) to match
+    streaming processing and enable fair comparison.
+    """
     pipeline.clear_cache()
 
-    # Resample to 16kHz for processing
-    audio_16k = resample(audio, mic_sr, 16000)
+    # Use StatefulResampler for input (match streaming behavior)
+    input_resampler = StatefulResampler(mic_sr, 16000)
+    audio_16k = input_resampler.resample_chunk(audio)
 
     output = pipeline.infer(
         audio_16k,
@@ -120,9 +125,10 @@ def process_true_batch(
         use_feature_cache=False,
     )
 
-    # Resample to output rate
+    # Use StatefulResampler for output (match streaming behavior)
     if pipeline.sample_rate != output_sr:
-        output = resample(output, pipeline.sample_rate, output_sr)
+        output_resampler = StatefulResampler(pipeline.sample_rate, output_sr)
+        output = output_resampler.resample_chunk(output)
 
     return output
 
@@ -174,7 +180,7 @@ def process_streaming_mode(
         rvc_overlap_sec=overlap_sec,
         index_rate=0.0,
         voice_gate_mode="off",
-        use_feature_cache=True,
+        use_feature_cache=False,  # Match true batch processing (no cache)
     )
 
     changer = RealtimeVoiceChanger(pipeline, config=rt_config)

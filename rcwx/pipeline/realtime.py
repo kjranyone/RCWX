@@ -214,6 +214,7 @@ class RealtimeVoiceChanger:
                 index_rate=0.0,
                 voice_gate_mode="off",
                 use_feature_cache=False,
+                allow_short_input=True,  # Allow short chunks for warmup
             )
             t = np.arange(warmup_samples) / self.config.input_sample_rate
             warmup_audio = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
@@ -226,6 +227,7 @@ class RealtimeVoiceChanger:
                     index_rate=self.config.index_rate,
                     voice_gate_mode=self.config.voice_gate_mode,
                     use_feature_cache=True,
+                    allow_short_input=True,  # Allow short chunks for warmup
                 )
             logger.info("Warmup complete")
         except Exception as e:
@@ -1525,6 +1527,7 @@ class RealtimeVoiceChanger:
             energy_threshold=self.config.energy_threshold,
             use_feature_cache=self.config.use_feature_cache,
             use_parallel_extraction=self.config.use_parallel_extraction,
+            allow_short_input=True,  # Allow short chunks for manual processing
         )
 
         # Resample to output sample rate (stateful for phase continuity)

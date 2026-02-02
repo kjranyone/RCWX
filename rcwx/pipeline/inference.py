@@ -409,7 +409,6 @@ class RVCPipeline:
         base_pad = int(16000 * 0.05)  # 800 samples
 
         # For chunk processing, use minimal padding to avoid excessive padding artifacts
-        logger.info(f"Padding check: allow_short_input={allow_short_input}, original_length={original_length}")
         if allow_short_input:
             t_pad = base_pad
         else:
