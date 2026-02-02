@@ -86,12 +86,13 @@ class ChunkBuffer:
 
         Returns:
             Audio chunk for inference
-            First chunk: [main] (no left context)
+            First chunk: [reflection_padding | main] (reflection padding as left context)
             Subsequent chunks: [context | main] (context from previous chunk)
 
         Note:
             Always advances by chunk_samples (uniform progression)
             w-okada style: extraConvertSize (context) is processed but trimmed from output
+            First chunk uses reflection padding to provide consistent context structure
         """
         # Determine required samples based on whether this is first chunk
         if self._is_first_chunk:
@@ -104,8 +105,22 @@ class ChunkBuffer:
         if len(self._input_buffer) < required:
             return None
 
-        # Extract chunk
-        chunk = self._input_buffer[:required].copy()
+        # Extract chunk with reflection padding for first chunk
+        if self._is_first_chunk and self.context_samples > 0:
+            # First chunk: use reflection padding for left context
+            main_chunk = self._input_buffer[:required].copy()
+            # Create reflection padding from the beginning of the main chunk
+            reflect_len = min(self.context_samples, len(main_chunk))
+            reflection = main_chunk[:reflect_len][::-1].copy()  # Reverse the first samples
+            if len(reflection) < self.context_samples:
+                # Pad with zeros if not enough samples for reflection
+                reflection = np.concatenate([
+                    np.zeros(self.context_samples - len(reflection), dtype=np.float32),
+                    reflection
+                ])
+            chunk = np.concatenate([reflection, main_chunk])
+        else:
+            chunk = self._input_buffer[:required].copy()
 
         # Always advance by chunk_samples (w-okada style: uniform progression)
         # This is the key difference from overlap-based chunking
