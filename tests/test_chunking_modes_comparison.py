@@ -140,9 +140,9 @@ def process_streaming_mode(
     mic_sr: int = 48000,
     output_sr: int = 48000,
     pitch_shift: int = 0,
-    chunk_sec: float = 0.35,
-    context_sec: float = 0.10,  # Increased for better boundary handling
-    crossfade_sec: float = 0.10,  # Increased for smoother transitions
+    chunk_sec: float = 0.35,  # Optimal value
+    context_sec: float = 0.12,  # Optimal value (125ms+ degrades quality)
+    crossfade_sec: float = 0.12,  # Optimal value (125ms+ degrades quality)
     overlap_sec: float = 0.22,
 ) -> tuple[np.ndarray, int, float]:
     """
