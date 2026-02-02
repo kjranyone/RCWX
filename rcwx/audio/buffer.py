@@ -69,13 +69,15 @@ class ChunkBuffer:
     def has_chunk(self) -> bool:
         """Check if a full chunk is available for processing.
 
-        Hybrid mode optimization: Always use the larger requirement (subsequent chunks)
-        to ensure early chunks have enough data. This prevents the issue where
-        the first block has too little data for the second chunk.
+        First chunk starts immediately with just main portion (no context).
+        Subsequent chunks require context from previous chunk.
         """
-        # Use subsequent chunk requirement for all chunks to ensure consistency
-        # This is slightly wasteful for first chunk but ensures all chunks process
-        required = self.chunk_samples + self.context_samples + self.lookahead_samples
+        if self._is_first_chunk:
+            # First chunk: start immediately with just main + lookahead
+            required = self.chunk_samples + self.lookahead_samples
+        else:
+            # Subsequent chunks: need context + main + lookahead
+            required = self.chunk_samples + self.context_samples + self.lookahead_samples
         return len(self._input_buffer) >= required
 
     def get_chunk(self) -> NDArray[np.float32] | None:
@@ -84,12 +86,13 @@ class ChunkBuffer:
 
         Returns:
             Audio chunk for inference
-            First chunk: [main] (no left context)
+            First chunk: [reflection_padding | main] (reflection padding as left context)
             Subsequent chunks: [context | main] (context from previous chunk)
 
         Note:
             Always advances by chunk_samples (uniform progression)
             w-okada style: extraConvertSize (context) is processed but trimmed from output
+            First chunk uses reflection padding to provide consistent context structure
         """
         # Determine required samples based on whether this is first chunk
         if self._is_first_chunk:
@@ -102,8 +105,22 @@ class ChunkBuffer:
         if len(self._input_buffer) < required:
             return None
 
-        # Extract chunk
-        chunk = self._input_buffer[:required].copy()
+        # Extract chunk with reflection padding for first chunk
+        if self._is_first_chunk and self.context_samples > 0:
+            # First chunk: use reflection padding for left context
+            main_chunk = self._input_buffer[:required].copy()
+            # Create reflection padding from the beginning of the main chunk
+            reflect_len = min(self.context_samples, len(main_chunk))
+            reflection = main_chunk[:reflect_len][::-1].copy()  # Reverse the first samples
+            if len(reflection) < self.context_samples:
+                # Pad with zeros if not enough samples for reflection
+                reflection = np.concatenate([
+                    np.zeros(self.context_samples - len(reflection), dtype=np.float32),
+                    reflection
+                ])
+            chunk = np.concatenate([reflection, main_chunk])
+        else:
+            chunk = self._input_buffer[:required].copy()
 
         # Always advance by chunk_samples (w-okada style: uniform progression)
         # This is the key difference from overlap-based chunking

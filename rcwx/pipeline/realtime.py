@@ -379,8 +379,8 @@ class RealtimeVoiceChanger:
 
         # Round chunk size to HuBERT hop multiple for stable output length
         # This prevents HuBERT frame quantization from varying output length
-        # Only in wokada mode - hybrid uses hop-based which guarantees 0 discontinuities
-        if self.config.chunking_mode == "wokada":
+        # Applied to both wokada and hybrid modes for consistent quality
+        if self.config.chunking_mode in ["wokada", "hybrid"]:
             # HuBERT hop @ 48kHz = 960 samples (320 @ 16kHz * 48/16)
             hubert_hop_48k = 960
             rounded_samples = (
