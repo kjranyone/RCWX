@@ -22,7 +22,7 @@ class AudioConfig:
     output_hostapi_filter: str = "WASAPI"  # Host API filter for output devices
     sample_rate: int = 16000
     output_sample_rate: int = 48000
-    chunk_sec: float = 0.10  # Ultra-low latency: 100ms (FCPE official min, RMVPE needs >= 0.32 sec)
+    chunk_sec: float = 0.15  # Recommended: 150ms (FCPE safe minimum, RMVPE needs >= 0.32 sec)
     crossfade_sec: float = 0.05
     input_gain_db: float = 0.0  # Input gain in dB
     # Input channel selection for stereo devices: "left", "right", "average"
