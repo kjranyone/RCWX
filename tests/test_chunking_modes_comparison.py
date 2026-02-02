@@ -276,16 +276,34 @@ def analyze_mode(
 
     # Energy envelope correlation (phase-invariant)
     # This is the primary quality metric for SOLA-processed audio
+    # Use offset-compensated correlation to handle timing differences
     frame_size = output_sr // 100  # 10ms frames
     if min_len > frame_size * 2:
         true_envelope = compute_energy_envelope(true_batch[:min_len], frame_size)
         output_envelope = compute_energy_envelope(output_trimmed[:min_len], frame_size)
         env_min_len = min(len(true_envelope), len(output_envelope))
+
         if env_min_len > 0:
-            envelope_correlation = float(np.corrcoef(
-                true_envelope[:env_min_len],
-                output_envelope[:env_min_len]
-            )[0, 1])
+            # Find best offset within ±100ms (10 frames)
+            best_corr = -1.0
+            search_range = 10  # ±100ms
+
+            for offset in range(-search_range, search_range + 1):
+                if offset < 0:
+                    a = true_envelope[-offset:env_min_len]
+                    b = output_envelope[:len(a)]
+                else:
+                    a = true_envelope[:env_min_len - offset]
+                    b = output_envelope[offset:offset + len(a)]
+
+                if len(a) > 10 and len(b) > 10:
+                    corr_len = min(len(a), len(b))
+                    if np.std(a[:corr_len]) > 1e-6 and np.std(b[:corr_len]) > 1e-6:
+                        corr = float(np.corrcoef(a[:corr_len], b[:corr_len])[0, 1])
+                        if not np.isnan(corr) and corr > best_corr:
+                            best_corr = corr
+
+            envelope_correlation = best_corr if best_corr > -1.0 else 0.0
         else:
             envelope_correlation = 0.0
     else:

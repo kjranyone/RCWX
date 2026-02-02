@@ -69,13 +69,15 @@ class ChunkBuffer:
     def has_chunk(self) -> bool:
         """Check if a full chunk is available for processing.
 
-        Hybrid mode optimization: Always use the larger requirement (subsequent chunks)
-        to ensure early chunks have enough data. This prevents the issue where
-        the first block has too little data for the second chunk.
+        First chunk starts immediately with just main portion (no context).
+        Subsequent chunks require context from previous chunk.
         """
-        # Use subsequent chunk requirement for all chunks to ensure consistency
-        # This is slightly wasteful for first chunk but ensures all chunks process
-        required = self.chunk_samples + self.context_samples + self.lookahead_samples
+        if self._is_first_chunk:
+            # First chunk: start immediately with just main + lookahead
+            required = self.chunk_samples + self.lookahead_samples
+        else:
+            # Subsequent chunks: need context + main + lookahead
+            required = self.chunk_samples + self.context_samples + self.lookahead_samples
         return len(self._input_buffer) >= required
 
     def get_chunk(self) -> NDArray[np.float32] | None:
