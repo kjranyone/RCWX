@@ -141,8 +141,8 @@ def process_streaming_mode(
     output_sr: int = 48000,
     pitch_shift: int = 0,
     chunk_sec: float = 0.35,
-    context_sec: float = 0.05,
-    crossfade_sec: float = 0.05,
+    context_sec: float = 0.10,  # Increased for better boundary handling
+    crossfade_sec: float = 0.10,  # Increased for smoother transitions
     overlap_sec: float = 0.22,
 ) -> tuple[np.ndarray, int, float]:
     """
