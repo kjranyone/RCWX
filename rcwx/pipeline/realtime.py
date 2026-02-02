@@ -456,6 +456,30 @@ class RealtimeVoiceChanger:
             f"mic_context={self.mic_context_samples}, out_cf={self.output_crossfade_samples}"
         )
 
+        # Guard: Check feature cache vs chunk size ratio
+        # Feature cache longer than chunk causes "temporal blur" - past features dominate
+        if self.config.use_feature_cache and hasattr(self.pipeline, '_feature_cache_frames'):
+            # Convert chunk samples to HuBERT frames (50fps)
+            # HuBERT hop = 320 @ 16kHz, mic is typically 48kHz
+            chunk_at_16k = self.mic_chunk_samples * 16000 / self.config.mic_sample_rate
+            chunk_frames = chunk_at_16k / 320  # HuBERT hop size
+            cache_frames = self.pipeline._feature_cache_frames
+
+            if chunk_frames > 0:
+                ratio = cache_frames / chunk_frames
+                if ratio > 1.0:
+                    logger.error(
+                        f"Feature cache ({cache_frames} frames, {cache_frames * 20}ms) exceeds chunk size "
+                        f"({chunk_frames:.1f} frames, {self.config.chunk_sec * 1000:.0f}ms). "
+                        f"Ratio={ratio:.2f}. This causes severe quality degradation - "
+                        f"reduce cache frames or increase chunk size."
+                    )
+                elif ratio > 0.6:
+                    logger.warning(
+                        f"Feature cache ({cache_frames} frames) is {ratio:.0%} of chunk size "
+                        f"({chunk_frames:.1f} frames). Consider reducing cache for better quality."
+                    )
+
     def _store_output_history(self, output: np.ndarray) -> None:
         """Store output samples for feedback detection."""
         # Resample to mic rate if different for comparison
