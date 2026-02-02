@@ -187,6 +187,27 @@ def apply_sola_crossfade(
                 + result[crossfade_start:crossfade_end] * state.fade_in_window
             )
 
+            # Post-processing: light smoothing near crossfade boundaries
+            # Reduces high-frequency discontinuities without audible degradation
+            smooth_radius = min(50, sola_buffer_frame // 10)  # ~50 samples (1ms @ 48kHz)
+            if smooth_radius > 0:
+                # Smooth region before crossfade
+                start_smooth = max(0, crossfade_start - smooth_radius)
+                end_smooth = min(len(result), crossfade_start + smooth_radius)
+                if end_smooth > start_smooth + 2:
+                    # 3-point moving average (very light smoothing)
+                    region = result[start_smooth:end_smooth]
+                    smoothed = np.convolve(region, [0.25, 0.5, 0.25], mode='same')
+                    result[start_smooth:end_smooth] = smoothed.astype(np.float32)
+
+                # Smooth region after crossfade
+                start_smooth = max(0, crossfade_end - smooth_radius)
+                end_smooth = min(len(result), crossfade_end + smooth_radius)
+                if end_smooth > start_smooth + 2:
+                    region = result[start_smooth:end_smooth]
+                    smoothed = np.convolve(region, [0.25, 0.5, 0.25], mode='same')
+                    result[start_smooth:end_smooth] = smoothed.astype(np.float32)
+
         # Trim context from the beginning
         if trim_samples > 0 and len(result) > trim_samples:
             result = result[trim_samples:]
