@@ -109,7 +109,7 @@ class RealtimeConfig:
     # Context: extra audio on left side for stable edge processing
     # This is discarded from output but provides context for RVC
     # 0.05 = 50ms context (minimal for low latency)
-    context_sec: float = 0.05
+    context_sec: float = 0.10  # Larger context improves HuBERT feature quality
 
     # Extra discard: additional samples to discard beyond context
     extra_sec: float = 0.0

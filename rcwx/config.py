@@ -75,8 +75,8 @@ class InferenceConfig:
 
     # --- Low-latency processing ---
     # Context: extra audio on left side for stable edge processing
-    # 0.05 = 50ms context (minimal for low latency)
-    context_sec: float = 0.05
+    # Larger context improves HuBERT feature quality (+2% @ 0.10 vs 0.05)
+    context_sec: float = 0.10
 
     # Lookahead: future samples (ADDS LATENCY!)
     # 0 = no lookahead (lowest latency)
