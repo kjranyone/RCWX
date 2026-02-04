@@ -335,6 +335,9 @@ def apply_sola_crossfade(
             # Extract crossfade region at optimal offset position
             crossfade_region = result[sola_offset : sola_offset + sola_buffer_frame].copy()
 
+            # Match RMS for energy consistency (with controlled limits)
+            crossfade_region = _match_rms(crossfade_region, state.sola_buffer, min_gain=0.5, max_gain=2.0)
+
             # Crossfade previous buffer with current chunk at offset position
             blended = (
                 state.sola_buffer * state.fade_out_window
@@ -344,14 +347,20 @@ def apply_sola_crossfade(
             # Place blended region at the beginning of output
             result[:sola_buffer_frame] = blended
 
-            # RVC WebUI mode: minimal de-click at boundary if needed
-            if prev_tail is not None and len(result) > 0:
-                delta = abs(float(prev_tail[-1]) - float(result[0]))
-                if delta > 0.05:
-                    declick_n = max(1, min(64, sola_buffer_frame // 4))
-                    head_end = float(result[declick_n - 1]) if len(result) >= declick_n else float(result[-1])
-                    ramp = np.linspace(float(prev_tail[-1]), head_end, declick_n, dtype=np.float32)
-                    result[:declick_n] = 0.7 * ramp + 0.3 * result[:declick_n]
+            # RVC WebUI mode: boundary smoothing if needed
+            if prev_tail is not None and len(result) > sola_buffer_frame:
+                # Check discontinuity at end of crossfade region
+                delta = abs(float(result[sola_buffer_frame - 1]) - float(result[sola_buffer_frame]))
+                if delta > 0.1:
+                    # Smooth transition from crossfade to rest of audio
+                    smooth_len = min(64, len(result) - sola_buffer_frame)
+                    if smooth_len > 1:
+                        t = np.linspace(0.0, 1.0, smooth_len, dtype=np.float32)
+                        fade = 0.5 * (1.0 - np.cos(np.pi * t))
+                        end_val = float(result[sola_buffer_frame - 1])
+                        result[sola_buffer_frame : sola_buffer_frame + smooth_len] = (
+                            end_val * (1.0 - fade) + result[sola_buffer_frame : sola_buffer_frame + smooth_len] * fade
+                        )
 
             # Save new buffer (tail of current result)
             state.sola_buffer = result[-sola_buffer_frame:].copy()

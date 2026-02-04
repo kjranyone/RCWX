@@ -172,7 +172,10 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
     """SOLA crossfade for w-okada/hybrid modes.
 
     Uses left context for phase-aligned crossfading.
-    Trims context from output.
+    Key features:
+    - Trims context from output (except first chunk's reflection padding)
+    - Uses correlation-based offset search for optimal phase alignment
+    - Applies boundary smoothing for low-correlation cases
     """
 
     def __init__(self, config: CrossfadeConfig):
@@ -187,6 +190,8 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             config.crossfade_samples,
             config.output_sample_rate,
         )
+        # Track previous output tail for boundary checks
+        self._prev_tail: Optional[NDArray[np.float32]] = None
 
     @property
     def mode_name(self) -> str:
@@ -201,16 +206,19 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
         """Process output with SOLA crossfade (w-okada mode).
 
         Args:
-            output: Inference output (includes context)
+            output: Inference output (includes context for chunk_index > 0)
             chunk_index: Current chunk index (0 = first)
 
         Returns:
             CrossfadeResult with context trimmed and SOLA applied
         """
-        # Calculate context to trim (skip for first chunk)
-        context_samples = 0
-        if chunk_index > 0 and self._config.context_sec > 0:
+        # Calculate context to trim
+        # First chunk: has reflection padding but we trim it like context
+        # Subsequent chunks: trim real context from previous chunk
+        if self._config.context_sec > 0:
             context_samples = self._config.context_samples
+        else:
+            context_samples = 0
 
         result = apply_sola_crossfade(
             output,
@@ -219,16 +227,41 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             context_samples=context_samples,
         )
 
+        audio = result.audio
+
+        # Apply additional boundary smoothing between chunks when SOLA correlation is low
+        if self._prev_tail is not None and len(self._prev_tail) > 0 and len(audio) > 0:
+            # Check boundary discontinuity
+            jump = abs(float(self._prev_tail[-1]) - float(audio[0]))
+            if jump > 0.1 and result.correlation < 0.5:
+                # Low correlation + large jump: apply smoothing
+                smooth_len = min(48, len(audio))
+                t = np.linspace(0.0, 1.0, smooth_len, dtype=np.float32)
+                fade = 0.5 * (1.0 - np.cos(np.pi * t))
+                prev_val = float(self._prev_tail[-1])
+                audio = audio.copy()
+                audio[:smooth_len] = prev_val * (1.0 - fade) + audio[:smooth_len] * fade
+
+        # Save tail for next boundary check
+        if len(audio) >= 64:
+            self._prev_tail = audio[-64:].copy()
+        else:
+            self._prev_tail = audio.copy() if len(audio) > 0 else None
+
         self._chunks_processed += 1
 
         if chunk_index < 5 or chunk_index % 50 == 0:
             logger.debug(
                 f"[SOLA-wokada] chunk={chunk_index}, "
                 f"offset={result.sola_offset}, corr={result.correlation:.4f}, "
-                f"out_len={len(result.audio)}"
+                f"out_len={len(audio)}"
             )
 
-        return result
+        return CrossfadeResult(
+            audio=audio,
+            sola_offset=result.sola_offset,
+            correlation=result.correlation,
+        )
 
     def flush(self) -> NDArray[np.float32]:
         """Flush remaining SOLA buffer."""
@@ -240,15 +273,18 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             self._config.crossfade_samples,
             self._config.output_sample_rate,
         )
-        self._sola_state.fade_out_window = 1.0 - self._sola_state.fade_in_window
+        self._prev_tail = None
         self._chunks_processed = 0
 
 
 class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
     """SOLA crossfade for RVC WebUI mode.
 
-    Uses overlap-based crossfading.
-    Trims output to hop length.
+    Uses overlap-based crossfading with improved phase alignment.
+    Key improvements:
+    - Uses larger crossfade buffer based on overlap for better phase search
+    - Applies RMS matching with controlled gain limits
+    - Trims output to hop length after SOLA processing
     """
 
     def __init__(self, config: CrossfadeConfig):
@@ -258,15 +294,34 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
             config: Crossfade configuration
         """
         super().__init__(config)
-        self._sola_state = SOLAState.create(
+
+        # Use larger of crossfade_samples or 1/4 of overlap for better phase search
+        # This gives SOLA more room to find optimal alignment
+        effective_crossfade = max(
             config.crossfade_samples,
+            min(config.overlap_samples // 4, config.crossfade_samples * 2),
+        )
+
+        self._sola_state = SOLAState.create(
+            effective_crossfade,
             config.output_sample_rate,
         )
+        self._effective_crossfade = effective_crossfade
 
         # Calculate hop for output trimming
         chunk_samples = int(config.output_sample_rate * config.chunk_sec)
+        self._chunk_samples = chunk_samples
         self._hop_samples = chunk_samples - config.overlap_samples
         self._first_chunk_samples = chunk_samples - config.overlap_samples
+
+        # Previous output tail for boundary smoothing
+        self._prev_tail: Optional[NDArray[np.float32]] = None
+
+        logger.debug(
+            f"[SOLARVCWebUICrossfade] Created: "
+            f"crossfade={effective_crossfade}, hop={self._hop_samples}, "
+            f"overlap={config.overlap_samples}"
+        )
 
     @property
     def mode_name(self) -> str:
@@ -287,10 +342,9 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         Returns:
             CrossfadeResult with SOLA applied and trimmed to hop length
         """
-        # Ensure fixed-length chunk before SOLA (RVC WebUI expects constant chunk size)
-        chunk_samples = int(self._config.output_sample_rate * self._config.chunk_sec)
-        if len(output) < chunk_samples:
-            pad_len = chunk_samples - len(output)
+        # Ensure sufficient length before SOLA
+        if len(output) < self._chunk_samples:
+            pad_len = self._chunk_samples - len(output)
             output = np.pad(output, (0, pad_len), mode="edge")
 
         # Apply SOLA crossfade
@@ -304,14 +358,30 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         audio = result.audio
 
         # Trim to correct length
-        if chunk_index == 0:
-            # First chunk: output (chunk - overlap) worth
-            if len(audio) > self._first_chunk_samples:
-                audio = audio[: self._first_chunk_samples]
+        target_len = self._first_chunk_samples if chunk_index == 0 else self._hop_samples
+
+        if len(audio) > target_len:
+            audio = audio[:target_len]
+        elif len(audio) < target_len:
+            # Pad if too short (shouldn't happen normally)
+            audio = np.pad(audio, (0, target_len - len(audio)), mode="edge")
+
+        # Apply boundary smoothing between chunks
+        if self._prev_tail is not None and len(self._prev_tail) > 0 and len(audio) > 0:
+            jump = abs(float(self._prev_tail[-1]) - float(audio[0]))
+            if jump > 0.15:
+                # Smooth the boundary with a short crossfade
+                smooth_len = min(32, len(audio))
+                t = np.linspace(0.0, 1.0, smooth_len, dtype=np.float32)
+                fade = 0.5 * (1.0 - np.cos(np.pi * t))
+                prev_val = float(self._prev_tail[-1])
+                audio[:smooth_len] = prev_val * (1.0 - fade) + audio[:smooth_len] * fade
+
+        # Save tail for next boundary check
+        if len(audio) >= 64:
+            self._prev_tail = audio[-64:].copy()
         else:
-            # Subsequent chunks: output hop worth
-            if len(audio) > self._hop_samples:
-                audio = audio[: self._hop_samples]
+            self._prev_tail = audio.copy() if len(audio) > 0 else None
 
         self._chunks_processed += 1
 
@@ -335,9 +405,145 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
     def reset(self) -> None:
         """Reset SOLA state for a new stream."""
         self._sola_state = SOLAState.create(
-            self._config.crossfade_samples,
+            self._effective_crossfade,
             self._config.output_sample_rate,
         )
+        self._prev_tail = None
+        self._chunks_processed = 0
+
+
+class SOLAHybridCrossfade(BaseCrossfadeStrategy):
+    """SOLA crossfade for hybrid mode.
+
+    Combines the best of wokada and RVC WebUI modes:
+    - Uses context-based chunking like wokada (for low latency)
+    - Uses larger crossfade buffer like RVC WebUI (for better phase alignment)
+    - Applies adaptive boundary smoothing based on audio characteristics
+    """
+
+    def __init__(self, config: CrossfadeConfig):
+        """Initialize SOLA hybrid crossfade.
+
+        Args:
+            config: Crossfade configuration
+        """
+        super().__init__(config)
+
+        # Use larger crossfade buffer for better phase search
+        # Hybrid: use 1.5x the configured crossfade for more search room
+        effective_crossfade = int(config.crossfade_samples * 1.5)
+
+        self._sola_state = SOLAState.create(
+            effective_crossfade,
+            config.output_sample_rate,
+        )
+        self._effective_crossfade = effective_crossfade
+
+        # Track previous output for adaptive smoothing
+        self._prev_tail: Optional[NDArray[np.float32]] = None
+        self._prev_rms: float = 0.0
+
+        logger.debug(
+            f"[SOLAHybridCrossfade] Created: "
+            f"effective_crossfade={effective_crossfade}, "
+            f"context={config.context_samples}"
+        )
+
+    @property
+    def mode_name(self) -> str:
+        """Return the name of this crossfade mode."""
+        return "sola_hybrid"
+
+    def process(
+        self,
+        output: NDArray[np.float32],
+        chunk_index: int,
+    ) -> CrossfadeResult:
+        """Process output with hybrid SOLA crossfade.
+
+        Args:
+            output: Inference output (includes context)
+            chunk_index: Current chunk index (0 = first)
+
+        Returns:
+            CrossfadeResult with context trimmed and SOLA applied
+        """
+        # Context handling: same as wokada
+        if self._config.context_sec > 0:
+            context_samples = self._config.context_samples
+        else:
+            context_samples = 0
+
+        result = apply_sola_crossfade(
+            output,
+            self._sola_state,
+            wokada_mode=True,
+            context_samples=context_samples,
+        )
+
+        audio = result.audio
+
+        # Calculate current RMS for adaptive processing
+        curr_rms = float(np.sqrt(np.mean(audio**2))) if len(audio) > 0 else 0.0
+
+        # Adaptive boundary smoothing
+        if self._prev_tail is not None and len(self._prev_tail) > 0 and len(audio) > 0:
+            jump = abs(float(self._prev_tail[-1]) - float(audio[0]))
+
+            # Adaptive threshold based on signal level
+            threshold = max(0.05, min(0.15, (curr_rms + self._prev_rms) * 0.5))
+
+            if jump > threshold:
+                # Calculate smoothing length based on correlation and signal
+                if result.correlation > 0.7:
+                    smooth_len = 16  # Good correlation: minimal smoothing
+                elif result.correlation > 0.4:
+                    smooth_len = 32  # Medium correlation
+                else:
+                    smooth_len = 64  # Poor correlation: more smoothing
+
+                smooth_len = min(smooth_len, len(audio))
+                if smooth_len > 1:
+                    t = np.linspace(0.0, 1.0, smooth_len, dtype=np.float32)
+                    fade = 0.5 * (1.0 - np.cos(np.pi * t))
+                    prev_val = float(self._prev_tail[-1])
+                    audio = audio.copy()
+                    audio[:smooth_len] = prev_val * (1.0 - fade) + audio[:smooth_len] * fade
+
+        # Save state for next chunk
+        if len(audio) >= 64:
+            self._prev_tail = audio[-64:].copy()
+        else:
+            self._prev_tail = audio.copy() if len(audio) > 0 else None
+        self._prev_rms = curr_rms
+
+        self._chunks_processed += 1
+
+        if chunk_index < 5 or chunk_index % 50 == 0:
+            logger.debug(
+                f"[SOLA-hybrid] chunk={chunk_index}, "
+                f"offset={result.sola_offset}, corr={result.correlation:.4f}, "
+                f"out_len={len(audio)}, rms={curr_rms:.4f}"
+            )
+
+        return CrossfadeResult(
+            audio=audio,
+            sola_offset=result.sola_offset,
+            correlation=result.correlation,
+        )
+
+    def flush(self) -> NDArray[np.float32]:
+        """Flush remaining SOLA buffer."""
+        return flush_sola_buffer(self._sola_state)
+
+    def reset(self) -> None:
+        """Reset SOLA state for a new stream."""
+        self._sola_state = SOLAState.create(
+            self._effective_crossfade,
+            self._config.output_sample_rate,
+        )
+        self._prev_tail = None
+        self._prev_rms = 0.0
         self._chunks_processed = 0
 
 
@@ -419,6 +625,11 @@ def create_crossfade_strategy(
 
     Returns:
         Appropriate crossfade strategy instance
+
+    Strategy selection:
+    - wokada: Context-based with standard SOLA (lowest latency)
+    - hybrid: Context-based with enhanced SOLA (better quality)
+    - rvc_webui: Overlap-based with RVC-style SOLA (highest quality)
     """
     if not use_sola:
         logger.debug("[CrossfadeStrategy] Using ManualTrimCrossfade (SOLA disabled)")
@@ -427,7 +638,10 @@ def create_crossfade_strategy(
     if chunking_mode == "rvc_webui":
         logger.debug("[CrossfadeStrategy] Using SOLARVCWebUICrossfade")
         return SOLARVCWebUICrossfade(config)
+    elif chunking_mode == "hybrid":
+        logger.debug("[CrossfadeStrategy] Using SOLAHybridCrossfade")
+        return SOLAHybridCrossfade(config)
     else:
-        # wokada and hybrid use the same SOLA strategy
+        # wokada mode: standard SOLA with context
         logger.debug(f"[CrossfadeStrategy] Using SOLAWokadaCrossfade (mode={chunking_mode})")
         return SOLAWokadaCrossfade(config)
