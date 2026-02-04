@@ -197,31 +197,17 @@ def apply_sola_crossfade(
     sola_buffer_frame = state.sola_buffer_frame
     sola_search_frame = state.sola_search_frame
 
-    # First chunk: save buffer from end
-    if state.sola_buffer is None:
-        if wokada_mode:
-            # w-okada mode: trim context even for first chunk
-            trim_samples = context_samples if context_samples > 0 else 0
-            if len(infer_wav) > trim_samples:
-                result = infer_wav[trim_samples:].copy()
-                # Save buffer from end
-                if len(result) > sola_buffer_frame:
-                    state.sola_buffer = result[-sola_buffer_frame:].copy()
-                return CrossfadeResult(audio=result)
-            return CrossfadeResult(audio=infer_wav.copy())
-        else:
-            # RVC WebUI mode
-            if len(infer_wav) > sola_buffer_frame:
-                state.sola_buffer = infer_wav[-sola_buffer_frame:].copy()
-                return CrossfadeResult(audio=infer_wav[:-sola_buffer_frame].copy())
-            return CrossfadeResult(audio=infer_wav.copy())
+    # First chunk: handled within each mode's logic below
 
-    # w-okada mode: Enhanced with SOLA crossfading for smooth chunk boundaries
-    # Uses left context for phase-aligned crossfading with previous buffer
+    # w-okada mode: SOLA crossfading for smooth chunk boundaries
+    # In w-okada mode, infer_wav = [context | main]
+    #
+    # Overlap-Add principle:
+    # - Each chunk outputs WITHOUT its tail (which will be crossfaded with next chunk)
+    # - The tail is saved in sola_buffer
+    # - Next chunk crossfades saved tail with its head, then outputs
+    # - This ensures seamless concatenation of chunk outputs
     if wokada_mode:
-        # In w-okada mode, infer_wav = [context | main]
-        # Trim context first, then crossfade at the boundary
-
         prev_tail = state.sola_buffer.copy() if state.sola_buffer is not None else None
         trim_samples = context_samples if context_samples > 0 else 0
 
@@ -229,36 +215,101 @@ def apply_sola_crossfade(
         if len(infer_wav) <= trim_samples:
             return CrossfadeResult(audio=infer_wav.copy(), sola_offset=0, correlation=0.0)
 
-        # Trim context from the beginning to get the main output
-        result = infer_wav[trim_samples:].copy()
+        # Trim context to get main output
+        main_output = infer_wav[trim_samples:].copy()
 
-        # Crossfade with previous buffer at the boundary (where context was trimmed)
-        if prev_tail is not None and len(result) >= sola_buffer_frame:
-            # Extract the head of current output for crossfading
-            head = result[:sola_buffer_frame].copy()
+        # First chunk: output WITHOUT tail, save tail for crossfade with next chunk
+        if prev_tail is None:
+            if len(main_output) > sola_buffer_frame:
+                state.sola_buffer = main_output[-sola_buffer_frame:].copy()
+                result = main_output[:-sola_buffer_frame].copy()
+            else:
+                result = main_output.copy()
+            return CrossfadeResult(audio=result, sola_offset=0, correlation=0.0)
 
-            # Match RMS to avoid energy dips
-            head = _match_rms(head, prev_tail)
+        # Subsequent chunks: crossfade prev_tail with head of main_output
+        sola_offset = 0
+        correlation = 0.0
+
+        if len(main_output) >= sola_buffer_frame + sola_search_frame:
+            # Find optimal offset for crossfade
+            sola_offset, correlation = _find_sola_offset_rvc(
+                prev_tail,
+                main_output,
+                sola_search_frame,
+            )
+
+            # Extract crossfade region at optimal offset
+            crossfade_region = main_output[sola_offset : sola_offset + sola_buffer_frame].copy()
+
+            # Match RMS with tighter limits
+            crossfade_region = _match_rms(crossfade_region, prev_tail, min_gain=0.5, max_gain=2.0)
 
             # Apply Hann window crossfade
-            result[:sola_buffer_frame] = (
+            blended = (
+                prev_tail * state.fade_out_window + crossfade_region * state.fade_in_window
+            )
+
+            # Build result: [blended | rest]
+            # Note: samples before sola_offset are skipped (phase alignment)
+            rest_start = sola_offset + sola_buffer_frame
+            if rest_start < len(main_output) - sola_buffer_frame:
+                # Have room for full result minus new tail
+                full_result = np.concatenate([blended, main_output[rest_start:]])
+                state.sola_buffer = full_result[-sola_buffer_frame:].copy()
+                result = full_result[:-sola_buffer_frame].copy()
+            elif rest_start < len(main_output):
+                # Short result, save tail if possible
+                full_result = np.concatenate([blended, main_output[rest_start:]])
+                if len(full_result) > sola_buffer_frame:
+                    state.sola_buffer = full_result[-sola_buffer_frame:].copy()
+                    result = full_result[:-sola_buffer_frame].copy()
+                else:
+                    state.sola_buffer = None
+                    result = full_result
+            else:
+                # Only blended region
+                state.sola_buffer = None
+                result = blended.copy()
+
+        elif len(main_output) >= sola_buffer_frame:
+            # Fallback: simple crossfade at position 0 without offset search
+            head = main_output[:sola_buffer_frame].copy()
+            head = _match_rms(head, prev_tail, min_gain=0.5, max_gain=2.0)
+            blended = (
                 prev_tail * state.fade_out_window + head * state.fade_in_window
             )
 
-            # Apply short declick processing at the very beginning (10ms @ 48kHz)
-            # This smooths any remaining discontinuities from RVC inference
-            declick_n = max(1, min(480, sola_buffer_frame // 5))
-            result = _declick_head(result, prev_tail, declick_n)
+            # Build result
+            if len(main_output) > 2 * sola_buffer_frame:
+                full_result = np.concatenate([blended, main_output[sola_buffer_frame:]])
+                state.sola_buffer = full_result[-sola_buffer_frame:].copy()
+                result = full_result[:-sola_buffer_frame].copy()
+            elif len(main_output) > sola_buffer_frame:
+                full_result = np.concatenate([blended, main_output[sola_buffer_frame:]])
+                state.sola_buffer = full_result[-sola_buffer_frame:].copy() if len(full_result) > sola_buffer_frame else None
+                result = full_result[:-sola_buffer_frame] if len(full_result) > sola_buffer_frame else full_result
+            else:
+                state.sola_buffer = None
+                result = blended.copy()
 
-        # Save buffer from end for next chunk
-        if len(result) > sola_buffer_frame:
-            state.sola_buffer = result[-sola_buffer_frame:].copy()
+        else:
+            # Very short output, can't crossfade properly
+            state.sola_buffer = None
+            result = main_output.copy()
 
-        return CrossfadeResult(audio=result, sola_offset=0, correlation=0.0)
+        return CrossfadeResult(audio=result, sola_offset=sola_offset, correlation=correlation)
 
     # RVC WebUI mode (original implementation)
     else:
-        prev_tail = state.sola_buffer.copy() if state.sola_buffer is not None else None
+        # First chunk in RVC WebUI mode: just save buffer and return
+        if state.sola_buffer is None:
+            if len(infer_wav) > sola_buffer_frame:
+                state.sola_buffer = infer_wav[-sola_buffer_frame:].copy()
+                return CrossfadeResult(audio=infer_wav[:-sola_buffer_frame].copy())
+            return CrossfadeResult(audio=infer_wav.copy())
+
+        prev_tail = state.sola_buffer.copy()
         # Not enough samples for SOLA search
         if len(infer_wav) < sola_buffer_frame + sola_search_frame:
             # Pad to required length to keep overlap-add stable
