@@ -63,10 +63,10 @@ class RealtimeConfig:
     # Internal processing rate (HuBERT/F0 models expect 16kHz)
     input_sample_rate: int = 16000
     output_sample_rate: int = 48000
-    # Optimized: 100ms for ultra-low latency with FCPE (official minimum)
+    # Optimized: 150ms for stable low latency with FCPE (official minimum 100ms)
     # FCPE: 100-150ms (stable RTF ~0.5x, latency ~250-350ms)
     # RMVPE: 250-350ms (stable RTF 0.54x, latency ~530ms)
-    chunk_sec: float = 0.10
+    chunk_sec: float = 0.15
     pitch_shift: int = 0
     use_f0: bool = True
     # F0 extraction method:
@@ -112,7 +112,7 @@ class RealtimeConfig:
     # Context: extra audio on left side for stable edge processing
     # This is discarded from output but provides context for RVC
     # 0.05 = 50ms context (minimal for low latency)
-    context_sec: float = 0.10  # Larger context improves HuBERT feature quality
+    context_sec: float = 0.05  # Larger context improves HuBERT feature quality
 
     # Extra discard: additional samples to discard beyond context
     extra_sec: float = 0.0
@@ -280,6 +280,30 @@ class RealtimeVoiceChanger:
                     f"(>{max_overlap:.3f}s). Auto-adjusting to {max_overlap:.3f}s"
                 )
                 self.config.rvc_overlap_sec = max_overlap
+        else:
+            # Validate context/crossfade for w-okada/hybrid modes
+            # Context must be smaller than chunk to avoid zero advance in ChunkBuffer
+            max_context = max(0.0, self.config.chunk_sec * 0.5)
+            if self.config.context_sec >= self.config.chunk_sec:
+                logger.warning(
+                    f"context_sec={self.config.context_sec:.3f}s >= chunk_sec={self.config.chunk_sec:.3f}s. "
+                    f"Auto-adjusting context_sec to {max_context:.3f}s"
+                )
+                self.config.context_sec = max_context
+            elif self.config.context_sec > max_context:
+                logger.warning(
+                    f"context_sec={self.config.context_sec:.3f}s is too large for chunk_sec={self.config.chunk_sec:.3f}s. "
+                    f"Auto-adjusting context_sec to {max_context:.3f}s"
+                )
+                self.config.context_sec = max_context
+
+            max_crossfade = max(0.0, self.config.chunk_sec * 0.5)
+            if self.config.crossfade_sec > max_crossfade:
+                logger.warning(
+                    f"crossfade_sec={self.config.crossfade_sec:.3f}s is too large for chunk_sec={self.config.chunk_sec:.3f}s. "
+                    f"Auto-adjusting crossfade_sec to {max_crossfade:.3f}s"
+                )
+                self.config.crossfade_sec = max_crossfade
 
         # Audio streams
         self.audio_input: Optional[AudioInput] = None
@@ -314,6 +338,8 @@ class RealtimeVoiceChanger:
 
         # Keep config.chunk_sec consistent with actual chunk size (after alignment)
         self.config.chunk_sec = self.mic_chunk_samples / self.config.mic_sample_rate
+        self._update_pipeline_cache_frames()
+        self._update_pipeline_cache_frames()
 
         # Output processing parameters (at output sample rate)
         # Crossfade: blending region between main outputs
@@ -481,6 +507,37 @@ class RealtimeVoiceChanger:
             self.config.chunking_mode,
             self.config.use_sola,
             crossfade_config,
+        )
+
+    def _update_pipeline_cache_frames(self) -> None:
+        """Adjust pipeline cache lengths based on current chunk size."""
+        # Default cache lengths (fallback if pipeline doesn't define them yet)
+        if not hasattr(self.pipeline, "_feature_cache_frames"):
+            self.pipeline._feature_cache_frames = self.config.feature_cache_frames
+        if not hasattr(self.pipeline, "_f0_cache_frames"):
+            self.pipeline._f0_cache_frames = self.config.f0_cache_frames
+
+        if not self.config.use_feature_cache:
+            return
+
+        # Convert chunk size to HuBERT frames (50fps)
+        chunk_at_16k = self.mic_chunk_samples * 16000 / self.config.mic_sample_rate
+        hubert_frames = max(1, int(round(chunk_at_16k / 320)))
+        max_feature_cache = max(2, int(hubert_frames * 0.5))
+
+        # F0 is 100fps, 2x HuBERT frames
+        f0_frames = hubert_frames * 2
+        max_f0_cache = max(4, int(f0_frames * 0.5))
+
+        target_feature = min(self.config.feature_cache_frames, max_feature_cache)
+        target_f0 = min(self.config.f0_cache_frames, max_f0_cache)
+
+        self.pipeline._feature_cache_frames = target_feature
+        self.pipeline._f0_cache_frames = target_f0
+
+        logger.info(
+            f"[CacheTune] feature_cache={target_feature} frames, f0_cache={target_f0} frames "
+            f"(chunk={self.config.chunk_sec * 1000:.0f}ms)"
         )
 
     def _recalculate_buffers(self) -> None:
@@ -1576,8 +1633,13 @@ class RealtimeVoiceChanger:
 
         Args:
             context_sec: Context duration in seconds (each side)
+
+        Note:
+            Minimum 50ms required for RVC inference continuity.
+            Too short context causes low SOLA correlation and discontinuous output.
         """
-        self.config.context_sec = max(0.0, min(0.3, context_sec))
+        # Minimum 50ms for inference continuity, max 300ms
+        self.config.context_sec = max(0.05, min(0.3, context_sec))
 
         # Apply immediately if running - recreate strategies
         if self._running:
@@ -1948,20 +2010,33 @@ class RealtimeVoiceChanger:
                     # Phase 8: Sync first chunk boundary flag back to main state
                     self._sola_state.is_first_chunk_boundary = sola_state_to_use.is_first_chunk_boundary
         else:
-            # No SOLA: Manually trim context from output to get only the "main" portion
-            # This is critical for matching batch processing output length
-            # Skip trimming for first chunk (no left context)
-            if self.config.chunking_mode != "rvc_webui" and self.config.context_sec > 0:
-                context_samples_output = int(
-                    self.config.output_sample_rate * self.config.context_sec
-                )
-                if len(output) > context_samples_output:
-                    output = output[context_samples_output:]
-                    # Log trimming for first few chunks
-                    if self.stats.frames_processed < 5:
-                        logger.info(
-                            f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
-                        )
+            # No SOLA: Manually trim output to maintain correct length
+            if self.config.chunking_mode == "rvc_webui":
+                # RVC WebUI mode still needs overlap trimming to hop size
+                hop_sec = self.mic_hop_samples / self.config.mic_sample_rate
+                output_hop_samples = int(self.config.output_sample_rate * hop_sec)
+                if self.stats.frames_processed == 0:
+                    first_chunk_sec = self.config.chunk_sec - self.config.rvc_overlap_sec
+                    first_chunk_samples = int(self.config.output_sample_rate * first_chunk_sec)
+                    if len(output) > first_chunk_samples:
+                        output = output[:first_chunk_samples]
+                else:
+                    if len(output) > output_hop_samples:
+                        output = output[:output_hop_samples]
+            else:
+                # w-okada/hybrid: trim left context to keep only main
+                # Skip trimming for first chunk (no left context)
+                if self.config.context_sec > 0:
+                    context_samples_output = int(
+                        self.config.output_sample_rate * self.config.context_sec
+                    )
+                    if len(output) > context_samples_output:
+                        output = output[context_samples_output:]
+                        # Log trimming for first few chunks
+                        if self.stats.frames_processed < 5:
+                            logger.info(
+                                f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
+                            )
 
         # Store output history for feedback detection
         self._store_output_history(output)

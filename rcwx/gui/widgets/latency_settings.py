@@ -28,7 +28,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.chunk_sec = 0.25
         self.prebuffer_chunks = 1
         self.buffer_margin = 1.0
-        self.context_sec = 0.10
+        self.context_sec = 0.10  # 100ms for better inference continuity
         self.lookahead_sec = 0.0
         self.crossfade_sec = 0.05
         self.use_sola = True
@@ -152,15 +152,17 @@ class LatencySettingsFrame(ctk.CTkFrame):
             f"{self.buffer_margin:.1f}x",
             self._on_margin_change,
         )
+        # Context minimum 50ms to ensure RVC inference continuity
+        # Too short context (<50ms) causes low SOLA correlation and discontinuous output
         self.context_slider, self.context_value = self._create_slider_row(
             frame,
             "コンテキスト",
             6,
-            0,
-            100,
+            50,  # Minimum 50ms (was 0, caused discontinuity)
+            150,  # Maximum 150ms
             20,
-            self.context_sec * 1000,
-            f"{int(self.context_sec * 1000)}ms",
+            max(50, self.context_sec * 1000),  # Enforce minimum
+            f"{int(max(50, self.context_sec * 1000))}ms",
             self._on_context_change,
         )
         self.crossfade_slider, self.crossfade_value = self._create_slider_row(
@@ -242,8 +244,17 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
     def _on_context_change(self, value: float) -> None:
         """Handle context size slider change."""
+        # Enforce minimum 50ms for inference continuity
+        value = max(50, value)
         self.context_sec = value / 1000
         self.context_value.configure(text=f"{int(value)}ms")
+
+        # Crossfade should not exceed context (causes discontinuity)
+        if self.crossfade_sec > self.context_sec:
+            self.crossfade_sec = self.context_sec
+            self.crossfade_slider.set(self.crossfade_sec * 1000)
+            self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
+
         self._notify_change()
 
     def _on_crossfade_change(self, value: float) -> None:
@@ -310,26 +321,30 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.chunk_sec = rounded_ms / 1000
         self.prebuffer_chunks = prebuffer_chunks
         self.buffer_margin = buffer_margin
-        self.context_sec = context_sec
+
+        # Enforce minimum context 50ms for inference continuity
+        self.context_sec = max(0.05, context_sec)
         self.lookahead_sec = lookahead_sec
-        self.crossfade_sec = crossfade_sec
+
+        # Crossfade should not exceed context
+        self.crossfade_sec = min(crossfade_sec, self.context_sec)
         self.use_sola = use_sola
         self.chunking_mode = chunking_mode
 
         # Update chunking mode UI
         self.chunking_mode_var.set(chunking_mode)
 
-        # Update sliders
+        # Update sliders (use self.* values which have been enforced)
         self.chunk_slider.set(rounded_ms)
         self.chunk_value.configure(text=f"{rounded_ms}ms")
         self.prebuf_slider.set(prebuffer_chunks)
         self.prebuf_value.configure(text=f"{prebuffer_chunks}チャンク")
         self.margin_slider.set(buffer_margin)
         self.margin_value.configure(text=f"{buffer_margin:.1f}x")
-        self.context_slider.set(context_sec * 1000)
-        self.context_value.configure(text=f"{int(context_sec * 1000)}ms")
-        self.crossfade_slider.set(crossfade_sec * 1000)
-        self.crossfade_value.configure(text=f"{int(crossfade_sec * 1000)}ms")
+        self.context_slider.set(self.context_sec * 1000)
+        self.context_value.configure(text=f"{int(self.context_sec * 1000)}ms")
+        self.crossfade_slider.set(self.crossfade_sec * 1000)
+        self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
         self.lookahead_slider.set(lookahead_sec * 1000)
         self.lookahead_value.configure(text=f"{int(lookahead_sec * 1000)}ms")
         self.sola_var.set(use_sola)

@@ -147,7 +147,13 @@ class ChunkBuffer:
         if self._is_first_chunk:
             # First chunk: advance less to create overlap for next chunk's context
             # This ensures second chunk's context = first chunk's main ending
-            advance = max(0, self.chunk_samples - self.context_samples)
+            advance = self.chunk_samples - self.context_samples
+            if advance <= 0:
+                logger.warning(
+                    "[ChunkBuffer] context_samples >= chunk_samples; "
+                    "forcing advance to chunk_samples to avoid repeated chunks"
+                )
+                advance = self.chunk_samples
             self._input_buffer = self._input_buffer[advance:]
             logger.debug(
                 f"[ChunkBuffer] First chunk advance: {advance} samples "

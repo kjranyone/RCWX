@@ -228,6 +228,9 @@ class RVCPipeline:
         self._feature_cache: Optional[torch.Tensor] = None  # [1, T_cache, C]
         self._f0_cache: Optional[torch.Tensor] = None  # [1, T_cache]
         self._f0_voiced_cache: Optional[torch.Tensor] = None  # [1, T_cache] bool
+        # Cache lengths (frames). Can be tuned by realtime controller.
+        self._feature_cache_frames: int = 20  # HuBERT frames @ 50fps
+        self._f0_cache_frames: int = 40  # F0 frames @ 100fps
 
         # Phase 5: Audio-level overlap cache for F0/HuBERT extraction
         # Store the tail of each audio chunk to prepend to the next chunk
@@ -682,7 +685,7 @@ class RVCPipeline:
         # Feature cache blending for chunk continuity (50fps HuBERT features)
         # Phase 2 improvement: Adaptive blending based on cosine similarity
         if use_feature_cache and self._feature_cache is not None:
-            max_cache_len = 20  # 20 frames @ 50fps = 400ms (extended from 10)
+            max_cache_len = max(1, int(self._feature_cache_frames))
             cache_avail = min(max_cache_len, self._feature_cache.shape[1], features.shape[1])
 
             if cache_avail > 0:
@@ -724,7 +727,7 @@ class RVCPipeline:
 
         # Update HuBERT feature cache (store tail for next chunk)
         if use_feature_cache:
-            cache_len = 20  # Extended cache length
+            cache_len = max(1, int(self._feature_cache_frames))
             if features.shape[1] > 0:
                 self._feature_cache = features[:, -cache_len:, :].detach()
 
@@ -806,7 +809,7 @@ class RVCPipeline:
                 # F0 cache blending for chunk continuity (100fps F0)
                 # Phase 1 improvement: Extended cache, sigmoid blending, jump detection
                 if use_feature_cache and self._f0_cache is not None:
-                    cache_len = 40  # 40 frames @ 100fps = 400ms (extended from 20)
+                    cache_len = max(1, int(self._f0_cache_frames))
                     blend_len = min(cache_len, self._f0_cache.shape[1], f0.shape[1])
                     if blend_len > 0:
                         prev_tail = self._f0_cache[:, -blend_len:]
@@ -900,7 +903,7 @@ class RVCPipeline:
                 # Update F0 cache (store tail for next chunk)
                 # Extended cache length for better boundary blending
                 if use_feature_cache:
-                    cache_len = 40  # 40 frames @ 100fps = 400ms
+                    cache_len = max(1, int(self._f0_cache_frames))
                     self._f0_cache = f0[:, -cache_len:].detach()
                     self._f0_voiced_cache = (f0 > 0)[:, -cache_len:].detach()
             elif f0 is not None and f0.numel() == 0:
@@ -1115,6 +1118,13 @@ class RVCPipeline:
             # Output too long - trim from end
             output = output[:expected_output_samples]
             logger.debug(f"Trimmed {length_diff} extra samples from end")
+        elif length_diff < 0 and abs(length_diff) > 100 and allow_short_input:
+            # Output too short (chunk processing) - pad zeros to expected length
+            # This prevents cumulative drift across chunks while avoiding resampling artifacts.
+            output = np.pad(output, (0, -length_diff))
+            logger.debug(
+                f"Padded output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
+            )
         elif length_diff < 0 and abs(length_diff) > 100 and not allow_short_input:
             # Output too short - resample to stretch to expected length
             # ONLY for batch processing (allow_short_input=False)
