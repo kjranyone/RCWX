@@ -185,8 +185,8 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             config: Crossfade configuration
         """
         super().__init__(config)
-        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
-        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms
+        # Phase 8: Use larger buffer for strong crossfade (80ms minimum)
+        min_phase8_buffer = int(config.output_sample_rate * 0.08)  # 80ms
         self._effective_crossfade = max(config.crossfade_samples, min_phase8_buffer)
 
         # Phase 8: Enable advanced SOLA with higher fallback threshold
@@ -304,14 +304,14 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         """
         super().__init__(config)
 
-        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
+        # Phase 8: Use larger buffer for strong crossfade (80ms minimum)
         # This ensures enough samples for smooth transitions when correlation is low
-        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms = 9600 samples at 48kHz
+        min_phase8_buffer = int(config.output_sample_rate * 0.08)  # 80ms = 9600 samples at 48kHz
 
         effective_crossfade = max(
             config.crossfade_samples,
             min(config.overlap_samples // 4, config.crossfade_samples * 2),
-            min_phase8_buffer,  # Phase 8: ensure 200ms minimum
+            min_phase8_buffer,  # Phase 8: ensure 80ms minimum
         )
 
         # Phase 8: Enable advanced SOLA with higher fallback threshold
@@ -448,8 +448,8 @@ class SOLAHybridCrossfade(BaseCrossfadeStrategy):
         """
         super().__init__(config)
 
-        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
-        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms
+        # Phase 8: Use larger buffer for strong crossfade (80ms minimum)
+        min_phase8_buffer = int(config.output_sample_rate * 0.08)  # 80ms
         effective_crossfade = max(
             int(config.crossfade_samples * 1.5),
             min_phase8_buffer,

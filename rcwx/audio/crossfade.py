@@ -167,9 +167,10 @@ def _apply_strong_crossfade(
     Returns:
         Tuple of (blended audio, actual crossfade length used)
     """
-    # Minimum crossfade: 150ms for very smooth RVC transitions
-    min_crossfade = int(sample_rate * 0.15)  # 150ms
-    crossfade_len = max(crossfade_len, min_crossfade)
+    # Minimum crossfade: 50ms (shorter to avoid phase interference / pitch wobble)
+    # Longer crossfades cause chorus-like artifacts when phases don't align
+    min_crossfade = int(sample_rate * 0.05)  # 50ms
+    crossfade_len = min(crossfade_len, int(sample_rate * 0.08))  # Cap at 80ms max
 
     # Ensure we have enough samples
     max_available = min(len(prev_tail), len(main_output) // 2)
@@ -437,15 +438,18 @@ def apply_sola_crossfade(
                 # Phase 8: Use strong crossfade optimized for RVC output
                 sample_rate = 48000  # Assumed output rate
 
-                # First chunk boundary needs extra-long crossfade (200ms)
-                # due to reflection padding vs real audio mismatch
+                # Shorter crossfade to avoid phase interference / pitch wobble
                 if state.is_first_chunk_boundary:
-                    min_crossfade_len = int(sample_rate * 0.20)  # 200ms for first boundary
+                    min_crossfade_len = int(sample_rate * 0.08)  # 80ms for first boundary
                     state.is_first_chunk_boundary = False  # Mark as processed
                 else:
-                    min_crossfade_len = int(sample_rate * 0.15)  # 150ms for others
+                    min_crossfade_len = int(sample_rate * 0.05)  # 50ms for others
 
-                target_crossfade_len = max(sola_buffer_frame * 3, min_crossfade_len)
+                # Cap crossfade length to avoid pitch artifacts
+                target_crossfade_len = min(
+                    max(sola_buffer_frame, min_crossfade_len),
+                    int(sample_rate * 0.08)  # Max 80ms
+                )
 
                 # Apply strong crossfade with zero-crossing detection
                 blended_output, actual_crossfade = _apply_strong_crossfade(
@@ -576,14 +580,18 @@ def apply_sola_crossfade(
         if use_fallback and len(infer_wav) >= sola_buffer_frame + sola_search_frame:
             sample_rate = 48000  # Assumed output rate
 
-            # First chunk boundary needs extra-long crossfade (200ms)
+            # Shorter crossfade to avoid phase interference / pitch wobble
             if state.is_first_chunk_boundary:
-                min_crossfade_len = int(sample_rate * 0.20)  # 200ms
+                min_crossfade_len = int(sample_rate * 0.08)  # 80ms for first boundary
                 state.is_first_chunk_boundary = False  # Mark as processed
             else:
-                min_crossfade_len = int(sample_rate * 0.15)  # 150ms
+                min_crossfade_len = int(sample_rate * 0.05)  # 50ms for others
 
-            target_crossfade_len = max(sola_buffer_frame * 3, min_crossfade_len)
+            # Cap crossfade length to avoid pitch artifacts
+            target_crossfade_len = min(
+                max(sola_buffer_frame, min_crossfade_len),
+                int(sample_rate * 0.08)  # Max 80ms
+            )
 
             # Apply strong crossfade with zero-crossing detection
             blended_output, actual_crossfade = _apply_strong_crossfade(

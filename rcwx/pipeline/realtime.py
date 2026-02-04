@@ -970,11 +970,11 @@ class RealtimeVoiceChanger:
                             )
 
                             # Use adaptive crossfade size
-                            # Phase 8: Use 200ms minimum buffer for strong crossfade
+                            # Phase 8: Use 80ms minimum buffer for strong crossfade
                             adaptive_crossfade_samples = int(
                                 self.config.output_sample_rate * adaptive_params['crossfade_sec']
                             )
-                            min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                            min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
                             adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
 
                             # Create temporary SOLA state with adaptive parameters
@@ -1331,8 +1331,8 @@ class RealtimeVoiceChanger:
         self._chunks_ready = 0
         self._output_started = False
         # Keep _sola_state for backward compatibility with existing SOLA logic
-        # Phase 8: Use 200ms minimum buffer for strong crossfade
-        min_phase8_buffer = int(self.config.output_sample_rate * 0.20)  # 200ms
+        # Phase 8: Use 80ms minimum buffer for strong crossfade
+        min_phase8_buffer = int(self.config.output_sample_rate * 0.08)  # 80ms
         sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
         self._sola_state = SOLAState.create(
             sola_buffer_size,
@@ -1627,8 +1627,8 @@ class RealtimeVoiceChanger:
             # Keep _sola_state for backward compatibility with existing SOLA logic
             self._sola_state = getattr(self._crossfade_strategy, '_sola_state', None)
             if enabled and self._sola_state is None:
-                # Phase 8: Use 200ms minimum buffer for strong crossfade
-                min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                # Phase 8: Use 80ms minimum buffer for strong crossfade
+                min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
                 sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
                 self._sola_state = SOLAState.create(
                     sola_buffer_size,
@@ -1656,8 +1656,8 @@ class RealtimeVoiceChanger:
             # Keep _sola_state for backward compatibility
             self._sola_state = getattr(self._crossfade_strategy, '_sola_state', None)
             if self.config.use_sola and self._sola_state is None:
-                # Phase 8: Use 200ms minimum buffer for strong crossfade
-                min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                # Phase 8: Use 80ms minimum buffer for strong crossfade
+                min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
                 sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
                 self._sola_state = SOLAState.create(
                     sola_buffer_size,
@@ -1869,11 +1869,11 @@ class RealtimeVoiceChanger:
                         )
 
                     # Use adaptive crossfade size
-                    # Phase 8: Use 200ms minimum buffer for strong crossfade
+                    # Phase 8: Use 80ms minimum buffer for strong crossfade
                     adaptive_crossfade_samples = int(
                         self.config.output_sample_rate * adaptive_params['crossfade_sec']
                     )
-                    min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                    min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
                     adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
                     adaptive_sola_state = SOLAState.create(
                         adaptive_buffer_size,
