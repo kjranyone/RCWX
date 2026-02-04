@@ -338,6 +338,22 @@ uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
 | Resampler相関 | > 0.99 |
 | 累積時間誤差 | < 10ms |
 
+### テストデータ
+
+`sample_data/` に含まれるテスト用音声ファイル:
+
+| ファイル | 内容 | 用途 |
+|----------|------|------|
+| `sustained_voice.wav` | 持続母音（デフォルト） | 基本テスト |
+| `sustained_tone.wav` | 持続音 | 音程安定性テスト |
+| `pure_sine.wav` | 純正弦波 | 信号処理検証 |
+| `nc283304.mp3` | 音声サンプル | 実音声テスト |
+
+カスタムファイルでテスト:
+```powershell
+uv run python tests/test_realtime_analysis.py --test-file path/to/your.wav
+```
+
 ## References
 
 - RVC WebUI

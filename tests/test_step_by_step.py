@@ -372,7 +372,7 @@ def analyze_boundary_artifacts(
 
 def main():
     parser = argparse.ArgumentParser(description="Step-by-Step Processing Analysis")
-    parser.add_argument("--test-file", type=Path, default=Path("sample_data/seki.wav"))
+    parser.add_argument("--test-file", type=Path, default=Path("sample_data/sustained_voice.wav"))
     parser.add_argument("--chunk-sec", type=float, default=0.15)
     parser.add_argument("--context-sec", type=float, default=0.10)
     parser.add_argument("--crossfade-sec", type=float, default=0.05)

@@ -532,7 +532,7 @@ def run_analysis(
 
 def main():
     parser = argparse.ArgumentParser(description="Realtime Voice Changer Analysis")
-    parser.add_argument("--test-file", type=Path, default=Path("sample_data/seki.wav"),
+    parser.add_argument("--test-file", type=Path, default=Path("sample_data/sustained_voice.wav"),
                        help="Path to test audio file")
     parser.add_argument("--chunk-sec", type=float, default=0.15,
                        help="Chunk size in seconds")
