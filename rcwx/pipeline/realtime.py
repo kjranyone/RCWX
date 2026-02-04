@@ -147,6 +147,30 @@ class RealtimeConfig:
     # Normalize output energy based on input energy for consistent dynamics
     # This reduces energy variations between chunks
     use_energy_normalization: bool = False
+
+    # --- Phase 1-4: Algorithm improvements for batch/streaming consistency ---
+    # F0 cache length in frames (100fps) - extended for better boundary blending
+    # 40 frames = 400ms cache for smoother F0 transitions
+    f0_cache_frames: int = 40
+
+    # HuBERT feature cache length in frames (50fps) - extended for adaptive blending
+    # 20 frames = 400ms cache for similarity-based blending
+    feature_cache_frames: int = 20
+
+    # Enable adaptive blending based on feature similarity
+    # When enabled, blend length adjusts dynamically based on cosine similarity
+    use_adaptive_blending: bool = True
+
+    # Use advanced SOLA with multi-candidate phase evaluation
+    # More accurate alignment but slightly higher CPU cost
+    # Phase 7: Enabled by default for better boundary alignment
+    sola_use_advanced: bool = True
+
+    # SOLA fallback threshold - switch to extended fade when correlation is low
+    # Lower values = more aggressive fallback to smooth transitions
+    # Phase 8: Always use strong crossfade for RVC output (correlation-based SOLA fails)
+    # Set to 1.0 to always use strong crossfade, which handles independent chunk phases better
+    sola_fallback_threshold: float = 0.8
     # Smoothing factor for energy tracking (0.0-1.0, higher = more smoothing)
     energy_smoothing: float = 0.9
 
@@ -161,6 +185,21 @@ class RealtimeConfig:
     use_chunk_gain_smoothing: bool = False
     # Smoothing factor for RMS target (0.0-1.0, higher = smoother)
     chunk_gain_smoothing: float = 0.95
+
+    def __post_init__(self) -> None:
+        """Validate and adjust configuration after initialization."""
+        # Round chunk_sec to 20ms boundary (HuBERT frame = 320 samples @ 16kHz)
+        # This prevents output length mismatch that causes buffer underruns
+        frame_ms = 20  # HuBERT frame duration in ms
+        chunk_ms = self.chunk_sec * 1000
+        rounded_ms = round(chunk_ms / frame_ms) * frame_ms
+        if rounded_ms != chunk_ms:
+            logger.info(
+                f"[RealtimeConfig] Rounding chunk_sec from {self.chunk_sec:.3f}s "
+                f"to {rounded_ms / 1000:.3f}s (HuBERT frame boundary alignment)"
+            )
+            # Use object.__setattr__ since dataclass might be frozen
+            object.__setattr__(self, "chunk_sec", rounded_ms / 1000)
 
 
 class RealtimeVoiceChanger:
@@ -255,8 +294,13 @@ class RealtimeVoiceChanger:
             if self._on_warmup_progress:
                 self._on_warmup_progress(1, 1, "準備完了")
 
-        # Note: Warmup is not needed - first few chunks may be slower due to
-        # XPU/CUDA kernel compilation, but prebuffer absorbs this delay
+        # Warmup inference to trigger XPU/CUDA kernel compilation
+        # This prevents massive latency on the first real audio chunk
+        if self._on_warmup_progress:
+            self._on_warmup_progress(0, 2, "ウォームアップ中...")
+        self._run_warmup_inference()
+        if self._on_warmup_progress:
+            self._on_warmup_progress(2, 2, "準備完了")
 
         # Create chunking strategy (replaces mode-dependent buffer initialization)
         self._chunking_strategy = self._create_chunking_strategy()
@@ -372,6 +416,42 @@ class RealtimeVoiceChanger:
             logger.info("Adaptive parameter adjustment enabled")
         else:
             self.adaptive_calc = None
+
+    def _run_warmup_inference(self) -> None:
+        """Run warmup inference to trigger XPU/CUDA kernel compilation.
+
+        This prevents massive latency on the first real audio chunk.
+        Runs 2 dummy inferences to ensure all kernels are compiled.
+        """
+        import numpy as np
+
+        # Create dummy audio chunk (silence with tiny noise to avoid special cases)
+        warmup_duration = 0.5  # 500ms chunk
+        warmup_samples = int(self.config.mic_sample_rate * warmup_duration)
+        dummy_audio = np.random.randn(warmup_samples).astype(np.float32) * 0.001
+
+        logger.info("[WARMUP] Starting warmup inference...")
+
+        try:
+            # Run 2 warmup inferences to ensure kernel compilation
+            for i in range(2):
+                _ = self.pipeline.infer(
+                    audio=dummy_audio,
+                    input_sr=self.config.mic_sample_rate,
+                    pitch_shift=getattr(self.config, 'pitch_shift', 0),
+                    f0_method=getattr(self.config, 'f0_method', 'rmvpe'),
+                    index_rate=getattr(self.config, 'index_rate', 0.5),
+                    use_feature_cache=False,  # Don't cache warmup
+                    allow_short_input=True,  # Allow shorter warmup chunks
+                )
+                logger.info(f"[WARMUP] Warmup inference {i+1}/2 complete")
+
+            # Clear any cached state from warmup
+            self.pipeline.clear_cache()
+            logger.info("[WARMUP] Warmup complete, caches cleared")
+
+        except Exception as e:
+            logger.warning(f"[WARMUP] Warmup failed (non-fatal): {e}")
 
     def _create_chunking_strategy(self):
         """Create chunking strategy based on current config."""
@@ -890,19 +970,24 @@ class RealtimeVoiceChanger:
                             )
 
                             # Use adaptive crossfade size
+                            # Phase 8: Use 200ms minimum buffer for strong crossfade
                             adaptive_crossfade_samples = int(
                                 self.config.output_sample_rate * adaptive_params['crossfade_sec']
                             )
+                            min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                            adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
 
                             # Create temporary SOLA state with adaptive parameters
                             adaptive_sola_state = SOLAState.create(
-                                adaptive_crossfade_samples,
+                                adaptive_buffer_size,
                                 self.config.output_sample_rate,
+                                use_advanced_sola=self.config.sola_use_advanced,
+                                fallback_threshold=self.config.sola_fallback_threshold,
                             )
                             # Resize sola_buffer if necessary
                             if self._sola_state.sola_buffer is not None:
                                 old_size = len(self._sola_state.sola_buffer)
-                                new_size = adaptive_crossfade_samples
+                                new_size = adaptive_buffer_size
 
                                 if old_size == new_size:
                                     # Same size, direct copy
@@ -919,6 +1004,9 @@ class RealtimeVoiceChanger:
                                     adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
 
                                 adaptive_sola_state.frames_processed = self._sola_state.frames_processed
+
+                            # Phase 8: Preserve first chunk boundary flag
+                            adaptive_sola_state.is_first_chunk_boundary = self._sola_state.is_first_chunk_boundary
 
                             sola_state_to_use = adaptive_sola_state
                             context_sec_to_use = adaptive_params['context_sec']
@@ -973,6 +1061,9 @@ class RealtimeVoiceChanger:
                                 self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
 
                             self._sola_state.frames_processed = sola_state_to_use.frames_processed
+
+                            # Phase 8: Sync first chunk boundary flag back to main state
+                            self._sola_state.is_first_chunk_boundary = sola_state_to_use.is_first_chunk_boundary
 
                         # Log SOLA stats periodically
                         if self.stats.frames_processed % 50 == 0:
@@ -1240,9 +1331,14 @@ class RealtimeVoiceChanger:
         self._chunks_ready = 0
         self._output_started = False
         # Keep _sola_state for backward compatibility with existing SOLA logic
+        # Phase 8: Use 200ms minimum buffer for strong crossfade
+        min_phase8_buffer = int(self.config.output_sample_rate * 0.20)  # 200ms
+        sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
         self._sola_state = SOLAState.create(
-            self.output_crossfade_samples,
+            sola_buffer_size,
             self.config.output_sample_rate,
+            use_advanced_sola=self.config.sola_use_advanced,
+            fallback_threshold=self.config.sola_fallback_threshold,
         )
 
         # Reset feedback detection state
@@ -1531,9 +1627,14 @@ class RealtimeVoiceChanger:
             # Keep _sola_state for backward compatibility with existing SOLA logic
             self._sola_state = getattr(self._crossfade_strategy, '_sola_state', None)
             if enabled and self._sola_state is None:
+                # Phase 8: Use 200ms minimum buffer for strong crossfade
+                min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
                 self._sola_state = SOLAState.create(
-                    self.output_crossfade_samples,
+                    sola_buffer_size,
                     self.config.output_sample_rate,
+                    use_advanced_sola=self.config.sola_use_advanced,
+                    fallback_threshold=self.config.sola_fallback_threshold,
                 )
 
         logger.info(f"SOLA {'enabled' if enabled else 'disabled'}")
@@ -1555,9 +1656,14 @@ class RealtimeVoiceChanger:
             # Keep _sola_state for backward compatibility
             self._sola_state = getattr(self._crossfade_strategy, '_sola_state', None)
             if self.config.use_sola and self._sola_state is None:
+                # Phase 8: Use 200ms minimum buffer for strong crossfade
+                min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                sola_buffer_size = max(self.output_crossfade_samples, min_phase8_buffer)
                 self._sola_state = SOLAState.create(
-                    self.output_crossfade_samples,
+                    sola_buffer_size,
                     self.config.output_sample_rate,
+                    use_advanced_sola=self.config.sola_use_advanced,
+                    fallback_threshold=self.config.sola_fallback_threshold,
                 )
 
         logger.info(f"Crossfade set to {self.config.crossfade_sec}s")
@@ -1763,18 +1869,23 @@ class RealtimeVoiceChanger:
                         )
 
                     # Use adaptive crossfade size
+                    # Phase 8: Use 200ms minimum buffer for strong crossfade
                     adaptive_crossfade_samples = int(
                         self.config.output_sample_rate * adaptive_params['crossfade_sec']
                     )
+                    min_phase8_buffer = int(self.config.output_sample_rate * 0.20)
+                    adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
                     adaptive_sola_state = SOLAState.create(
-                        adaptive_crossfade_samples,
+                        adaptive_buffer_size,
                         self.config.output_sample_rate,
+                        use_advanced_sola=self.config.sola_use_advanced,
+                        fallback_threshold=self.config.sola_fallback_threshold,
                     )
 
                     # Resize sola_buffer if necessary
                     if self._sola_state.sola_buffer is not None:
                         old_size = len(self._sola_state.sola_buffer)
-                        new_size = adaptive_crossfade_samples
+                        new_size = adaptive_buffer_size
 
                         if old_size == new_size:
                             # Same size, direct copy
@@ -1791,6 +1902,9 @@ class RealtimeVoiceChanger:
                             adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
 
                         adaptive_sola_state.frames_processed = self._sola_state.frames_processed
+
+                    # Phase 8: Preserve first chunk boundary flag
+                    adaptive_sola_state.is_first_chunk_boundary = self._sola_state.is_first_chunk_boundary
 
                     sola_state_to_use = adaptive_sola_state
                     context_sec_to_use = adaptive_params['context_sec']
@@ -1830,6 +1944,9 @@ class RealtimeVoiceChanger:
                         self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
 
                     self._sola_state.frames_processed = sola_state_to_use.frames_processed
+
+                    # Phase 8: Sync first chunk boundary flag back to main state
+                    self._sola_state.is_first_chunk_boundary = sola_state_to_use.is_first_chunk_boundary
         else:
             # No SOLA: Manually trim context from output to get only the "main" portion
             # This is critical for matching batch processing output length

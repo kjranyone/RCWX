@@ -12,7 +12,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, medfilt
 
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
@@ -42,6 +42,114 @@ def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.
     normalized_cutoff = cutoff / nyquist
     b, a = butter(5, normalized_cutoff, btype="high")
     return filtfilt(b, a, audio).astype(np.float32)
+
+
+def sigmoid_blend_weights(steps: int, steepness: float = 4.0) -> np.ndarray:
+    """Generate sigmoid-shaped blend weights for smoother transitions.
+
+    Args:
+        steps: Number of blend steps
+        steepness: Controls the sharpness of the transition (4.0 = smooth S-curve)
+
+    Returns:
+        Array of weights from ~1.0 to ~0.0 (sigmoid curve)
+    """
+    x = np.linspace(-steepness, steepness, steps)
+    return 1.0 / (1.0 + np.exp(x))
+
+
+def smooth_f0_spikes(f0: torch.Tensor, window: int = 3) -> torch.Tensor:
+    """Remove F0 spikes using median filter on voiced regions.
+
+    Args:
+        f0: F0 tensor [B, T]
+        window: Median filter window size (odd number, default 3)
+
+    Returns:
+        Smoothed F0 tensor with spikes removed
+    """
+    if f0.shape[1] < window:
+        return f0
+
+    # Convert to numpy for scipy median filter (must be float32 for medfilt)
+    f0_np = f0.cpu().to(torch.float32).numpy()
+    result = np.zeros_like(f0_np)
+
+    for b in range(f0_np.shape[0]):
+        # Get voiced mask (f0 > 0)
+        voiced = f0_np[b] > 0
+
+        # Apply median filter only to voiced regions
+        if np.any(voiced):
+            # medfilt preserves array length
+            filtered = medfilt(f0_np[b].astype(np.float64), window).astype(np.float32)
+
+            # Only apply to voiced regions (keep unvoiced as 0)
+            result[b] = np.where(voiced, filtered, f0_np[b])
+        else:
+            result[b] = f0_np[b]
+
+    return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
+
+
+def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 8.0, sample_rate: float = 100.0) -> torch.Tensor:
+    """Apply lowpass filter to F0 to remove high-frequency jitter.
+
+    Phase 6: Butterworth lowpass filter for smoother F0 contour.
+    Only applies to voiced regions to preserve unvoiced detection.
+
+    Args:
+        f0: F0 tensor [B, T] in Hz
+        cutoff_hz: Cutoff frequency in Hz (default 8Hz - removes jitter above ~8Hz)
+        sample_rate: F0 sample rate in Hz (default 100fps)
+
+    Returns:
+        Lowpass filtered F0 tensor
+    """
+    if f0.shape[1] < 10:  # Too short to filter
+        return f0
+
+    # Convert to numpy
+    f0_np = f0.cpu().to(torch.float32).numpy()
+    result = np.zeros_like(f0_np)
+
+    # Design lowpass filter
+    nyquist = sample_rate / 2
+    normalized_cutoff = cutoff_hz / nyquist
+    # Use order 2 for gentler filtering
+    b, a = butter(2, normalized_cutoff, btype="low")
+
+    for batch in range(f0_np.shape[0]):
+        voiced = f0_np[batch] > 0
+
+        if np.sum(voiced) > 10:  # Need enough voiced samples
+            # Extract voiced regions and interpolate gaps for filtering
+            f0_interp = f0_np[batch].copy()
+
+            # Simple linear interpolation for unvoiced gaps
+            voiced_indices = np.where(voiced)[0]
+            if len(voiced_indices) > 1:
+                # Interpolate between voiced regions
+                for i in range(len(voiced_indices) - 1):
+                    start = voiced_indices[i]
+                    end = voiced_indices[i + 1]
+                    if end - start > 1:  # There's a gap
+                        f0_interp[start:end + 1] = np.linspace(
+                            f0_np[batch, start], f0_np[batch, end], end - start + 1
+                        )
+
+            # Apply lowpass filter
+            try:
+                filtered = filtfilt(b, a, f0_interp).astype(np.float32)
+                # Only keep filtered values in voiced regions
+                result[batch] = np.where(voiced, filtered, 0.0)
+            except ValueError:
+                # Filter failed, return original
+                result[batch] = f0_np[batch]
+        else:
+            result[batch] = f0_np[batch]
+
+    return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
 
 
 class RVCPipeline:
@@ -120,6 +228,18 @@ class RVCPipeline:
         self._feature_cache: Optional[torch.Tensor] = None  # [1, T_cache, C]
         self._f0_cache: Optional[torch.Tensor] = None  # [1, T_cache]
         self._f0_voiced_cache: Optional[torch.Tensor] = None  # [1, T_cache] bool
+
+        # Phase 5: Audio-level overlap cache for F0/HuBERT extraction
+        # Store the tail of each audio chunk to prepend to the next chunk
+        # This allows F0/HuBERT to see continuous audio across boundaries
+        self._audio_cache: Optional[np.ndarray] = None  # [T_audio] at 16kHz
+        self._audio_cache_len: int = 3200  # 200ms at 16kHz (covers F0/HuBERT receptive fields)
+
+        # Phase 8: Output overlap cache for smooth chunk boundaries
+        # Store the tail of synthesizer output for crossfade with next chunk
+        # This enables overlap-add blending at the audio output level
+        self._output_cache: Optional[np.ndarray] = None  # [T_output] at model sample rate
+        self._output_overlap_len: int = 0  # Set dynamically based on crossfade_sec
 
     def load(self) -> None:
         """Load all models."""
@@ -316,6 +436,8 @@ class RVCPipeline:
         self._feature_cache = None
         self._f0_cache = None
         self._f0_voiced_cache = None
+        self._audio_cache = None
+        self._output_cache = None
 
     @torch.no_grad()
     def infer(
@@ -404,6 +526,29 @@ class RVCPipeline:
         # without needing feature-level padding (which causes length mismatch issues)
         original_length = len(audio_np)
         hubert_hop = 320
+        f0_hop = 160  # F0 models use 160 sample hop (100fps at 16kHz)
+
+        # Phase 5: Audio-level overlap for F0/HuBERT extraction continuity
+        # DISABLED: This feature caused audio doubling issues because the overlap
+        # portion's output wasn't being properly discarded. The feature-level
+        # caching (Phase 1-2) provides sufficient continuity without this.
+        # TODO: Re-enable after fixing output trimming to discard overlap portion
+        audio_overlap_samples = 0
+        hubert_overlap_frames = 0
+        f0_overlap_frames = 0
+        # if use_feature_cache and self._audio_cache is not None:
+        #     # Prepend cached audio
+        #     audio_overlap_samples = len(self._audio_cache)
+        #     audio_np = np.concatenate([self._audio_cache, audio_np])
+        #     logger.debug(
+        #         f"Audio overlap: prepended {audio_overlap_samples} samples ({audio_overlap_samples/16:.1f}ms)"
+        #     )
+
+        # Update audio cache with tail of current chunk (for future use)
+        # Currently disabled but keeping cache updated for potential re-enabling
+        if use_feature_cache:
+            cache_len = min(self._audio_cache_len, original_length)
+            self._audio_cache = audio_np[-cache_len:].copy()
 
         # Base padding: 50ms (800 samples) for batch processing
         # Chunk processing uses reduced padding (1 HuBERT hop) below
@@ -516,6 +661,14 @@ class RVCPipeline:
             f"HuBERT features: shape={features.shape}, min={features.min():.4f}, max={features.max():.4f}"
         )
 
+        # Phase 5: Trim overlap frames from HuBERT features
+        # These frames came from the prepended audio cache and should be discarded
+        if hubert_overlap_frames > 0 and features.shape[1] > hubert_overlap_frames:
+            features = features[:, hubert_overlap_frames:, :]
+            logger.debug(
+                f"HuBERT overlap trim: removed {hubert_overlap_frames} frames, new shape={features.shape}"
+            )
+
         # Apply FAISS index retrieval if enabled (before interpolation, like original RVC)
         if index_rate > 0 and self.faiss_index is not None:
             logger.info(
@@ -527,21 +680,51 @@ class RVCPipeline:
             )
 
         # Feature cache blending for chunk continuity (50fps HuBERT features)
+        # Phase 2 improvement: Adaptive blending based on cosine similarity
         if use_feature_cache and self._feature_cache is not None:
-            cache_len = 10  # 10 frames @ 50fps = 200ms
-            blend_len = min(cache_len, self._feature_cache.shape[1], features.shape[1])
-            if blend_len > 0:
-                prev_tail = self._feature_cache[:, -blend_len:, :]
-                alpha = torch.linspace(
-                    1.0, 0.0, steps=blend_len, device=features.device, dtype=features.dtype
-                ).view(1, -1, 1)
-                features[:, :blend_len, :] = (
-                    prev_tail * alpha + features[:, :blend_len, :] * (1.0 - alpha)
-                )
+            max_cache_len = 20  # 20 frames @ 50fps = 400ms (extended from 10)
+            cache_avail = min(max_cache_len, self._feature_cache.shape[1], features.shape[1])
+
+            if cache_avail > 0:
+                prev_tail = self._feature_cache[:, -cache_avail:, :]
+                curr_head = features[:, :cache_avail, :].clone()
+
+                # Calculate cosine similarity at boundary
+                prev_last = prev_tail[:, -1:, :]  # [B, 1, C]
+                curr_first = curr_head[:, :1, :]  # [B, 1, C]
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    prev_last.squeeze(1), curr_first.squeeze(1), dim=-1
+                )  # [B]
+
+                # Adaptive blend length: lower similarity = longer blend
+                # similarity 0.9+ -> 5 frames, similarity 0.5 -> 15 frames
+                adaptive_blend = int((1.0 - cos_sim.mean().item()) * max_cache_len) + 5
+                blend_len = min(adaptive_blend, cache_avail)
+
+                if blend_len > 0:
+                    # Sigmoid blending for smoother transitions
+                    alpha_np = sigmoid_blend_weights(blend_len, steepness=4.0)
+                    alpha = torch.from_numpy(alpha_np).to(
+                        device=features.device, dtype=features.dtype
+                    ).view(1, -1, 1)
+
+                    # Blend features
+                    blended = prev_tail[:, -blend_len:, :] * alpha + curr_head[:, :blend_len, :] * (1.0 - alpha)
+
+                    # Preserve original norm (feature magnitude)
+                    orig_norms = torch.norm(curr_head[:, :blend_len, :], dim=-1, keepdim=True)
+                    blended_norms = torch.norm(blended, dim=-1, keepdim=True) + 1e-8
+                    blended = blended * (orig_norms / blended_norms)
+
+                    features[:, :blend_len, :] = blended
+
+                    logger.debug(
+                        f"HuBERT adaptive blend: cos_sim={cos_sim.mean().item():.3f}, blend_len={blend_len}"
+                    )
 
         # Update HuBERT feature cache (store tail for next chunk)
         if use_feature_cache:
-            cache_len = 10
+            cache_len = 20  # Extended cache length
             if features.shape[1] > 0:
                 self._feature_cache = features[:, -cache_len:, :].detach()
 
@@ -585,6 +768,14 @@ class RVCPipeline:
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
 
+            # Phase 5: Trim overlap frames from F0
+            # These frames came from the prepended audio cache and should be discarded
+            if f0 is not None and f0_overlap_frames > 0 and f0.shape[1] > f0_overlap_frames:
+                f0 = f0[:, f0_overlap_frames:]
+                logger.debug(
+                    f"F0 overlap trim: removed {f0_overlap_frames} frames, new shape={f0.shape}"
+                )
+
             if f0 is not None and f0.numel() > 0:  # Check for non-empty F0
                 # FCPE smoothing for stability (reduce frame-to-frame jitter)
                 if f0_method == "fcpe":
@@ -613,8 +804,9 @@ class RVCPipeline:
                     ).squeeze(1)
 
                 # F0 cache blending for chunk continuity (100fps F0)
+                # Phase 1 improvement: Extended cache, sigmoid blending, jump detection
                 if use_feature_cache and self._f0_cache is not None:
-                    cache_len = 20  # 20 frames @ 100fps = 200ms
+                    cache_len = 40  # 40 frames @ 100fps = 400ms (extended from 20)
                     blend_len = min(cache_len, self._f0_cache.shape[1], f0.shape[1])
                     if blend_len > 0:
                         prev_tail = self._f0_cache[:, -blend_len:]
@@ -623,14 +815,54 @@ class RVCPipeline:
                             if self._f0_voiced_cache is not None
                             else prev_tail > 0
                         )
-                        cur_head = f0[:, :blend_len]
+                        cur_head = f0[:, :blend_len].clone()
                         cur_voiced = cur_head > 0
                         blend_mask = prev_voiced & cur_voiced
-                        alpha = torch.linspace(
-                            1.0, 0.0, steps=blend_len, device=f0.device, dtype=f0.dtype
+
+                        # Sigmoid blending for smoother transitions
+                        alpha_np = sigmoid_blend_weights(blend_len, steepness=4.0)
+                        alpha = torch.from_numpy(alpha_np).to(
+                            device=f0.device, dtype=f0.dtype
                         ).view(1, -1)
+
+                        # Detect large jumps and apply linear interpolation
+                        # Check the boundary between cache and current
+                        prev_last_f0 = prev_tail[:, -1]
+                        cur_first_f0 = cur_head[:, 0]
+                        both_voiced = (prev_last_f0 > 0) & (cur_first_f0 > 0)
+
+                        if both_voiced.any():
+                            jump = torch.abs(prev_last_f0 - cur_first_f0)
+                            # If jump > 50Hz, apply linear interpolation at boundary
+                            if jump.item() > 50:
+                                # Linear interpolation for first few frames
+                                interp_len = min(10, blend_len)
+                                interp_weights = torch.linspace(
+                                    0.0, 1.0, interp_len, device=f0.device, dtype=f0.dtype
+                                ).view(1, -1)
+                                # Interpolate from prev_last_f0 to values further in cur_head
+                                target_f0 = cur_head[:, interp_len - 1 : interp_len]
+                                if target_f0.numel() > 0:
+                                    interp_f0 = prev_last_f0.view(-1, 1) * (1 - interp_weights) + \
+                                                target_f0 * interp_weights
+                                    # Apply interpolation only where both are voiced
+                                    for i in range(interp_len):
+                                        if cur_head[:, i].item() > 0:
+                                            cur_head[:, i] = interp_f0[:, i]
+                                logger.debug(
+                                    f"F0 jump {jump.item():.1f}Hz detected, applied linear interpolation"
+                                )
+
+                        # Apply sigmoid blending
                         blended = prev_tail * alpha + cur_head * (1.0 - alpha)
-                        f0[:, :blend_len] = torch.where(blend_mask, blended, cur_head)
+                        f0[:, :blend_len] = torch.where(blend_mask, blended, f0[:, :blend_len])
+
+                # Apply median filter to remove F0 spikes
+                f0 = smooth_f0_spikes(f0, window=3)
+
+                # Phase 6: Apply lowpass filter to remove high-frequency jitter
+                # Cutoff at 8Hz removes frame-to-frame jitter while preserving natural vibrato
+                f0 = lowpass_f0(f0, cutoff_hz=8.0, sample_rate=100.0)
 
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
@@ -666,8 +898,9 @@ class RVCPipeline:
                 voiced_mask_for_gate = voiced_mask.float()  # [B, T]
 
                 # Update F0 cache (store tail for next chunk)
+                # Extended cache length for better boundary blending
                 if use_feature_cache:
-                    cache_len = 20
+                    cache_len = 40  # 40 frames @ 100fps = 400ms
                     self._f0_cache = f0[:, -cache_len:].detach()
                     self._f0_voiced_cache = (f0 > 0)[:, -cache_len:].detach()
             elif f0 is not None and f0.numel() == 0:

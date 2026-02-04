@@ -185,10 +185,16 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             config: Crossfade configuration
         """
         super().__init__(config)
-        # w-okada mode: use crossfade_samples for SOLA buffer/search
+        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
+        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms
+        self._effective_crossfade = max(config.crossfade_samples, min_phase8_buffer)
+
+        # Phase 8: Enable advanced SOLA with higher fallback threshold
         self._sola_state = SOLAState.create(
-            config.crossfade_samples,
+            self._effective_crossfade,
             config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,
         )
         # Track previous output tail for boundary checks
         self._prev_tail: Optional[NDArray[np.float32]] = None
@@ -269,9 +275,12 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
 
     def reset(self) -> None:
         """Reset SOLA state for a new stream."""
+        # Phase 8: Preserve advanced SOLA settings on reset
         self._sola_state = SOLAState.create(
-            self._config.crossfade_samples,
+            self._effective_crossfade,
             self._config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,
         )
         self._prev_tail = None
         self._chunks_processed = 0
@@ -295,16 +304,23 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         """
         super().__init__(config)
 
-        # Use larger of crossfade_samples or 1/4 of overlap for better phase search
-        # This gives SOLA more room to find optimal alignment
+        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
+        # This ensures enough samples for smooth transitions when correlation is low
+        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms = 9600 samples at 48kHz
+
         effective_crossfade = max(
             config.crossfade_samples,
             min(config.overlap_samples // 4, config.crossfade_samples * 2),
+            min_phase8_buffer,  # Phase 8: ensure 200ms minimum
         )
 
+        # Phase 8: Enable advanced SOLA with higher fallback threshold
+        # for better handling of RVC's chunk-to-chunk discontinuities
         self._sola_state = SOLAState.create(
             effective_crossfade,
             config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,  # High threshold to trigger strong crossfade
         )
         self._effective_crossfade = effective_crossfade
 
@@ -404,9 +420,12 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
 
     def reset(self) -> None:
         """Reset SOLA state for a new stream."""
+        # Phase 8: Preserve advanced SOLA settings on reset
         self._sola_state = SOLAState.create(
             self._effective_crossfade,
             self._config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,
         )
         self._prev_tail = None
         self._chunks_processed = 0
@@ -429,13 +448,19 @@ class SOLAHybridCrossfade(BaseCrossfadeStrategy):
         """
         super().__init__(config)
 
-        # Use larger crossfade buffer for better phase search
-        # Hybrid: use 1.5x the configured crossfade for more search room
-        effective_crossfade = int(config.crossfade_samples * 1.5)
+        # Phase 8: Use larger buffer for strong crossfade (200ms minimum)
+        min_phase8_buffer = int(config.output_sample_rate * 0.20)  # 200ms
+        effective_crossfade = max(
+            int(config.crossfade_samples * 1.5),
+            min_phase8_buffer,
+        )
 
+        # Phase 8: Enable advanced SOLA with higher fallback threshold
         self._sola_state = SOLAState.create(
             effective_crossfade,
             config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,
         )
         self._effective_crossfade = effective_crossfade
 
@@ -538,9 +563,12 @@ class SOLAHybridCrossfade(BaseCrossfadeStrategy):
 
     def reset(self) -> None:
         """Reset SOLA state for a new stream."""
+        # Phase 8: Preserve advanced SOLA settings on reset
         self._sola_state = SOLAState.create(
             self._effective_crossfade,
             self._config.output_sample_rate,
+            use_advanced_sola=True,
+            fallback_threshold=0.8,
         )
         self._prev_tail = None
         self._prev_rms = 0.0
