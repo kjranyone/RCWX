@@ -196,11 +196,12 @@ def _apply_strong_crossfade(
             prev_region = prev_region[-actual_len:]
             main_region = main_output[:actual_len].copy() - main_dc
 
-    # Create cos^6 fade curves (very smooth S-curve, slower transition than cos^4)
+    # Create smooth fade curves that sum to 1.0 (energy-preserving)
     t = np.linspace(0.0, 1.0, actual_len, dtype=np.float32)
-    # cos^6 provides even smoother transition with more gradual edges
-    fade_in = np.power(np.sin(np.pi * t / 2), 6)
-    fade_out = np.power(np.cos(np.pi * t / 2), 6)
+    # Use smoothstep-like curve: 3t² - 2t³ for smooth S-curve
+    # This ensures fade_in + fade_out = 1.0 at all points
+    fade_in = 3 * t**2 - 2 * t**3  # Smoothstep: 0→1
+    fade_out = 1.0 - fade_in        # Complementary: 1→0
 
     # RMS matching with wider tolerance - preserve dynamics
     prev_rms = np.sqrt(np.mean(prev_region**2)) + 1e-8
