@@ -283,6 +283,7 @@ uv run python tests/test_realtime_analysis.py --test-file sample_data/seki.wav
 | `test_diagnostic.py` | コンポーネント別診断 | 不要 |
 | `test_realtime_analysis.py` | バッチ vs ストリーミング比較 | 必要 |
 | `test_step_by_step.py` | 中間結果の詳細解析 | 必要 |
+| `test_realtime_integration.py` | スレッド統合テスト | 必要 |
 
 ### test_diagnostic.py
 
@@ -329,6 +330,22 @@ uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
 **保存される中間ファイル** (`test_output/step_by_step/chunk_XXX/`):
 - `0_input.wav` → `1_resample_16k.wav` → `2_infer.wav` → `3_resample_output.wav` → `4_sola.wav`
 
+### test_realtime_integration.py
+
+GUIと同等のスレッド構成（入力/推論/出力）でテスト。
+SimulatedAudioDeviceで実デバイスのタイミング（ジッター含む）をエミュレート。
+
+```powershell
+uv run python tests/test_realtime_integration.py                  # 10秒テスト
+uv run python tests/test_realtime_integration.py --duration 60    # 長時間テスト
+uv run python tests/test_realtime_integration.py --stress         # CPU負荷テスト
+```
+
+**評価項目**:
+- `underruns`: 出力バッファ枯渇（音切れ）
+- `overruns`: 入力キュー溢れ
+- `latency`: チャンク処理時間
+
 ### 品質基準
 
 | 指標 | 合格基準 |
@@ -337,6 +354,8 @@ uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
 | 境界ジャンプ (>0.1) | 0 件 |
 | Resampler相関 | > 0.99 |
 | 累積時間誤差 | < 10ms |
+| Underruns | 0 件 |
+| Overruns | < 5 件 |
 
 ### テストデータ
 
@@ -353,6 +372,17 @@ uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
 ```powershell
 uv run python tests/test_realtime_analysis.py --test-file path/to/your.wav
 ```
+
+### テストの限界
+
+現在のテストでカバーしていない項目:
+
+| 項目 | 説明 |
+|------|------|
+| 実デバイスレイテンシ | sounddeviceドライバの遅延 |
+| 自然音声 | 子音・無音区間・ビブラート |
+| パラメータ変更 | 変換中のpitch/index_rate変更 |
+| 長時間安定性 | 数時間の連続動作 |
 
 ## References
 
