@@ -252,7 +252,7 @@ class HuBERTLoader:
         if audio.dim() == 1:
             audio = audio.unsqueeze(0)
 
-        audio = audio.to(self.device).float()
+        audio = audio.to(self.device).to(self.dtype)
 
         outputs = self.model(audio, output_hidden_states=True)
         features = outputs.hidden_states[output_layer]

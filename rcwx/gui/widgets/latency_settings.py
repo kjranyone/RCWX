@@ -117,15 +117,16 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """Setup advanced control sliders."""
         frame = self.advanced_frame
 
+        # Step=20ms to align with HuBERT frame boundary (320 samples @ 16kHz = 20ms)
         self.chunk_slider, self.chunk_value = self._create_slider_row(
             frame,
             "チャンクサイズ",
             0,
             100,
             600,
-            50,
-            self.chunk_sec * 1000,
-            f"{int(self.chunk_sec * 1000)}ms",
+            20,
+            self._round_to_frame_boundary(self.chunk_sec * 1000),
+            f"{int(self._round_to_frame_boundary(self.chunk_sec * 1000))}ms",
             self._on_chunk_change,
         )
         self.prebuf_slider, self.prebuf_value = self._create_slider_row(
@@ -212,10 +213,16 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.chunking_mode = value
         self._notify_change()
 
+    def _round_to_frame_boundary(self, ms: float) -> int:
+        """Round milliseconds to nearest HuBERT frame boundary (20ms)."""
+        return int(round(ms / 20) * 20)
+
     def _on_chunk_change(self, value: float) -> None:
         """Handle chunk size slider change."""
-        self.chunk_sec = value / 1000
-        self.chunk_value.configure(text=f"{int(value)}ms")
+        # Round to 20ms boundary (HuBERT frame size = 320 samples @ 16kHz)
+        rounded_ms = self._round_to_frame_boundary(value)
+        self.chunk_sec = rounded_ms / 1000
+        self.chunk_value.configure(text=f"{rounded_ms}ms")
         self._update_estimate()
         self._notify_change()
 
@@ -298,7 +305,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
         chunking_mode: str = "wokada",
     ) -> None:
         """Set individual values directly (for restoring saved settings)."""
-        self.chunk_sec = chunk_sec
+        # Round chunk_sec to 20ms boundary (HuBERT frame alignment)
+        rounded_ms = self._round_to_frame_boundary(chunk_sec * 1000)
+        self.chunk_sec = rounded_ms / 1000
         self.prebuffer_chunks = prebuffer_chunks
         self.buffer_margin = buffer_margin
         self.context_sec = context_sec
@@ -311,8 +320,8 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.chunking_mode_var.set(chunking_mode)
 
         # Update sliders
-        self.chunk_slider.set(chunk_sec * 1000)
-        self.chunk_value.configure(text=f"{int(chunk_sec * 1000)}ms")
+        self.chunk_slider.set(rounded_ms)
+        self.chunk_value.configure(text=f"{rounded_ms}ms")
         self.prebuf_slider.set(prebuffer_chunks)
         self.prebuf_value.configure(text=f"{prebuffer_chunks}チャンク")
         self.margin_slider.set(buffer_margin)
