@@ -140,13 +140,23 @@ class ChunkBuffer:
                     f"required={required}, total={len(chunk)}"
                 )
 
-        # Always advance by chunk_samples (w-okada style: uniform progression)
-        # This is the key difference from overlap-based chunking
-        self._input_buffer = self._input_buffer[self.chunk_samples :]
-
-        # Update flag after first chunk processed
+        # Advance input buffer
+        # w-okada style: For first chunk, advance by (chunk - context) so that
+        # the next chunk's context overlaps with this chunk's main ending.
+        # For subsequent chunks, advance by chunk_samples (full main portion).
         if self._is_first_chunk:
+            # First chunk: advance less to create overlap for next chunk's context
+            # This ensures second chunk's context = first chunk's main ending
+            advance = max(0, self.chunk_samples - self.context_samples)
+            self._input_buffer = self._input_buffer[advance:]
+            logger.debug(
+                f"[ChunkBuffer] First chunk advance: {advance} samples "
+                f"(chunk={self.chunk_samples} - context={self.context_samples})"
+            )
             self._is_first_chunk = False
+        else:
+            # Subsequent chunks: uniform progression by chunk_samples
+            self._input_buffer = self._input_buffer[self.chunk_samples:]
 
         return chunk
 

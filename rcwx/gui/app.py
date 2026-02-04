@@ -100,6 +100,9 @@ class RCWXApp(ctk.CTk):
         self.tab_audio = self.tabview.add("オーディオ")
         self.tab_settings = self.tabview.add("詳細設定")
 
+        # Handle tab change events
+        self.tabview.configure(command=self._on_tab_changed)
+
         # Setup main tab
         self._setup_main_tab()
 
@@ -931,6 +934,18 @@ class RCWXApp(ctk.CTk):
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
 
+    def _on_tab_changed(self, tab_name: str) -> None:
+        """Handle tab change event."""
+        if not hasattr(self, "audio_settings"):
+            return
+
+        if tab_name == "オーディオ":
+            # Start auto-refresh when audio tab is selected
+            self.audio_settings.start_auto_refresh(interval_ms=1000)
+        else:
+            # Stop auto-refresh when leaving audio tab
+            self.audio_settings.stop_auto_refresh()
+
     def _update_audio_device_display(self) -> None:
         """Update audio device labels in main panel."""
         if hasattr(self, "audio_settings"):
@@ -1020,6 +1035,9 @@ class RCWXApp(ctk.CTk):
 
         # Stop audio monitor
         self.audio_settings.stop_monitor()
+
+        # Stop device auto-refresh
+        self.audio_settings.stop_auto_refresh()
 
         # Save config
         self._save_config()
