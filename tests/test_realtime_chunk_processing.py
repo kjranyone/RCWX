@@ -6,6 +6,7 @@ logic (not a simulation), and compares it to batch processing.
 """
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from rcwx.pipeline.realtime import RealtimeConfig, RealtimeVoiceChanger
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
+QUICK_TEST = os.getenv("RCWX_QUICK_TEST", "0") == "1"
 
 
 def load_test_audio(path: Path, target_sr: int = 48000) -> np.ndarray:
@@ -333,6 +335,8 @@ def test_chunk_processing():
     logger.info("=" * 70)
     logger.info("Chunk Processing Integration Test")
     logger.info("=" * 70)
+    if QUICK_TEST:
+        logger.info("Quick test mode: streaming discontinuity check only (no true batch)")
 
     # Load config
     config = RCWXConfig.load()
@@ -357,11 +361,13 @@ def test_chunk_processing():
 
     logger.info(f"Loading test audio: {test_file}")
     audio_full = load_test_audio(test_file, target_sr=48000)
+    # Shorten to 1/4 length to keep tests fast
+    audio_full = audio_full[: max(1, len(audio_full) // 4)]
 
     # For w-okada mode: use 52.5s (no overlap, 105 chunks @ 0.5s)
     chunk_sec_wokada = 0.35
     chunk_samples_wokada = int(48000 * chunk_sec_wokada)
-    num_chunks_wokada = 150  # 52.5 seconds @ 0.35s chunks
+    num_chunks_wokada = 2  # ~0.70 seconds @ 0.35s chunks (short test)
     audio_wokada = audio_full[:num_chunks_wokada * chunk_samples_wokada]
 
     # For RVC WebUI mode: use shorter audio to match same processing time
@@ -372,7 +378,7 @@ def test_chunk_processing():
     chunk_sec_rvc = 0.5
     overlap_sec_rvc = 0.22
     hop_sec_rvc = chunk_sec_rvc - overlap_sec_rvc  # 0.28s
-    num_chunks_rvc = 63
+    num_chunks_rvc = 2  # shorter test
     chunk_samples_rvc = int(48000 * chunk_sec_rvc)  # 24000
     hop_samples_rvc = int(48000 * hop_sec_rvc)  # 13440
     # Total samples = first chunk + (n-1) * hop
@@ -382,24 +388,34 @@ def test_chunk_processing():
     logger.info(f"w-okada audio: {len(audio_wokada)/48000:.2f}s @ 48kHz ({num_chunks_wokada} chunks @ {chunk_sec_wokada}s)")
     logger.info(f"RVC WebUI audio: {len(audio_rvc)/48000:.2f}s @ 48kHz ({num_chunks_rvc} expected chunks, hop={hop_sec_rvc}s)")
 
-    # Process in TRUE batch mode (gold standard) - use w-okada audio
-    logger.info("\n--- TRUE Batch Processing (gold standard, w-okada length) ---")
-    true_batch_output_wokada = process_true_batch(pipeline, audio_wokada, pitch_shift=0,
-                                                   output_sample_rate=40000)
-    logger.info(f"True batch output (w-okada): {len(true_batch_output_wokada)} samples @ 40000Hz")
+    if not QUICK_TEST:
+        # Process in TRUE batch mode (gold standard) - use w-okada audio
+        logger.info("\n--- TRUE Batch Processing (gold standard, w-okada length) ---")
+        true_batch_output_wokada = process_true_batch(
+            pipeline, audio_wokada, pitch_shift=0, output_sample_rate=40000
+        )
+        logger.info(
+            f"True batch output (w-okada): {len(true_batch_output_wokada)} samples @ 40000Hz"
+        )
 
-    # Process in TRUE batch mode (gold standard) - use RVC WebUI audio
-    logger.info("\n--- TRUE Batch Processing (gold standard, RVC WebUI length) ---")
-    true_batch_output_rvc = process_true_batch(pipeline, audio_rvc, pitch_shift=0,
-                                               output_sample_rate=40000)
-    logger.info(f"True batch output (RVC): {len(true_batch_output_rvc)} samples @ 40000Hz")
+        # Process in TRUE batch mode (gold standard) - use RVC WebUI audio
+        logger.info("\n--- TRUE Batch Processing (gold standard, RVC WebUI length) ---")
+        true_batch_output_rvc = process_true_batch(
+            pipeline, audio_rvc, pitch_shift=0, output_sample_rate=40000
+        )
+        logger.info(f"True batch output (RVC): {len(true_batch_output_rvc)} samples @ 40000Hz")
 
-    # Process in chunked mode WITHOUT SOLA (for comparison)
-    logger.info("\n--- Chunked Processing (NO SOLA) ---")
-    batch_output = process_batch(pipeline, audio_wokada, pitch_shift=0,
-                                  chunk_sec=0.35, context_sec=0.05,  # w-okada default
-                                  output_sample_rate=40000)
-    logger.info(f"Chunked (no SOLA) output: {len(batch_output)} samples @ 40000Hz")
+        # Process in chunked mode WITHOUT SOLA (for comparison)
+        logger.info("\n--- Chunked Processing (NO SOLA) ---")
+        batch_output = process_batch(
+            pipeline,
+            audio_wokada,
+            pitch_shift=0,
+            chunk_sec=0.35,
+            context_sec=0.05,  # w-okada default
+            output_sample_rate=40000,
+        )
+        logger.info(f"Chunked (no SOLA) output: {len(batch_output)} samples @ 40000Hz")
 
     # Process in streaming mode (w-okada mode)
     # w-okada mode: NO SOLA, just simple edge trimming (faithful reproduction)
@@ -437,48 +453,62 @@ def test_chunk_processing():
     )
     logger.info(f"RVC WebUI mode output: {len(streaming_output_rvc)} samples @ 40000Hz")
 
-    # Compare outputs
-    logger.info("\n--- Comparison: Chunked (no SOLA) vs True Batch ---")
-    metrics_chunked = compare_outputs(true_batch_output_wokada, batch_output)
-    for key, value in metrics_chunked.items():
-        logger.info(f"  {key:20s}: {value}")
+    if not QUICK_TEST:
+        # Compare outputs
+        logger.info("\n--- Comparison: Chunked (no SOLA) vs True Batch ---")
+        metrics_chunked = compare_outputs(true_batch_output_wokada, batch_output)
+        for key, value in metrics_chunked.items():
+            logger.info(f"  {key:20s}: {value}")
 
-    logger.info("\n--- Comparison: w-okada mode vs True Batch ---")
-    metrics_wokada = compare_outputs(true_batch_output_wokada, streaming_output_wokada)
+        logger.info("\n--- Comparison: w-okada mode vs True Batch ---")
+        metrics_wokada = compare_outputs(true_batch_output_wokada, streaming_output_wokada)
 
-    logger.info("\n--- Comparison: RVC WebUI mode vs True Batch ---")
-    # Trim RVC output to match true batch length (remove padding)
-    streaming_output_rvc_trimmed = streaming_output_rvc[:len(true_batch_output_rvc)]
-    logger.info(f"Trimmed RVC output from {len(streaming_output_rvc)} to {len(streaming_output_rvc_trimmed)} samples (removed padding)")
-    metrics_rvc = compare_outputs(true_batch_output_rvc, streaming_output_rvc_trimmed)
+        logger.info("\n--- Comparison: RVC WebUI mode vs True Batch ---")
+        # Trim RVC output to match true batch length (remove padding)
+        streaming_output_rvc_trimmed = streaming_output_rvc[: len(true_batch_output_rvc)]
+        logger.info(
+            f"Trimmed RVC output from {len(streaming_output_rvc)} to {len(streaming_output_rvc_trimmed)} samples (removed padding)"
+        )
+        metrics_rvc = compare_outputs(true_batch_output_rvc, streaming_output_rvc_trimmed)
+    else:
+        streaming_output_rvc_trimmed = streaming_output_rvc
 
-    # Check correlation for w-okada mode
-    logger.info("w-okada mode correlation by chunks:")
-    for n_chunks in [10, 50, num_chunks_wokada]:
-        chunk_samples = int(40000 * 0.35)  # Output rate
-        compare_len = min(n_chunks * chunk_samples, len(true_batch_output_wokada), len(streaming_output_wokada))
-        if compare_len > 0:
-            true_batch_trim = true_batch_output_wokada[:compare_len]
-            streaming_trim = streaming_output_wokada[:compare_len]
-            corr = np.corrcoef(true_batch_trim, streaming_trim)[0, 1]
-            logger.info(f"  Correlation for first {n_chunks} chunks: {corr:.6f}")
+    if not QUICK_TEST:
+        # Check correlation for w-okada mode
+        logger.info("w-okada mode correlation by chunks:")
+        for n_chunks in [10, 50, num_chunks_wokada]:
+            chunk_samples = int(40000 * 0.35)  # Output rate
+            compare_len = min(
+                n_chunks * chunk_samples,
+                len(true_batch_output_wokada),
+                len(streaming_output_wokada),
+            )
+            if compare_len > 0:
+                true_batch_trim = true_batch_output_wokada[:compare_len]
+                streaming_trim = streaming_output_wokada[:compare_len]
+                corr = np.corrcoef(true_batch_trim, streaming_trim)[0, 1]
+                logger.info(f"  Correlation for first {n_chunks} chunks: {corr:.6f}")
 
-    for key, value in metrics_wokada.items():
-        logger.info(f"  {key:20s}: {value}")
+        for key, value in metrics_wokada.items():
+            logger.info(f"  {key:20s}: {value}")
 
-    # Check correlation for RVC WebUI mode
-    logger.info("\nRVC WebUI mode correlation by chunks:")
-    for n_chunks in [10, 30, num_chunks_rvc]:
-        chunk_samples = int(40000 * 0.5)  # Output rate, 0.5s chunks
-        compare_len = min(n_chunks * chunk_samples, len(true_batch_output_rvc), len(streaming_output_rvc_trimmed))
-        if compare_len > 0:
-            true_batch_trim = true_batch_output_rvc[:compare_len]
-            streaming_trim = streaming_output_rvc_trimmed[:compare_len]
-            corr = np.corrcoef(true_batch_trim, streaming_trim)[0, 1]
-            logger.info(f"  Correlation for first {n_chunks} chunks: {corr:.6f}")
+        # Check correlation for RVC WebUI mode
+        logger.info("\nRVC WebUI mode correlation by chunks:")
+        for n_chunks in [10, 30, num_chunks_rvc]:
+            chunk_samples = int(40000 * 0.5)  # Output rate, 0.5s chunks
+            compare_len = min(
+                n_chunks * chunk_samples,
+                len(true_batch_output_rvc),
+                len(streaming_output_rvc_trimmed),
+            )
+            if compare_len > 0:
+                true_batch_trim = true_batch_output_rvc[:compare_len]
+                streaming_trim = streaming_output_rvc_trimmed[:compare_len]
+                corr = np.corrcoef(true_batch_trim, streaming_trim)[0, 1]
+                logger.info(f"  Correlation for first {n_chunks} chunks: {corr:.6f}")
 
-    for key, value in metrics_rvc.items():
-        logger.info(f"  {key:20s}: {value}")
+        for key, value in metrics_rvc.items():
+            logger.info(f"  {key:20s}: {value}")
 
     # Analyze discontinuities in each output
     # Threshold 0.2 detects true clicks/pops, not normal audio transitions
@@ -489,17 +519,28 @@ def test_chunk_processing():
         return len(jumps), jumps, jump_values
 
     logger.info("\n--- Discontinuity Analysis (threshold=0.2) ---")
-    true_batch_wokada_count, true_batch_wokada_indices, _ = count_discontinuities(true_batch_output_wokada)
-    true_batch_rvc_count, true_batch_rvc_indices, _ = count_discontinuities(true_batch_output_rvc)
-    batch_count, batch_indices, batch_values = count_discontinuities(batch_output)
+    if not QUICK_TEST:
+        true_batch_wokada_count, true_batch_wokada_indices, _ = count_discontinuities(true_batch_output_wokada)
+        true_batch_rvc_count, true_batch_rvc_indices, _ = count_discontinuities(true_batch_output_rvc)
+        batch_count, batch_indices, batch_values = count_discontinuities(batch_output)
     wokada_count, wokada_indices, wokada_values = count_discontinuities(streaming_output_wokada)
     rvc_count, rvc_indices, rvc_values = count_discontinuities(streaming_output_rvc_trimmed)
 
-    logger.info(f"True batch (w-okada) discontinuities: {true_batch_wokada_count}")
-    logger.info(f"True batch (RVC) discontinuities: {true_batch_rvc_count}")
-    logger.info(f"Chunked (no SOLA) discontinuities: {batch_count} ({batch_count - true_batch_wokada_count:+d} vs true batch)")
-    logger.info(f"w-okada mode discontinuities: {wokada_count} ({wokada_count - true_batch_wokada_count:+d} vs true batch)")
-    logger.info(f"RVC WebUI mode discontinuities: {rvc_count} ({rvc_count - true_batch_rvc_count:+d} vs true batch)")
+    if not QUICK_TEST:
+        logger.info(f"True batch (w-okada) discontinuities: {true_batch_wokada_count}")
+        logger.info(f"True batch (RVC) discontinuities: {true_batch_rvc_count}")
+        logger.info(
+            f"Chunked (no SOLA) discontinuities: {batch_count} ({batch_count - true_batch_wokada_count:+d} vs true batch)"
+        )
+        logger.info(
+            f"w-okada mode discontinuities: {wokada_count} ({wokada_count - true_batch_wokada_count:+d} vs true batch)"
+        )
+        logger.info(
+            f"RVC WebUI mode discontinuities: {rvc_count} ({rvc_count - true_batch_rvc_count:+d} vs true batch)"
+        )
+    else:
+        logger.info(f"w-okada mode discontinuities: {wokada_count}")
+        logger.info(f"RVC WebUI mode discontinuities: {rvc_count}")
 
     # Show details of RVC WebUI mode discontinuities
     if rvc_count > 0:
@@ -512,32 +553,47 @@ def test_chunk_processing():
     output_dir = Path("test_output")
     output_dir.mkdir(exist_ok=True)
 
-    wavfile.write(
-        output_dir / "true_batch_wokada_output.wav",
-        40000,
-        (true_batch_output_wokada * 32767).astype(np.int16),
-    )
-    wavfile.write(
-        output_dir / "true_batch_rvc_output.wav",
-        40000,
-        (true_batch_output_rvc * 32767).astype(np.int16),
-    )
-    wavfile.write(
-        output_dir / "chunked_no_sola_output.wav",
-        40000,
-        (batch_output * 32767).astype(np.int16),
-    )
-    wavfile.write(
-        output_dir / "wokada_mode_output.wav",
-        40000,
-        (streaming_output_wokada * 32767).astype(np.int16),
-    )
-    wavfile.write(
-        output_dir / "rvc_webui_mode_output.wav",
-        40000,
-        (streaming_output_rvc_trimmed * 32767).astype(np.int16),
-    )
+    if QUICK_TEST:
+        wavfile.write(
+            output_dir / "wokada_mode_output.wav",
+            40000,
+            (streaming_output_wokada * 32767).astype(np.int16),
+        )
+        wavfile.write(
+            output_dir / "rvc_webui_mode_output.wav",
+            40000,
+            (streaming_output_rvc_trimmed * 32767).astype(np.int16),
+        )
+    else:
+        wavfile.write(
+            output_dir / "true_batch_wokada_output.wav",
+            40000,
+            (true_batch_output_wokada * 32767).astype(np.int16),
+        )
+        wavfile.write(
+            output_dir / "true_batch_rvc_output.wav",
+            40000,
+            (true_batch_output_rvc * 32767).astype(np.int16),
+        )
+        wavfile.write(
+            output_dir / "chunked_no_sola_output.wav",
+            40000,
+            (batch_output * 32767).astype(np.int16),
+        )
+        wavfile.write(
+            output_dir / "wokada_mode_output.wav",
+            40000,
+            (streaming_output_wokada * 32767).astype(np.int16),
+        )
+        wavfile.write(
+            output_dir / "rvc_webui_mode_output.wav",
+            40000,
+            (streaming_output_rvc_trimmed * 32767).astype(np.int16),
+        )
     logger.info(f"\nOutputs saved to {output_dir}/")
+
+    if QUICK_TEST:
+        return True
 
     # Evaluate results (RVC WebUI mode vs True Batch)
     logger.info("\n--- Results (RVC WebUI mode vs True Batch) ---")

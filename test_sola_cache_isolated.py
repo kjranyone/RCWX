@@ -1,4 +1,4 @@
-"""Test SOLA + Cache configuration only (without smoothing)."""
+"""Test SOLA + Cache in isolation (same code as test_chunk_continuity.py)."""
 
 import sys
 from pathlib import Path
@@ -27,29 +27,49 @@ def load_audio(path: str, max_sec: float = 5.0) -> np.ndarray:
     return audio
 
 
-def detect_discontinuities(audio: np.ndarray, threshold: float = 0.10) -> int:
-    """Count discontinuities above threshold."""
+def detect_discontinuities(audio: np.ndarray, threshold: float = 0.05) -> list:
+    """Detect sudden jumps (discontinuities) in audio."""
     if len(audio) < 2:
-        return 0
+        return []
+
     diff = np.abs(np.diff(audio))
-    return np.sum(diff > threshold)
+    discontinuities = np.where(diff > threshold)[0]
+
+    # Group nearby discontinuities
+    groups = []
+    if len(discontinuities) > 0:
+        current_group = [discontinuities[0]]
+        for idx in discontinuities[1:]:
+            if idx - current_group[-1] < 100:  # Within 100 samples
+                current_group.append(idx)
+            else:
+                groups.append(current_group)
+                current_group = [idx]
+        groups.append(current_group)
+
+    return groups
 
 
-def process_streaming(pipeline, audio):
-    """Process with SOLA + Cache."""
+def process_streaming(pipeline, audio, use_sola, use_cache, chunking_mode, description):
+    """Process with specific settings and return output + stats."""
+    print(f"\n{'='*80}")
+    print(f"Testing: {description}")
+    print(f"  use_sola: {use_sola}, use_cache: {use_cache}, mode: {chunking_mode}")
+    print(f"{'='*80}")
+
     rt_config = RealtimeConfig(
         mic_sample_rate=48000,
         input_sample_rate=16000,
         output_sample_rate=48000,
         chunk_sec=0.15,
         f0_method="fcpe",
-        chunking_mode="wokada",
+        chunking_mode=chunking_mode,
         context_sec=0.10,
-        crossfade_sec=0.10,  # Increased from 0.05 to 0.10 (100ms)
-        use_sola=True,
+        crossfade_sec=0.05,
+        use_sola=use_sola,
         index_rate=0.0,
         voice_gate_mode="expand",
-        use_feature_cache=True,
+        use_feature_cache=use_cache,
         prebuffer_chunks=1,
         buffer_margin=0.3,
     )
@@ -88,33 +108,45 @@ def process_streaming(pipeline, audio):
 
     output = np.concatenate(outputs) if outputs else np.array([], dtype=np.float32)
 
-    # Count discontinuities
-    disc_count = detect_discontinuities(output, threshold=0.10)
+    # Analyze discontinuities
+    discontinuities = detect_discontinuities(output, threshold=0.05)
 
     print(f"  Output: {len(output)} samples ({len(output)/48000:.2f}s)")
-    print(f"  Discontinuities (>0.10): {disc_count}")
+    print(f"  Discontinuities: {len(discontinuities)} groups")
 
-    return output, disc_count
+    if len(discontinuities) > 0:
+        print(f"  First 5 discontinuity positions (samples):")
+        for i, group in enumerate(discontinuities[:5]):
+            time_sec = group[0] / 48000
+            print(f"    {i+1}. Sample {group[0]} ({time_sec:.3f}s) - {len(group)} samples")
+
+    return output, len(discontinuities)
 
 
 def main():
     print("="*80)
-    print("SOLA + CACHE TEST (Smoothing Disabled)")
+    print("SOLA + CACHE ISOLATED TEST")
     print("="*80)
 
-    # Load
+    # Load fresh pipeline
     pipeline = RVCPipeline("sample_data/hogaraka/hogarakav2.pth", use_compile=False)
-    pipeline.load()  # IMPORTANT: Load models before use
+    pipeline.load()
     audio = load_audio("sample_data/seki.wav", max_sec=5.0)
     print(f"\nInput: {len(audio)/48000:.2f}s @ 48kHz\n")
 
-    # Test
-    output, disc_count = process_streaming(pipeline, audio)
+    # Test SOLA + Cache only
+    output, disc_count = process_streaming(
+        pipeline, audio,
+        use_sola=True,
+        use_cache=True,
+        chunking_mode="wokada",
+        description="SOLA + Cache (isolated)"
+    )
 
     # Save to file
     output_dir = Path("test_output")
     output_dir.mkdir(exist_ok=True)
-    filename = "test_sola_cache_no_smoothing.wav"
+    filename = "test_sola_cache_isolated.wav"
     filepath = output_dir / filename
 
     # Convert to int16 for WAV
@@ -123,19 +155,22 @@ def main():
 
     print(f"\n  Saved: {filepath}")
 
+    # Analyze with 0.10 threshold
+    diff = np.abs(np.diff(output))
+    disc_010 = np.sum(diff > 0.10)
+
     print("\n" + "="*80)
     print("RESULT")
     print("="*80)
-    print(f"  Discontinuities (>0.10): {disc_count}")
-    print(f"  Previous (with smoothing): 178")
+    print(f"  Discontinuities (>0.05): {disc_count} groups")
+    print(f"  Discontinuities (>0.10): {disc_010} individual")
+    print(f"\n  Expected (smoothing removed): 115 individual")
+    print(f"  Previous (with smoothing): 178 individual")
 
-    if disc_count < 178:
-        print(f"\n  [OK] Improved! Reduction: {178 - disc_count}")
-        print("       Smoothing was causing additional discontinuities.")
-    elif disc_count == 178:
-        print("\n  [INFO] No change. Smoothing was not the issue.")
+    if disc_010 <= 120:
+        print(f"\n  [OK] Smoothing removed successfully!")
     else:
-        print(f"\n  [NG] Worse! Increase: {disc_count - 178}")
+        print(f"\n  [NG] Still has smoothing artifacts")
 
     print("="*80)
 

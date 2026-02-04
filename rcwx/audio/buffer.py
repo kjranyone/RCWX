@@ -217,7 +217,8 @@ class OutputBuffer:
         Returns:
             Number of old samples dropped to maintain max latency (0 if none)
         """
-        self._buffer = np.concatenate([self._buffer, audio])
+        if len(audio) > 0:
+            self._buffer = np.concatenate([self._buffer, audio])
 
         # Drop OLD samples if buffer exceeds max latency
         # This keeps playback close to real-time by catching up

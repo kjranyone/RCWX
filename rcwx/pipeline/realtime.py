@@ -150,6 +150,18 @@ class RealtimeConfig:
     # Smoothing factor for energy tracking (0.0-1.0, higher = more smoothing)
     energy_smoothing: float = 0.9
 
+    # --- Peak normalization ---
+    # Normalize output peak based on input peak to prevent excessive amplitude swings
+    use_peak_normalization: bool = False
+    # Smoothing factor for peak tracking (0.0-1.0, higher = more smoothing)
+    peak_smoothing: float = 0.9
+
+    # --- Chunk gain smoothing ---
+    # Reduce chunk-to-chunk loudness variation with a slow RMS target
+    use_chunk_gain_smoothing: bool = False
+    # Smoothing factor for RMS target (0.0-1.0, higher = smoother)
+    chunk_gain_smoothing: float = 0.95
+
 
 class RealtimeVoiceChanger:
     """
@@ -176,34 +188,59 @@ class RealtimeVoiceChanger:
         self.config = config or RealtimeConfig()
         self._on_warmup_progress = on_warmup_progress
 
+        # Note: normalization is optional and should be user-controlled
+        # chunk gain smoothing should be user-controlled
+
         # Validate chunk_sec to prevent buffer overflow
-        if not (0.05 <= self.config.chunk_sec <= 0.4):
+        # Use slightly larger minimums to account for HuBERT alignment rounding
+        if self.config.f0_method == "fcpe":
+            min_chunk = 0.11  # FCPE minimum 0.10s + margin for alignment
+            default_chunk = 0.15
+        elif self.config.f0_method == "rmvpe":
+            min_chunk = 0.33  # RMVPE minimum 0.32s + margin for alignment
+            default_chunk = 0.35
+        else:
+            min_chunk = 0.10
+            default_chunk = 0.15
+
+        if self.config.chunk_sec < min_chunk or self.config.chunk_sec > 0.5:
             logger.warning(
-                f"Invalid chunk_sec={self.config.chunk_sec}s detected! "
-                f"Resetting to default 0.1s (FCPE) / 0.35s (RMVPE)"
+                f"Invalid chunk_sec={self.config.chunk_sec}s for {self.config.f0_method}! "
+                f"Valid range: {min_chunk}s-0.5s. Resetting to {default_chunk}s"
             )
-            # Auto-detect based on F0 method
-            if self.config.f0_method == "fcpe":
-                self.config.chunk_sec = 0.1
-            elif self.config.f0_method == "rmvpe":
-                self.config.chunk_sec = 0.35
-            else:
-                self.config.chunk_sec = 0.1
+            self.config.chunk_sec = default_chunk
 
-        # Calculate buffer sizes (at mic sample rate for input buffering)
-        # Main chunk size (the "useful" audio we want to output per iteration)
-        self.mic_chunk_samples = int(self.config.mic_sample_rate * self.config.chunk_sec)
+        # Validate rvc_overlap_sec for rvc_webui mode
+        # overlap must be less than chunk_sec to avoid buffer errors
+        if self.config.chunking_mode == "rvc_webui":
+            max_overlap = self.config.chunk_sec * 0.5  # Conservative: 50% overlap maximum
+            min_chunk_for_overlap = self.config.rvc_overlap_sec * 2.0  # Chunk should be at least 2x overlap
 
-        # Context: extra audio on each side for stable processing (will be discarded)
-        self.mic_context_samples = int(self.config.mic_sample_rate * self.config.context_sec)
+            # If chunk_sec is too small for the overlap, increase chunk_sec instead
+            if self.config.chunk_sec < min_chunk_for_overlap:
+                old_chunk = self.config.chunk_sec
+                self.config.chunk_sec = min_chunk_for_overlap
+                logger.warning(
+                    f"chunk_sec={old_chunk:.3f}s is too small for rvc_overlap_sec={self.config.rvc_overlap_sec:.3f}s! "
+                    f"Auto-adjusting chunk_sec to {self.config.chunk_sec:.3f}s (2x overlap)"
+                )
+                # Recalculate max_overlap with new chunk_sec
+                max_overlap = self.config.chunk_sec * 0.5
 
-        # Lookahead: additional future samples for right context (adds latency)
-        self.mic_lookahead_samples = int(self.config.mic_sample_rate * self.config.lookahead_sec)
-
-        # Total input chunk size = left_context + main + lookahead (right_context)
-        # ChunkBuffer returns: [left_context | main | lookahead]
-        # First chunk uses reflection padding for left_context
-        self.mic_total_chunk = self.mic_chunk_samples + self.mic_context_samples + self.mic_lookahead_samples
+            # Now validate overlap against (possibly adjusted) chunk_sec
+            if self.config.rvc_overlap_sec >= self.config.chunk_sec:
+                logger.warning(
+                    f"Invalid rvc_overlap_sec={self.config.rvc_overlap_sec}s "
+                    f">= chunk_sec={self.config.chunk_sec}s! "
+                    f"Auto-adjusting to {max_overlap:.3f}s (50% of chunk_sec)"
+                )
+                self.config.rvc_overlap_sec = max_overlap
+            elif self.config.rvc_overlap_sec > max_overlap:
+                logger.warning(
+                    f"rvc_overlap_sec={self.config.rvc_overlap_sec}s is too large "
+                    f"(>{max_overlap:.3f}s). Auto-adjusting to {max_overlap:.3f}s"
+                )
+                self.config.rvc_overlap_sec = max_overlap
 
         # Audio streams
         self.audio_input: Optional[AudioInput] = None
@@ -224,8 +261,15 @@ class RealtimeVoiceChanger:
         # Create chunking strategy (replaces mode-dependent buffer initialization)
         self._chunking_strategy = self._create_chunking_strategy()
 
-        # Store hop samples for output processing (strategy provides this)
+        # Sync effective chunk sizes from strategy (may be HuBERT-aligned)
+        self.mic_chunk_samples = self._chunking_strategy.chunk_samples
         self.mic_hop_samples = self._chunking_strategy.hop_samples
+        self.mic_context_samples = self._chunking_strategy.context_samples
+        self.mic_lookahead_samples = self._chunking_strategy.lookahead_samples
+        self.mic_total_chunk = self.mic_chunk_samples + self.mic_context_samples + self.mic_lookahead_samples
+
+        # Keep config.chunk_sec consistent with actual chunk size (after alignment)
+        self.config.chunk_sec = self.mic_chunk_samples / self.config.mic_sample_rate
 
         # Output processing parameters (at output sample rate)
         # Crossfade: blending region between main outputs
@@ -280,6 +324,10 @@ class RealtimeVoiceChanger:
         self._input_rms_ema: float = 0.0  # Exponential moving average of input RMS
         self._output_rms_ema: float = 0.0  # Exponential moving average of output RMS
         self._energy_ratio_ema: float = 1.0  # Smoothed input/output energy ratio
+        # Peak normalization state (tracks input/output peaks for consistent amplitude)
+        self._input_peak_ema: float = 0.0
+        # Chunk gain smoothing state (tracks output RMS target)
+        self._output_rms_target: float = 0.0
 
         # Callbacks
         self.on_stats_update: Optional[Callable[[RealtimeStats], None]] = None
@@ -369,6 +417,9 @@ class RealtimeVoiceChanger:
         self.mic_context_samples = self._chunking_strategy.context_samples
         self.mic_lookahead_samples = self._chunking_strategy.lookahead_samples
         self.mic_total_chunk = self.mic_chunk_samples + 2 * self.mic_context_samples
+
+        # Keep config.chunk_sec consistent with actual chunk size (after alignment)
+        self.config.chunk_sec = self.mic_chunk_samples / self.config.mic_sample_rate
 
         # Keep _sola_state for backward compatibility
         self._sola_state = getattr(self._crossfade_strategy, '_sola_state', None)
@@ -633,6 +684,7 @@ class RealtimeVoiceChanger:
 
                 # Calculate input RMS for energy tracking
                 input_rms = np.sqrt(np.mean(chunk**2))
+                input_peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
 
                 # Update input RMS EMA for energy normalization
                 if self.config.use_energy_normalization and input_rms > 1e-6:
@@ -641,6 +693,14 @@ class RealtimeVoiceChanger:
                         self._input_rms_ema = input_rms
                     else:
                         self._input_rms_ema = alpha * self._input_rms_ema + (1 - alpha) * input_rms
+
+                # Update input peak EMA for peak normalization
+                if self.config.use_peak_normalization and input_peak > 1e-6:
+                    alpha = self.config.peak_smoothing
+                    if self._input_peak_ema < 1e-6:
+                        self._input_peak_ema = input_peak
+                    else:
+                        self._input_peak_ema = alpha * self._input_peak_ema + (1 - alpha) * input_peak
 
                 # Debug: log input chunk stats
                 if self.stats.frames_processed < 3:
@@ -793,7 +853,7 @@ class RealtimeVoiceChanger:
                         if self.stats.frames_processed < 3:
                             logger.info(f"[HYBRID-BLOCK] Entering hybrid mode block")
                         context_samples_output = 0
-                        if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                        if self.config.context_sec > 0:
                             context_samples_output = int(
                                 self.config.output_sample_rate * self.config.context_sec
                             )
@@ -879,7 +939,7 @@ class RealtimeVoiceChanger:
 
                         # Calculate context size
                         context_samples_output = 0
-                        if self.stats.frames_processed > 0 and context_sec_to_use > 0:
+                        if context_sec_to_use > 0:
                             context_samples_output = int(
                                 self.config.output_sample_rate * context_sec_to_use
                             )
@@ -924,7 +984,7 @@ class RealtimeVoiceChanger:
                     # No SOLA: Manually trim context from output to get only the "main" portion
                     # This is critical for matching batch processing output length
                     # Skip trimming for first chunk (no left context)
-                    if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                    if self.config.chunking_mode != "rvc_webui" and self.config.context_sec > 0:
                         context_samples_output = int(
                             self.config.output_sample_rate * self.config.context_sec
                         )
@@ -955,11 +1015,7 @@ class RealtimeVoiceChanger:
 
                         # Scale output to maintain consistent input/output relationship
                         # Use smoothed ratio to reduce energy fluctuations between chunks
-                        scale = (
-                            self._energy_ratio_ema * (output_rms / self._input_rms_ema)
-                            if self._input_rms_ema > 1e-6
-                            else 1.0
-                        )
+                        scale = self._energy_ratio_ema
                         # Limit scaling range to avoid extreme amplification/attenuation
                         scale = np.clip(scale, 0.7, 1.4)
                         output = output * scale
@@ -970,6 +1026,29 @@ class RealtimeVoiceChanger:
                                 f"in_rms={self._input_rms_ema:.4f}, out_rms={output_rms:.4f}, "
                                 f"ratio={current_ratio:.3f}, ema_ratio={self._energy_ratio_ema:.3f}, scale={scale:.3f}"
                             )
+
+                # Apply peak normalization if enabled
+                if self.config.use_peak_normalization and self._input_peak_ema > 1e-6:
+                    output_peak = float(np.max(np.abs(output))) if len(output) else 0.0
+                    if output_peak > 1e-6:
+                        peak_scale = self._input_peak_ema / output_peak
+                        peak_scale = np.clip(peak_scale, 0.5, 1.5)
+                        output = output * peak_scale
+
+                # Smooth chunk gain to reduce loudness variation (RVC-style continuity)
+                if self.config.use_chunk_gain_smoothing:
+                    output_rms = np.sqrt(np.mean(output**2)) if len(output) else 0.0
+                    if output_rms > 1e-6:
+                        alpha = self.config.chunk_gain_smoothing
+                        if self._output_rms_target < 1e-6:
+                            self._output_rms_target = output_rms
+                        else:
+                            self._output_rms_target = (
+                                alpha * self._output_rms_target + (1 - alpha) * output_rms
+                            )
+                        gain = self._output_rms_target / output_rms
+                        gain = np.clip(gain, 0.9, 1.1)
+                        output = output * gain
 
                 # Debug: log output audio signature to detect feedback
                 if self.stats.frames_processed < 20:
@@ -1024,6 +1103,19 @@ class RealtimeVoiceChanger:
                         f"under={self.stats.buffer_underruns}, over={self.stats.buffer_overruns}"
                     )
 
+                # Performance monitoring: detect when inference is too slow
+                chunk_duration_ms = self.config.chunk_sec * 1000
+                if self.stats.inference_ms > chunk_duration_ms * 0.8:  # 80% threshold
+                    if self.stats.frames_processed % 50 == 0:  # Warn every 50 chunks to avoid spam
+                        logger.warning(
+                            f"[PERFORMANCE] Inference too slow: {self.stats.inference_ms:.0f}ms > {chunk_duration_ms:.0f}ms (chunk). "
+                            f"Suggestions: (1) Increase chunk_sec to {self.config.chunk_sec * 1.5:.2f}s, "
+                            f"(2) Reduce index_ratio to 0.5, "
+                            f"(3) Enable use_parallel_extraction=true, "
+                            f"(4) Switch f0_method to 'fcpe' or 'none'. "
+                            f"Current underruns: {self.stats.buffer_underruns}"
+                        )
+
                 # Calculate latency
                 self.stats.latency_ms = (
                     self.config.chunk_sec * 1000
@@ -1073,7 +1165,7 @@ class RealtimeVoiceChanger:
                 continue
             except Exception as e:
                 error_msg = str(e)
-                logger.error(f"Inference error: {error_msg}")
+                logger.error(f"Inference error: {error_msg}", exc_info=True)
 
                 # Provide helpful error message for common issues
                 if (
@@ -1632,7 +1724,7 @@ class RealtimeVoiceChanger:
                 # Hybrid mode: RVC-style hop + w-okada context structure
                 # Context is used for quality but trimmed from output to maintain length
                 context_samples_output = 0
-                if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+                if self.config.context_sec > 0:
                     context_samples_output = int(
                         self.config.output_sample_rate * self.config.context_sec
                     )
@@ -1704,7 +1796,7 @@ class RealtimeVoiceChanger:
                     context_sec_to_use = adaptive_params['context_sec']
 
                 context_samples_output = 0
-                if self.stats.frames_processed > 0 and context_sec_to_use > 0:
+                if context_sec_to_use > 0:
                     context_samples_output = int(
                         self.config.output_sample_rate * context_sec_to_use
                     )
@@ -1742,7 +1834,7 @@ class RealtimeVoiceChanger:
             # No SOLA: Manually trim context from output to get only the "main" portion
             # This is critical for matching batch processing output length
             # Skip trimming for first chunk (no left context)
-            if self.stats.frames_processed > 0 and self.config.context_sec > 0:
+            if self.config.chunking_mode != "rvc_webui" and self.config.context_sec > 0:
                 context_samples_output = int(
                     self.config.output_sample_rate * self.config.context_sec
                 )

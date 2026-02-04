@@ -95,6 +95,12 @@ class InferenceConfig:
     # Uses RVC-style correlation-based phase alignment
     use_sola: bool = True
 
+    # --- Chunk gain smoothing ---
+    # Reduce chunk-to-chunk loudness variation with a slow RMS target
+    use_chunk_gain_smoothing: bool = False
+    # Smoothing factor for RMS target (0.0-1.0, higher = smoother)
+    chunk_gain_smoothing: float = 0.95
+
     # Chunking mode: "wokada" (context-based, default) or "rvc_webui" (overlap-based, perfect continuity)
     chunking_mode: str = "wokada"
 

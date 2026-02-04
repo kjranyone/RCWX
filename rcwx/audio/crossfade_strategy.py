@@ -182,6 +182,7 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             config: Crossfade configuration
         """
         super().__init__(config)
+        # w-okada mode: use crossfade_samples for SOLA buffer/search
         self._sola_state = SOLAState.create(
             config.crossfade_samples,
             config.output_sample_rate,
@@ -239,6 +240,7 @@ class SOLAWokadaCrossfade(BaseCrossfadeStrategy):
             self._config.crossfade_samples,
             self._config.output_sample_rate,
         )
+        self._sola_state.fade_out_window = 1.0 - self._sola_state.fade_in_window
         self._chunks_processed = 0
 
 
@@ -285,6 +287,12 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         Returns:
             CrossfadeResult with SOLA applied and trimmed to hop length
         """
+        # Ensure fixed-length chunk before SOLA (RVC WebUI expects constant chunk size)
+        chunk_samples = int(self._config.output_sample_rate * self._config.chunk_sec)
+        if len(output) < chunk_samples:
+            pad_len = chunk_samples - len(output)
+            output = np.pad(output, (0, pad_len), mode="edge")
+
         # Apply SOLA crossfade
         result = apply_sola_crossfade(
             output,

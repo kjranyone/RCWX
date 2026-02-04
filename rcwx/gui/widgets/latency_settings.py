@@ -1,72 +1,17 @@
-"""Latency settings widget with mode selection and advanced controls."""
+"""Latency settings widget with advanced controls."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Callable, Optional
 
 import customtkinter as ctk
 
 
-@dataclass
-class LatencyPreset:
-    """Preset for latency configuration."""
-
-    name: str
-    description: str
-    chunk_sec: float
-    prebuffer_chunks: int
-    buffer_margin: float
-    context_sec: float
-    lookahead_sec: float
-    crossfade_sec: float
-    use_sola: bool
-    chunking_mode: str = "wokada"  # "wokada" or "rvc_webui"
-
-
-# Predefined latency presets
-LATENCY_PRESETS = {
-    "low": LatencyPreset(
-        name="低遅延",
-        description="~400ms (音切れリスクあり)",
-        chunk_sec=0.2,
-        prebuffer_chunks=0,
-        buffer_margin=0.5,
-        context_sec=0.03,
-        lookahead_sec=0.0,
-        crossfade_sec=0.03,
-        use_sola=True,
-    ),
-    "balanced": LatencyPreset(
-        name="バランス",
-        description="~500ms (推奨)",
-        chunk_sec=0.35,
-        prebuffer_chunks=1,
-        buffer_margin=0.5,
-        context_sec=0.10,  # Larger context improves quality (+2%)
-        lookahead_sec=0.0,
-        crossfade_sec=0.05,
-        use_sola=True,
-    ),
-    "quality": LatencyPreset(
-        name="高品質",
-        description="~700ms (安定重視)",
-        chunk_sec=0.5,
-        prebuffer_chunks=2,
-        buffer_margin=1.0,
-        context_sec=0.15,  # Maximum context for best quality
-        lookahead_sec=0.05,
-        crossfade_sec=0.08,
-        use_sola=True,
-    ),
-}
-
-
 class LatencySettingsFrame(ctk.CTkFrame):
     """
-    Latency settings widget with mode selection and advanced controls.
+    Latency settings widget with chunking mode and parameter controls.
 
-    Provides both simple preset selection and detailed parameter adjustment.
+    Provides direct access to all latency-related parameters.
     """
 
     def __init__(
@@ -79,17 +24,15 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         self.on_settings_changed = on_settings_changed
 
-        # Current settings (start with balanced)
-        self._current_preset = "balanced"
-        preset = LATENCY_PRESETS["balanced"]
-        self.chunk_sec = preset.chunk_sec
-        self.prebuffer_chunks = preset.prebuffer_chunks
-        self.buffer_margin = preset.buffer_margin
-        self.context_sec = preset.context_sec
-        self.lookahead_sec = preset.lookahead_sec
-        self.crossfade_sec = preset.crossfade_sec
-        self.use_sola = preset.use_sola
-        self.chunking_mode = preset.chunking_mode
+        # Default settings
+        self.chunk_sec = 0.25
+        self.prebuffer_chunks = 1
+        self.buffer_margin = 1.0
+        self.context_sec = 0.10
+        self.lookahead_sec = 0.0
+        self.crossfade_sec = 0.05
+        self.use_sola = True
+        self.chunking_mode = "wokada"
 
         self._setup_ui()
 
@@ -131,41 +74,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
             row=3, column=0, columnspan=2, padx=10, pady=(2, 5), sticky="ew"
         )
 
-        # Preset selection (radio buttons)
-        preset_label = ctk.CTkLabel(
-            self,
-            text="プリセット",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        )
-        preset_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
-
-        self.mode_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.mode_frame.grid(row=5, column=0, columnspan=2, padx=10, pady=2, sticky="ew")
-
-        self.mode_var = ctk.StringVar(value="balanced")
-
-        for i, (key, preset) in enumerate(LATENCY_PRESETS.items()):
-            rb = ctk.CTkRadioButton(
-                self.mode_frame,
-                text=f"{preset.name} {preset.description}",
-                variable=self.mode_var,
-                value=key,
-                command=self._on_mode_change,
-            )
-            rb.grid(row=i, column=0, padx=5, pady=2, sticky="w")
-
-        # Advanced settings toggle
-        self.advanced_var = ctk.BooleanVar(value=False)
-        self.advanced_toggle = ctk.CTkCheckBox(
-            self,
-            text="詳細設定を表示",
-            variable=self.advanced_var,
-            command=self._toggle_advanced,
-        )
-        self.advanced_toggle.grid(row=6, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="w")
-
-        # Advanced settings frame (hidden by default)
+        # Advanced settings frame (always visible)
         self.advanced_frame = ctk.CTkFrame(self)
+        self.advanced_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="ew")
         self._setup_advanced_controls()
 
         # Configure grid
@@ -296,56 +207,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
         frame.grid_columnconfigure(0, weight=1)
         self._update_estimate()
 
-    def _toggle_advanced(self) -> None:
-        """Toggle advanced settings visibility."""
-        if self.advanced_var.get():
-            self.advanced_frame.grid(
-                row=6, column=0, columnspan=2, padx=10, pady=(0, 3), sticky="ew"
-            )
-        else:
-            self.advanced_frame.grid_forget()
-
     def _on_chunking_mode_change(self, value: str) -> None:
         """Handle chunking mode change."""
         self.chunking_mode = value
-        self._notify_change()
-
-    def _on_mode_change(self) -> None:
-        """Handle mode selection change."""
-        mode = self.mode_var.get()
-        self._current_preset = mode
-        preset = LATENCY_PRESETS[mode]
-
-        # Update values
-        self.chunk_sec = preset.chunk_sec
-        self.prebuffer_chunks = preset.prebuffer_chunks
-        self.buffer_margin = preset.buffer_margin
-        self.context_sec = preset.context_sec
-        self.lookahead_sec = preset.lookahead_sec
-        self.crossfade_sec = preset.crossfade_sec
-        self.use_sola = preset.use_sola
-        self.chunking_mode = preset.chunking_mode
-
-        # Update chunking mode UI
-        self.chunking_mode_var.set(self.chunking_mode)
-
-        # Update sliders if advanced is visible
-        if self.advanced_var.get():
-            self.chunk_slider.set(self.chunk_sec * 1000)
-            self.chunk_value.configure(text=f"{int(self.chunk_sec * 1000)}ms")
-            self.prebuf_slider.set(self.prebuffer_chunks)
-            self.prebuf_value.configure(text=f"{self.prebuffer_chunks}チャンク")
-            self.margin_slider.set(self.buffer_margin)
-            self.margin_value.configure(text=f"{self.buffer_margin:.1f}x")
-            self.context_slider.set(self.context_sec * 1000)
-            self.context_value.configure(text=f"{int(self.context_sec * 1000)}ms")
-            self.crossfade_slider.set(self.crossfade_sec * 1000)
-            self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
-            self.lookahead_slider.set(self.lookahead_sec * 1000)
-            self.lookahead_value.configure(text=f"{int(self.lookahead_sec * 1000)}ms")
-            self.sola_var.set(self.use_sola)
-            self._update_estimate()
-
         self._notify_change()
 
     def _on_chunk_change(self, value: float) -> None:
@@ -421,12 +285,6 @@ class LatencySettingsFrame(ctk.CTkFrame):
             "use_sola": self.use_sola,
             "chunking_mode": self.chunking_mode,
         }
-
-    def set_preset(self, preset_name: str) -> None:
-        """Set a preset by name."""
-        if preset_name in LATENCY_PRESETS:
-            self.mode_var.set(preset_name)
-            self._on_mode_change()
 
     def set_values(
         self,

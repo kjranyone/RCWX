@@ -92,16 +92,29 @@ class FCPE:
         if audio.dim() == 2:
             audio = audio.unsqueeze(-1)  # [B, T] -> [B, T, 1]
 
+        # Stabilize input range for FCPE mel extractor
+        # Large input gain can drive mel features out of expected range and cause errors.
+        with torch.no_grad():
+            peak = torch.max(torch.abs(audio))
+            if peak > 1.0:
+                audio = audio * (0.97 / peak)
+            else:
+                audio = torch.clamp(audio, -1.0, 1.0)
+
         # Run inference
         # decoder_mode options: 'local_argmax', 'global_argmax'
-        f0 = self.model.infer(
-            audio,
-            sr=self.sample_rate,
-            decoder_mode='local_argmax',
-            threshold=threshold,
-            f0_min=f0_min,
-            f0_max=f0_max,
-        )
+        try:
+            f0 = self.model.infer(
+                audio,
+                sr=self.sample_rate,
+                decoder_mode='local_argmax',
+                threshold=threshold,
+                f0_min=f0_min,
+                f0_max=f0_max,
+            )
+        except Exception as e:
+            logger.warning(f"FCPE inference failed: {e}")
+            return torch.zeros(audio.shape[0], audio.shape[1] // self.hop_length, device=audio.device, dtype=self.dtype)
 
         # f0 shape: [B, T_frames, 1] -> [B, T_frames]
         if f0.dim() == 3:

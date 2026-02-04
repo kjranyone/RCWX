@@ -116,8 +116,10 @@ class RVCPipeline:
         self.sample_rate: int = 40000
         self._loaded: bool = False
 
-        # w-okada style: No feature caching
-        # Features are recomputed each time from audio buffer for consistency
+        # Feature cache for chunk continuity (HuBERT/F0 boundary blending)
+        self._feature_cache: Optional[torch.Tensor] = None  # [1, T_cache, C]
+        self._f0_cache: Optional[torch.Tensor] = None  # [1, T_cache]
+        self._f0_voiced_cache: Optional[torch.Tensor] = None  # [1, T_cache] bool
 
     def load(self) -> None:
         """Load all models."""
@@ -311,8 +313,9 @@ class RVCPipeline:
 
         Call this when starting a new audio stream or after a long pause.
         """
-        # w-okada style: No feature cache to clear
-        pass
+        self._feature_cache = None
+        self._f0_cache = None
+        self._f0_voiced_cache = None
 
     @torch.no_grad()
     def infer(
@@ -523,8 +526,24 @@ class RVCPipeline:
                 f"Index retrieval applied: index_rate={index_rate}, features_after={features.shape} mean={features.mean():.4f} std={features.std():.4f}"
             )
 
-        # w-okada style: No feature cache blending
-        # Features are computed fresh each time for consistency
+        # Feature cache blending for chunk continuity (50fps HuBERT features)
+        if use_feature_cache and self._feature_cache is not None:
+            cache_len = 10  # 10 frames @ 50fps = 200ms
+            blend_len = min(cache_len, self._feature_cache.shape[1], features.shape[1])
+            if blend_len > 0:
+                prev_tail = self._feature_cache[:, -blend_len:, :]
+                alpha = torch.linspace(
+                    1.0, 0.0, steps=blend_len, device=features.device, dtype=features.dtype
+                ).view(1, -1, 1)
+                features[:, :blend_len, :] = (
+                    prev_tail * alpha + features[:, :blend_len, :] * (1.0 - alpha)
+                )
+
+        # Update HuBERT feature cache (store tail for next chunk)
+        if use_feature_cache:
+            cache_len = 10
+            if features.shape[1] > 0:
+                self._feature_cache = features[:, -cache_len:, :].detach()
 
         # Interpolate features to match synthesizer expectation
         # RVC uses bilinear (linear) interpolation for 2x upscale
@@ -567,6 +586,17 @@ class RVCPipeline:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
 
             if f0 is not None and f0.numel() > 0:  # Check for non-empty F0
+                # FCPE smoothing for stability (reduce frame-to-frame jitter)
+                if f0_method == "fcpe":
+                    # Light smoothing to reduce jitter without adding artifacts
+                    f0_smooth = torch.nn.functional.avg_pool1d(
+                        f0.unsqueeze(1),
+                        kernel_size=5,
+                        stride=1,
+                        padding=2,
+                    ).squeeze(1)
+                    f0 = torch.where(f0 > 0, f0_smooth, f0)
+
                 # Apply pitch shift (only to voiced regions where f0 > 0)
                 if pitch_shift != 0:
                     f0 = torch.where(f0 > 0, f0 * (2 ** (pitch_shift / 12)), f0)
@@ -582,8 +612,25 @@ class RVCPipeline:
                         align_corners=False,
                     ).squeeze(1)
 
-                # w-okada style: No F0 cache blending
-                # F0 is computed fresh each time for consistency
+                # F0 cache blending for chunk continuity (100fps F0)
+                if use_feature_cache and self._f0_cache is not None:
+                    cache_len = 20  # 20 frames @ 100fps = 200ms
+                    blend_len = min(cache_len, self._f0_cache.shape[1], f0.shape[1])
+                    if blend_len > 0:
+                        prev_tail = self._f0_cache[:, -blend_len:]
+                        prev_voiced = (
+                            self._f0_voiced_cache[:, -blend_len:]
+                            if self._f0_voiced_cache is not None
+                            else prev_tail > 0
+                        )
+                        cur_head = f0[:, :blend_len]
+                        cur_voiced = cur_head > 0
+                        blend_mask = prev_voiced & cur_voiced
+                        alpha = torch.linspace(
+                            1.0, 0.0, steps=blend_len, device=f0.device, dtype=f0.dtype
+                        ).view(1, -1)
+                        blended = prev_tail * alpha + cur_head * (1.0 - alpha)
+                        f0[:, :blend_len] = torch.where(blend_mask, blended, cur_head)
 
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
@@ -617,6 +664,12 @@ class RVCPipeline:
 
                 # Store voiced mask for gating (will be used after synthesis)
                 voiced_mask_for_gate = voiced_mask.float()  # [B, T]
+
+                # Update F0 cache (store tail for next chunk)
+                if use_feature_cache:
+                    cache_len = 20
+                    self._f0_cache = f0[:, -cache_len:].detach()
+                    self._f0_voiced_cache = (f0 > 0)[:, -cache_len:].detach()
             elif f0 is not None and f0.numel() == 0:
                 # F0 extraction returned empty array (input too short)
                 logger.warning(
