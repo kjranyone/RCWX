@@ -150,6 +150,14 @@ def test_feature_cache(model_path: Optional[str] = None):
     from rcwx.config import RCWXConfig
     from rcwx.pipeline.inference import RVCPipeline
 
+    # Check FCPE availability
+    try:
+        import torchfcpe
+        f0_method = "fcpe"
+    except ImportError:
+        f0_method = "rmvpe"
+        logger.info("FCPE not available, using RMVPE (requires larger chunks)")
+
     logger.info("=" * 60)
     logger.info("TEST: Feature Cache Effect")
     logger.info("=" * 60)
@@ -168,8 +176,8 @@ def test_feature_cache(model_path: Optional[str] = None):
     t = np.linspace(0, duration, int(sr * duration), dtype=np.float32)
     test_audio = 0.5 * np.sin(2 * np.pi * 440 * t)
 
-    # チャンクサイズ別テスト
-    chunk_secs = [0.10, 0.15, 0.20, 0.35]
+    # チャンクサイズ別テスト (RMVPEは0.32s以上必要)
+    chunk_secs = [0.35, 0.40, 0.50]
     results = {}
 
     for chunk_sec in chunk_secs:
@@ -188,7 +196,7 @@ def test_feature_cache(model_path: Optional[str] = None):
                 chunk,
                 input_sr=sr,
                 pitch_shift=0,
-                f0_method="fcpe",
+                f0_method=f0_method,
                 use_feature_cache=True,
                 allow_short_input=True,
             )
@@ -210,7 +218,7 @@ def test_feature_cache(model_path: Optional[str] = None):
                 chunk,
                 input_sr=sr,
                 pitch_shift=0,
-                f0_method="fcpe",
+                f0_method=f0_method,
                 use_feature_cache=False,
                 allow_short_input=True,
             )
