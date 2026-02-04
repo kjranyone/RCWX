@@ -264,11 +264,79 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 
 ## Tests
 
-### チャンク処理統合テスト
+リアルタイム音声変換の品質を検証するためのテストフレームワーク。
+
+### クイックスタート
 
 ```powershell
-uv run python tests/test_realtime_chunk_processing.py
+# 全診断テスト（モデル不要）
+uv run python tests/test_diagnostic.py
+
+# ストリーミング品質テスト（モデル必要）
+uv run python tests/test_realtime_analysis.py --test-file sample_data/seki.wav
 ```
+
+### テスト一覧
+
+| テスト | 用途 | モデル |
+|--------|------|--------|
+| `test_diagnostic.py` | コンポーネント別診断 | 不要 |
+| `test_realtime_analysis.py` | バッチ vs ストリーミング比較 | 必要 |
+| `test_step_by_step.py` | 中間結果の詳細解析 | 必要 |
+
+### test_diagnostic.py
+
+各処理コンポーネントを個別にテスト。
+
+```powershell
+uv run python tests/test_diagnostic.py --component all
+uv run python tests/test_diagnostic.py --component sola      # SOLA単体
+uv run python tests/test_diagnostic.py --component resampler # リサンプラ単体
+```
+
+**テスト項目**:
+- `resampler`: StatefulResampler vs バッチ（相関 > 0.99）
+- `sola`: クロスフェード品質（不連続性 = 0）
+- `chunk_boundary`: ChunkBufferのコンテキスト重複
+- `latency`: サンプル数の累積誤差（< 10ms）
+- `feature_cache`: キャッシュあり/なしの比較
+
+### test_realtime_analysis.py
+
+ストリーミング処理をバッチ処理（ゴールドスタンダード）と比較。
+
+```powershell
+uv run python tests/test_realtime_analysis.py --visualize
+uv run python tests/test_realtime_analysis.py --chunking-mode rvc_webui
+uv run python tests/test_realtime_analysis.py --chunk-sec 0.20 --f0-method fcpe
+```
+
+**評価メトリクス**:
+- `correlation_vs_batch`: バッチ出力との相関
+- `discontinuities`: 不連続性（>0.2のジャンプ）の数
+- `inference_ms`: チャンクごとの推論時間
+
+**出力**: `test_output/analysis/` に wav と analysis.json を保存。
+
+### test_step_by_step.py
+
+各処理ステップの中間結果を保存。
+
+```powershell
+uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
+```
+
+**保存される中間ファイル** (`test_output/step_by_step/chunk_XXX/`):
+- `0_input.wav` → `1_resample_16k.wav` → `2_infer.wav` → `3_resample_output.wav` → `4_sola.wav`
+
+### 品質基準
+
+| 指標 | 合格基準 |
+|------|----------|
+| SOLA不連続性 | 0 件 |
+| 境界ジャンプ (>0.1) | 0 件 |
+| Resampler相関 | > 0.99 |
+| 累積時間誤差 | < 10ms |
 
 ## References
 
