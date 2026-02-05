@@ -237,6 +237,8 @@ class RVCPipeline:
         # This allows F0/HuBERT to see continuous audio across boundaries
         self._audio_cache: Optional[np.ndarray] = None  # [T_audio] at 16kHz
         self._audio_cache_len: int = 3200  # 200ms at 16kHz (covers F0/HuBERT receptive fields)
+        # Streaming history buffer for HuBERT context
+        self._stream_history: Optional[np.ndarray] = None  # [T_audio] at 16kHz
 
         # Phase 8: Output overlap cache for smooth chunk boundaries
         # Store the tail of synthesizer output for crossfade with next chunk
@@ -441,6 +443,7 @@ class RVCPipeline:
         self._f0_voiced_cache = None
         self._audio_cache = None
         self._output_cache = None
+        self._stream_history = None
 
     @torch.no_grad()
     def infer(
@@ -458,6 +461,9 @@ class RVCPipeline:
         use_feature_cache: bool = True,
         use_parallel_extraction: bool = True,
         allow_short_input: bool = False,
+        pad_mode: str = "chunk",
+        synth_min_frames: int | None = MIN_SYNTH_FEATURE_FRAMES,
+        history_sec: float = 0.0,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -479,6 +485,13 @@ class RVCPipeline:
             noise_reference: Optional noise sample for denoiser (auto-learns if None)
             use_feature_cache: Enable feature caching for chunk continuity (default True)
             use_parallel_extraction: Enable parallel HuBERT+F0 extraction (~10-15% speedup)
+            pad_mode: Audio padding mode:
+                - "chunk": per-chunk padding (default, legacy behavior)
+                - "batch": batch-style padding (reflection at stream boundaries)
+                - "none": no audio-level padding (use for chunked streaming)
+            synth_min_frames: Minimum feature frames for synthesizer decoder.
+                Set to 0 or None to disable short-input padding (test-only).
+            history_sec: Prepend this many seconds of past audio for HuBERT context.
 
         Returns:
             Converted audio at model sample rate (usually 40kHz)
@@ -519,6 +532,23 @@ class RVCPipeline:
             audio = torch.from_numpy(audio_np).float()
             logger.debug("Applied noise reduction")
 
+        # Keep a copy of current chunk for history/output length tracking
+        chunk_audio_np = audio_np
+        chunk_length = len(chunk_audio_np)
+
+        # Optional: prepend past audio for HuBERT context
+        history_samples = int(max(0.0, history_sec) * 16000)
+        history_len_used = 0
+        if history_samples > 0:
+            if self._stream_history is None:
+                self._stream_history = np.zeros(0, dtype=chunk_audio_np.dtype)
+            if len(self._stream_history) > 0:
+                history_len_used = min(len(self._stream_history), history_samples)
+                history_slice = self._stream_history[-history_len_used:]
+                audio_np = np.concatenate([history_slice, chunk_audio_np])
+            # Update history buffer with current chunk
+            self._stream_history = np.concatenate([self._stream_history, chunk_audio_np])[-history_samples:]
+
         # Apply high-pass filter to remove DC offset and low-frequency noise
         # Original RVC uses 48Hz cutoff Butterworth filter
         audio_np = highpass_filter(audio_np, sr=16000, cutoff=48)
@@ -527,31 +557,38 @@ class RVCPipeline:
         # Base padding: 50ms (800 samples @ 16kHz)
         # For short inputs, increase padding to ensure we get MIN_SYNTH_FEATURE_FRAMES
         # without needing feature-level padding (which causes length mismatch issues)
-        original_length = len(audio_np)
+        input_length = len(audio_np)
         hubert_hop = 320
         f0_hop = 160  # F0 models use 160 sample hop (100fps at 16kHz)
 
         # Phase 5: Audio-level overlap for F0/HuBERT extraction continuity
-        # DISABLED: This feature caused audio doubling issues because the overlap
-        # portion's output wasn't being properly discarded. The feature-level
-        # caching (Phase 1-2) provides sufficient continuity without this.
-        # TODO: Re-enable after fixing output trimming to discard overlap portion
+        # Re-enabled: prepend cached audio and discard overlap frames from features/F0.
         audio_overlap_samples = 0
         hubert_overlap_frames = 0
         f0_overlap_frames = 0
-        # if use_feature_cache and self._audio_cache is not None:
-        #     # Prepend cached audio
-        #     audio_overlap_samples = len(self._audio_cache)
-        #     audio_np = np.concatenate([self._audio_cache, audio_np])
-        #     logger.debug(
-        #         f"Audio overlap: prepended {audio_overlap_samples} samples ({audio_overlap_samples/16:.1f}ms)"
-        #     )
+        raw_audio_np = chunk_audio_np
+        if history_samples <= 0 and use_feature_cache and self._audio_cache is not None and len(self._audio_cache) > 0:
+            audio_overlap_samples = len(self._audio_cache)
+            audio_np = np.concatenate([self._audio_cache, audio_np])
+            hubert_overlap_frames = audio_overlap_samples // hubert_hop
+            f0_overlap_frames = audio_overlap_samples // f0_hop
+            logger.debug(
+                f"Audio overlap: prepended {audio_overlap_samples} samples "
+                f"({audio_overlap_samples/16:.1f}ms), "
+                f"hubert_overlap_frames={hubert_overlap_frames}, "
+                f"f0_overlap_frames={f0_overlap_frames}"
+            )
 
         # Update audio cache with tail of current chunk (for future use)
         # Currently disabled but keeping cache updated for potential re-enabling
         if use_feature_cache:
-            cache_len = min(self._audio_cache_len, original_length)
-            self._audio_cache = audio_np[-cache_len:].copy()
+            cache_len = min(self._audio_cache_len, chunk_length)
+            self._audio_cache = raw_audio_np[-cache_len:].copy()
+
+        pad_mode = pad_mode.lower()
+        valid_pad_modes = {"chunk", "batch", "none"}
+        if pad_mode not in valid_pad_modes:
+            raise ValueError(f"Invalid pad_mode: {pad_mode} (valid: {sorted(valid_pad_modes)})")
 
         # Base padding: 50ms (800 samples) for batch processing
         # Chunk processing uses reduced padding (1 HuBERT hop) below
@@ -560,7 +597,9 @@ class RVCPipeline:
         # For chunk processing, use minimal padding to avoid excessive padding artifacts
         # Optimal: 1 HuBERT hop (320 samples = 20ms) for batch/chunk consistency
         # This reduces padding accumulation at chunk boundaries while maintaining edge quality
-        if allow_short_input:
+        if pad_mode == "none":
+            t_pad = 0
+        elif pad_mode == "chunk" and allow_short_input:
             t_pad = hubert_hop  # 320 samples (20ms @ 16kHz, 1 HuBERT hop) - optimal
         else:
             # Calculate minimum input samples needed for MIN_SYNTH_FEATURE_FRAMES features
@@ -571,7 +610,7 @@ class RVCPipeline:
             min_input_samples = (min_hubert_frames + 2) * hubert_hop  # 10880 samples (with buffer)
 
             # Check if we need extra padding to meet minimum
-            total_with_base = base_pad + original_length + base_pad
+            total_with_base = base_pad + input_length + base_pad
             if total_with_base < min_input_samples:
                 # Need more padding - distribute evenly
                 extra_needed = min_input_samples - total_with_base
@@ -585,17 +624,23 @@ class RVCPipeline:
 
         t_pad_tgt = int(t_pad * self.sample_rate / 16000)  # Output padding samples (proportional)
 
-        # Pad to multiple of HuBERT hop size (320) to avoid frame truncation
-        padded_for_hubert = t_pad + original_length + t_pad
-        remainder = padded_for_hubert % hubert_hop
-        if remainder != 0:
-            extra_pad = hubert_hop - remainder
-        else:
+        if pad_mode == "none":
             extra_pad = 0
+        else:
+            # Pad to multiple of HuBERT hop size (320) to avoid frame truncation
+            padded_for_hubert = t_pad + input_length + t_pad
+            remainder = padded_for_hubert % hubert_hop
+            if remainder != 0:
+                extra_pad = hubert_hop - remainder
+            else:
+                extra_pad = 0
 
-        audio_np = np.pad(audio_np, (t_pad, t_pad + extra_pad), mode="reflect")
+        if t_pad > 0 or extra_pad > 0:
+            audio_np = np.pad(audio_np, (t_pad, t_pad + extra_pad), mode="reflect")
         logger.info(
-            f"Padding: original={original_length}, t_pad={t_pad}, extra_pad={extra_pad}, final={len(audio_np)}"
+            f"Padding: chunk={chunk_length}, input={input_length}, "
+            f"t_pad={t_pad}, extra_pad={extra_pad}, "
+            f"final={len(audio_np)} (mode={pad_mode})"
         )
 
         audio = torch.from_numpy(audio_np).float()
@@ -608,7 +653,7 @@ class RVCPipeline:
 
         # Debug: input audio stats
         logger.info(
-            f"Input audio: shape={audio.shape} (padded from {original_length}), min={audio.min():.4f}, max={audio.max():.4f}"
+            f"Input audio: shape={audio.shape} (chunk={chunk_length}, input={input_length}), min={audio.min():.4f}, max={audio.max():.4f}"
         )
 
         # Determine output dimension and layer based on model version
@@ -931,8 +976,11 @@ class RVCPipeline:
         # Pad features if too short for synthesizer decoder
         # The decoder's upsampling convolutions require minimum input length
         synth_pad_frames = 0
-        if features.shape[1] < MIN_SYNTH_FEATURE_FRAMES:
-            synth_pad_frames = MIN_SYNTH_FEATURE_FRAMES - features.shape[1]
+        min_synth_frames = (
+            MIN_SYNTH_FEATURE_FRAMES if synth_min_frames is None else synth_min_frames
+        )
+        if min_synth_frames > 0 and features.shape[1] < min_synth_frames:
+            synth_pad_frames = min_synth_frames - features.shape[1]
             pad_left = synth_pad_frames // 2
             pad_right = synth_pad_frames - pad_left
 
@@ -963,7 +1011,7 @@ class RVCPipeline:
             if pitchf is not None:
                 pitchf = torch.nn.functional.pad(pitchf, (pad_left, pad_right), mode=pad_mode)
             logger.info(
-                f"Padded short input: {features.shape[1] - synth_pad_frames} -> {features.shape[1]} frames (min={MIN_SYNTH_FEATURE_FRAMES})"
+                f"Padded short input: {features.shape[1] - synth_pad_frames} -> {features.shape[1]} frames (min={min_synth_frames})"
             )
 
         # Run synthesizer
@@ -1103,12 +1151,20 @@ class RVCPipeline:
                 f"Trimmed {trim_start} from start, {trim_end} from end (pre-trim tail rms={pre_trim_tail_rms:.4f})"
             )
 
+        if history_len_used > 0:
+            history_output_samples = int(history_len_used * self.sample_rate / 16000)
+            if len(output) > history_output_samples:
+                output = output[history_output_samples:]
+                logger.info(
+                    f"Trimmed history from start: {history_output_samples} samples (history_sec={history_sec:.3f})"
+                )
+
         # Note: HuBERT frame quantization causes output to be slightly shorter than ideally expected.
         # We intentionally do NOT pad/extend to match expected length, as artificial waveform
         # repetition creates artifacts at chunk boundaries. Instead:
         # - Accept the actual output length (crossfade handles variable-length chunks)
         # - Only trim if output is too long (rare edge case)
-        expected_output_samples = int(original_length * self.sample_rate / 16000)
+        expected_output_samples = int(chunk_length * self.sample_rate / 16000)
         length_diff = len(output) - expected_output_samples
         logger.info(
             f"Length check: got {len(output)}, expected {expected_output_samples}, diff={length_diff}"
@@ -1118,21 +1174,21 @@ class RVCPipeline:
             # Output too long - trim from end
             output = output[:expected_output_samples]
             logger.debug(f"Trimmed {length_diff} extra samples from end")
-        elif length_diff < 0 and abs(length_diff) > 100 and allow_short_input:
-            # Output too short (chunk processing) - pad zeros to expected length
-            # This prevents cumulative drift across chunks while avoiding resampling artifacts.
-            output = np.pad(output, (0, -length_diff))
-            logger.debug(
-                f"Padded output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
-            )
-        elif length_diff < 0 and abs(length_diff) > 100 and not allow_short_input:
-            # Output too short - resample to stretch to expected length
-            # ONLY for batch processing (allow_short_input=False)
-            # For chunk processing, accept the actual length to avoid phase discontinuities
-            output = resample(output, len(output), expected_output_samples)
-            logger.debug(
-                f"Resampled output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
-            )
+        elif length_diff < 0 and abs(length_diff) > 100:
+            if allow_short_input and pad_mode == "chunk":
+                # Output too short (chunk processing) - pad zeros to expected length
+                # This prevents cumulative drift across chunks while avoiding resampling artifacts.
+                output = np.pad(output, (0, -length_diff))
+                logger.debug(
+                    f"Padded output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
+                )
+            else:
+                # Output too short - resample to stretch to expected length
+                # Used for batch, and for streaming with pad_mode="none" to avoid zero-padding artifacts.
+                output = resample(output, len(output), expected_output_samples)
+                logger.debug(
+                    f"Resampled output from {expected_output_samples + length_diff} to {expected_output_samples} samples"
+                )
 
         logger.info(
             f"Final output: shape={output.shape}, min={output.min():.4f}, max={output.max():.4f}"

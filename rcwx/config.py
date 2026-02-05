@@ -22,8 +22,8 @@ class AudioConfig:
     output_hostapi_filter: str = "WASAPI"  # Host API filter for output devices
     sample_rate: int = 16000
     output_sample_rate: int = 48000
-    chunk_sec: float = 0.16  # 160ms (20ms boundary for HuBERT frame alignment, RMVPE needs >= 0.32s)
-    crossfade_sec: float = 0.05
+    chunk_sec: float = 0.5  # 500ms (RVC WebUI overlap default)
+    crossfade_sec: float = 0.22
     input_gain_db: float = 0.0  # Input gain in dB
     # Input channel selection for stereo devices: "left", "right", "average"
     input_channel_selection: str = "average"
@@ -72,6 +72,8 @@ class InferenceConfig:
     energy_threshold: float = 0.05
     # Feature caching for chunk continuity (blends HuBERT/F0 at boundaries)
     use_feature_cache: bool = True
+    # Realtime engine selection: "v1" (legacy) or "v2" (reimplemented)
+    realtime_engine: str = "v2"
 
     # --- Low-latency processing ---
     # Context: extra audio on left side for stable edge processing
@@ -86,10 +88,10 @@ class InferenceConfig:
     extra_sec: float = 0.0
 
     # Chunking mode: "wokada" (context-based), "rvc_webui" (overlap-based), "hybrid" (RVC hop + w-okada context)
-    chunking_mode: str = "wokada"
+    chunking_mode: str = "rvc_webui"
 
     # Crossfade length for SOLA blending (50ms is sufficient)
-    crossfade_sec: float = 0.05
+    crossfade_sec: float = 0.22
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
     # Uses RVC-style correlation-based phase alignment
@@ -102,7 +104,7 @@ class InferenceConfig:
     chunk_gain_smoothing: float = 0.95
 
     # Chunking mode: "wokada" (context-based, default) or "rvc_webui" (overlap-based, perfect continuity)
-    chunking_mode: str = "wokada"
+    chunking_mode: str = "rvc_webui"
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 

@@ -8,10 +8,15 @@ from scipy.io import wavfile
 from pathlib import Path
 
 
-def find_sustained_region(audio: np.ndarray, sr: int, min_duration: float = 2.0) -> tuple[int, int]:
+def find_sustained_region(
+    audio: np.ndarray,
+    sr: int,
+    min_duration: float = 3.0,
+    base_threshold: float = 0.02,
+    min_threshold: float = 0.005,
+) -> tuple[int, int, float]:
     """Find a region with sustained energy (no silence)."""
     window = int(sr * 0.02)  # 20ms
-    threshold = 0.02
 
     # Calculate energy
     energies = []
@@ -20,6 +25,13 @@ def find_sustained_region(audio: np.ndarray, sr: int, min_duration: float = 2.0)
         energies.append(energy)
 
     energies = np.array(energies)
+    if energies.size == 0:
+        return 0, 0, 0.0
+
+    # Dynamic threshold: use a fraction of loud regions, but never below min_threshold
+    top_n = max(1, int(0.1 * len(energies)))
+    loud_ref = np.median(np.sort(energies)[-top_n:])
+    threshold = max(min_threshold, min(base_threshold, loud_ref * 0.6))
 
     # Find longest continuous region above threshold
     above = energies > threshold
@@ -46,12 +58,13 @@ def find_sustained_region(audio: np.ndarray, sr: int, min_duration: float = 2.0)
     start_sample = best_start * window
     end_sample = (best_start + best_len) * window
 
-    return start_sample, end_sample
+    return start_sample, end_sample, float(threshold)
 
 
 def main():
     input_path = Path("sample_data/kakita.wav")
     output_path = Path("sample_data/sustained_voice.wav")
+    target_sec = 10.0
 
     sr, audio = wavfile.read(input_path)
     if audio.dtype == np.int16:
@@ -63,21 +76,24 @@ def main():
     print(f"  Duration: {len(audio) / sr:.2f} sec")
 
     # Find sustained region
-    start, end = find_sustained_region(audio, sr, min_duration=2.0)
+    start, end, threshold = find_sustained_region(audio, sr, min_duration=3.0)
     duration = (end - start) / sr
 
-    print(f"  Sustained region: {start/sr:.2f}s - {end/sr:.2f}s ({duration:.2f}s)")
+    print(
+        f"  Sustained region: {start/sr:.2f}s - {end/sr:.2f}s ({duration:.2f}s), "
+        f"threshold={threshold:.4f}"
+    )
 
-    if duration < 2.0:
-        print("WARNING: No sustained region found, using first 3 seconds")
+    if duration < 3.0:
+        print("WARNING: No sustained region found, using first 10 seconds")
         start = 0
-        end = min(int(sr * 3), len(audio))
+        end = min(int(sr * 10), len(audio))
 
     # Extract and save
     extracted = audio[start:end]
 
-    # Extend to 5 seconds by repeating
-    target_len = int(sr * 5)
+    # Extend to target length by repeating
+    target_len = int(sr * target_sec)
     if len(extracted) < target_len:
         repeats = target_len // len(extracted) + 1
         extracted = np.tile(extracted, repeats)[:target_len]

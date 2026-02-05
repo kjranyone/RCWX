@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import customtkinter as ctk
 import sounddevice as sd
 
 from rcwx.pipeline.realtime import RealtimeConfig, RealtimeStats, RealtimeVoiceChanger
+from rcwx.pipeline.realtime_v2 import RealtimeVoiceChangerV2
 
 if TYPE_CHECKING:
     from rcwx.gui.app import RCWXApp
@@ -36,7 +38,7 @@ class RealtimeController:
             app: Reference to main application
         """
         self.app = app
-        self.voice_changer: Optional[RealtimeVoiceChanger] = None
+        self.voice_changer: Optional[RealtimeVoiceChanger | RealtimeVoiceChangerV2] = None
         self._buffer_warning_shown = {'underrun': False, 'overrun': False}
 
     def toggle(self) -> None:
@@ -114,8 +116,17 @@ class RealtimeController:
                 use_sola=latency["use_sola"],
             )
 
+            engine = os.getenv(
+                "RCWX_REALTIME_ENGINE",
+                getattr(self.app.config.inference, "realtime_engine", "v1"),
+            )
+            if engine == "v2":
+                VoiceChanger = RealtimeVoiceChangerV2
+            else:
+                VoiceChanger = RealtimeVoiceChanger
+
             # Create voice changer with warmup progress callback
-            self.voice_changer = RealtimeVoiceChanger(
+            self.voice_changer = VoiceChanger(
                 self.app.pipeline,
                 config=rt_config,
                 on_warmup_progress=self._on_warmup_progress,

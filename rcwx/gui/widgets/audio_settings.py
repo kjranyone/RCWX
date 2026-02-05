@@ -43,7 +43,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.output_sample_rate: int = 48000  # Default, auto-detected on device change
         self.input_channels: int = 1  # Default, auto-detected on device change
         self.output_channels: int = 1  # Default, auto-detected on device change
-        self.chunk_sec: float = 0.35
+        self.chunk_sec: float = 0.5
         self.input_gain_db: float = 0.0  # Input gain in dB
 
         self._load_device_lists()
@@ -196,7 +196,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
         # Note: Chunk size is now managed by LatencySettingsFrame
         # Keep chunk_sec and chunk_options for backwards compatibility
-        self.chunk_sec: float = 0.35
+        self.chunk_sec: float = 0.5
         self.chunk_options = [
             ("200ms (低遅延/F0なし)", 0.2),
             ("350ms (バランス)", 0.35),

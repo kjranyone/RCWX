@@ -24,6 +24,7 @@ from rcwx.gui.widgets.model_selector import ModelSelector
 from rcwx.gui.widgets.pitch_control import PitchControl
 from rcwx.pipeline.inference import RVCPipeline
 from rcwx.pipeline.realtime import RealtimeStats
+from rcwx.pipeline.realtime_v2 import RealtimeVoiceChangerV2
 
 # Set PortAudio API preference for Windows (WASAPI for better compatibility)
 # This prevents WDM-KS errors with certain audio drivers
@@ -839,6 +840,7 @@ class RCWXApp(ctk.CTk):
             crossfade_sec=self.config.inference.crossfade_sec,
             use_sola=self.config.inference.use_sola,
             chunking_mode=getattr(self.config.inference, "chunking_mode", "wokada"),
+            realtime_engine=getattr(self.config.inference, "realtime_engine", "v2"),
         )
 
     def _on_audio_settings_changed(self) -> None:
@@ -860,10 +862,20 @@ class RCWXApp(ctk.CTk):
             # Check if chunking mode changed (requires restart)
             current_mode = self.realtime_controller.voice_changer.config.chunking_mode
             new_mode = settings["chunking_mode"]
+            current_engine = (
+                "v2"
+                if isinstance(self.realtime_controller.voice_changer, RealtimeVoiceChangerV2)
+                else "v1"
+            )
+            new_engine = settings.get("realtime_engine", current_engine)
 
-            if current_mode != new_mode:
-                # Chunking mode changed - need to restart
-                logger.info(f"Chunking mode changed: {current_mode} -> {new_mode}, restarting...")
+            if current_mode != new_mode or current_engine != new_engine:
+                # Chunking mode or engine changed - need to restart
+                logger.info(
+                    "Realtime settings changed: "
+                    f"mode {current_mode} -> {new_mode}, "
+                    f"engine {current_engine} -> {new_engine}. Restarting..."
+                )
                 was_running = self._is_running
 
                 if was_running:
@@ -924,6 +936,7 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.crossfade_sec = latency["crossfade_sec"]
                 self.config.inference.use_sola = latency["use_sola"]
                 self.config.inference.chunking_mode = latency.get("chunking_mode", "wokada")
+                self.config.inference.realtime_engine = latency.get("realtime_engine", "v2")
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()

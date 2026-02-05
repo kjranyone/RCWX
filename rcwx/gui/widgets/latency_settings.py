@@ -25,43 +25,59 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.on_settings_changed = on_settings_changed
 
         # Default settings
-        self.chunk_sec = 0.25
+        self.chunk_sec = 0.5
         self.prebuffer_chunks = 1
         self.buffer_margin = 1.0
         self.context_sec = 0.10  # 100ms for better inference continuity
         self.lookahead_sec = 0.0
-        self.crossfade_sec = 0.05
+        self.crossfade_sec = 0.22
         self.use_sola = True
-        self.chunking_mode = "wokada"
+        self.chunking_mode = "rvc_webui"
+        self.realtime_engine = "v2"
 
         self._setup_ui()
 
     def _setup_ui(self) -> None:
         """Setup the UI components."""
-        # Header
         header = ctk.CTkLabel(
             self,
-            text="レイテンシ設定",
+            text="Latency Settings",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         header.grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(5, 2))
 
-        # Chunking mode selection
-        chunking_label = ctk.CTkLabel(
+        engine_label = ctk.CTkLabel(
             self,
-            text="チャンキング方式",
+            text="Realtime Engine",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        chunking_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(8, 2))
+        engine_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 2))
 
-        # Description label
+        self.engine_var = ctk.StringVar(value=self.realtime_engine)
+        self.engine_selector = ctk.CTkSegmentedButton(
+            self,
+            values=["v2", "v1"],
+            variable=self.engine_var,
+            command=self._on_engine_change,
+        )
+        self.engine_selector.grid(
+            row=2, column=0, columnspan=2, padx=10, pady=(0, 6), sticky="ew"
+        )
+
+        chunking_label = ctk.CTkLabel(
+            self,
+            text="Chunking Mode",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        chunking_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=10, pady=(4, 2))
+
         chunking_desc = ctk.CTkLabel(
             self,
-            text="w-okada: 低レイテンシ | RVC WebUI: 完全連続 | hybrid: RVC hop + w-okada context",
+            text="w-okada: context | RVC WebUI: overlap | hybrid: RVC hop + context",
             font=ctk.CTkFont(size=10),
             text_color="gray",
         )
-        chunking_desc.grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=0)
+        chunking_desc.grid(row=4, column=0, columnspan=2, sticky="w", padx=10, pady=0)
 
         self.chunking_mode_var = ctk.StringVar(value=self.chunking_mode)
         self.chunking_mode_selector = ctk.CTkSegmentedButton(
@@ -71,16 +87,15 @@ class LatencySettingsFrame(ctk.CTkFrame):
             command=self._on_chunking_mode_change,
         )
         self.chunking_mode_selector.grid(
-            row=3, column=0, columnspan=2, padx=10, pady=(2, 5), sticky="ew"
+            row=5, column=0, columnspan=2, padx=10, pady=(2, 5), sticky="ew"
         )
 
-        # Advanced settings frame (always visible)
         self.advanced_frame = ctk.CTkFrame(self)
-        self.advanced_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="ew")
+        self.advanced_frame.grid(row=6, column=0, columnspan=2, padx=10, pady=(5, 3), sticky="ew")
         self._setup_advanced_controls()
 
-        # Configure grid
         self.grid_columnconfigure(0, weight=1)
+
 
     def _create_slider_row(
         self,
@@ -122,7 +137,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             frame,
             "チャンクサイズ",
             0,
-            100,
+            250,
             600,
             20,
             self._round_to_frame_boundary(self.chunk_sec * 1000),
@@ -213,11 +228,27 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def _on_chunking_mode_change(self, value: str) -> None:
         """Handle chunking mode change."""
         self.chunking_mode = value
+        max_crossfade = self._max_crossfade_sec()
+        if self.crossfade_sec > max_crossfade:
+            self.crossfade_sec = max_crossfade
+            self.crossfade_slider.set(self.crossfade_sec * 1000)
+            self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
+        self._notify_change()
+
+    def _on_engine_change(self, value: str) -> None:
+        """Handle realtime engine change."""
+        self.realtime_engine = value
         self._notify_change()
 
     def _round_to_frame_boundary(self, ms: float) -> int:
         """Round milliseconds to nearest HuBERT frame boundary (20ms)."""
         return int(round(ms / 20) * 20)
+
+    def _max_crossfade_sec(self) -> float:
+        """Get maximum crossfade allowed for the current chunking mode."""
+        if self.chunking_mode == "rvc_webui":
+            return max(0.0, self.chunk_sec * 0.5)
+        return max(0.0, min(self.context_sec, self.chunk_sec * 0.5))
 
     def _on_chunk_change(self, value: float) -> None:
         """Handle chunk size slider change."""
@@ -225,6 +256,11 @@ class LatencySettingsFrame(ctk.CTkFrame):
         rounded_ms = self._round_to_frame_boundary(value)
         self.chunk_sec = rounded_ms / 1000
         self.chunk_value.configure(text=f"{rounded_ms}ms")
+        max_crossfade = self._max_crossfade_sec()
+        if self.crossfade_sec > max_crossfade:
+            self.crossfade_sec = max_crossfade
+            self.crossfade_slider.set(self.crossfade_sec * 1000)
+            self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
         self._update_estimate()
         self._notify_change()
 
@@ -249,9 +285,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.context_sec = value / 1000
         self.context_value.configure(text=f"{int(value)}ms")
 
-        # Crossfade should not exceed context (causes discontinuity)
-        if self.crossfade_sec > self.context_sec:
-            self.crossfade_sec = self.context_sec
+        max_crossfade = self._max_crossfade_sec()
+        if self.crossfade_sec > max_crossfade:
+            self.crossfade_sec = max_crossfade
             self.crossfade_slider.set(self.crossfade_sec * 1000)
             self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
 
@@ -259,8 +295,11 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
     def _on_crossfade_change(self, value: float) -> None:
         """Handle crossfade size slider change."""
-        self.crossfade_sec = value / 1000
-        self.crossfade_value.configure(text=f"{int(value)}ms")
+        max_crossfade = self._max_crossfade_sec()
+        self.crossfade_sec = min(value / 1000, max_crossfade)
+        self.crossfade_value.configure(text=f"{int(self.crossfade_sec * 1000)}ms")
+        if self.crossfade_sec != value / 1000:
+            self.crossfade_slider.set(self.crossfade_sec * 1000)
         self._notify_change()
 
     def _on_lookahead_change(self, value: float) -> None:
@@ -302,6 +341,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             "crossfade_sec": self.crossfade_sec,
             "use_sola": self.use_sola,
             "chunking_mode": self.chunking_mode,
+            "realtime_engine": self.realtime_engine,
         }
 
     def set_values(
@@ -314,6 +354,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         crossfade_sec: float,
         use_sola: bool = True,
         chunking_mode: str = "wokada",
+        realtime_engine: str = "v2",
     ) -> None:
         """Set individual values directly (for restoring saved settings)."""
         # Round chunk_sec to 20ms boundary (HuBERT frame alignment)
@@ -322,17 +363,19 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.prebuffer_chunks = prebuffer_chunks
         self.buffer_margin = buffer_margin
 
+        self.chunking_mode = chunking_mode
+        self.realtime_engine = realtime_engine
         # Enforce minimum context 50ms for inference continuity
         self.context_sec = max(0.05, context_sec)
         self.lookahead_sec = lookahead_sec
 
-        # Crossfade should not exceed context
-        self.crossfade_sec = min(crossfade_sec, self.context_sec)
+        max_crossfade = self._max_crossfade_sec()
+        self.crossfade_sec = min(crossfade_sec, max_crossfade)
         self.use_sola = use_sola
-        self.chunking_mode = chunking_mode
 
         # Update chunking mode UI
         self.chunking_mode_var.set(chunking_mode)
+        self.engine_var.set(realtime_engine)
 
         # Update sliders (use self.* values which have been enforced)
         self.chunk_slider.set(rounded_ms)

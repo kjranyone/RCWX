@@ -10,7 +10,15 @@ from typing import Optional, Protocol, runtime_checkable
 import numpy as np
 from numpy.typing import NDArray
 
-from .crossfade import CrossfadeResult, SOLAState, apply_sola_crossfade, flush_sola_buffer
+from .crossfade import (
+    CrossfadeResult,
+    SOLAState,
+    _apply_boundary_rms_smoothing,
+    _blend_head_with_prev_tail,
+    _declick_head,
+    apply_sola_crossfade,
+    flush_sola_buffer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -308,9 +316,10 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
         # This ensures enough samples for smooth transitions when correlation is low
         min_phase8_buffer = int(config.output_sample_rate * 0.08)  # 80ms = 9600 samples at 48kHz
 
+        # Prefer using the overlap size as crossfade buffer when reasonable.
+        # This aligns SOLA output length with hop size and reduces trimming artifacts.
         effective_crossfade = max(
-            config.crossfade_samples,
-            min(config.overlap_samples // 4, config.crossfade_samples * 2),
+            min(config.overlap_samples, config.crossfade_samples * 6),
             min_phase8_buffer,  # Phase 8: ensure 80ms minimum
         )
 
@@ -321,6 +330,11 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
             config.output_sample_rate,
             use_advanced_sola=True,
             fallback_threshold=0.8,  # High threshold to trigger strong crossfade
+        )
+        # Limit SOLA search to overlap region for RVC WebUI mode
+        self._sola_state.sola_search_frame = min(
+            self._sola_state.sola_search_frame,
+            config.overlap_samples,
         )
         self._effective_crossfade = effective_crossfade
 
@@ -384,14 +398,22 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
 
         # Apply boundary smoothing between chunks
         if self._prev_tail is not None and len(self._prev_tail) > 0 and len(audio) > 0:
+            # Always apply a short overlap blend at the head
+            blend_len = min(64, len(audio), len(self._prev_tail))
+            audio = _blend_head_with_prev_tail(audio, self._prev_tail, blend_len)
+
             jump = abs(float(self._prev_tail[-1]) - float(audio[0]))
-            if jump > 0.15:
-                # Smooth the boundary with a short crossfade
-                smooth_len = min(32, len(audio))
-                t = np.linspace(0.0, 1.0, smooth_len, dtype=np.float32)
-                fade = 0.5 * (1.0 - np.cos(np.pi * t))
-                prev_val = float(self._prev_tail[-1])
-                audio[:smooth_len] = prev_val * (1.0 - fade) + audio[:smooth_len] * fade
+            if jump > 0.12 or result.correlation < 0.5:
+                # Stronger overlap blend and RMS smoothing for low correlation or large jumps
+                strong_len = min(192, len(audio), len(self._prev_tail))
+                audio = _blend_head_with_prev_tail(audio, self._prev_tail, strong_len)
+                audio = _apply_boundary_rms_smoothing(
+                    audio,
+                    self._prev_tail,
+                    window=min(128, len(audio), len(self._prev_tail)),
+                    min_gain=0.8,
+                    max_gain=1.2,
+                )
 
         # Save tail for next boundary check
         if len(audio) >= 64:
@@ -426,6 +448,10 @@ class SOLARVCWebUICrossfade(BaseCrossfadeStrategy):
             self._config.output_sample_rate,
             use_advanced_sola=True,
             fallback_threshold=0.8,
+        )
+        self._sola_state.sola_search_frame = min(
+            self._sola_state.sola_search_frame,
+            self._config.overlap_samples,
         )
         self._prev_tail = None
         self._chunks_processed = 0

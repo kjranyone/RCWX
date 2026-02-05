@@ -79,6 +79,24 @@ def _declick_head(
     return out
 
 
+def _blend_head_with_prev_tail(
+    audio: NDArray[np.float32],
+    prev_tail: NDArray[np.float32],
+    samples: int,
+) -> NDArray[np.float32]:
+    """Blend current head with previous tail over a short overlap."""
+    if samples <= 1 or len(audio) < samples or len(prev_tail) < samples:
+        return audio
+    t = np.linspace(0.0, 1.0, samples, dtype=np.float32)
+    fade = 0.5 * (1.0 - np.cos(np.pi * t))  # Hann
+    head = audio[:samples]
+    tail = prev_tail[-samples:]
+    blended = tail * (1.0 - fade) + head * fade
+    out = audio.copy()
+    out[:samples] = blended
+    return out
+
+
 def calculate_dynamic_search_range(f0_hz: float, sample_rate: int) -> int:
     """Calculate dynamic SOLA search range based on F0.
 
@@ -239,10 +257,14 @@ class SOLAState:
     # Phase 3: Extended state for advanced SOLA
     use_advanced_sola: bool = False
     fallback_threshold: float = 0.3
+    # 0.0 = stable (shorter fallback), 1.0 = unstable (longer fallback)
+    fallback_strength: float = 0.0
     last_f0_hz: float = 0.0
     # Phase 8: Track first chunk for special handling
     # First chunk boundary often has discontinuity due to reflection padding
     is_first_chunk_boundary: bool = True
+    # Output sample rate for time-based fallback lengths
+    sample_rate: int = 48000
 
     @staticmethod
     def create(
@@ -286,7 +308,9 @@ class SOLAState:
             fade_out_window=fade_out,
             use_advanced_sola=use_advanced_sola,
             fallback_threshold=fallback_threshold,
+            fallback_strength=0.0,
             is_first_chunk_boundary=True,
+            sample_rate=sample_rate,
         )
 
 
@@ -363,6 +387,11 @@ def apply_sola_crossfade(
 
     sola_buffer_frame = state.sola_buffer_frame
     sola_search_frame = state.sola_search_frame
+    if state.last_f0_hz > 0:
+        dynamic_search = calculate_dynamic_search_range(
+            state.last_f0_hz, state.sample_rate
+        )
+        sola_search_frame = min(sola_buffer_frame, dynamic_search)
 
     # First chunk: handled within each mode's logic below
 
@@ -436,20 +465,18 @@ def apply_sola_crossfade(
 
             if use_fallback:
                 # Phase 8: Use strong crossfade optimized for RVC output
-                sample_rate = 48000  # Assumed output rate
+                sample_rate = state.sample_rate
 
-                # Shorter crossfade to avoid phase interference / pitch wobble
+                # Adaptive fallback length: stable -> shorter, unstable -> longer
+                strength = float(np.clip(state.fallback_strength, 0.0, 1.0))
                 if state.is_first_chunk_boundary:
-                    min_crossfade_len = int(sample_rate * 0.08)  # 80ms for first boundary
+                    strength = 1.0
                     state.is_first_chunk_boundary = False  # Mark as processed
-                else:
-                    min_crossfade_len = int(sample_rate * 0.05)  # 50ms for others
 
-                # Cap crossfade length to avoid pitch artifacts
-                target_crossfade_len = min(
-                    max(sola_buffer_frame, min_crossfade_len),
-                    int(sample_rate * 0.08)  # Max 80ms
-                )
+                min_ms = 0.05
+                max_ms = 0.08
+                target_ms = min_ms + (max_ms - min_ms) * strength
+                target_crossfade_len = int(sample_rate * target_ms)
 
                 # Apply strong crossfade with zero-crossing detection
                 blended_output, actual_crossfade = _apply_strong_crossfade(
@@ -561,12 +588,21 @@ def apply_sola_crossfade(
             else:
                 return CrossfadeResult(audio=infer_wav.copy(), sola_offset=0, correlation=0.0)
 
-        # Find optimal offset using RVC-style correlation-only search
-        sola_offset, correlation = _find_sola_offset_rvc(
-            state.sola_buffer,
-            infer_wav,
-            sola_search_frame,
-        )
+        # Find optimal offset (advanced or correlation-only)
+        if state.use_advanced_sola:
+            sola_offset, correlation = _find_sola_offset(
+                state.sola_buffer,
+                infer_wav,
+                sola_search_frame,
+                fade_in_window=state.fade_in_window,
+                fade_out_window=state.fade_out_window,
+            )
+        else:
+            sola_offset, correlation = _find_sola_offset_rvc(
+                state.sola_buffer,
+                infer_wav,
+                sola_search_frame,
+            )
 
         # Phase 8: Low correlation or first chunk boundary fallback
         use_fallback = correlation < state.fallback_threshold or state.is_first_chunk_boundary
@@ -578,20 +614,18 @@ def apply_sola_crossfade(
 
         # Phase 8: Relax the length check - need at least buffer + some headroom
         if use_fallback and len(infer_wav) >= sola_buffer_frame + sola_search_frame:
-            sample_rate = 48000  # Assumed output rate
+            sample_rate = state.sample_rate
 
-            # Shorter crossfade to avoid phase interference / pitch wobble
+            # Adaptive fallback length: stable -> shorter, unstable -> longer
+            strength = float(np.clip(state.fallback_strength, 0.0, 1.0))
             if state.is_first_chunk_boundary:
-                min_crossfade_len = int(sample_rate * 0.08)  # 80ms for first boundary
+                strength = 1.0
                 state.is_first_chunk_boundary = False  # Mark as processed
-            else:
-                min_crossfade_len = int(sample_rate * 0.05)  # 50ms for others
 
-            # Cap crossfade length to avoid pitch artifacts
-            target_crossfade_len = min(
-                max(sola_buffer_frame, min_crossfade_len),
-                int(sample_rate * 0.08)  # Max 80ms
-            )
+            min_ms = 0.05
+            max_ms = 0.08
+            target_ms = min_ms + (max_ms - min_ms) * strength
+            target_crossfade_len = int(sample_rate * target_ms)
 
             # Apply strong crossfade with zero-crossing detection
             blended_output, actual_crossfade = _apply_strong_crossfade(
@@ -604,7 +638,8 @@ def apply_sola_crossfade(
             logger.info(
                 f"[SOLA-Phase8-FALLBACK] Applied strong crossfade: "
                 f"target={target_crossfade_len}, actual={actual_crossfade}, "
-                f"min={min_crossfade_len} samples"
+                f"range={int(sample_rate * min_ms)}-{int(sample_rate * max_ms)} "
+                f"samples, strength={strength:.2f}"
             )
 
             # Save new buffer from tail
@@ -646,9 +681,20 @@ def apply_sola_crossfade(
 
             # RVC WebUI mode: boundary smoothing if needed
             if prev_tail is not None and len(result) > sola_buffer_frame:
+                # Always apply a tiny join smoothing between blended region and the rest
+                base_len = min(32, sola_buffer_frame, len(result) - sola_buffer_frame)
+                if base_len > 1:
+                    t = np.linspace(0.0, 1.0, base_len, dtype=np.float32)
+                    fade = 0.5 * (1.0 - np.cos(np.pi * t))
+                    left = result[sola_buffer_frame - base_len : sola_buffer_frame].copy()
+                    right = result[sola_buffer_frame : sola_buffer_frame + base_len].copy()
+                    result[sola_buffer_frame - base_len : sola_buffer_frame] = (
+                        left * (1.0 - fade) + right * fade
+                    )
+
                 # Check discontinuity at end of crossfade region
                 delta = abs(float(result[sola_buffer_frame - 1]) - float(result[sola_buffer_frame]))
-                if delta > 0.1:
+                if delta > 0.08:
                     # Smooth transition from crossfade to rest of audio
                     smooth_len = min(64, len(result) - sola_buffer_frame)
                     if smooth_len > 1:

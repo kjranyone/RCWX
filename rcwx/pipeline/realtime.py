@@ -26,6 +26,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class _InputChunkInfo:
+    """Prepared input chunk information for inference processing."""
+
+    chunk_mic: np.ndarray
+    chunk_model: np.ndarray
+    input_rms: float
+    input_peak: float
+
+
+@dataclass
 class RealtimeStats:
     """Statistics for real-time processing."""
 
@@ -63,10 +73,10 @@ class RealtimeConfig:
     # Internal processing rate (HuBERT/F0 models expect 16kHz)
     input_sample_rate: int = 16000
     output_sample_rate: int = 48000
-    # Optimized: 150ms for stable low latency with FCPE (official minimum 100ms)
+    # Optimized: 500ms for RVC WebUI overlap (stable continuity)
     # FCPE: 100-150ms (stable RTF ~0.5x, latency ~250-350ms)
     # RMVPE: 250-350ms (stable RTF 0.54x, latency ~530ms)
-    chunk_sec: float = 0.15
+    chunk_sec: float = 0.5
     pitch_shift: int = 0
     use_f0: bool = True
     # F0 extraction method:
@@ -97,12 +107,17 @@ class RealtimeConfig:
     energy_threshold: float = 0.05
     # Feature caching for chunk continuity
     use_feature_cache: bool = True
+    # Minimum feature frames for synthesizer decoder (64 default)
+    # Set to 0 to disable short-input padding (test-only)
+    synth_min_frames: int = 64
+    # Prepend past audio to HuBERT for context (seconds)
+    history_sec: float = 0.0
 
     # --- Chunking mode ---
-    # "wokada": w-okada style context-based chunking (default)
+    # "wokada": w-okada style context-based chunking
     # "rvc_webui": RVC WebUI style overlap-based chunking (perfect continuity)
     # "hybrid": Hybrid RVC+Stitching - RVC hop + w-okada context + optimized SOLA
-    chunking_mode: str = "wokada"
+    chunking_mode: str = "rvc_webui"
 
     # --- w-okada style processing ---
     # Each chunk: [left_context | main | right_context]
@@ -118,8 +133,8 @@ class RealtimeConfig:
     extra_sec: float = 0.0
 
     # Crossfade region for SOLA blending
-    # 50ms is sufficient for smooth transitions
-    crossfade_sec: float = 0.05
+    # 220ms is aligned with the default RVC WebUI overlap
+    crossfade_sec: float = 0.22
 
     # Lookahead: future samples for right context (ADDS LATENCY!)
     # 0 = no lookahead (lowest latency)
@@ -469,6 +484,7 @@ class RealtimeVoiceChanger:
                     index_rate=getattr(self.config, 'index_rate', 0.5),
                     use_feature_cache=False,  # Don't cache warmup
                     allow_short_input=True,  # Allow shorter warmup chunks
+                    synth_min_frames=getattr(self.config, "synth_min_frames", 64),
                 )
                 logger.info(f"[WARMUP] Warmup inference {i+1}/2 complete")
 
@@ -686,6 +702,393 @@ class RealtimeVoiceChanger:
         except Exception:
             return 0.0
 
+    def _min_required_samples(self) -> int:
+        """Minimum required samples for a valid chunk."""
+        if self.config.chunking_mode == "rvc_webui":
+            return self.mic_chunk_samples
+        return self.mic_chunk_samples + self.mic_context_samples
+
+    def _log_input_chunk(self, chunk: np.ndarray, input_rms: float) -> None:
+        """Log input chunk stats for early debugging."""
+        if self.stats.frames_processed < 3:
+            if self.config.chunking_mode == "rvc_webui":
+                expected_len = self.mic_chunk_samples
+            else:
+                expected_len = (
+                    self.mic_chunk_samples
+                    + self.mic_context_samples
+                    + self.mic_lookahead_samples
+                )
+            logger.info(
+                f"Raw input chunk: len={len(chunk)} (expected={expected_len}, mode={self.config.chunking_mode}), "
+                f"min={chunk.min():.4f}, max={chunk.max():.4f}, rms={input_rms:.4f}"
+            )
+
+    def _prepare_input_chunk(self, chunk: np.ndarray) -> Optional[_InputChunkInfo]:
+        """Apply gain, validate length, resample, and denoise."""
+        if self.config.input_gain_db != 0.0:
+            gain_linear = 10 ** (self.config.input_gain_db / 20)
+            chunk = chunk * gain_linear
+
+        chunk_at_mic_rate = chunk.copy()
+        input_rms = np.sqrt(np.mean(chunk**2)) if len(chunk) else 0.0
+        input_peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
+
+        if self.config.use_energy_normalization and input_rms > 1e-6:
+            alpha = self.config.energy_smoothing
+            if self._input_rms_ema < 1e-6:
+                self._input_rms_ema = input_rms
+            else:
+                self._input_rms_ema = alpha * self._input_rms_ema + (1 - alpha) * input_rms
+
+        if self.config.use_peak_normalization and input_peak > 1e-6:
+            alpha = self.config.peak_smoothing
+            if self._input_peak_ema < 1e-6:
+                self._input_peak_ema = input_peak
+            else:
+                self._input_peak_ema = alpha * self._input_peak_ema + (1 - alpha) * input_peak
+
+        self._log_input_chunk(chunk, input_rms)
+
+        min_required_samples = self._min_required_samples()
+        if len(chunk) < min_required_samples:
+            logger.warning(
+                f"Chunk too short: {len(chunk)} < {min_required_samples} (mode={self.config.chunking_mode}), skipping"
+            )
+            return None
+
+        if self.config.mic_sample_rate != self.config.input_sample_rate:
+            chunk = self.input_resampler.resample_chunk(chunk)
+            if self.stats.frames_processed < 3:
+                logger.info(
+                    f"After stateful resample: len={len(chunk)}, "
+                    f"min={chunk.min():.4f}, max={chunk.max():.4f}"
+                )
+
+        if self.config.denoise_enabled:
+            if self.stats.frames_processed < 3:
+                logger.info(f"Applying denoise (method={self.config.denoise_method})")
+            chunk = denoise_audio(
+                chunk,
+                sample_rate=self.config.input_sample_rate,
+                method=self.config.denoise_method,
+                device="cpu",
+            )
+            if self.stats.frames_processed < 3:
+                logger.info(
+                    f"After denoise: len={len(chunk)}, "
+                    f"min={chunk.min():.4f}, max={chunk.max():.4f}"
+                )
+
+        return _InputChunkInfo(
+            chunk_mic=chunk_at_mic_rate,
+            chunk_model=chunk,
+            input_rms=input_rms,
+            input_peak=input_peak,
+        )
+
+    def _run_inference(self, chunk: np.ndarray) -> np.ndarray:
+        """Run model inference for a prepared chunk."""
+        pad_mode = "none" if self.config.chunking_mode == "wokada" else "chunk"
+        return self.pipeline.infer(
+            chunk,
+            input_sr=self.config.input_sample_rate,
+            pitch_shift=self.config.pitch_shift,
+            f0_method=self.config.f0_method if self.config.use_f0 else "none",
+            index_rate=self.config.index_rate,
+            index_k=self.config.index_k,
+            voice_gate_mode=self.config.voice_gate_mode,
+            energy_threshold=self.config.energy_threshold,
+            use_feature_cache=self.config.use_feature_cache,
+            use_parallel_extraction=self.config.use_parallel_extraction,
+            allow_short_input=True,
+            pad_mode=pad_mode,
+            synth_min_frames=self.config.synth_min_frames,
+            history_sec=self.config.history_sec,
+        )
+
+    def _apply_sola_and_trim(self, output: np.ndarray, chunk_at_mic_rate: np.ndarray) -> np.ndarray:
+        """Apply SOLA crossfade (mode-dependent) and trim to hop length."""
+        if self.stats.frames_processed < 3:
+            logger.info(
+                f"[SOLA-DEBUG] chunk={self.stats.frames_processed}, "
+                f"use_sola={self.config.use_sola}, "
+                f"sola_state_exists={self._sola_state is not None}, "
+                f"chunking_mode={self.config.chunking_mode}"
+            )
+
+        if self.config.use_sola and self._sola_state is not None:
+            if self.config.chunking_mode == "rvc_webui":
+                if self.stats.frames_processed < 3:
+                    logger.info(f"[RVC-WEBUI-BLOCK] Entering rvc_webui mode block")
+                pre_sola_len = len(output)
+                cf_result = apply_sola_crossfade(
+                    output,
+                    self._sola_state,
+                    wokada_mode=False,
+                    context_samples=0,
+                )
+                post_sola_len = len(cf_result.audio)
+                output = cf_result.audio
+
+                hop_sec = self.mic_hop_samples / self.config.mic_sample_rate
+                output_hop_samples = int(self.config.output_sample_rate * hop_sec)
+
+                pre_trim_len = len(output)
+                if self.stats.frames_processed == 0:
+                    first_chunk_sec = self.config.chunk_sec - self.config.rvc_overlap_sec
+                    first_chunk_samples = int(
+                        self.config.output_sample_rate * first_chunk_sec
+                    )
+                    if len(output) > first_chunk_samples:
+                        output = output[:first_chunk_samples]
+                else:
+                    if len(output) > output_hop_samples:
+                        output = output[:output_hop_samples]
+
+                if self.stats.frames_processed < 5:
+                    logger.info(
+                        f"[SOLA-RVC-DBG] chunk={self.stats.frames_processed}, "
+                        f"pre_sola={pre_sola_len}, post_sola={post_sola_len}, "
+                        f"pre_trim={pre_trim_len}, post_trim={len(output)}, "
+                        f"hop_samples={output_hop_samples}, mic_hop={self.mic_hop_samples}"
+                    )
+
+                if self.stats.frames_processed % 50 == 0:
+                    logger.debug(
+                        f"[SOLA-RVC] chunk={self.stats.frames_processed}, "
+                        f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}, "
+                        f"out_len={len(output)}"
+                    )
+            elif self.config.chunking_mode == "hybrid":
+                if self.stats.frames_processed < 3:
+                    logger.info(f"[HYBRID-BLOCK] Entering hybrid mode block")
+                context_samples_output = 0
+                if self.config.context_sec > 0:
+                    context_samples_output = int(
+                        self.config.output_sample_rate * self.config.context_sec
+                    )
+
+                cf_result = apply_sola_crossfade(
+                    output,
+                    self._sola_state,
+                    wokada_mode=True,
+                    context_samples=context_samples_output,
+                )
+                output = cf_result.audio
+
+                if self.stats.frames_processed % 50 == 0:
+                    logger.debug(
+                        f"[SOLA-HYB] chunk={self.stats.frames_processed}, "
+                        f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}"
+                    )
+            else:
+                if self.stats.frames_processed < 3:
+                    logger.info(f"[WOKADA-BLOCK] Entering w-okada mode block")
+
+                if self.stats.frames_processed < 3:
+                    logger.info(f"[DEBUG] adaptive_calc exists: {self.adaptive_calc is not None}")
+
+                if self.adaptive_calc is not None:
+                    adaptive_params = self.adaptive_calc.analyze_and_adjust(
+                        chunk_at_mic_rate,
+                        f0=None,
+                    )
+
+                    adaptive_crossfade_samples = int(
+                        self.config.output_sample_rate * adaptive_params['crossfade_sec']
+                    )
+                    min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
+                    adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
+
+                    adaptive_sola_state = SOLAState.create(
+                        adaptive_buffer_size,
+                        self.config.output_sample_rate,
+                        use_advanced_sola=self.config.sola_use_advanced,
+                        fallback_threshold=self.config.sola_fallback_threshold,
+                    )
+                    if self._sola_state.sola_buffer is not None:
+                        old_size = len(self._sola_state.sola_buffer)
+                        new_size = adaptive_buffer_size
+
+                        if old_size == new_size:
+                            adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer.copy()
+                        elif old_size < new_size:
+                            adaptive_sola_state.sola_buffer = np.pad(
+                                self._sola_state.sola_buffer,
+                                (0, new_size - old_size),
+                                mode='constant'
+                            )
+                        else:
+                            adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
+
+                        adaptive_sola_state.frames_processed = self._sola_state.frames_processed
+
+                    adaptive_sola_state.is_first_chunk_boundary = self._sola_state.is_first_chunk_boundary
+
+                    sola_state_to_use = adaptive_sola_state
+                    context_sec_to_use = adaptive_params['context_sec']
+
+                    if self.stats.frames_processed < 10 or self.stats.frames_processed % 20 == 0:
+                        logger.info(
+                            f"[ADAPTIVE] chunk={self.stats.frames_processed}, "
+                            f"energy={adaptive_params['energy']:.3f}, "
+                            f"flux={adaptive_params['flux']:.3f}, "
+                            f"crossfade={adaptive_params['crossfade_sec']:.3f}s, "
+                            f"context={adaptive_params['context_sec']:.3f}s"
+                        )
+                else:
+                    sola_state_to_use = self._sola_state
+                    context_sec_to_use = self.config.context_sec
+
+                context_samples_output = 0
+                if context_sec_to_use > 0:
+                    context_samples_output = int(
+                        self.config.output_sample_rate * context_sec_to_use
+                    )
+
+                cf_result = apply_sola_crossfade(
+                    output,
+                    sola_state_to_use,
+                    wokada_mode=True,
+                    context_samples=context_samples_output,
+                )
+                output = cf_result.audio
+
+                if self.adaptive_calc is not None and sola_state_to_use.sola_buffer is not None:
+                    adaptive_size = len(sola_state_to_use.sola_buffer)
+                    main_size = self._sola_state.sola_buffer_frame
+
+                    if adaptive_size == main_size:
+                        self._sola_state.sola_buffer = sola_state_to_use.sola_buffer.copy()
+                    elif adaptive_size < main_size:
+                        self._sola_state.sola_buffer = np.pad(
+                            sola_state_to_use.sola_buffer,
+                            (0, main_size - adaptive_size),
+                            mode='constant'
+                        )
+                    else:
+                        self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
+
+                    self._sola_state.frames_processed = sola_state_to_use.frames_processed
+                    self._sola_state.is_first_chunk_boundary = sola_state_to_use.is_first_chunk_boundary
+
+                if self.stats.frames_processed % 50 == 0:
+                    logger.debug(
+                        f"[SOLA] chunk={self.stats.frames_processed}, "
+                        f"offset={cf_result.sola_offset}"
+                    )
+        else:
+            if self.config.chunking_mode != "rvc_webui" and self.config.context_sec > 0:
+                context_samples_output = int(
+                    self.config.output_sample_rate * self.config.context_sec
+                )
+                if len(output) > context_samples_output:
+                    output = output[context_samples_output:]
+                    if self.stats.frames_processed < 5:
+                        logger.info(
+                            f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
+                        )
+
+        return output
+
+    def _apply_leveling(self, output: np.ndarray) -> np.ndarray:
+        """Apply energy/peak normalization and chunk gain smoothing."""
+        if self.config.use_energy_normalization:
+            output_rms = np.sqrt(np.mean(output**2)) if len(output) else 0.0
+            if output_rms > 1e-6 and self._input_rms_ema > 1e-6:
+                current_ratio = self._input_rms_ema / output_rms
+                alpha = self.config.energy_smoothing
+                if self._energy_ratio_ema < 0.1:
+                    self._energy_ratio_ema = current_ratio
+                else:
+                    self._energy_ratio_ema = (
+                        alpha * self._energy_ratio_ema + (1 - alpha) * current_ratio
+                    )
+
+                scale = np.clip(self._energy_ratio_ema, 0.7, 1.4)
+                output = output * scale
+
+                if self.stats.frames_processed < 10:
+                    logger.debug(
+                        f"[ENERGY] chunk={self.stats.frames_processed}, "
+                        f"in_rms={self._input_rms_ema:.4f}, out_rms={output_rms:.4f}, "
+                        f"ratio={current_ratio:.3f}, ema_ratio={self._energy_ratio_ema:.3f}, scale={scale:.3f}"
+                    )
+
+        if self.config.use_peak_normalization and self._input_peak_ema > 1e-6:
+            output_peak = float(np.max(np.abs(output))) if len(output) else 0.0
+            if output_peak > 1e-6:
+                peak_scale = self._input_peak_ema / output_peak
+                peak_scale = np.clip(peak_scale, 0.5, 1.5)
+                output = output * peak_scale
+
+        if self.config.use_chunk_gain_smoothing:
+            output_rms = np.sqrt(np.mean(output**2)) if len(output) else 0.0
+            if output_rms > 1e-6:
+                alpha = self.config.chunk_gain_smoothing
+                if self._output_rms_target < 1e-6:
+                    self._output_rms_target = output_rms
+                else:
+                    self._output_rms_target = (
+                        alpha * self._output_rms_target + (1 - alpha) * output_rms
+                    )
+                gain = self._output_rms_target / output_rms
+                gain = np.clip(gain, 0.9, 1.1)
+                output = output * gain
+
+        return output
+
+    def _maybe_check_feedback(self, chunk_at_mic_rate: np.ndarray) -> None:
+        """Check and report feedback periodically."""
+        if (
+            self.stats.frames_processed > 0
+            and self.stats.frames_processed % self._feedback_check_interval == 0
+        ):
+            correlation = self._check_feedback(chunk_at_mic_rate)
+            self.stats.feedback_correlation = correlation
+
+            if correlation > 0.3 and not self._feedback_warning_shown:
+                self.stats.feedback_detected = True
+                self._feedback_warning_shown = True
+                logger.warning(
+                    f"[FEEDBACK] 音声フィードバックを検出しました (相関係数={correlation:.2f}). "
+                    "Windowsの「このデバイスを聴く」が有効になっていないか確認してください。"
+                )
+                if self.on_error:
+                    self.on_error(
+                        "フィードバック検出: 入力と出力が接続されている可能性があります。\n"
+                        "「サウンド設定」→「録音デバイス」→「プロパティ」→「聴く」タブで\n"
+                        "「このデバイスを聴く」が無効になっているか確認してください。"
+                    )
+
+    def _postprocess_output(self, output: np.ndarray, chunk_at_mic_rate: np.ndarray) -> np.ndarray:
+        """Resample, crossfade, normalize, and record feedback metrics."""
+        if self.pipeline.sample_rate != self.config.output_sample_rate:
+            output = self.output_resampler.resample_chunk(output)
+
+        max_val = np.max(np.abs(output)) if len(output) else 0.0
+        if max_val > 1.0:
+            output = np.tanh(output)
+            if self.stats.frames_processed <= 5:
+                logger.warning(f"Audio clipping detected: max={max_val:.2f}")
+
+        output = self._apply_sola_and_trim(output, chunk_at_mic_rate)
+        output = self._apply_leveling(output)
+
+        if self.stats.frames_processed < 20:
+            output_hash = hash(output[:100].tobytes()) % 10000
+            output_rms = np.sqrt(np.mean(output**2)) if len(output) else 0.0
+            logger.info(
+                f"[OUTPUT-PROC] len={len(output)}, hash={output_hash}, "
+                f"rms={output_rms:.6f}, first5={output[:5]}"
+            )
+
+        self._store_output_history(output)
+        self._maybe_check_feedback(chunk_at_mic_rate)
+
+        return output
+
     def _on_audio_input(self, audio: np.ndarray) -> None:
         """Callback for audio input."""
         # Debug: log input audio signature to detect feedback
@@ -811,428 +1214,12 @@ class RealtimeVoiceChanger:
                 # Process timing
                 start_time = time.perf_counter()
 
-                # Apply input gain
-                if self.config.input_gain_db != 0.0:
-                    gain_linear = 10 ** (self.config.input_gain_db / 20)
-                    chunk = chunk * gain_linear
-
-                # Store raw input chunk at mic rate for feedback detection
-                chunk_at_mic_rate = chunk.copy()
-
-                # Calculate input RMS for energy tracking
-                input_rms = np.sqrt(np.mean(chunk**2))
-                input_peak = float(np.max(np.abs(chunk))) if len(chunk) else 0.0
-
-                # Update input RMS EMA for energy normalization
-                if self.config.use_energy_normalization and input_rms > 1e-6:
-                    alpha = self.config.energy_smoothing
-                    if self._input_rms_ema < 1e-6:
-                        self._input_rms_ema = input_rms
-                    else:
-                        self._input_rms_ema = alpha * self._input_rms_ema + (1 - alpha) * input_rms
-
-                # Update input peak EMA for peak normalization
-                if self.config.use_peak_normalization and input_peak > 1e-6:
-                    alpha = self.config.peak_smoothing
-                    if self._input_peak_ema < 1e-6:
-                        self._input_peak_ema = input_peak
-                    else:
-                        self._input_peak_ema = alpha * self._input_peak_ema + (1 - alpha) * input_peak
-
-                # Debug: log input chunk stats
-                if self.stats.frames_processed < 3:
-                    # Expected chunk size depends on chunking mode
-                    if self.config.chunking_mode == "rvc_webui":
-                        # RVC WebUI mode: just main chunk (no context/lookahead added)
-                        expected_len = self.mic_chunk_samples
-                    else:
-                        # wokada/hybrid: context + main + lookahead
-                        expected_len = self.mic_chunk_samples + self.mic_context_samples + self.mic_lookahead_samples
-                    logger.info(
-                        f"Raw input chunk: len={len(chunk)} (expected={expected_len}, mode={self.config.chunking_mode}), "
-                        f"min={chunk.min():.4f}, max={chunk.max():.4f}, rms={input_rms:.4f}"
-                    )
-
-                # Validate chunk size - skip if too short (prevents zero-size array errors)
-                # For rvc_webui mode: just main is required
-                # For wokada/hybrid: main + context is required (lookahead is optional)
-                if self.config.chunking_mode == "rvc_webui":
-                    min_required_samples = self.mic_chunk_samples
-                else:
-                    # Need at least main + context for proper processing
-                    min_required_samples = self.mic_chunk_samples + self.mic_context_samples
-
-                if len(chunk) < min_required_samples:
-                    logger.warning(
-                        f"Chunk too short: {len(chunk)} < {min_required_samples} (mode={self.config.chunking_mode}), skipping"
-                    )
+                info = self._prepare_input_chunk(chunk)
+                if info is None:
                     continue
 
-                # Resample from mic rate to processing rate (stateful for phase continuity)
-                if self.config.mic_sample_rate != self.config.input_sample_rate:
-                    chunk = self.input_resampler.resample_chunk(chunk)
-                    if self.stats.frames_processed < 3:
-                        logger.info(
-                            f"After stateful resample: len={len(chunk)}, "
-                            f"min={chunk.min():.4f}, max={chunk.max():.4f}"
-                        )
-
-                # Apply noise cancellation if enabled
-                if self.config.denoise_enabled:
-                    if self.stats.frames_processed < 3:
-                        logger.info(f"Applying denoise (method={self.config.denoise_method})")
-                    chunk = denoise_audio(
-                        chunk,
-                        sample_rate=self.config.input_sample_rate,
-                        method=self.config.denoise_method,
-                        device="cpu",  # ML denoiser runs on CPU for stability
-                    )
-                    if self.stats.frames_processed < 3:
-                        logger.info(
-                            f"After denoise: len={len(chunk)}, "
-                            f"min={chunk.min():.4f}, max={chunk.max():.4f}"
-                        )
-
-                # Run inference
-                output = self.pipeline.infer(
-                    chunk,
-                    input_sr=self.config.input_sample_rate,
-                    pitch_shift=self.config.pitch_shift,
-                    f0_method=self.config.f0_method if self.config.use_f0 else "none",
-                    index_rate=self.config.index_rate,
-                    index_k=self.config.index_k,
-                    voice_gate_mode=self.config.voice_gate_mode,
-                    energy_threshold=self.config.energy_threshold,
-                    use_feature_cache=self.config.use_feature_cache,
-                    use_parallel_extraction=self.config.use_parallel_extraction,
-                    allow_short_input=True,  # Allow short chunks for low latency
-                )
-
-                # Resample to output sample rate (stateful for phase continuity)
-                if self.pipeline.sample_rate != self.config.output_sample_rate:
-                    output = self.output_resampler.resample_chunk(output)
-
-                # Soft clipping to prevent harsh distortion
-                max_val = np.max(np.abs(output))
-                if max_val > 1.0:
-                    output = np.tanh(output)  # Soft clip
-                    if self.stats.frames_processed <= 5:
-                        logger.warning(f"Audio clipping detected: max={max_val:.2f}")
-
-                # Apply SOLA crossfade (mode-dependent)
-                # Debug: Log SOLA conditions (first 3 chunks only)
-                if self.stats.frames_processed < 3:
-                    logger.info(
-                        f"[SOLA-DEBUG] chunk={self.stats.frames_processed}, "
-                        f"use_sola={self.config.use_sola}, "
-                        f"sola_state_exists={self._sola_state is not None}, "
-                        f"chunking_mode={self.config.chunking_mode}"
-                    )
-
-                if self.config.use_sola and self._sola_state is not None:
-                    if self.config.chunking_mode == "rvc_webui":
-                        # RVC WebUI mode: overlap-based SOLA
-                        # Each chunk overlaps with previous, SOLA finds optimal offset
-                        if self.stats.frames_processed < 3:
-                            logger.info(f"[RVC-WEBUI-BLOCK] Entering rvc_webui mode block")
-                        pre_sola_len = len(output)
-                        cf_result = apply_sola_crossfade(
-                            output,
-                            self._sola_state,
-                            wokada_mode=False,  # RVC WebUI mode
-                            context_samples=0,
-                        )
-                        post_sola_len = len(cf_result.audio)
-                        output = cf_result.audio
-
-                        # CRITICAL FIX: Trim output to hop_samples to maintain correct length
-                        # Input advances by hop_samples, so output should match
-                        # hop_sec = mic_hop_samples / mic_sr
-                        # output_hop_samples = output_sr * hop_sec
-                        hop_sec = self.mic_hop_samples / self.config.mic_sample_rate
-                        output_hop_samples = int(self.config.output_sample_rate * hop_sec)
-
-                        # First chunk: output full chunk minus overlap
-                        # Subsequent chunks: output hop_samples worth
-                        pre_trim_len = len(output)
-                        if self.stats.frames_processed == 0:
-                            # First chunk: keep chunk - overlap worth of audio
-                            first_chunk_sec = self.config.chunk_sec - self.config.rvc_overlap_sec
-                            first_chunk_samples = int(
-                                self.config.output_sample_rate * first_chunk_sec
-                            )
-                            if len(output) > first_chunk_samples:
-                                output = output[:first_chunk_samples]
-                        else:
-                            # Subsequent chunks: keep hop_samples worth
-                            if len(output) > output_hop_samples:
-                                output = output[:output_hop_samples]
-
-                        # Log SOLA stats for debugging
-                        if self.stats.frames_processed < 5:
-                            logger.info(
-                                f"[SOLA-RVC-DBG] chunk={self.stats.frames_processed}, "
-                                f"pre_sola={pre_sola_len}, post_sola={post_sola_len}, "
-                                f"pre_trim={pre_trim_len}, post_trim={len(output)}, "
-                                f"hop_samples={output_hop_samples}, mic_hop={self.mic_hop_samples}"
-                            )
-
-                        # Log SOLA stats periodically
-                        if self.stats.frames_processed % 50 == 0:
-                            logger.debug(
-                                f"[SOLA-RVC] chunk={self.stats.frames_processed}, "
-                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}, "
-                                f"out_len={len(output)}"
-                            )
-                    elif self.config.chunking_mode == "hybrid":
-                        # Hybrid mode: RVC-style hop + w-okada context structure
-                        # Context is used for quality but trimmed from output to maintain length
-                        if self.stats.frames_processed < 3:
-                            logger.info(f"[HYBRID-BLOCK] Entering hybrid mode block")
-                        context_samples_output = 0
-                        if self.config.context_sec > 0:
-                            context_samples_output = int(
-                                self.config.output_sample_rate * self.config.context_sec
-                            )
-
-                        cf_result = apply_sola_crossfade(
-                            output,
-                            self._sola_state,
-                            wokada_mode=True,
-                            context_samples=context_samples_output,
-                        )
-                        output = cf_result.audio
-
-                        # Log SOLA stats periodically
-                        if self.stats.frames_processed % 50 == 0:
-                            logger.debug(
-                                f"[SOLA-HYB] chunk={self.stats.frames_processed}, "
-                                f"offset={cf_result.sola_offset}, corr={cf_result.correlation:.4f}"
-                            )
-                    else:
-                        # w-okada mode: context-based SOLA
-                        if self.stats.frames_processed < 3:
-                            logger.info(f"[WOKADA-BLOCK] Entering w-okada mode block")
-
-                        # Debug: check if adaptive calc exists
-                        if self.stats.frames_processed < 3:
-                            logger.info(f"[DEBUG] adaptive_calc exists: {self.adaptive_calc is not None}")
-
-                        # Adaptive parameter adjustment
-                        if self.adaptive_calc is not None:
-                            # Analyze audio characteristics (use input chunk at mic rate)
-                            adaptive_params = self.adaptive_calc.analyze_and_adjust(
-                                chunk_at_mic_rate,
-                                f0=None,  # F0 not available at this stage
-                            )
-
-                            # Use adaptive crossfade size
-                            # Phase 8: Use 80ms minimum buffer for strong crossfade
-                            adaptive_crossfade_samples = int(
-                                self.config.output_sample_rate * adaptive_params['crossfade_sec']
-                            )
-                            min_phase8_buffer = int(self.config.output_sample_rate * 0.08)
-                            adaptive_buffer_size = max(adaptive_crossfade_samples, min_phase8_buffer)
-
-                            # Create temporary SOLA state with adaptive parameters
-                            adaptive_sola_state = SOLAState.create(
-                                adaptive_buffer_size,
-                                self.config.output_sample_rate,
-                                use_advanced_sola=self.config.sola_use_advanced,
-                                fallback_threshold=self.config.sola_fallback_threshold,
-                            )
-                            # Resize sola_buffer if necessary
-                            if self._sola_state.sola_buffer is not None:
-                                old_size = len(self._sola_state.sola_buffer)
-                                new_size = adaptive_buffer_size
-
-                                if old_size == new_size:
-                                    # Same size, direct copy
-                                    adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer.copy()
-                                elif old_size < new_size:
-                                    # Pad with zeros on the right
-                                    adaptive_sola_state.sola_buffer = np.pad(
-                                        self._sola_state.sola_buffer,
-                                        (0, new_size - old_size),
-                                        mode='constant'
-                                    )
-                                else:
-                                    # Trim from the left (keep most recent audio)
-                                    adaptive_sola_state.sola_buffer = self._sola_state.sola_buffer[old_size - new_size:].copy()
-
-                                adaptive_sola_state.frames_processed = self._sola_state.frames_processed
-
-                            # Phase 8: Preserve first chunk boundary flag
-                            adaptive_sola_state.is_first_chunk_boundary = self._sola_state.is_first_chunk_boundary
-
-                            sola_state_to_use = adaptive_sola_state
-                            context_sec_to_use = adaptive_params['context_sec']
-
-                            # Log adaptive parameters occasionally
-                            if self.stats.frames_processed < 10 or self.stats.frames_processed % 20 == 0:
-                                logger.info(
-                                    f"[ADAPTIVE] chunk={self.stats.frames_processed}, "
-                                    f"energy={adaptive_params['energy']:.3f}, "
-                                    f"flux={adaptive_params['flux']:.3f}, "
-                                    f"crossfade={adaptive_params['crossfade_sec']:.3f}s, "
-                                    f"context={adaptive_params['context_sec']:.3f}s"
-                                )
-                        else:
-                            # Use fixed parameters
-                            sola_state_to_use = self._sola_state
-                            context_sec_to_use = self.config.context_sec
-
-                        # Calculate context size
-                        context_samples_output = 0
-                        if context_sec_to_use > 0:
-                            context_samples_output = int(
-                                self.config.output_sample_rate * context_sec_to_use
-                            )
-
-                        cf_result = apply_sola_crossfade(
-                            output,
-                            sola_state_to_use,
-                            wokada_mode=True,
-                            context_samples=context_samples_output,
-                        )
-                        output = cf_result.audio
-
-                        # Update main SOLA state buffer if using adaptive
-                        if self.adaptive_calc is not None and sola_state_to_use.sola_buffer is not None:
-                            # Resize back to main SOLA state size if necessary
-                            adaptive_size = len(sola_state_to_use.sola_buffer)
-                            main_size = self._sola_state.sola_buffer_frame
-
-                            if adaptive_size == main_size:
-                                # Same size, direct copy
-                                self._sola_state.sola_buffer = sola_state_to_use.sola_buffer.copy()
-                            elif adaptive_size < main_size:
-                                # Pad with zeros on the right
-                                self._sola_state.sola_buffer = np.pad(
-                                    sola_state_to_use.sola_buffer,
-                                    (0, main_size - adaptive_size),
-                                    mode='constant'
-                                )
-                            else:
-                                # Trim from the left (keep most recent audio)
-                                self._sola_state.sola_buffer = sola_state_to_use.sola_buffer[adaptive_size - main_size:].copy()
-
-                            self._sola_state.frames_processed = sola_state_to_use.frames_processed
-
-                            # Phase 8: Sync first chunk boundary flag back to main state
-                            self._sola_state.is_first_chunk_boundary = sola_state_to_use.is_first_chunk_boundary
-
-                        # Log SOLA stats periodically
-                        if self.stats.frames_processed % 50 == 0:
-                            logger.debug(
-                                f"[SOLA] chunk={self.stats.frames_processed}, "
-                                f"offset={cf_result.sola_offset}"
-                            )
-                else:
-                    # No SOLA: Manually trim context from output to get only the "main" portion
-                    # This is critical for matching batch processing output length
-                    # Skip trimming for first chunk (no left context)
-                    if self.config.chunking_mode != "rvc_webui" and self.config.context_sec > 0:
-                        context_samples_output = int(
-                            self.config.output_sample_rate * self.config.context_sec
-                        )
-                        if len(output) > context_samples_output:
-                            output = output[context_samples_output:]
-                            # Log trimming for first few chunks
-                            if self.stats.frames_processed < 5:
-                                logger.info(
-                                    f"[TRIM] Chunk #{self.stats.frames_processed}: trimmed {context_samples_output} samples from start"
-                                )
-
-                # Apply energy normalization if enabled
-                if self.config.use_energy_normalization:
-                    # Calculate current output RMS
-                    output_rms = np.sqrt(np.mean(output**2))
-                    if output_rms > 1e-6 and self._input_rms_ema > 1e-6:
-                        # Track input/output energy ratio
-                        current_ratio = self._input_rms_ema / output_rms
-
-                        # Update energy ratio EMA (smooth the ratio, not the individual RMS values)
-                        alpha = self.config.energy_smoothing
-                        if self._energy_ratio_ema < 0.1:  # Not yet initialized
-                            self._energy_ratio_ema = current_ratio
-                        else:
-                            self._energy_ratio_ema = (
-                                alpha * self._energy_ratio_ema + (1 - alpha) * current_ratio
-                            )
-
-                        # Scale output to maintain consistent input/output relationship
-                        # Use smoothed ratio to reduce energy fluctuations between chunks
-                        scale = self._energy_ratio_ema
-                        # Limit scaling range to avoid extreme amplification/attenuation
-                        scale = np.clip(scale, 0.7, 1.4)
-                        output = output * scale
-
-                        if self.stats.frames_processed < 10:
-                            logger.debug(
-                                f"[ENERGY] chunk={self.stats.frames_processed}, "
-                                f"in_rms={self._input_rms_ema:.4f}, out_rms={output_rms:.4f}, "
-                                f"ratio={current_ratio:.3f}, ema_ratio={self._energy_ratio_ema:.3f}, scale={scale:.3f}"
-                            )
-
-                # Apply peak normalization if enabled
-                if self.config.use_peak_normalization and self._input_peak_ema > 1e-6:
-                    output_peak = float(np.max(np.abs(output))) if len(output) else 0.0
-                    if output_peak > 1e-6:
-                        peak_scale = self._input_peak_ema / output_peak
-                        peak_scale = np.clip(peak_scale, 0.5, 1.5)
-                        output = output * peak_scale
-
-                # Smooth chunk gain to reduce loudness variation (RVC-style continuity)
-                if self.config.use_chunk_gain_smoothing:
-                    output_rms = np.sqrt(np.mean(output**2)) if len(output) else 0.0
-                    if output_rms > 1e-6:
-                        alpha = self.config.chunk_gain_smoothing
-                        if self._output_rms_target < 1e-6:
-                            self._output_rms_target = output_rms
-                        else:
-                            self._output_rms_target = (
-                                alpha * self._output_rms_target + (1 - alpha) * output_rms
-                            )
-                        gain = self._output_rms_target / output_rms
-                        gain = np.clip(gain, 0.9, 1.1)
-                        output = output * gain
-
-                # Debug: log output audio signature to detect feedback
-                if self.stats.frames_processed < 20:
-                    output_hash = hash(output[:100].tobytes()) % 10000
-                    output_rms = np.sqrt(np.mean(output**2))
-                    logger.info(
-                        f"[OUTPUT-PROC] len={len(output)}, hash={output_hash}, "
-                        f"rms={output_rms:.6f}, first5={output[:5]}"
-                    )
-
-                # Store output for feedback detection
-                self._store_output_history(output)
-
-                # Check for feedback periodically
-                if (
-                    self.stats.frames_processed > 0
-                    and self.stats.frames_processed % self._feedback_check_interval == 0
-                ):
-                    # Get raw input chunk for comparison (at mic rate)
-                    raw_input = chunk_at_mic_rate if "chunk_at_mic_rate" in locals() else chunk
-                    correlation = self._check_feedback(raw_input)
-                    self.stats.feedback_correlation = correlation
-
-                    if correlation > 0.3 and not self._feedback_warning_shown:
-                        self.stats.feedback_detected = True
-                        self._feedback_warning_shown = True
-                        logger.warning(
-                            f"[FEEDBACK] 音声フィードバックを検出しました (相関係数={correlation:.2f}). "
-                            "Windowsの「このデバイスを聴く」が有効になっていないか確認してください。"
-                        )
-                        if self.on_error:
-                            self.on_error(
-                                "フィードバック検出: 入力と出力が接続されている可能性があります。\n"
-                                "「サウンド設定」→「録音デバイス」→「プロパティ」→「聴く」タブで\n"
-                                "「このデバイスを聴く」が無効になっているか確認してください。"
-                            )
+                output = self._run_inference(info.chunk_model)
+                output = self._postprocess_output(output, info.chunk_mic)
 
                 # Update stats
                 inference_time = time.perf_counter() - start_time
@@ -1707,7 +1694,12 @@ class RealtimeVoiceChanger:
         Args:
             crossfade_sec: Crossfade duration in seconds
         """
-        self.config.crossfade_sec = max(0.0, min(0.2, crossfade_sec))
+        if self.config.chunking_mode == "rvc_webui":
+            max_crossfade = max(0.0, self.config.chunk_sec * 0.5)
+        else:
+            max_crossfade = max(0.0, min(self.config.context_sec, self.config.chunk_sec * 0.5))
+
+        self.config.crossfade_sec = max(0.0, min(max_crossfade, crossfade_sec))
 
         # Apply immediately if running - recreate crossfade strategy
         if self._running:
@@ -1839,6 +1831,7 @@ class RealtimeVoiceChanger:
             )
 
         # Run inference
+        pad_mode = "none" if self.config.chunking_mode == "wokada" else "chunk"
         output = self.pipeline.infer(
             chunk,
             input_sr=self.config.input_sample_rate,
@@ -1851,6 +1844,9 @@ class RealtimeVoiceChanger:
             use_feature_cache=self.config.use_feature_cache,
             use_parallel_extraction=self.config.use_parallel_extraction,
             allow_short_input=True,  # Allow short chunks for manual processing
+            pad_mode=pad_mode,
+            synth_min_frames=self.config.synth_min_frames,
+            history_sec=self.config.history_sec,
         )
 
         # Resample to output sample rate (stateful for phase continuity)
