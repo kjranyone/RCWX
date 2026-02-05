@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Callable, Optional
@@ -114,6 +115,11 @@ class RealtimeVoiceChangerV2:
         # F0 stability tracking (for adaptive SOLA fallback)
         self._f0_ema = 0.0
         self._f0_dev_ema = 0.0
+
+        # Overload protection (drop spikes -> temporary quality reduction)
+        self._queue_full_times: deque[float] = deque(maxlen=50)
+        self._overload_until: float = 0.0
+        self._overload_active = False
 
         # Adaptive parameters
         self.adaptive_calc = (
@@ -336,7 +342,7 @@ class RealtimeVoiceChangerV2:
         if self.config.mic_sample_rate != self.config.input_sample_rate:
             chunk = self.input_resampler.resample_chunk(chunk)
 
-        if self.config.denoise_enabled:
+        if self._is_overloaded() is False and self.config.denoise_enabled:
             chunk = denoise_audio(
                 chunk,
                 sample_rate=self.config.input_sample_rate,
@@ -360,12 +366,22 @@ class RealtimeVoiceChangerV2:
     def _infer(self, chunk: np.ndarray) -> np.ndarray:
         pad_mode = "none" if self.config.chunking_mode == "wokada" else "chunk"
         history_sec = self.config.history_sec
+
+        if self._is_overloaded():
+            use_f0 = False
+            f0_method = "none"
+            index_rate = 0.0
+        else:
+            use_f0 = self.config.use_f0
+            f0_method = self.config.f0_method
+            index_rate = self.config.index_rate
+
         return self.pipeline.infer(
             chunk,
             input_sr=self.config.input_sample_rate,
             pitch_shift=self.config.pitch_shift,
-            f0_method=self.config.f0_method if self.config.use_f0 else "none",
-            index_rate=self.config.index_rate,
+            f0_method=f0_method if use_f0 else "none",
+            index_rate=index_rate,
             index_k=self.config.index_k,
             voice_gate_mode=self.config.voice_gate_mode,
             energy_threshold=self.config.energy_threshold,
@@ -613,6 +629,7 @@ class RealtimeVoiceChangerV2:
                 self._input_queue.put_nowait(result.chunk)
             except Exception:
                 logger.warning("Input queue full, dropping chunk")
+                self._record_queue_full()
                 break
 
     def process_next_chunk(self) -> bool:
@@ -770,6 +787,33 @@ class RealtimeVoiceChangerV2:
         threshold = base + (0.5 - stability) * 0.2
         self._sola_state.fallback_threshold = float(np.clip(threshold, 0.5, 0.9))
         self._sola_state.fallback_strength = float(np.clip(1.0 - stability, 0.0, 1.0))
+
+    def _record_queue_full(self) -> None:
+        now = time.time()
+        self._queue_full_times.append(now)
+        self._maybe_enter_overload(now)
+
+    def _maybe_enter_overload(self, now: float) -> None:
+        # If we see 3+ drops within 1 second, enter overload mode for 2 seconds
+        recent = [t for t in self._queue_full_times if now - t <= 1.0]
+        if len(recent) >= 3 and self._overload_until < now:
+            self._overload_until = now + 2.0
+            if not self._overload_active:
+                self._overload_active = True
+                logger.warning(
+                    "Overload detected: temporarily disabling denoise/F0/index for stability"
+                )
+
+    def _is_overloaded(self) -> bool:
+        if self._overload_until <= 0:
+            return False
+        now = time.time()
+        if now <= self._overload_until:
+            return True
+        if self._overload_active:
+            self._overload_active = False
+            logger.info("Overload cleared: restoring full quality settings")
+        return False
 
     def _effective_history_sec(self) -> float:
         """Compatibility hook for future history tuning (currently passthrough)."""
