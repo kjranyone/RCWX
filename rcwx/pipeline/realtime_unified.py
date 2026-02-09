@@ -285,12 +285,43 @@ class RealtimeVoiceChangerUnified:
         """Round sample count up to nearest multiple of hop."""
         return ((samples + hop - 1) // hop) * hop
 
+    def _recalculate_sizes(self) -> None:
+        """Recalculate derived sample counts from current config."""
+        hubert_hop = 320
+        self._hop_samples_16k = self._align_to_hop(
+            int(self.config.chunk_sec * 16000), hubert_hop
+        )
+        self._overlap_samples_16k = self._align_to_hop(
+            int(self.config.overlap_sec * 16000), hubert_hop
+        )
+        self._hop_samples_mic = int(
+            self._hop_samples_16k * self.config.mic_sample_rate / 16000
+        )
+
+        # SOLA extra samples
+        crossfade_samples_out = int(
+            self.config.output_sample_rate * self.config.crossfade_sec
+        )
+        search_samples_out = int(
+            self.config.output_sample_rate * self.config.sola_search_ms / 1000
+        )
+        self._sola_state.crossfade_samples = crossfade_samples_out
+        self._sola_state.search_samples = search_samples_out
+        self._sola_state._hann_fade_in = None
+        self._sola_state._hann_fade_out = None
+        sola_extra_out = crossfade_samples_out + search_samples_out
+        self._sola_extra_model = int(
+            sola_extra_out * self.pipeline.sample_rate
+            / self.config.output_sample_rate
+        )
+
     # ======== Lifecycle ========
 
     def start(self) -> None:
         if self._running:
             return
 
+        self._recalculate_sizes()
         self.pipeline.clear_cache()
         self.stats.reset()
         self.output_buffer.clear()
@@ -379,7 +410,20 @@ class RealtimeVoiceChangerUnified:
         self.config.use_f0 = enabled
 
     def set_f0_method(self, method: str) -> None:
+        old = self.config.f0_method
         self.config.f0_method = method
+        # Enforce minimum chunk_sec for the new F0 method
+        if self.config.use_f0:
+            min_chunk = {"rmvpe": 0.32, "fcpe": 0.10}.get(method, 0.0)
+            if min_chunk > 0 and self.config.chunk_sec < min_chunk:
+                logger.info(
+                    f"F0 method {method} requires chunk_sec >= {min_chunk}s, "
+                    f"adjusting from {self.config.chunk_sec}s"
+                )
+                self.set_chunk_sec(min_chunk)
+                return
+        if old != method:
+            logger.info(f"F0 method changed: {old} -> {method}")
 
     def set_index_rate(self, rate: float) -> None:
         self.config.index_rate = rate

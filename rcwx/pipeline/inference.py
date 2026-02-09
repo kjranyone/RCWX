@@ -1390,6 +1390,11 @@ class RVCPipeline:
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         return self.rmvpe.infer(audio_t)
+                logger.warning(
+                    "[INFER] F0 parallel extraction returned None "
+                    f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
+                    f"rmvpe={'loaded' if self.rmvpe else 'None'})"
+                )
                 return None
 
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1427,6 +1432,10 @@ class RVCPipeline:
         if use_f0:
             f0 = f0_raw
             if f0 is None:
+                logger.debug(
+                    "[INFER] F0 parallel result was None, trying sequential fallback "
+                    f"(method={f0_method})"
+                )
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.fcpe.infer(audio_t, threshold=0.006)
@@ -1477,6 +1486,11 @@ class RVCPipeline:
                 voiced_mask_for_gate = voiced_mask.float()
 
             if pitch is None:
+                logger.warning(
+                    "[INFER] F0 extraction failed — using flat pitch "
+                    f"(method={f0_method}, f0_raw={'OK' if f0_raw is not None else 'None'}, "
+                    f"audio_samples={audio_t.shape[-1]})"
+                )
                 pitch = torch.ones(
                     features.shape[0], features.shape[1],
                     dtype=torch.long, device=self.device,
@@ -1488,6 +1502,10 @@ class RVCPipeline:
 
         # Fallback: F0 model but f0_method="none" (e.g. overload protection)
         if self.has_f0 and pitch is None:
+            logger.warning(
+                "[INFER] F0 skipped — flat pitch fallback "
+                f"(f0_method={f0_method}, use_f0={use_f0})"
+            )
             pitch = torch.ones(
                 features.shape[0], features.shape[1],
                 dtype=torch.long, device=self.device,
