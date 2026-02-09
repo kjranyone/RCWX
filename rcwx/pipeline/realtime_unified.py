@@ -615,13 +615,14 @@ class RealtimeVoiceChangerUnified:
                     output_48k = np.tanh(output_48k)
 
                 # --- Stage 7: SOLA crossfade ---
+                # target_len = hop_mic: forces output to exactly hop_mic
+                # samples and places the hold-back contiguously after
+                # the output boundary, preventing latency drift.
                 if self.config.use_sola:
-                    output_48k = sola_crossfade(output_48k, self._sola_state)
-
-                # --- Stage 7b: Output length ---
-                # Hold-back SOLA + sola_extra_samples (= cf + search):
-                #   output ≈ hop_mic + search - offset ≈ hop_mic (± search)
-                # Small surplus (0–10ms/chunk) absorbed by RingOutputBuffer.
+                    output_48k = sola_crossfade(
+                        output_48k, self._sola_state,
+                        target_len=self._hop_samples_mic,
+                    )
 
                 # --- Stage 8: Feedback detection ---
                 self._store_output_history(output_48k)

@@ -51,20 +51,23 @@ class SolaState:
 def sola_crossfade(
     audio: NDArray[np.float32],
     state: SolaState,
+    target_len: int = 0,
 ) -> NDArray[np.float32]:
     """Apply SOLA crossfade to consecutive audio chunks.
 
-    Hold-back design: the buffer stores the last `cf` samples of each
-    chunk, withholding them from output.  The next chunk's start is
-    crossfaded with that held-back tail.
+    Hold-back design: the buffer stores `cf` samples immediately after
+    the output region, withholding them from playback.  The next chunk
+    crossfades its start with that held-back tail.
 
-    When the upstream produces `hop + cf + search` samples (via
-    sola_extra_samples), the net output is approximately `hop + search
-    - offset`, which is close to `hop` samples per chunk.
+    When ``target_len > 0`` the output is forced to exactly that many
+    samples, and the hold-back is taken from immediately after the
+    output boundary.  This prevents cumulative latency drift while
+    keeping the hold-back contiguous with the output (no content gap).
 
     Args:
         audio: Current chunk audio (at output sample rate).
         state: SOLA state (modified in-place).
+        target_len: If >0, force output to this exact length.
 
     Returns:
         Crossfaded audio chunk.
@@ -78,8 +81,11 @@ def sola_crossfade(
 
     state._ensure_window()
 
-    # First chunk: hold back last cf samples, output the rest
+    # First chunk: output + hold-back, no crossfade
     if state.buffer is None:
+        if target_len > 0 and len(audio) >= target_len + cf:
+            state.buffer = audio[target_len:target_len + cf].copy()
+            return audio[:target_len]
         if len(audio) > cf:
             state.buffer = audio[-cf:].copy()
             return audio[:-cf]
@@ -112,13 +118,20 @@ def sola_crossfade(
     # Remaining audio after crossfade region
     remaining = audio[offset + cf:]
 
+    # Output length: cf (crossfaded) + take (from remaining)
+    if target_len > 0:
+        take = target_len - cf
+        if take >= 0 and take + cf <= len(remaining):
+            # Hold-back contiguous with output — no content gap
+            state.buffer = remaining[take:take + cf].copy()
+            result = np.concatenate([crossfaded, remaining[:take]])
+            return result
+        # Fall through to default if audio too short for target
+
     if len(remaining) >= cf:
-        # Hold back last cf samples for next crossfade
         state.buffer = remaining[-cf:].copy()
         result = np.concatenate([crossfaded, remaining[:-cf]])
     else:
-        # Not enough remaining to hold back — use crossfaded + remaining
-        # and hold back from the full audio tail
         state.buffer = audio[-cf:].copy()
         result = np.concatenate([crossfaded, remaining])
 
@@ -168,29 +181,40 @@ def _find_best_offset(
     if max_offset <= 0:
         return 0
 
-    # Slide prev_tail across search_region to find best match
-    best_offset = 0
-    best_corr = -np.inf
-
-    # Normalize prev_tail
+    # Normalize prev_tail (zero-mean by construction)
     pt_mean = np.mean(prev_tail)
     pt_centered = prev_tail - pt_mean
     pt_norm = np.sqrt(np.sum(pt_centered ** 2))
     if pt_norm < 1e-8:
         return 0
 
-    for off in range(max_offset + 1):
-        candidate = search_region[off:off + crossfade_samples]
-        if len(candidate) < crossfade_samples:
-            break
-        c_mean = np.mean(candidate)
-        c_centered = candidate - c_mean
-        c_norm = np.sqrt(np.sum(c_centered ** 2))
-        if c_norm < 1e-8:
-            continue
-        corr = np.dot(pt_centered, c_centered) / (pt_norm * c_norm)
-        if corr > best_corr:
-            best_corr = corr
-            best_offset = off
+    cf = crossfade_samples
+    region = search_region[:cf + max_offset]
 
-    return best_offset
+    # Dot products via np.correlate (C-implemented):
+    # Since sum(pt_centered)==0, centering the candidate windows doesn't
+    # change the dot product: dot(pt_centered, w - mean(w)) = dot(pt_centered, w).
+    dots = np.correlate(region, pt_centered, mode="valid")  # length: max_offset+1
+
+    # Per-window norms via cumulative sums (O(N), no large intermediates):
+    # norm^2 = sum((w - mean)^2) = sum(w^2) - cf * mean^2
+    x = region.astype(np.float64)
+    cumsum = np.empty(len(x) + 1, dtype=np.float64)
+    cumsum[0] = 0.0
+    np.cumsum(x, out=cumsum[1:])
+    cumsum_sq = np.empty(len(x) + 1, dtype=np.float64)
+    cumsum_sq[0] = 0.0
+    np.cumsum(x * x, out=cumsum_sq[1:])
+
+    window_sums = cumsum[cf:cf + max_offset + 1] - cumsum[:max_offset + 1]
+    window_sq_sums = cumsum_sq[cf:cf + max_offset + 1] - cumsum_sq[:max_offset + 1]
+    norms_sq = np.maximum(window_sq_sums - window_sums * window_sums / cf, 0.0)
+    norms = np.sqrt(norms_sq)
+
+    # Normalized cross-correlation (invalid windows → -inf)
+    corrs = np.full(max_offset + 1, -np.inf)
+    valid = norms > 1e-8
+    corrs[valid] = dots[valid] / (pt_norm * norms[valid])
+
+    # argmax returns first index on tie — same as the sequential scan
+    return int(np.argmax(corrs))
