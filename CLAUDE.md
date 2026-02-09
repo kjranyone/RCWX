@@ -1,356 +1,230 @@
-﻿# CLAUDE.md - RCWX Development Guide
+﻿# RCWX Development Guide
 
 ## Project Overview
 
 **RCWX** = RVC Real-time Voice Changer on Intel Arc (XPU)
 
-RVC v2モデルを使ったリアルタイムボイスチェンジャー。Intel Arc GPU (XPU)に最適化した実装で、GUIとCLIの両方を提供します。
+RVC v2モデルを使ったリアルタイムボイスチェンジャー。現行のリアルタイム処理は
+`RealtimeVoiceChangerUnified` を中心とした単一パス実装です。
 
 ## Quick Start
 
 ```powershell
-# 1. 依存関係インストール（PyTorch XPU版が自動的にインストールされる）
+# 1) 依存関係インストール（PyTorch XPU版を使用）
 uv sync
 
-# 2. XPU確認
-uv run python -c "import torch; print(f'XPU: {torch.xpu.is_available()}')"
+# 2) XPU確認
+uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available())"
 
-# 3. モデルダウンロード（HuBERT, RMVPE）
+# 3) 必須モデルをダウンロード（HuBERT / RMVPE）
 uv run rcwx download
 
-# 4. (推奨) FCPE低レイテンシF0抽出をインストール
+# 4) (推奨) FCPE低レイテンシF0を追加
 uv sync --extra lowlatency
 # または: pip install torchfcpe
 
-# 5. (オプション) ML Denoiserの確認（Facebook Denoiser）
-uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(f'ML Denoiser: {is_ml_denoiser_available()}')"
+# 5) (オプション) ML Denoiser利用可否を確認
+uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(is_ml_denoiser_available())"
 
-# 6. オーディオデバイス診断 (推奨: フィードバック防止)
+# 6) (推奨) フィードバック診断
 uv run rcwx diagnose
 
-# 7. GUI起動
+# 7) GUI起動
 uv run rcwx
 ```
 
-## 初回起動時のデフォルト設定
+## Current Architecture
 
-`config.py` のデフォルト値に基づきます（GUIは保存済み設定を復元）。
-
-- F0方式: `fcpe`
-- Audio `chunk_sec`: **0.15s (150ms)** (GUIで唯一のユーザー制御パラメータ)
-- 以下はchunk_secから自動導出 (GUI上は読み取り専用):
-  - `overlap_sec`: 80ms (chunk_secの50%, 60-200ms, 20ms刻み)
-  - `crossfade_sec`: 40ms (chunk_secの25%, 10-80ms, 10ms刻み)
-  - `prebuffer_chunks`: 1 (固定)
-  - `buffer_margin`: 0.5 (固定)
-  - `lookahead_sec`: 0.0 (固定)
-  - `use_sola`: true (固定)
-- `sola_search_ms`: 10.0
-- `use_parallel_extraction`: true
-- `resample_method`: `linear`
-
-F0方式ごとの最小チャンク（自動補正あり）:
-- FCPE: 0.10s
-- RMVPE: 0.32s
-
-## Architecture
-
+```text
+AudioInput (mic rate)
+  -> Input accumulator (hop単位)
+  -> [Input Queue]
+  -> Inference Thread
+       1) input gain
+       2) StatefulResampler (mic -> 16k)
+       3) optional denoise (auto/ml/spectral)
+       4) [overlap | new_hop] を組み立て
+       5) RVCPipeline.infer_streaming()
+       6) StatefulResampler (model_sr -> output_sr)
+       7) soft clip + SOLA crossfade
+       8) feedback detection
+       9) [Output Queue]
+  -> RingOutputBuffer
+  -> AudioOutput (48kHz)
 ```
-┌─────────────────────────────────────────────────────────────┐
-│               RealtimeVoiceChangerUnified                     │
-├─────────────────────────────────────────────────────────────┤
-│  AudioInput (48kHz)                                          │
-│       │                                                      │
-│       ▼                                                      │
-│  InputAccumulator (hop蓄積)                                   │
-│       │                                                      │
-│       ▼                                                      │
-│  [Input Queue] ──► Inference Thread                          │
-│                         │                                    │
-│                    Input Gain (dB)                           │
-│                         │                                    │
-│                    Resample 48k→16k (StatefulResampler)      │
-│                         │                                    │
-│                    Denoise (ML/Spectral, optional)           │
-│                         │                                    │
-│                    ChunkAssembly                              │
-│                    [overlap | new_hop] (HuBERT整列)           │
-│                         │                                    │
-│                    ┌──────────────────────────┐              │
-│                    │ RVCPipeline.infer_streaming() │          │
-│                    ├──────────────────────────┤              │
-│                    │ HuBERT (全音声)           │              │
-│                    │ F0 (全音声) [並列抽出]     │              │
-│                    │ overlapフレーム除去        │              │
-│                    │ FAISS Index Search        │              │
-│                    │ Synthesizer               │              │
-│                    │ Voice Gate                │              │
-│                    └──────────────────────────┘              │
-│                         │                                    │
-│                    Resample model_sr→48k (StatefulResampler) │
-│                         │                                    │
-│                    SimpleSola (conv1d相関 + Hann窓)          │
-│                         │                                    │
-│                    Feedback Detection                         │
-│                         │                                    │
-│  [Output Queue] ◄───────┘                                    │
-│       │                                                      │
-│       ▼                                                      │
-│  RingOutputBuffer (事前確保、3×chunk容量)                     │
-│       │                                                      │
-│       ▼                                                      │
-│  AudioOutput (48kHz)                                         │
-└─────────────────────────────────────────────────────────────┘
-```
+
+実装上の要点:
+- リアルタイム経路は `pipeline/realtime_unified.py` のみを使用
+- チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
+- 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
+- 旧GUIトグルの `use_feature_cache` は廃止
+- 過負荷時は一時的に `f0_method="none"` と `index_rate=0.0` に自動退避
 
 ## Directory Structure
 
-```
+```text
 rcwx/
-├── cli.py                 # CLIエントリポイント、ログ設定
-├── config.py              # RCWXConfig (JSON永続化)
-├── device.py              # XPU/CUDA/CPU選択
-├── diagnose.py            # オーディオフィードバック診断ツール
-├── downloader.py          # モデルダウンロード
+├── cli.py
+├── config.py
+├── device.py
+├── diagnose.py
+├── downloader.py
 ├── audio/
-│   ├── input.py           # AudioInput (sounddevice)
-│   ├── output.py          # AudioOutput (sounddevice)
-│   ├── buffer.py          # ChunkBuffer, OutputBuffer, RingOutputBuffer
-│   ├── sola.py            # シンプルSOLA (相関+Hann窓クロスフェード)
-│   ├── resample.py        # resample_poly / stateful resampler
-│   └── denoise.py         # ML/Spectral denoise
+│   ├── input.py
+│   ├── output.py
+│   ├── buffer.py          # RingOutputBuffer など
+│   ├── resample.py        # StatefulResampler
+│   ├── sola.py            # simple SOLA
+│   └── denoise.py         # auto/ml/spectral
 ├── models/
-│   ├── hubert.py          # HuBERTFeatureExtractor (transformers)
-│   ├── hubert_fairseq.py  # Fairseq形式HuBERT
-│   ├── hubert_loader.py   # HuBERT統合ローダー
-│   ├── rmvpe.py           # RMVPE F0抽出
-│   ├── fcpe.py            # FCPE F0抽出
-│   ├── synthesizer.py     # SynthesizerLoader
-│   └── infer_pack/        # RVC WebUIから移植したコアモジュール
+│   ├── hubert_loader.py
+│   ├── rmvpe.py
+│   ├── fcpe.py
+│   ├── synthesizer.py
+│   └── infer_pack/
 ├── pipeline/
-│   ├── inference.py       # RVCPipeline (バッチ推論 + infer_streaming)
-│   └── realtime_unified.py # RealtimeVoiceChangerUnified (統合パイプライン)
+│   ├── inference.py       # infer / infer_streaming
+│   └── realtime_unified.py
 └── gui/
-    ├── app.py             # RCWXApp (CustomTkinter)
-    └── widgets/           # UIコンポーネント
+    ├── app.py
+    ├── realtime_controller.py
+    └── widgets/
+        ├── audio_settings.py
+        ├── latency_settings.py
+        ├── latency_monitor.py
+        ├── model_selector.py
+        └── pitch_control.py
 ```
 
-## Key Configuration
+## Configuration (Current)
 
-### AudioConfig (config.py)
+### `AudioConfig` (`rcwx/config.py`)
 
-| パラメータ | デフォルト | 説明 |
-|-----------|-----------|------|
-| `sample_rate` | 16000 | 入力処理レート |
-| `output_sample_rate` | 48000 | 出力レート |
-| `chunk_sec` | 0.15 | チャンクサイズ（GUIの初期値） |
-| `crossfade_sec` | 0.05 | クロスフェード長 |
-| `prebuffer_chunks` | 1 | 出力開始前のプリバッファ |
-| `buffer_margin` | 0.3 | バッファマージン |
-| `input_gain_db` | 0.0 | 入力ゲイン |
+| Key | Default | Notes |
+|---|---:|---|
+| `sample_rate` | `16000` | 内部処理入力レート |
+| `output_sample_rate` | `48000` | 出力レート |
+| `chunk_sec` | `0.5` | 保存設定上のチャンク長 |
+| `prebuffer_chunks` | `1` | 出力プリバッファ |
+| `buffer_margin` | `0.3` | バッファ余裕 |
+| `input_gain_db` | `0.0` | 入力ゲイン |
+| `input_channel_selection` | `average` | left/right/average |
+| `input_hostapi_filter` | `WASAPI` | Windows向け |
+| `output_hostapi_filter` | `WASAPI` | Windows向け |
 
-### InferenceConfig (config.py)
+### `InferenceConfig` (`rcwx/config.py`)
 
-| パラメータ | デフォルト | 説明 |
-|-----------|-----------|------|
-| `f0_method` | `fcpe` | F0方式 (`fcpe` / `rmvpe`) |
-| `use_parallel_extraction` | true | HuBERT+F0並列抽出 |
+| Key | Default | Notes |
+|---|---:|---|
+| `f0_method` | `fcpe` | `fcpe` / `rmvpe` |
+| `use_f0` | `true` | F0有効化 |
+| `use_index` | `false` | FAISS有効化 |
+| `index_ratio` | `0.5` | FAISS混合率 |
+| `index_k` | `4` | 近傍数 |
+| `use_compile` | `false` | 既定OFF |
 | `resample_method` | `linear` | `linear` / `poly` |
-| `index_k` | 4 | FAISS近傍数 |
+| `use_parallel_extraction` | `true` | HuBERT+F0並列 |
 | `voice_gate_mode` | `expand` | off/strict/expand/energy |
-| `energy_threshold` | 0.05 | energyモード閾値 |
-| `overlap_sec` | 0.10 | 音声レベルオーバーラップ（HuBERT連続性） |
-| `lookahead_sec` | 0.0 | 先読み（レイテンシ増） |
-| `crossfade_sec` | 0.05 | SOLAクロスフェード長 |
-| `use_sola` | true | SOLA有効化 |
-| `sola_search_ms` | 10.0 | SOLA探索窓（ms） |
-| `denoise.enabled` | false | ノイズ除去有効化 |
+| `energy_threshold` | `0.05` | energyモード閾値 |
+| `overlap_sec` | `0.10` | 音声オーバーラップ |
+| `crossfade_sec` | `0.05` | SOLAクロスフェード長 |
+| `use_sola` | `true` | SOLA有効化 |
+| `sola_search_ms` | `10.0` | SOLA探索窓 |
+| `denoise.enabled` | `false` | ノイズ除去 |
 | `denoise.method` | `auto` | `auto` / `ml` / `spectral` |
 
-### RealtimeConfig (pipeline/realtime_unified.py)
+注記:
+- `lookahead_sec` と `use_feature_cache` は **現行設定に存在しません**。
+- `denoise.method="deepfilter"` は互換エイリアスとして受理されます（内部はML扱い）。
 
-実行時にGUIの設定を反映して生成されます。主要パラメータ:
-- `chunk_sec`: チャンクサイズ（HuBERTフレーム境界20msに自動整列）
-- `overlap_sec`: 音声オーバーラップ（デフォルト0.10s）
-- `crossfade_sec`: SOLAクロスフェード長
-- `sola_search_ms`: SOLA探索窓（デフォルト10ms）
-- `prebuffer_chunks`: プリバッファチャンク数
-- `buffer_margin`: バッファマージン
+### `RealtimeConfig` (`rcwx/pipeline/realtime_unified.py`)
+
+実行時にGUI設定から生成される主要値:
+- `chunk_sec` (既定 0.15、20ms境界に丸め)
+- `overlap_sec` (既定 0.10、20ms境界に丸め)
+- `crossfade_sec` (既定 0.05)
+- `sola_search_ms` (既定 10.0)
+- `prebuffer_chunks` (既定 1)
+- `buffer_margin` (既定 0.3)
+- `f0_method` (既定 `fcpe`)
+- `max_queue_size` (既定 8)
+
+## GUI Latency Model (Current)
+
+`LatencySettingsFrame` でユーザーが直接変更できるのは `chunk_sec` のみです。
+他は自動導出されます。
+
+自動導出ルール (`rcwx/gui/widgets/latency_settings.py`):
+- `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
+- `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
+- `prebuffer_chunks` = 1
+- `buffer_margin` = 0.5
+- `use_sola` = true
+
+補足:
+- GUI起動時は `config.audio.chunk_sec` を復元し、上記の自動値を再計算します。
+- 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
 
 ## CLI Commands
 
 ```powershell
-uv run rcwx              # GUI起動
-uv run rcwx devices      # デバイス一覧
-uv run rcwx download     # モデルダウンロード
+uv run rcwx                  # GUI起動（command省略時デフォルト）
+uv run rcwx gui              # GUI起動
+uv run rcwx devices          # デバイス一覧
+uv run rcwx download         # 必須モデルダウンロード
 uv run rcwx run in.wav model.pth -o out.wav --pitch 5
-uv run rcwx info model.pth
-uv run rcwx diagnose     # フィードバック診断
-uv run rcwx logs         # ログファイル一覧
-uv run rcwx logs --tail 50   # 最新ログの末尾50行
+uv run rcwx info model.pth   # モデル情報
+uv run rcwx diagnose         # フィードバック診断
+uv run rcwx logs             # ログ一覧
+uv run rcwx logs --tail 50   # 最新ログ末尾
 uv run rcwx logs --open      # 最新ログを開く
 ```
 
-## Log Investigation
+## Logs & Diagnostics
 
-### ログファイル
+ログ保存先:
+- `~/.config/rcwx/logs/rcwx_YYYYMMDD_HHMMSS.log`
 
-```
-~/.config/rcwx/logs/rcwx_YYYYMMDD_HHMMSS.log
-```
+よく出るログ:
+- `[INPUT] Queue full, dropping chunk`
+- `[INFER] Chunk #...`
+- `[PERF] Inference slow ...`
+- `[FEEDBACK] Detected feedback (corr=...)`
+- `[WARMUP] ...`
 
-### ログタグ
+トラブルシュート:
+- Queue full が頻発: `chunk_sec` 増、デノイズOFF、F0方式見直し
+- 遅延増加: `chunk_sec`/`buffer_margin` 見直し、出力デバイス設定確認
+- フィードバック警告: `uv run rcwx diagnose` 実施、入出力ループ回避
+- XPU未認識: `uv sync` 後に `torch.__version__` が `+xpu` か確認
 
-| タグ | 説明 |
-|------|------|
-| `[INPUT]` | 入力コールバック / 入力キュー監視 |
-| `[OUTPUT]` | 出力コールバック / バッファ監視 |
-| `[INFER]` | 推論スレッド / 処理時間 / レイテンシ |
-| `[SOLA]` | SOLA処理オフセット |
-| `[FEEDBACK]` | フィードバック検出 |
+## Models
 
-## Troubleshooting
-
-### バッファアンダーラン (音切れ)
-
-```
-[OUTPUT] Buffer underrun #1
-```
-
-- `chunk_sec` を増やす
-- `buffer_margin` を増やす
-- `f0_method` を `fcpe` または `none` にする
-
-### バッファオーバーラン (遅延増加)
-
-```
-[INPUT] Queue full, dropping chunk
-```
-
-- 出力デバイスのサンプルレート確認
-- デノイズを無効化
-- `max_queue_size` を確認
-
-### フィードバック検出
-
-```
-[FEEDBACK] 音声フィードバックを検出しました (相関係数=0.45)
-```
-
-- `rcwx diagnose` で設定確認
-- 入出力デバイスを別インターフェースにする
-- Windowsの「このデバイスを聴く」を無効化
-
-### XPUが認識されない
-
-```powershell
-uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available())"
-```
-
-- `+xpu` でない場合: `uv sync --reinstall` を実行
+既定配置:
+- `~/.cache/rcwx/models/hubert/hubert_base.pt`
+- `~/.cache/rcwx/models/rmvpe/rmvpe.pt`
+- RVC本体モデル: 任意の `*.pth`
+- FAISS index: モデル隣接の `*.index`（自動検出）
 
 ## Tests
 
-リアルタイム音声変換の品質を検証するためのテストフレームワーク。
-
-### クイックスタート
+主なテスト:
 
 ```powershell
-# コンポーネント診断テスト（モデル必要）
 uv run python tests/integration/test_diagnostic.py
-
-# infer_streaming() API検証（モデル必要）
 uv run python tests/integration/test_infer_streaming.py
+uv run python tests/integration/test_realtime_integration.py
+uv run python tests/integration/test_chunking_modes_comparison.py
+uv run python tests/crossfade/test_sola_compensation.py
+uv run python tests/models/test_inference.py
+uv run python tests/models/test_rmvpe.py
+uv run python tests/models/test_cumulative_context.py
 ```
-
-### ディレクトリ構成
-
-```
-tests/
-├── integration/                   # 統合テスト（モデル必要）
-│   ├── test_diagnostic.py             # コンポーネント別診断
-│   ├── test_realtime_integration.py   # マルチスレッド統合テスト
-│   ├── test_infer_streaming.py        # infer_streaming() API検証
-│   └── test_chunking_modes_comparison.py  # チャンキング比較
-│
-├── crossfade/                     # SOLA・クロスフェード
-│   └── test_sola_compensation.py      # SOLAタイミングドリフト検証
-│
-├── models/                        # モデル固有テスト
-│   ├── test_inference.py              # RVCパイプライン推論
-│   ├── test_rmvpe.py                  # RMVPE F0抽出
-│   └── test_cumulative_context.py     # HuBERT累積コンテキスト
-│
-└── test_output/                   # テスト出力
-```
-
-### test_diagnostic.py
-
-各処理コンポーネントを個別にテスト。
-
-```powershell
-uv run python tests/integration/test_diagnostic.py --component all
-uv run python tests/integration/test_diagnostic.py --component sola      # SOLA単体
-uv run python tests/integration/test_diagnostic.py --component resampler # リサンプラ単体
-```
-
-**テスト項目**:
-- `resampler`: StatefulResampler vs バッチ（相関 > 0.99）
-- `sola`: クロスフェード品質（不連続性 = 0）
-- `latency`: サンプル数の累積誤差（< 10ms）
-
-### test_realtime_integration.py
-
-GUIと同等のスレッド構成（入力/推論/出力）でテスト。
-SimulatedAudioDeviceで実デバイスのタイミング（ジッター含む）をエミュレート。
-
-```powershell
-uv run python tests/integration/test_realtime_integration.py                  # 10秒テスト
-uv run python tests/integration/test_realtime_integration.py --duration 60    # 長時間テスト
-uv run python tests/integration/test_realtime_integration.py --stress         # CPU負荷テスト
-```
-
-**評価項目**:
-- `underruns`: 出力バッファ枯渇（音切れ）
-- `overruns`: 入力キュー溢れ
-- `latency`: チャンク処理時間
-
-### 品質基準
-
-| 指標 | 合格基準 |
-|------|----------|
-| SOLA不連続性 | 0 件 |
-| Resampler相関 | > 0.99 |
-| 累積時間誤差 | < 10ms |
-| Underruns | 0 件 |
-| Overruns | < 5 件 |
-
-### テストデータ
-
-`sample_data/` に含まれるテスト用音声ファイル:
-
-| ファイル | 内容 | 用途 |
-|----------|------|------|
-| `sustained_voice.wav` | 持続母音（デフォルト） | 基本テスト |
-| `sustained_tone.wav` | 持続音 | 音程安定性テスト |
-| `pure_sine.wav` | 純正弦波 | 信号処理検証 |
-| `nc283304.mp3` | 音声サンプル | 実音声テスト |
-
-### テストの限界
-
-現在のテストでカバーしていない項目:
-
-| 項目 | 説明 |
-|------|------|
-| 実デバイスレイテンシ | sounddeviceドライバの遅延 |
-| 自然音声 | 子音・無音区間・ビブラート |
-| パラメータ変更 | 変換中のpitch/index_rate変更 |
-| 長時間安定性 | 数時間の連続動作 |
 
 ## References
 
+- w-okada/voice-changer
 - RVC WebUI
 - PyTorch XPU
-- Facebook Denoiser (denoiser)
-- FCPE (torchfcpe)
-- w-okada Voice Changer
+- Facebook Denoiser (`denoiser`)
+- torchfcpe
