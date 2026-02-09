@@ -70,11 +70,6 @@ class InferenceConfig:
     # Lower = more sensitive (catches quieter sounds but may pass noise)
     # Higher = less sensitive (better noise rejection but may cut soft sounds)
     energy_threshold: float = 0.05
-    # Feature caching (kept for GUI checkbox, no longer used by unified pipeline)
-    use_feature_cache: bool = True
-
-    # Lookahead: future samples (ADDS LATENCY!)
-    lookahead_sec: float = 0.0
 
     # Audio-level overlap for HuBERT continuity
     overlap_sec: float = 0.10
@@ -127,30 +122,6 @@ class RCWXConfig:
         # Handle nested denoise config
         denoise_data = inference_data.pop("denoise", {})
         denoise_config = DenoiseConfig(**denoise_data) if denoise_data else DenoiseConfig()
-
-        # Migrate old inference config keys
-        if "use_input_overlap" in inference_data:
-            inference_data.pop("use_input_overlap")
-        if "use_overlap_crossfade" in inference_data:
-            inference_data.pop("use_overlap_crossfade")
-        # Migrate context_sec -> overlap_sec
-        if "context_sec" in inference_data and "overlap_sec" not in inference_data:
-            inference_data["overlap_sec"] = inference_data.pop("context_sec")
-        elif "context_sec" in inference_data:
-            inference_data.pop("context_sec")
-
-        # Remove deprecated keys that no longer exist in InferenceConfig
-        _deprecated_keys = [
-            "use_chunk_gain_smoothing", "chunk_gain_smoothing",
-            "use_adaptive_blending", "f0_cache_frames", "feature_cache_frames",
-            "sola_use_advanced", "sola_fallback_threshold",
-            "use_energy_normalization", "use_peak_normalization",
-            "peak_smoothing", "energy_smoothing",
-            "use_adaptive_parameters", "history_sec", "extra_sec",
-            "rvc_overlap_sec", "sola_search_ratio",
-        ]
-        for key in _deprecated_keys:
-            inference_data.pop(key, None)
 
         # Filter out any unknown keys to prevent TypeError
         import dataclasses

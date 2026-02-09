@@ -366,16 +366,7 @@ class RCWXApp(ctk.CTk):
         )
         self.chunk_label.pack(anchor="w", padx=10, pady=(5, 3))
 
-        self.use_feature_cache_var = ctk.BooleanVar(value=self.config.inference.use_feature_cache)
-        self.use_feature_cache_cb = ctk.CTkCheckBox(
-            self.chunk_frame,
-            text="特徴量キャッシュ (HuBERT/F0継続性)",
-            variable=self.use_feature_cache_var,
-            command=self._on_feature_cache_changed,
-        )
-        self.use_feature_cache_cb.pack(anchor="w", padx=10, pady=(2, 5))
-
-        # Note: Context, Lookahead, SOLA settings are in the Latency Settings panel (Audio tab)
+        # Note: Overlap/Crossfade/SOLA settings are in the Latency Settings panel (Audio tab)
 
         # === Right column ===
         self.right_column = ctk.CTkFrame(self.main_columns, fg_color="transparent")
@@ -811,12 +802,6 @@ class RCWXApp(ctk.CTk):
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_energy_threshold(value)
 
-    def _on_feature_cache_changed(self) -> None:
-        """Handle feature cache toggle change."""
-        self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_feature_cache(self.use_feature_cache_var.get())
-
     def _get_index_rate(self) -> float:
         """Get current index rate (0 if disabled)."""
         if self.use_index_var.get():
@@ -849,12 +834,15 @@ class RCWXApp(ctk.CTk):
             settings = self.latency_settings.get_settings()
             logger.debug(f"Latency settings changed: {settings}")
 
-            # Apply all settings (including auto-derived) to running voice changer
-            self.realtime_controller.voice_changer.set_chunk_sec(settings["chunk_sec"])
-            self.realtime_controller.voice_changer.set_prebuffer_chunks(settings["prebuffer_chunks"])
-            self.realtime_controller.voice_changer.set_buffer_margin(settings["buffer_margin"])
-            self.realtime_controller.voice_changer.set_context(settings["context_sec"])
-            self.realtime_controller.voice_changer.set_crossfade(settings["crossfade_sec"])
+            # Update all config values BEFORE triggering restart.
+            # set_chunk_sec() restarts the pipeline, so overlap/crossfade/
+            # prebuffer/margin must be set first to take effect.
+            vc = self.realtime_controller.voice_changer
+            vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
+            vc.set_buffer_margin(settings["buffer_margin"])
+            vc.set_overlap(settings["overlap_sec"])
+            vc.set_crossfade(settings["crossfade_sec"])
+            vc.set_chunk_sec(settings["chunk_sec"])
 
 
     def _save_config(self) -> None:
@@ -875,15 +863,13 @@ class RCWXApp(ctk.CTk):
             self.config.inference.denoise.method = self.denoise_method_var.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()
             self.config.inference.energy_threshold = self.energy_threshold_slider.get()
-            self.config.inference.use_feature_cache = self.use_feature_cache_var.get()
             # Save latency settings (all from LatencySettingsFrame)
             if hasattr(self, "latency_settings"):
                 latency = self.latency_settings.get_settings()
                 self.config.audio.chunk_sec = latency["chunk_sec"]
                 self.config.audio.prebuffer_chunks = latency["prebuffer_chunks"]
                 self.config.audio.buffer_margin = latency["buffer_margin"]
-                self.config.inference.overlap_sec = latency["context_sec"]
-                self.config.inference.lookahead_sec = latency["lookahead_sec"]
+                self.config.inference.overlap_sec = latency["overlap_sec"]
                 self.config.inference.crossfade_sec = latency["crossfade_sec"]
                 self.config.inference.use_sola = latency["use_sola"]
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db

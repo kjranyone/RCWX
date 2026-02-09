@@ -108,18 +108,6 @@ class RealtimeConfig:
     # Synthesizer
     synth_min_frames: int = 64
 
-    # Backward-compatible aliases
-    @property
-    def context_sec(self) -> float:
-        return self.overlap_sec
-
-    @context_sec.setter
-    def context_sec(self, value: float) -> None:
-        self.overlap_sec = value
-
-    # Stubs kept for compatibility with GUI code that may reference old fields
-    lookahead_sec: float = 0.0
-
     def __post_init__(self) -> None:
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
@@ -438,9 +426,6 @@ class RealtimeVoiceChangerUnified:
     def set_energy_threshold(self, value: float) -> None:
         self.config.energy_threshold = value
 
-    def set_feature_cache(self, enabled: bool) -> None:
-        pass  # No feature cache in unified pipeline
-
     def set_chunk_sec(self, chunk_sec: float) -> None:
         old = self.config.chunk_sec
         self.config.chunk_sec = max(0.1, min(0.6, chunk_sec))
@@ -456,15 +441,12 @@ class RealtimeVoiceChangerUnified:
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
 
-    def set_context(self, context_sec: float) -> None:
-        self.config.overlap_sec = max(0.0, float(context_sec))
+    def set_overlap(self, overlap_sec: float) -> None:
+        self.config.overlap_sec = max(0.0, float(overlap_sec))
         # Recompute derived sample count
         self._overlap_samples_16k = self._align_to_hop(
             int(self.config.overlap_sec * 16000), 320
         )
-
-    def set_lookahead(self, lookahead_sec: float) -> None:
-        self.config.lookahead_sec = max(0.0, float(lookahead_sec))
 
     def set_crossfade(self, crossfade_sec: float) -> None:
         self.config.crossfade_sec = max(0.0, crossfade_sec)

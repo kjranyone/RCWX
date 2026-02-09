@@ -97,9 +97,8 @@ class RealtimeController:
                 chunk_sec=latency["chunk_sec"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
                 buffer_margin=latency["buffer_margin"],
-                overlap_sec=latency["context_sec"],  # context_sec -> overlap_sec
+                overlap_sec=latency["overlap_sec"],
                 crossfade_sec=latency["crossfade_sec"],
-                lookahead_sec=latency["lookahead_sec"],
                 use_sola=latency["use_sola"],
                 # Pitch settings
                 pitch_shift=self.app.pitch_control.pitch,

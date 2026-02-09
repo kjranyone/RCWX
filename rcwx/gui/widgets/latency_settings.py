@@ -11,7 +11,7 @@ def _auto_params(chunk_sec: float) -> dict:
     """Derive latency parameters automatically from chunk_sec.
 
     Returns dict with overlap_sec, crossfade_sec, prebuffer_chunks,
-    buffer_margin, lookahead_sec, use_sola.
+    buffer_margin, use_sola.
     """
     # overlap: 100% of chunk for maximum HuBERT context continuity,
     # clamped [60ms, 200ms], rounded to 20ms (HuBERT frame boundary)
@@ -28,7 +28,6 @@ def _auto_params(chunk_sec: float) -> dict:
         "crossfade_sec": crossfade_ms / 1000,
         "prebuffer_chunks": 1,
         "buffer_margin": 0.5,
-        "lookahead_sec": 0.0,
         "use_sola": True,
     }
 
@@ -204,39 +203,21 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """Get current latency settings as a dictionary.
 
         Returns all parameters including auto-derived ones.
-        Keys: chunk_sec, prebuffer_chunks, buffer_margin,
-              context_sec (overlap), lookahead_sec, crossfade_sec, use_sola.
         """
         auto = _auto_params(self.chunk_sec)
         return {
             "chunk_sec": self.chunk_sec,
             "prebuffer_chunks": auto["prebuffer_chunks"],
             "buffer_margin": auto["buffer_margin"],
-            "context_sec": auto["overlap_sec"],  # maps to overlap_sec in unified config
-            "lookahead_sec": auto["lookahead_sec"],
+            "overlap_sec": auto["overlap_sec"],
             "crossfade_sec": auto["crossfade_sec"],
             "use_sola": auto["use_sola"],
         }
 
-    def set_values(
-        self,
-        chunk_sec: float,
-        # Accepted but ignored — auto-derived now
-        prebuffer_chunks: int = 1,
-        buffer_margin: float = 0.5,
-        context_sec: float = 0.10,
-        lookahead_sec: float = 0.0,
-        crossfade_sec: float = 0.05,
-        use_sola: bool = True,
-        # Ignored — kept for backward compatibility with saved settings
-        chunking_mode: str = "wokada",
-        realtime_engine: str = "v2",
-    ) -> None:
+    def set_values(self, chunk_sec: float) -> None:
         """Restore chunk_sec from saved settings.
 
-        Only chunk_sec is applied; all other parameters are auto-derived.
-        Extra keyword arguments are accepted for backward compatibility
-        but silently ignored.
+        All other parameters are auto-derived.
         """
         rounded_ms = self._round_to_frame_boundary(chunk_sec * 1000)
         self.chunk_sec = rounded_ms / 1000
