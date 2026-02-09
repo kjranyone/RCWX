@@ -256,30 +256,42 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 ### クイックスタート
 
 ```powershell
-# 全診断テスト（モデル不要）
-uv run python tests/test_diagnostic.py
+# コンポーネント診断テスト（モデル必要）
+uv run python tests/integration/test_diagnostic.py
 
-# ストリーミング品質テスト（モデル必要）
-uv run python tests/test_realtime_analysis.py --test-file sample_data/seki.wav
+# infer_streaming() API検証（モデル必要）
+uv run python tests/integration/test_infer_streaming.py
 ```
 
-### テスト一覧
+### ディレクトリ構成
 
-| テスト | 用途 | モデル |
-|--------|------|--------|
-| `test_diagnostic.py` | コンポーネント別診断 | 不要 |
-| `test_realtime_analysis.py` | バッチ vs ストリーミング比較 | 必要 |
-| `test_step_by_step.py` | 中間結果の詳細解析 | 必要 |
-| `test_realtime_integration.py` | スレッド統合テスト | 必要 |
+```
+tests/
+├── integration/                   # 統合テスト（モデル必要）
+│   ├── test_diagnostic.py             # コンポーネント別診断
+│   ├── test_realtime_integration.py   # マルチスレッド統合テスト
+│   ├── test_infer_streaming.py        # infer_streaming() API検証
+│   └── test_chunking_modes_comparison.py  # チャンキング比較
+│
+├── crossfade/                     # SOLA・クロスフェード
+│   └── test_sola_compensation.py      # SOLAタイミングドリフト検証
+│
+├── models/                        # モデル固有テスト
+│   ├── test_inference.py              # RVCパイプライン推論
+│   ├── test_rmvpe.py                  # RMVPE F0抽出
+│   └── test_cumulative_context.py     # HuBERT累積コンテキスト
+│
+└── test_output/                   # テスト出力
+```
 
 ### test_diagnostic.py
 
 各処理コンポーネントを個別にテスト。
 
 ```powershell
-uv run python tests/test_diagnostic.py --component all
-uv run python tests/test_diagnostic.py --component sola      # SOLA単体
-uv run python tests/test_diagnostic.py --component resampler # リサンプラ単体
+uv run python tests/integration/test_diagnostic.py --component all
+uv run python tests/integration/test_diagnostic.py --component sola      # SOLA単体
+uv run python tests/integration/test_diagnostic.py --component resampler # リサンプラ単体
 ```
 
 **テスト項目**:
@@ -287,42 +299,15 @@ uv run python tests/test_diagnostic.py --component resampler # リサンプラ�
 - `sola`: クロスフェード品質（不連続性 = 0）
 - `latency`: サンプル数の累積誤差（< 10ms）
 
-### test_realtime_analysis.py
-
-ストリーミング処理をバッチ処理（ゴールドスタンダード）と比較。
-
-```powershell
-uv run python tests/test_realtime_analysis.py --visualize
-uv run python tests/test_realtime_analysis.py --chunk-sec 0.20 --f0-method fcpe
-```
-
-**評価メトリクス**:
-- `correlation_vs_batch`: バッチ出力との相関
-- `discontinuities`: 不連続性（>0.2のジャンプ）の数
-- `inference_ms`: チャンクごとの推論時間
-
-**出力**: `test_output/analysis/` に wav と analysis.json を保存。
-
-### test_step_by_step.py
-
-各処理ステップの中間結果を保存。
-
-```powershell
-uv run python tests/test_step_by_step.py --chunk-idx 0 1 2 3
-```
-
-**保存される中間ファイル** (`test_output/step_by_step/chunk_XXX/`):
-- `0_input.wav` → `1_resample_16k.wav` → `2_infer.wav` → `3_resample_output.wav` → `4_sola.wav`
-
 ### test_realtime_integration.py
 
 GUIと同等のスレッド構成（入力/推論/出力）でテスト。
 SimulatedAudioDeviceで実デバイスのタイミング（ジッター含む）をエミュレート。
 
 ```powershell
-uv run python tests/test_realtime_integration.py                  # 10秒テスト
-uv run python tests/test_realtime_integration.py --duration 60    # 長時間テスト
-uv run python tests/test_realtime_integration.py --stress         # CPU負荷テスト
+uv run python tests/integration/test_realtime_integration.py                  # 10秒テスト
+uv run python tests/integration/test_realtime_integration.py --duration 60    # 長時間テスト
+uv run python tests/integration/test_realtime_integration.py --stress         # CPU負荷テスト
 ```
 
 **評価項目**:
@@ -335,7 +320,6 @@ uv run python tests/test_realtime_integration.py --stress         # CPU負荷テ
 | 指標 | 合格基準 |
 |------|----------|
 | SOLA不連続性 | 0 件 |
-| 境界ジャンプ (>0.1) | 0 件 |
 | Resampler相関 | > 0.99 |
 | 累積時間誤差 | < 10ms |
 | Underruns | 0 件 |
@@ -351,11 +335,6 @@ uv run python tests/test_realtime_integration.py --stress         # CPU負荷テ
 | `sustained_tone.wav` | 持続音 | 音程安定性テスト |
 | `pure_sine.wav` | 純正弦波 | 信号処理検証 |
 | `nc283304.mp3` | 音声サンプル | 実音声テスト |
-
-カスタムファイルでテスト:
-```powershell
-uv run python tests/test_realtime_analysis.py --test-file path/to/your.wav
-```
 
 ### テストの限界
 
