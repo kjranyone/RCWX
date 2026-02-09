@@ -37,71 +37,66 @@ uv run rcwx
 `config.py` のデフォルト値に基づきます（GUIは保存済み設定を復元）。
 
 - F0方式: `fcpe`
-- Audio `chunk_sec`: **0.15s (150ms)**
-- Realtime `chunk_sec`（実行時）: **0.10s (100ms)**
-- `buffer_margin`: 0.3
-- `context_sec`: 0.10s
-- `crossfade_sec`: 0.05s
-- `lookahead_sec`: 0.0s
-- `use_sola`: true
+- Audio `chunk_sec`: **0.15s (150ms)** (GUIで唯一のユーザー制御パラメータ)
+- 以下はchunk_secから自動導出 (GUI上は読み取り専用):
+  - `overlap_sec`: 80ms (chunk_secの50%, 60-200ms, 20ms刻み)
+  - `crossfade_sec`: 40ms (chunk_secの25%, 10-80ms, 10ms刻み)
+  - `prebuffer_chunks`: 1 (固定)
+  - `buffer_margin`: 0.5 (固定)
+  - `lookahead_sec`: 0.0 (固定)
+  - `use_sola`: true (固定)
+- `sola_search_ms`: 10.0
 - `use_parallel_extraction`: true
 - `resample_method`: `linear`
-- `chunking_mode`: `wokada`
 
 F0方式ごとの最小チャンク（自動補正あり）:
 - FCPE: 0.10s
 - RMVPE: 0.32s
 
-## GUIのレイテンシプリセット
-
-`rcwx/gui/widgets/latency_settings.py` の定義。
-
-- low: chunk 0.20s / prebuffer 0 / margin 0.5 / context 0.03 / crossfade 0.03
-- balanced: chunk 0.35s / prebuffer 1 / margin 0.5 / context 0.10 / crossfade 0.05
-- quality: chunk 0.50s / prebuffer 2 / margin 1.0 / context 0.15 / crossfade 0.08 / lookahead 0.05
-
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     RealtimeVoiceChanger                    │
+│               RealtimeVoiceChangerUnified                     │
 ├─────────────────────────────────────────────────────────────┤
 │  AudioInput (48kHz)                                          │
 │       │                                                      │
 │       ▼                                                      │
-│  ChunkBuffer (context + lookahead)                           │
+│  InputAccumulator (hop蓄積)                                   │
 │       │                                                      │
 │       ▼                                                      │
 │  [Input Queue] ──► Inference Thread                          │
 │                         │                                    │
 │                    Input Gain (dB)                           │
 │                         │                                    │
-│                    Resample 48k→16k                          │
+│                    Resample 48k→16k (StatefulResampler)      │
 │                         │                                    │
-│                    Denoise (ML/Spectral)                     │
+│                    Denoise (ML/Spectral, optional)           │
 │                         │                                    │
-│                    ┌─────────────────────┐                   │
-│                    │  RVCPipeline.infer() │                  │
-│                    ├──────────────────────┤                  │
-│                    │ HuBERT (feature)     │                  │
-│                    │ └─ Feature Cache     │                  │
-│                    │ F0 (RMVPE/FCPE)      │                  │
-│                    │ └─ F0 Cache          │                  │
-│                    │ FAISS Index Search   │                  │
-│                    │ Synthesizer          │                  │
-│                    │ └─ Voice Gate        │                  │
-│                    └──────────────────────┘                  │
+│                    ChunkAssembly                              │
+│                    [overlap | new_hop] (HuBERT整列)           │
 │                         │                                    │
-│                    Resample 40k→48k                          │
+│                    ┌──────────────────────────┐              │
+│                    │ RVCPipeline.infer_streaming() │          │
+│                    ├──────────────────────────┤              │
+│                    │ HuBERT (全音声)           │              │
+│                    │ F0 (全音声) [並列抽出]     │              │
+│                    │ overlapフレーム除去        │              │
+│                    │ FAISS Index Search        │              │
+│                    │ Synthesizer               │              │
+│                    │ Voice Gate                │              │
+│                    └──────────────────────────┘              │
 │                         │                                    │
-│                    SOLA Crossfade                            │
+│                    Resample model_sr→48k (StatefulResampler) │
+│                         │                                    │
+│                    SimpleSola (conv1d相関 + Hann窓)          │
 │                         │                                    │
 │                    Feedback Detection                         │
 │                         │                                    │
 │  [Output Queue] ◄───────┘                                    │
 │       │                                                      │
 │       ▼                                                      │
-│  OutputBuffer (dynamic latency)                              │
+│  RingOutputBuffer (事前確保、3×chunk容量)                     │
 │       │                                                      │
 │       ▼                                                      │
 │  AudioOutput (48kHz)                                         │
@@ -120,13 +115,10 @@ rcwx/
 ├── audio/
 │   ├── input.py           # AudioInput (sounddevice)
 │   ├── output.py          # AudioOutput (sounddevice)
-│   ├── buffer.py          # ChunkBuffer, OutputBuffer
-│   ├── crossfade.py       # SOLA処理
-│   ├── crossfade_strategy.py # クロスフェード戦略
-│   ├── analysis.py        # Adaptive parameter計算
+│   ├── buffer.py          # ChunkBuffer, OutputBuffer, RingOutputBuffer
+│   ├── sola.py            # シンプルSOLA (相関+Hann窓クロスフェード)
 │   ├── resample.py        # resample_poly / stateful resampler
 │   └── denoise.py         # ML/Spectral denoise
-├── audio/chunking/        # chunking mode実装
 ├── models/
 │   ├── hubert.py          # HuBERTFeatureExtractor (transformers)
 │   ├── hubert_fairseq.py  # Fairseq形式HuBERT
@@ -136,8 +128,8 @@ rcwx/
 │   ├── synthesizer.py     # SynthesizerLoader
 │   └── infer_pack/        # RVC WebUIから移植したコアモジュール
 ├── pipeline/
-│   ├── inference.py       # RVCPipeline (単発推論、特徴キャッシング)
-│   └── realtime.py        # RealtimeVoiceChanger
+│   ├── inference.py       # RVCPipeline (バッチ推論 + infer_streaming)
+│   └── realtime_unified.py # RealtimeVoiceChangerUnified (統合パイプライン)
 └── gui/
     ├── app.py             # RCWXApp (CustomTkinter)
     └── widgets/           # UIコンポーネント
@@ -167,28 +159,23 @@ rcwx/
 | `index_k` | 4 | FAISS近傍数 |
 | `voice_gate_mode` | `expand` | off/strict/expand/energy |
 | `energy_threshold` | 0.05 | energyモード閾値 |
-| `use_feature_cache` | true | チャンク連続性キャッシュ |
-| `context_sec` | 0.10 | 左コンテキスト |
+| `overlap_sec` | 0.10 | 音声レベルオーバーラップ（HuBERT連続性） |
 | `lookahead_sec` | 0.0 | 先読み（レイテンシ増） |
-| `crossfade_sec` | 0.05 | クロスフェード |
+| `crossfade_sec` | 0.05 | SOLAクロスフェード長 |
 | `use_sola` | true | SOLA有効化 |
-| `chunking_mode` | `wokada` | `wokada` / `rvc_webui` / `hybrid` |
+| `sola_search_ms` | 10.0 | SOLA探索窓（ms） |
 | `denoise.enabled` | false | ノイズ除去有効化 |
 | `denoise.method` | `auto` | `auto` / `ml` / `spectral` |
 
-### RealtimeConfig (pipeline/realtime.py)
+### RealtimeConfig (pipeline/realtime_unified.py)
 
-実行時にGUIの設定を反映して生成されます。追加パラメータ:
-- `chunking_mode`: `wokada` / `rvc_webui` / `hybrid`
-- `rvc_overlap_sec`: 0.22（rvc_webui専用）
-- `use_adaptive_parameters`: 既定 false（クロスフェード/コンテキストを自動調整）
-- `use_energy_normalization`: 既定 false（出力エネルギー正規化）
-
-## Chunking Modes
-
-- `wokada`: コンテキスト付きチャンク処理。低レイテンシ。
-- `rvc_webui`: オーバーラップ基準のチャンク（連続性重視）。
-- `hybrid`: RVC hop + w-okada context + 最適化SOLA。
+実行時にGUIの設定を反映して生成されます。主要パラメータ:
+- `chunk_sec`: チャンクサイズ（HuBERTフレーム境界20msに自動整列）
+- `overlap_sec`: 音声オーバーラップ（デフォルト0.10s）
+- `crossfade_sec`: SOLAクロスフェード長
+- `sola_search_ms`: SOLA探索窓（デフォルト10ms）
+- `prebuffer_chunks`: プリバッファチャンク数
+- `buffer_margin`: バッファマージン
 
 ## CLI Commands
 
@@ -298,9 +285,7 @@ uv run python tests/test_diagnostic.py --component resampler # リサンプラ�
 **テスト項目**:
 - `resampler`: StatefulResampler vs バッチ（相関 > 0.99）
 - `sola`: クロスフェード品質（不連続性 = 0）
-- `chunk_boundary`: ChunkBufferのコンテキスト重複
 - `latency`: サンプル数の累積誤差（< 10ms）
-- `feature_cache`: キャッシュあり/なしの比較
 
 ### test_realtime_analysis.py
 
@@ -308,7 +293,6 @@ uv run python tests/test_diagnostic.py --component resampler # リサンプラ�
 
 ```powershell
 uv run python tests/test_realtime_analysis.py --visualize
-uv run python tests/test_realtime_analysis.py --chunking-mode rvc_webui
 uv run python tests/test_realtime_analysis.py --chunk-sec 0.20 --f0-method fcpe
 ```
 

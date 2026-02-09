@@ -23,8 +23,6 @@ from rcwx.gui.widgets.latency_monitor import LatencyMonitor
 from rcwx.gui.widgets.model_selector import ModelSelector
 from rcwx.gui.widgets.pitch_control import PitchControl
 from rcwx.pipeline.inference import RVCPipeline
-from rcwx.pipeline.realtime import RealtimeStats
-from rcwx.pipeline.realtime_v2 import RealtimeVoiceChangerV2
 
 # Set PortAudio API preference for Windows (WASAPI for better compatibility)
 # This prevents WDM-KS errors with certain audio drivers
@@ -826,22 +824,14 @@ class RCWXApp(ctk.CTk):
         return 0.0
 
     def _restore_latency_settings(self) -> None:
-        """Restore latency settings from config."""
+        """Restore latency settings from config.
+
+        Only chunk_sec is restored; other parameters are auto-derived.
+        """
         if not hasattr(self, "latency_settings"):
             return
 
-        # Restore saved values
-        self.latency_settings.set_values(
-            chunk_sec=self.config.audio.chunk_sec,
-            prebuffer_chunks=self.config.audio.prebuffer_chunks,
-            buffer_margin=self.config.audio.buffer_margin,
-            context_sec=self.config.inference.context_sec,
-            lookahead_sec=self.config.inference.lookahead_sec,
-            crossfade_sec=self.config.inference.crossfade_sec,
-            use_sola=self.config.inference.use_sola,
-            chunking_mode=getattr(self.config.inference, "chunking_mode", "wokada"),
-            realtime_engine=getattr(self.config.inference, "realtime_engine", "v2"),
-        )
+        self.latency_settings.set_values(chunk_sec=self.config.audio.chunk_sec)
 
     def _on_audio_settings_changed(self) -> None:
         """Handle audio settings change."""
@@ -859,52 +849,13 @@ class RCWXApp(ctk.CTk):
             settings = self.latency_settings.get_settings()
             logger.debug(f"Latency settings changed: {settings}")
 
-            # Check if chunking mode changed (requires restart)
-            current_mode = self.realtime_controller.voice_changer.config.chunking_mode
-            new_mode = settings["chunking_mode"]
-            current_engine = (
-                "v2"
-                if isinstance(self.realtime_controller.voice_changer, RealtimeVoiceChangerV2)
-                else "v1"
-            )
-            new_engine = settings.get("realtime_engine", current_engine)
-
-            if current_mode != new_mode or current_engine != new_engine:
-                # Chunking mode or engine changed - need to restart
-                logger.info(
-                    "Realtime settings changed: "
-                    f"mode {current_mode} -> {new_mode}, "
-                    f"engine {current_engine} -> {new_engine}. Restarting..."
-                )
-                was_running = self._is_running
-
-                if was_running:
-                    # Stop current voice changer
-                    self.realtime_controller.stop()
-
-                    # Wait for audio streams to fully stop (500ms is safer)
-                    # Then restart with new settings
-                    self.after(500, self._restart_after_mode_change)
-                return
-
-            # Apply real-time settings (for non-mode changes)
+            # Apply all settings (including auto-derived) to running voice changer
             self.realtime_controller.voice_changer.set_chunk_sec(settings["chunk_sec"])
             self.realtime_controller.voice_changer.set_prebuffer_chunks(settings["prebuffer_chunks"])
             self.realtime_controller.voice_changer.set_buffer_margin(settings["buffer_margin"])
             self.realtime_controller.voice_changer.set_context(settings["context_sec"])
-            self.realtime_controller.voice_changer.set_lookahead(settings["lookahead_sec"])
             self.realtime_controller.voice_changer.set_crossfade(settings["crossfade_sec"])
-            self.realtime_controller.voice_changer.set_sola(settings["use_sola"])
 
-    def _restart_after_mode_change(self) -> None:
-        """Restart voice changer after mode change."""
-        if not self._is_running:
-            # Ensure queues are cleared before restart
-            if self.realtime_controller.voice_changer:
-                self.realtime_controller.voice_changer._clear_queues()
-                self.realtime_controller.voice_changer._clear_buffers()
-            # Restart with new settings
-            self.realtime_controller.start()
 
     def _save_config(self) -> None:
         """Save all config settings immediately."""
@@ -931,12 +882,10 @@ class RCWXApp(ctk.CTk):
                 self.config.audio.chunk_sec = latency["chunk_sec"]
                 self.config.audio.prebuffer_chunks = latency["prebuffer_chunks"]
                 self.config.audio.buffer_margin = latency["buffer_margin"]
-                self.config.inference.context_sec = latency["context_sec"]
+                self.config.inference.overlap_sec = latency["context_sec"]
                 self.config.inference.lookahead_sec = latency["lookahead_sec"]
                 self.config.inference.crossfade_sec = latency["crossfade_sec"]
                 self.config.inference.use_sola = latency["use_sola"]
-                self.config.inference.chunking_mode = latency.get("chunking_mode", "wokada")
-                self.config.inference.realtime_engine = latency.get("realtime_engine", "v2")
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()
@@ -947,11 +896,12 @@ class RCWXApp(ctk.CTk):
         except Exception as e:
             logger.error(f"Failed to save config: {e}")
 
-    def _on_tab_changed(self, tab_name: str) -> None:
+    def _on_tab_changed(self) -> None:
         """Handle tab change event."""
         if not hasattr(self, "audio_settings"):
             return
 
+        tab_name = self.tabview.get()
         if tab_name == "オーディオ":
             # Start auto-refresh when audio tab is selected
             self.audio_settings.start_auto_refresh(interval_ms=1000)
@@ -975,63 +925,6 @@ class RCWXApp(ctk.CTk):
     def _toggle_running(self) -> None:
         """Toggle voice changer on/off."""
         self.realtime_controller.toggle()
-
-    def _on_stats_update(self, stats: RealtimeStats) -> None:
-        """Handle stats update from voice changer."""
-        # Update UI from main thread
-        self.after(0, lambda: self.status_bar.update_stats(stats))
-
-        # Show buffer warnings (first occurrence only, after threshold)
-        # Threshold: 5 occurrences to avoid false positives during startup
-        BUFFER_WARNING_THRESHOLD = 5
-
-        # Buffer underrun warning
-        if stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['underrun']:
-            self._buffer_warning_shown['underrun'] = True
-            self.after(0, self._show_buffer_underrun_warning)
-
-        # Buffer overrun warning
-        if stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['overrun']:
-            self._buffer_warning_shown['overrun'] = True
-            self.after(0, self._show_buffer_overrun_warning)
-
-    def _on_inference_error(self, error_msg: str) -> None:
-        """Handle inference error from voice changer."""
-        # Update UI from main thread
-        self.after(0, lambda: self._show_error(error_msg))
-
-    def _show_warning(self, title: str, message: str) -> None:
-        """Show warning dialog."""
-        import customtkinter as ctk
-
-        dialog = ctk.CTkToplevel(self)
-        dialog.title(title)
-        dialog.geometry("450x300")
-        dialog.transient(self)
-        dialog.grab_set()
-
-        # Center on parent
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 450) // 2
-        y = self.winfo_y() + (self.winfo_height() - 300) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        label = ctk.CTkLabel(
-            dialog,
-            text=message,
-            justify="left",
-            wraplength=410,
-        )
-        label.pack(pady=20, padx=20)
-
-        btn = ctk.CTkButton(dialog, text="OK", command=dialog.destroy)
-        btn.pack(pady=10)
-
-    def _show_error(self, error_msg: str) -> None:
-        """Show error message in UI."""
-        # Show in model selector's status label (truncate long messages)
-        short_msg = error_msg[:60] + "..." if len(error_msg) > 60 else error_msg
-        self.model_selector.status_label.configure(text=short_msg, text_color="#ff6666")
 
     def _run_audio_test(self) -> None:
         """Run audio test: record -> convert -> playback."""

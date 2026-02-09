@@ -275,17 +275,10 @@ def test_sola_crossfade():
     """
     SOLA crossfadeの品質検証。
 
-    問題点:
-    - RMS matchingによる歪み
-    - 位相不連続性
-    - declick処理の効果
+    新しいSimpleSola実装（rcwx.audio.sola）をテスト。
+    正弦波チャンクをSOLA処理し、境界不連続がゼロであることを確認。
     """
-    from rcwx.audio.crossfade import (
-        SOLAState,
-        apply_sola_crossfade,
-        _match_rms,
-        _declick_head,
-    )
+    from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
 
     logger.info("=" * 60)
     logger.info("TEST: SOLA Crossfade Quality")
@@ -295,11 +288,11 @@ def test_sola_crossfade():
     sample_rate = 48000
     chunk_sec = 0.15
     crossfade_sec = 0.05
-    context_sec = 0.10
+    search_ms = 10.0
 
     chunk_samples = int(sample_rate * chunk_sec)
     crossfade_samples = int(sample_rate * crossfade_sec)
-    context_samples = int(sample_rate * context_sec)
+    search_samples = int(sample_rate * search_ms / 1000)
 
     # 連続した正弦波（理想的なケース）
     duration = 1.0
@@ -307,45 +300,29 @@ def test_sola_crossfade():
     continuous_signal = 0.5 * np.sin(2 * np.pi * 440 * t)
 
     # チャンクに分割
-    total_chunk = context_samples + chunk_samples
     chunks = []
     pos = 0
-    while pos < len(continuous_signal):
-        if pos == 0:
-            # 最初のチャンク: context + main
-            chunk = continuous_signal[:chunk_samples + context_samples]
-        else:
-            start = max(0, pos - context_samples)
-            chunk = continuous_signal[start : pos + chunk_samples]
-
-        if len(chunk) < context_samples + chunk_samples // 2:
-            break
-
-        chunks.append(chunk)
+    while pos + chunk_samples <= len(continuous_signal):
+        chunks.append(continuous_signal[pos : pos + chunk_samples])
         pos += chunk_samples
 
     logger.info(f"Created {len(chunks)} chunks")
 
     # SOLA処理
-    sola_state = SOLAState.create(crossfade_samples, sample_rate)
+    state = SolaState(
+        crossfade_samples=crossfade_samples,
+        search_samples=search_samples,
+    )
 
     outputs = []
-    sola_offsets = []
-    correlations = []
+    for chunk in chunks:
+        result = sola_crossfade(chunk, state)
+        outputs.append(result)
 
-    for i, chunk in enumerate(chunks):
-        ctx_samples = context_samples if i > 0 else 0
-
-        result = apply_sola_crossfade(
-            chunk,
-            sola_state,
-            wokada_mode=True,
-            context_samples=ctx_samples,
-        )
-
-        outputs.append(result.audio)
-        sola_offsets.append(result.sola_offset)
-        correlations.append(result.correlation)
+    # Flush remaining buffer
+    tail = sola_flush(state)
+    if tail is not None and len(tail) > 0:
+        outputs.append(tail)
 
     # 連結
     sola_output = np.concatenate(outputs)
@@ -362,46 +339,19 @@ def test_sola_crossfade():
     # メトリクス
     mae = np.mean(np.abs(original_trim - sola_trim))
     rmse = np.sqrt(np.mean((original_trim - sola_trim)**2))
-    correlation = np.corrcoef(original_trim, sola_trim)[0, 1]
+    if np.std(original_trim) > 1e-6 and np.std(sola_trim) > 1e-6:
+        correlation = np.corrcoef(original_trim, sola_trim)[0, 1]
+    else:
+        correlation = 0.0
 
     logger.info(f"SOLA output length: {len(sola_output)}")
     logger.info(f"Original vs SOLA: corr={correlation:.6f}, rmse={rmse:.6f}")
     logger.info(f"Discontinuities (>0.1): {len(discontinuities)}")
-    logger.info(f"SOLA offsets: {sola_offsets}")
-
-    # RMS matching テスト
-    logger.info("\n--- RMS Matching Test ---")
-    test_target = np.array([0.1, 0.2, 0.3], dtype=np.float32)
-    test_ref = np.array([0.5, 0.6, 0.7], dtype=np.float32)
-
-    matched = _match_rms(test_target, test_ref)
-    target_rms = np.sqrt(np.mean(test_target**2))
-    ref_rms = np.sqrt(np.mean(test_ref**2))
-    matched_rms = np.sqrt(np.mean(matched**2))
-    gain = matched_rms / target_rms
-
-    logger.info(f"Target RMS: {target_rms:.4f}, Ref RMS: {ref_rms:.4f}, Matched RMS: {matched_rms:.4f}")
-    logger.info(f"Applied gain: {gain:.4f}")
-
-    if gain > 2.0:
-        logger.warning("WARNING: RMS matching applied gain > 2.0, may cause distortion")
-
-    # Declick テスト
-    logger.info("\n--- Declick Test ---")
-    prev_tail = np.array([0.5, 0.5, 0.5], dtype=np.float32)
-    curr_audio = np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=np.float32)
-
-    declicked = _declick_head(curr_audio, prev_tail, samples=3)
-    logger.info(f"Original: {curr_audio[:3]}")
-    logger.info(f"Declicked: {declicked[:3]}")
-    logger.info(f"Jump before: {abs(prev_tail[-1] - curr_audio[0]):.4f}")
-    logger.info(f"Jump after: {abs(prev_tail[-1] - declicked[0]):.4f}")
 
     return {
         'correlation': correlation,
         'rmse': rmse,
         'discontinuities': len(discontinuities),
-        'sola_offsets': sola_offsets,
     }
 
 

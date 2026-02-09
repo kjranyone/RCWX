@@ -70,41 +70,23 @@ class InferenceConfig:
     # Lower = more sensitive (catches quieter sounds but may pass noise)
     # Higher = less sensitive (better noise rejection but may cut soft sounds)
     energy_threshold: float = 0.05
-    # Feature caching for chunk continuity (blends HuBERT/F0 at boundaries)
+    # Feature caching (kept for GUI checkbox, no longer used by unified pipeline)
     use_feature_cache: bool = True
-    # Realtime engine selection: "v1" (legacy) or "v2" (reimplemented)
-    realtime_engine: str = "v2"
-
-    # --- Low-latency processing ---
-    # Context: extra audio on left side for stable edge processing
-    # Larger context improves HuBERT feature quality (+2% @ 0.10 vs 0.05)
-    context_sec: float = 0.05
 
     # Lookahead: future samples (ADDS LATENCY!)
-    # 0 = no lookahead (lowest latency)
     lookahead_sec: float = 0.0
 
-    # Extra discard: additional samples to remove beyond context
-    extra_sec: float = 0.0
+    # Audio-level overlap for HuBERT continuity
+    overlap_sec: float = 0.10
 
-    # Chunking mode: "wokada" (context-based), "rvc_webui" (overlap-based), "hybrid" (RVC hop + w-okada context)
-    chunking_mode: str = "rvc_webui"
-
-    # Crossfade length for SOLA blending (50ms is sufficient)
-    crossfade_sec: float = 0.22
+    # Crossfade length for SOLA blending
+    crossfade_sec: float = 0.05
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
-    # Uses RVC-style correlation-based phase alignment
     use_sola: bool = True
 
-    # --- Chunk gain smoothing ---
-    # Reduce chunk-to-chunk loudness variation with a slow RMS target
-    use_chunk_gain_smoothing: bool = False
-    # Smoothing factor for RMS target (0.0-1.0, higher = smoother)
-    chunk_gain_smoothing: float = 0.95
-
-    # Chunking mode: "wokada" (context-based, default) or "rvc_webui" (overlap-based, perfect continuity)
-    chunking_mode: str = "rvc_webui"
+    # SOLA search window in ms
+    sola_search_ms: float = 10.0
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 
@@ -146,18 +128,38 @@ class RCWXConfig:
         denoise_data = inference_data.pop("denoise", {})
         denoise_config = DenoiseConfig(**denoise_data) if denoise_data else DenoiseConfig()
 
-        # Migrate old inference config keys to w-okada style
+        # Migrate old inference config keys
         if "use_input_overlap" in inference_data:
             inference_data.pop("use_input_overlap")
         if "use_overlap_crossfade" in inference_data:
             inference_data.pop("use_overlap_crossfade")
-        if "overlap_sec" in inference_data:
-            # Migrate overlap_sec to context_sec
-            inference_data["context_sec"] = inference_data.pop("overlap_sec")
+        # Migrate context_sec -> overlap_sec
+        if "context_sec" in inference_data and "overlap_sec" not in inference_data:
+            inference_data["overlap_sec"] = inference_data.pop("context_sec")
+        elif "context_sec" in inference_data:
+            inference_data.pop("context_sec")
+
+        # Remove deprecated keys that no longer exist in InferenceConfig
+        _deprecated_keys = [
+            "use_chunk_gain_smoothing", "chunk_gain_smoothing",
+            "use_adaptive_blending", "f0_cache_frames", "feature_cache_frames",
+            "sola_use_advanced", "sola_fallback_threshold",
+            "use_energy_normalization", "use_peak_normalization",
+            "peak_smoothing", "energy_smoothing",
+            "use_adaptive_parameters", "history_sec", "extra_sec",
+            "rvc_overlap_sec", "sola_search_ratio",
+        ]
+        for key in _deprecated_keys:
+            inference_data.pop(key, None)
+
+        # Filter out any unknown keys to prevent TypeError
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(InferenceConfig)} - {"denoise"}
+        filtered_inference = {k: v for k, v in inference_data.items() if k in valid_fields}
 
         return cls(
             audio=AudioConfig(**audio_data),
-            inference=InferenceConfig(denoise=denoise_config, **inference_data),
+            inference=InferenceConfig(denoise=denoise_config, **filtered_inference),
             **data,
         )
 

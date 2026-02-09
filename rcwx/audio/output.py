@@ -55,11 +55,17 @@ class AudioOutput(AudioStreamBase):
         if self._callback is not None:
             audio = self._callback(frames)
             if len(audio) >= frames:
-                outdata[:, 0] = audio[:frames]
+                mono = audio[:frames]
             else:
-                outdata.fill(0)
+                mono = np.zeros(frames, dtype=np.float32)
                 if len(audio) > 0:
-                    outdata[: len(audio), 0] = audio
+                    mono[: len(audio)] = audio
+
+            # Write mono to all output channels
+            if outdata.ndim > 1 and outdata.shape[1] > 1:
+                outdata[:] = mono[:, np.newaxis]
+            else:
+                outdata[:, 0] = mono
         else:
             outdata.fill(0)
 

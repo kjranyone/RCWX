@@ -274,6 +274,7 @@ class SynthesizerLoader:
         pitch: Optional[torch.Tensor] = None,
         pitchf: Optional[torch.Tensor] = None,
         speaker_id: Optional[torch.Tensor] = None,
+        noise_scale: float = 0.66666,
     ) -> torch.Tensor:
         """
         Run inference on the loaded model.
@@ -284,6 +285,7 @@ class SynthesizerLoader:
             pitch: Pitch indices (for F0 models) [B, T]
             pitchf: Pitch values in Hz (for F0 models) [B, T]
             speaker_id: Speaker ID tensor [B]
+            noise_scale: VAE noise coefficient (0=deterministic, 0.66666=default)
 
         Returns:
             Generated audio [B, T_out]
@@ -311,12 +313,14 @@ class SynthesizerLoader:
                 pitch,
                 pitchf,
                 speaker_id,
+                noise_scale=noise_scale,
             )
         else:
             output = self.model.infer(
                 features,
                 feature_lengths,
                 speaker_id,
+                noise_scale=noise_scale,
             )
 
         return output.squeeze(1)

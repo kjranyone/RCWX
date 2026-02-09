@@ -623,6 +623,7 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         skip_head: int = 0,
         return_length: int = 0,
         return_length2: int = 0,
+        noise_scale: float = 0.66666,
     ) -> torch.Tensor:
         """
         Args:
@@ -631,6 +632,7 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
             pitch: Pitch indices [B, T]
             pitchf: Pitch in Hz [B, T]
             sid: Speaker ID [B]
+            noise_scale: VAE noise coefficient (0=deterministic, 0.66666=default)
         """
         g = self.emb_g(sid).unsqueeze(-1)
         # TextEncoder expects [B, T, C] format
@@ -646,8 +648,7 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
             x_mask = x_mask[:, :, head : head + tail]
             pitchf = pitchf[:, head : head + tail]
 
-        # Match RVC WebUI: noise coefficient 0.66666, apply x_mask to z_p
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
 
         n_res = return_length2 if return_length2 > 0 else None
@@ -767,12 +768,14 @@ class SynthesizerTrnMs256NSFsidNono(nn.Module):
         skip_head: int = 0,
         return_length: int = 0,
         return_length2: int = 0,
+        noise_scale: float = 0.66666,
     ) -> torch.Tensor:
         """
         Args:
             phone: HuBERT features [B, T, C] - NOT transposed
             phone_lengths: Feature lengths [B]
             sid: Speaker ID [B]
+            noise_scale: VAE noise coefficient (0=deterministic, 0.66666=default)
         """
         g = self.emb_g(sid).unsqueeze(-1)
         # TextEncoder expects [B, T, C] format, no pitch for non-F0 models
@@ -787,8 +790,7 @@ class SynthesizerTrnMs256NSFsidNono(nn.Module):
             logs_p = logs_p[:, :, head : head + tail]
             x_mask = x_mask[:, :, head : head + tail]
 
-        # Match RVC WebUI: noise coefficient 0.66666, apply x_mask to z_p
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
         z = self.flow(z_p, x_mask, g=g, reverse=True)
 
         n_res = return_length2 if return_length2 > 0 else None

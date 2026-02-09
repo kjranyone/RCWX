@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # 64 frames @ 100fps = 640ms worth of features
 MIN_SYNTH_FEATURE_FRAMES = 64
 
+# Maximum audio context for HuBERT in streaming mode (16kHz samples).
+# Longer context = better feature quality (HuBERT is a transformer that
+# benefits from seeing more audio).  F0 is extracted on the current chunk
+# only (pitch detection is local), so this doesn't affect F0 processing time.
+# 2.0s (32000 samples) gives cosine similarity ~0.60 vs batch features.
+MAX_HUBERT_CONTEXT_16K = 32000  # 2.0 seconds @ 16kHz
+
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
     """Apply high-pass filter to remove DC offset and low-frequency noise.
@@ -444,6 +451,10 @@ class RVCPipeline:
         self._audio_cache = None
         self._output_cache = None
         self._stream_history = None
+        # Streaming feature cache (used by infer_streaming to avoid synth padding)
+        self._streaming_feat_cache = None
+        # HuBERT audio context buffer (accumulates 16kHz audio for richer context)
+        self._streaming_audio_history = None
 
     @torch.no_grad()
     def infer(
@@ -464,6 +475,7 @@ class RVCPipeline:
         pad_mode: str = "chunk",
         synth_min_frames: int | None = MIN_SYNTH_FEATURE_FRAMES,
         history_sec: float = 0.0,
+        noise_scale: float = 0.66666,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -1024,6 +1036,7 @@ class RVCPipeline:
                 feature_lengths,
                 pitch=pitch,
                 pitchf=pitchf,
+                noise_scale=noise_scale,
             )
 
         logger.info(
@@ -1134,8 +1147,12 @@ class RVCPipeline:
         # t_pad_tgt was calculated earlier based on actual t_pad used
         # Also account for extra_pad added for HuBERT alignment
         extra_pad_tgt = int(extra_pad * self.sample_rate / 16000)
+        # HuBERT produces (input / 320) - 1 frames, so synthesizer output
+        # is 1 HuBERT frame shorter than naive expectation.  Reduce trim_end
+        # to compensate (same fix as infer_streaming).
+        hubert_deficit = 2 * (self.sample_rate // 100)
         trim_start = t_pad_tgt
-        trim_end = t_pad_tgt + extra_pad_tgt
+        trim_end = max(0, t_pad_tgt + extra_pad_tgt - hubert_deficit)
 
         # Debug: check output before trimming
         pre_trim_tail_rms = (
@@ -1193,6 +1210,447 @@ class RVCPipeline:
         logger.info(
             f"Final output: shape={output.shape}, min={output.min():.4f}, max={output.max():.4f}"
         )
+        return output
+
+    @torch.no_grad()
+    def infer_streaming(
+        self,
+        audio_16k: np.ndarray,
+        overlap_samples: int,
+        pitch_shift: int = 0,
+        f0_method: str = "fcpe",
+        index_rate: float = 0.0,
+        index_k: int = 4,
+        voice_gate_mode: str = "expand",
+        energy_threshold: float = 0.05,
+        use_parallel_extraction: bool = True,
+        noise_scale: float = 0.66666,
+        sola_extra_samples: int = 0,
+    ) -> np.ndarray:
+        """Streaming inference with audio-level overlap.
+
+        Processes [overlap | new_hop] audio through the full pipeline
+        (HuBERT -> synthesizer), then trims the synthesizer OUTPUT to
+        keep only the new_hop portion (plus optional SOLA extra).
+
+        Args:
+            audio_16k: Input audio at 16kHz, shape [overlap + new_hop].
+                       Length MUST be a multiple of 320 (HuBERT hop).
+                       overlap_samples MUST also be a multiple of 320.
+            overlap_samples: Number of overlap samples from previous chunk.
+            pitch_shift: Pitch shift in semitones.
+            f0_method: F0 extraction method ("fcpe", "rmvpe", "none").
+            index_rate: FAISS index blending ratio (0=off).
+            index_k: Number of FAISS neighbors.
+            voice_gate_mode: Voice gate mode (off/strict/expand/energy).
+            energy_threshold: Energy threshold for "energy" gate mode.
+            use_parallel_extraction: Enable parallel HuBERT+F0 extraction.
+            sola_extra_samples: Extra samples to keep from overlap region
+                (at model sample rate) to compensate for SOLA crossfade
+                deficit. When SOLA is enabled, consecutive outputs overlap
+                by this amount so SOLA can crossfade without losing samples.
+
+        Returns:
+            Converted audio at model sample rate (usually 40kHz).
+            Output length = new_hop + sola_extra_samples.
+        """
+        if not self._loaded:
+            self.load()
+
+        hubert_hop = 320
+
+        # Validate alignment
+        total_samples = len(audio_16k)
+        assert total_samples % hubert_hop == 0, (
+            f"audio_16k length {total_samples} is not a multiple of {hubert_hop}"
+        )
+        assert overlap_samples % hubert_hop == 0, (
+            f"overlap_samples {overlap_samples} is not a multiple of {hubert_hop}"
+        )
+
+        new_samples = total_samples - overlap_samples
+        assert new_samples > 0, "No new audio samples after overlap"
+
+        # Expected output length (at model sample rate)
+        # Include sola_extra so consecutive outputs overlap by that amount,
+        # allowing SOLA crossfade to consume those samples without deficit.
+        expected_output = int(new_samples * self.sample_rate / 16000) + sola_extra_samples
+
+        # --- HuBERT audio context buffer ---
+        # Accumulate real 16kHz audio so HuBERT processes a larger context
+        # window each chunk.  Up to MAX_HUBERT_CONTEXT_16K (2.0s) of audio
+        # is kept, producing coherent features from a single forward pass.
+        # F0 is extracted on the current chunk only (pitch is local).
+        t_pad = 800
+
+        new_hop_16k = audio_16k[overlap_samples:]
+
+        # Minimum 16kHz audio (before padding) to produce MIN_SYNTH_FEATURE_FRAMES
+        # from a single HuBERT forward pass.
+        # HuBERT: (input + 2*t_pad) / 320 - 1 frames @ 50fps, interpolated 2x → 100fps
+        # 64 features → 32 HuBERT frames → 33*320 - 2*t_pad = 8960 samples
+        min_audio_for_full_features = (
+            (MIN_SYNTH_FEATURE_FRAMES // 2 + 1) * hubert_hop - 2 * t_pad
+        )
+
+        # --- Audio history for HuBERT (capped for fast synthesis) ---
+        if self._streaming_audio_history is None:
+            self._streaming_audio_history = audio_16k.copy()
+        else:
+            self._streaming_audio_history = np.concatenate([
+                self._streaming_audio_history, new_hop_16k
+            ])
+        if len(self._streaming_audio_history) > min_audio_for_full_features:
+            self._streaming_audio_history = (
+                self._streaming_audio_history[-min_audio_for_full_features:]
+            )
+
+        # Extend audio_16k with HuBERT history (capped ~8960 for synthesis).
+        pre_context_samples = 0
+        if len(self._streaming_audio_history) > total_samples:
+            pre_context_samples = len(self._streaming_audio_history) - total_samples
+            # Treat pre-context as additional overlap (trimmed from output)
+            audio_16k = self._streaming_audio_history.copy()
+            total_samples = len(audio_16k)
+            overlap_samples = overlap_samples + pre_context_samples
+
+        # Apply high-pass filter
+        audio_filtered = highpass_filter(audio_16k, sr=16000, cutoff=48)
+
+        # Reflection padding for edge handling (fixed 50ms like batch infer)
+        input_length = len(audio_filtered)
+
+        # Ensure padded audio is multiple of hubert_hop
+        padded_for_hubert = t_pad + input_length + t_pad
+        remainder = padded_for_hubert % hubert_hop
+        extra_pad = (hubert_hop - remainder) if remainder != 0 else 0
+
+        audio_padded = np.pad(
+            audio_filtered, (t_pad, t_pad + extra_pad), mode="reflect"
+        )
+
+        # Pad HuBERT input to a fixed size
+        # As the audio history grows, the input size changes every chunk,
+        # triggering expensive kernel compilations on Intel XPU.  By padding
+        # to the maximum expected size, we get a single compilation on the
+        # first chunk and stable performance thereafter.  The extra synthesis
+        # output from the end padding is exactly consumed by the increased
+        # trim_right, so net output length is unchanged.
+        fixed_hubert_input = (
+            (min_audio_for_full_features + 2 * t_pad + hubert_hop - 1)
+            // hubert_hop * hubert_hop
+        )
+        if len(audio_padded) < fixed_hubert_input:
+            end_pad = fixed_hubert_input - len(audio_padded)
+            audio_padded = np.pad(audio_padded, (0, end_pad), mode="reflect")
+            extra_pad += end_pad
+
+        # Output-level trim amounts (at model sample rate)
+        t_pad_tgt = int(t_pad * self.sample_rate / 16000)
+        extra_pad_tgt = int(extra_pad * self.sample_rate / 16000)
+        overlap_tgt = int(overlap_samples * self.sample_rate / 16000)
+        # HuBERT produces (input / 320) - 1 frames, so the synthesizer output
+        # is 1 HuBERT frame shorter than the naive expectation.  In output
+        # space this is 2 feature-frames * samples_per_frame.
+        hubert_deficit = 2 * (self.sample_rate // 100)
+        # Left trim: padding + overlap (minus sola_extra to keep extra overlap
+        # in the output for SOLA crossfade compensation).
+        # Right trim: padding + extra - deficit.
+        trim_left = max(0, t_pad_tgt + overlap_tgt - sola_extra_samples)
+        trim_right = max(0, t_pad_tgt + extra_pad_tgt - hubert_deficit)
+
+        # Convert to tensors
+        audio_t = (
+            torch.from_numpy(audio_padded).float().unsqueeze(0).to(self.device)
+        )
+        # Determine HuBERT output params
+        if self.synthesizer.version == 1:
+            output_dim = 256
+            output_layer = 9
+        else:
+            output_dim = 768
+            output_layer = 12
+
+        # Parallel HuBERT + F0 extraction (both use audio_t for frame alignment)
+        features = None
+        f0_raw = None
+        use_f0 = self.has_f0 and f0_method != "none"
+
+        if use_parallel_extraction and use_f0:
+            def extract_hubert():
+                with torch.autocast(device_type=self.device, dtype=self.dtype):
+                    return self.hubert.extract(
+                        audio_t, output_layer=output_layer, output_dim=output_dim
+                    )
+
+            def extract_f0():
+                if f0_method == "fcpe" and self.fcpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        return self.fcpe.infer(audio_t, threshold=0.006)
+                elif self.rmvpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        return self.rmvpe.infer(audio_t)
+                return None
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                hubert_future = executor.submit(extract_hubert)
+                f0_future = executor.submit(extract_f0)
+                features = hubert_future.result()
+                f0_raw = f0_future.result()
+        else:
+            with torch.autocast(device_type=self.device, dtype=self.dtype):
+                features = self.hubert.extract(
+                    audio_t, output_layer=output_layer, output_dim=output_dim
+                )
+
+        # FAISS index retrieval
+        if index_rate > 0 and self.faiss_index is not None:
+            features = self._search_index(features, index_rate, k=index_k)
+
+        # Interpolate features 2x (50fps -> 100fps for synthesizer)
+        features = torch.nn.functional.interpolate(
+            features.permute(0, 2, 1),
+            scale_factor=2,
+            mode="linear",
+            align_corners=False,
+        ).permute(0, 2, 1)
+
+        feature_lengths = torch.tensor(
+            [features.shape[1]], dtype=torch.long, device=self.device
+        )
+
+        # F0 processing (same audio_t as HuBERT for perfect frame alignment)
+        pitch = None
+        pitchf = None
+        voiced_mask_for_gate = None
+
+        if use_f0:
+            f0 = f0_raw
+            if f0 is None:
+                if f0_method == "fcpe" and self.fcpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        f0 = self.fcpe.infer(audio_t, threshold=0.006)
+                elif self.rmvpe is not None:
+                    with torch.autocast(device_type=self.device, dtype=self.dtype):
+                        f0 = self.rmvpe.infer(audio_t)
+
+            if f0 is not None and f0.numel() > 0:
+                # FCPE smoothing
+                if f0_method == "fcpe":
+                    f0_smooth = torch.nn.functional.avg_pool1d(
+                        f0.unsqueeze(1), kernel_size=5, stride=1, padding=2,
+                    ).squeeze(1)
+                    f0 = torch.where(f0 > 0, f0_smooth, f0)
+
+                # Pitch shift
+                if pitch_shift != 0:
+                    f0 = torch.where(f0 > 0, f0 * (2 ** (pitch_shift / 12)), f0)
+
+                # Align F0 to feature length (F0 from same audio_t, minor hop mismatch)
+                if f0.shape[1] != features.shape[1]:
+                    f0 = torch.nn.functional.interpolate(
+                        f0.unsqueeze(1),
+                        size=features.shape[1],
+                        mode="linear",
+                        align_corners=False,
+                    ).squeeze(1)
+
+                # Median filter for spike removal
+                f0 = smooth_f0_spikes(f0, window=3)
+
+                # Lowpass filter for jitter removal
+                f0 = lowpass_f0(f0, cutoff_hz=8.0, sample_rate=100.0)
+
+                pitchf = f0.to(self.dtype)
+
+                # Quantized pitch for embedding
+                f0_mel_min = 1127 * math.log(1 + 50 / 700)
+                f0_mel_max = 1127 * math.log(1 + 1100 / 700)
+                f0_mel = 1127 * torch.log(1 + f0 / 700)
+                voiced_mask = f0_mel > 0
+                f0_mel_normalized = torch.where(
+                    voiced_mask,
+                    (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
+                    f0_mel,
+                )
+                pitch = torch.clamp(f0_mel_normalized, 1, 255).round().long()
+                voiced_mask_for_gate = voiced_mask.float()
+
+            if pitch is None:
+                pitch = torch.ones(
+                    features.shape[0], features.shape[1],
+                    dtype=torch.long, device=self.device,
+                )
+                pitchf = torch.zeros(
+                    features.shape[0], features.shape[1],
+                    dtype=self.dtype, device=self.device,
+                )
+
+        # Fallback: F0 model but f0_method="none" (e.g. overload protection)
+        if self.has_f0 and pitch is None:
+            pitch = torch.ones(
+                features.shape[0], features.shape[1],
+                dtype=torch.long, device=self.device,
+            )
+            pitchf = torch.zeros(
+                features.shape[0], features.shape[1],
+                dtype=self.dtype, device=self.device,
+            )
+
+        # --- Feature cache: use real features from previous chunk instead
+        # of reflect-padding when the current chunk is too short for the
+        # synthesizer decoder.  This gives the decoder real context from
+        # the preceding audio, dramatically improving output quality for
+        # low-latency chunk sizes.
+        cache_prepend_frames = 0
+        new_features_for_cache = features.clone()
+        new_pitch_for_cache = pitch.clone() if pitch is not None else None
+        new_pitchf_for_cache = pitchf.clone() if pitchf is not None else None
+
+        if (
+            self._streaming_feat_cache is not None
+            and features.shape[1] < MIN_SYNTH_FEATURE_FRAMES
+        ):
+            c_feat, c_pitch, c_pitchf = self._streaming_feat_cache
+            need = MIN_SYNTH_FEATURE_FRAMES - features.shape[1]
+            avail = c_feat.shape[1]
+            cache_prepend_frames = min(need, avail)
+
+            features = torch.cat(
+                [c_feat[:, -cache_prepend_frames:], features], dim=1
+            )
+            feature_lengths = torch.tensor(
+                [features.shape[1]], dtype=torch.long, device=self.device,
+            )
+            if pitch is not None and c_pitch is not None:
+                pitch = torch.cat(
+                    [c_pitch[:, -cache_prepend_frames:], pitch], dim=1
+                )
+            if pitchf is not None and c_pitchf is not None:
+                pitchf = torch.cat(
+                    [c_pitchf[:, -cache_prepend_frames:], pitchf], dim=1
+                )
+            # Extend voice gate mask to cover cached prefix (all-voiced,
+            # since the cached portion is trimmed from the output anyway).
+            if voiced_mask_for_gate is not None:
+                cache_mask = torch.ones(
+                    1, cache_prepend_frames,
+                    dtype=voiced_mask_for_gate.dtype,
+                    device=voiced_mask_for_gate.device,
+                )
+                voiced_mask_for_gate = torch.cat(
+                    [cache_mask, voiced_mask_for_gate], dim=1
+                )
+            trim_left += cache_prepend_frames * (self.sample_rate // 100)
+
+        # Fallback: reflect-pad if still too short (first chunk, no cache)
+        synth_pad_frames = 0
+        if features.shape[1] < MIN_SYNTH_FEATURE_FRAMES:
+            synth_pad_frames = MIN_SYNTH_FEATURE_FRAMES - features.shape[1]
+            pad_left = synth_pad_frames // 2
+            pad_right = synth_pad_frames - pad_left
+
+            current_size = features.shape[1]
+            pad_mode = "replicate" if max(pad_left, pad_right) >= current_size else "reflect"
+
+            features = torch.nn.functional.pad(
+                features.permute(0, 2, 1), (pad_left, pad_right), mode=pad_mode,
+            ).permute(0, 2, 1)
+            feature_lengths = torch.tensor(
+                [features.shape[1]], dtype=torch.long, device=self.device,
+            )
+            if pitch is not None:
+                pitch = torch.nn.functional.pad(pitch, (pad_left, pad_right), mode=pad_mode)
+            if pitchf is not None:
+                pitchf = torch.nn.functional.pad(pitchf, (pad_left, pad_right), mode=pad_mode)
+
+        # Save current chunk's features for next call's cache
+        self._streaming_feat_cache = (
+            new_features_for_cache,
+            new_pitch_for_cache,
+            new_pitchf_for_cache,
+        )
+
+        # Run synthesizer on FULL features (cache + padding + overlap + new_hop)
+        with torch.autocast(device_type=self.device, dtype=self.dtype):
+            output = self.synthesizer.infer(
+                features, feature_lengths, pitch=pitch, pitchf=pitchf,
+                noise_scale=noise_scale,
+            )
+
+        # Trim synthesizer reflect-padding (only used for first chunk)
+        if synth_pad_frames > 0:
+            samples_per_frame = self.sample_rate // 100
+            sp_left = (synth_pad_frames // 2) * samples_per_frame
+            sp_right = (synth_pad_frames - synth_pad_frames // 2) * samples_per_frame
+            if output.shape[-1] > sp_left + sp_right:
+                output = (
+                    output[..., sp_left:-sp_right]
+                    if sp_right > 0
+                    else output[..., sp_left:]
+                )
+
+        # Voice gating (on full output, before trimming)
+        if voice_gate_mode != "off" and voiced_mask_for_gate is not None:
+            output_len = output.shape[-1]
+            gate_mask = voiced_mask_for_gate.clone()
+
+            if voice_gate_mode == "expand":
+                expand_frames = 2
+                gate_mask = torch.nn.functional.max_pool1d(
+                    gate_mask.unsqueeze(1),
+                    kernel_size=expand_frames * 2 + 1,
+                    stride=1,
+                    padding=expand_frames,
+                ).squeeze(1)
+            elif voice_gate_mode == "energy":
+                frame_size = output_len // gate_mask.shape[-1]
+                if frame_size > 0:
+                    output_frames = output.unfold(-1, frame_size, frame_size)
+                    frame_energy = (output_frames ** 2).mean(dim=-1)
+                    energy_max = frame_energy.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+                    energy_mask = (frame_energy / energy_max > energy_threshold).float()
+                    if energy_mask.shape[-1] == gate_mask.shape[-1]:
+                        gate_mask = torch.maximum(gate_mask, energy_mask)
+
+            gate_mask = torch.nn.functional.interpolate(
+                gate_mask.unsqueeze(1), size=output_len,
+                mode="linear", align_corners=False,
+            ).squeeze(1)
+
+            smooth_samples = int(self.sample_rate * 0.005)
+            if smooth_samples > 1:
+                kernel = torch.ones(1, 1, smooth_samples, device=gate_mask.device) / smooth_samples
+                gate_mask = torch.nn.functional.conv1d(
+                    gate_mask.unsqueeze(1), kernel, padding=smooth_samples // 2,
+                ).squeeze(1)
+                if gate_mask.shape[-1] != output_len:
+                    gate_mask = gate_mask[..., :output_len]
+                gate_mask = torch.clamp(gate_mask, 0, 1)
+
+            output = output * gate_mask
+
+        # Convert to numpy
+        output = output.cpu().float().numpy()
+        if output.ndim == 2:
+            output = output[0]
+
+        # Trim output: remove padding + overlap from left, padding from right
+        # This extracts only the new_hop portion
+        if trim_right > 0 and len(output) > trim_left + trim_right:
+            output = output[trim_left:-trim_right]
+        elif len(output) > trim_left:
+            output = output[trim_left:]
+
+        # Adjust to exact expected length (match infer() behavior)
+        length_diff = len(output) - expected_output
+        if length_diff > 0:
+            # Output too long — trim from end
+            output = output[:expected_output]
+        elif length_diff < 0 and abs(length_diff) > 100:
+            # Output too short — resample to stretch (consistent with batch infer)
+            output = resample(output, len(output), expected_output)
+
         return output
 
     def get_info(self) -> dict:

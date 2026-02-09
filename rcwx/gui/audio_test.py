@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,12 @@ class AudioTestManager:
         """
         self.app = app
         self._test_running = False  # Flag to prevent concurrent tests
+        self._conversion_done = threading.Event()
+        self._conversion_result: dict = {}
+        # Intermediate state for async conversion
+        self._pending_audio: np.ndarray | None = None
+        self._pending_out_sr: int = 0
+        self._pending_debug_dir: Path | None = None
 
     def run_test(self) -> None:
         """
@@ -147,63 +154,103 @@ class AudioTestManager:
             logger.info(f"Saved: debug_audio/02_input_16k.wav ({process_sr}Hz)")
 
             # Convert if pipeline is loaded
-            output_sr = out_sr  # Default to output device rate
             if self.app.pipeline is not None:
                 self.app.test_status.configure(text="🔄 変換中...", text_color="#66b3ff")
                 self.app.update_idletasks()
 
-                # Run conversion in background thread to avoid UI freeze
-                import threading
-                import torch
+                # Store state for async completion
+                self._pending_audio = audio
+                self._pending_out_sr = out_sr
+                self._pending_debug_dir = debug_dir
 
-                conversion_result = {"audio": None, "error": None, "model_sr": None}
-                conversion_done = threading.Event()
+                # Run conversion in background thread
+                self._conversion_done.clear()
+                self._conversion_result = {"audio": None, "error": None, "model_sr": None}
 
-                def convert_thread():
-                    try:
-                        audio_tensor = torch.from_numpy(audio).float()
-                        converted = self.app.pipeline.infer(
-                            audio_tensor,
-                            pitch_shift=self.app.pitch_control.pitch,
-                            f0_method=self.app.pitch_control.f0_method,
-                            index_rate=self.app._get_index_rate(),
-                            voice_gate_mode=self.app.voice_gate_mode_var.get(),
-                            energy_threshold=self.app.energy_threshold_slider.get(),
-                            use_feature_cache=False,
-                        )
-                        conversion_result["audio"] = converted
-                        conversion_result["model_sr"] = self.app.pipeline.sample_rate
-                    except Exception as e:
-                        conversion_result["error"] = str(e)
-                    finally:
-                        conversion_done.set()
-
-                thread = threading.Thread(target=convert_thread, daemon=True)
+                thread = threading.Thread(target=self._convert_thread, daemon=True)
                 thread.start()
 
-                # Wait with UI updates
-                while not conversion_done.wait(timeout=0.1):
-                    self.app.update_idletasks()
-
-                if conversion_result["error"]:
-                    raise RuntimeError(conversion_result["error"])
-
-                audio_converted = conversion_result["audio"]
-                model_sr = conversion_result["model_sr"]
-
-                # Save converted output at model rate
-                wavfile.write(debug_dir / "03_output_model.wav", model_sr, audio_converted)
-                logger.info(f"Saved: debug_audio/03_output_model.wav ({model_sr}Hz)")
-
-                # Resample from model rate to output device rate
-                if model_sr != out_sr:
-                    audio = resample(audio_converted, model_sr, out_sr)
-                else:
-                    audio = audio_converted
+                # Non-blocking poll via after() — return control to mainloop
+                self.app.after(100, self._poll_conversion)
+                return
             else:
                 # No conversion - resample back to output rate for playback
                 if process_sr != out_sr:
                     audio = resample(audio, process_sr, out_sr)
+
+            self._finish_playback(audio, out_sr, debug_dir, has_pipeline=False)
+
+        except Exception as e:
+            self._handle_error(e)
+            self._cleanup()
+
+    def _convert_thread(self) -> None:
+        """Run pipeline.infer() in a background thread."""
+        import torch
+
+        try:
+            audio_tensor = torch.from_numpy(self._pending_audio).float()
+            converted = self.app.pipeline.infer(
+                audio_tensor,
+                pitch_shift=self.app.pitch_control.pitch,
+                f0_method=self.app.pitch_control.f0_method,
+                index_rate=self.app._get_index_rate(),
+                voice_gate_mode=self.app.voice_gate_mode_var.get(),
+                energy_threshold=self.app.energy_threshold_slider.get(),
+                use_feature_cache=False,
+            )
+            self._conversion_result["audio"] = converted
+            self._conversion_result["model_sr"] = self.app.pipeline.sample_rate
+        except Exception as e:
+            self._conversion_result["error"] = str(e)
+        finally:
+            self._conversion_done.set()
+
+    def _poll_conversion(self) -> None:
+        """Non-blocking poll for conversion completion via after()."""
+        if self._conversion_done.is_set():
+            self._on_conversion_done()
+        else:
+            self.app.after(100, self._poll_conversion)
+
+    def _on_conversion_done(self) -> None:
+        """Handle conversion result after background thread finishes."""
+        try:
+            if self._conversion_result.get("error"):
+                raise RuntimeError(self._conversion_result["error"])
+
+            audio_converted = self._conversion_result["audio"]
+            model_sr = self._conversion_result["model_sr"]
+            out_sr = self._pending_out_sr
+            debug_dir = self._pending_debug_dir
+
+            # Save converted output at model rate
+            wavfile.write(debug_dir / "03_output_model.wav", model_sr, audio_converted)
+            logger.info(f"Saved: debug_audio/03_output_model.wav ({model_sr}Hz)")
+
+            # Resample from model rate to output device rate
+            if model_sr != out_sr:
+                audio = resample(audio_converted, model_sr, out_sr)
+            else:
+                audio = audio_converted
+
+            self._finish_playback(audio, out_sr, debug_dir, has_pipeline=True)
+
+        except Exception as e:
+            self._handle_error(e)
+            self._cleanup()
+
+    def _finish_playback(
+        self,
+        audio: np.ndarray,
+        out_sr: int,
+        debug_dir: Path,
+        *,
+        has_pipeline: bool,
+    ) -> None:
+        """Save final output and play back on main thread."""
+        try:
+            output_device = self.app.audio_settings.output_device
 
             # Save final output
             wavfile.write(debug_dir / "04_output_final.wav", out_sr, audio)
@@ -214,12 +261,10 @@ class AudioTestManager:
             self.app.test_status.configure(text="🔊 再生中...", text_color="#66ff66")
             self.app.update_idletasks()
 
-            # Try playback with different sample rates if needed
             playback_rates = [out_sr, 48000, 44100]
             played = False
             for try_sr in playback_rates:
                 try:
-                    # Resample if needed for this playback rate
                     playback_audio = audio
                     if try_sr != out_sr and not played:
                         playback_audio = resample(audio, out_sr, try_sr)
@@ -231,36 +276,43 @@ class AudioTestManager:
                         logger.warning(f"Playback fallback to {try_sr}Hz (device may not support {out_sr}Hz)")
                     break
                 except Exception as e:
-                    if try_sr == playback_rates[-1]:  # Last attempt
+                    if try_sr == playback_rates[-1]:
                         raise
                     logger.warning(f"Failed to play at {try_sr}Hz: {e}, trying next rate...")
                     continue
 
             # Done
-            if self.app.pipeline is not None:
+            if has_pipeline:
                 self.app.test_status.configure(text="✓ 完了 (debug_audio/に保存)", text_color="green")
             else:
                 self.app.test_status.configure(text="✓ 完了 (変換なし)", text_color="gray")
 
         except Exception as e:
-            logger.error(f"Audio test failed: {e}")
-            error_msg = str(e)
-
-            # Provide helpful error messages
-            if "Invalid sample rate" in error_msg or "PaErrorCode -9997" in error_msg:
-                self.app.test_status.configure(
-                    text="エラー: サンプルレート非対応（デバイス設定を確認）",
-                    text_color="red"
-                )
-            elif "Invalid number of channels" in error_msg:
-                self.app.test_status.configure(
-                    text="エラー: チャンネル数非対応（デバイス設定を確認）",
-                    text_color="red"
-                )
-            else:
-                short_msg = error_msg[:50]
-                self.app.test_status.configure(text=f"エラー: {short_msg}", text_color="red")
-
+            self._handle_error(e)
         finally:
-            self._test_running = False
-            self.app.test_btn.configure(state="normal")
+            self._cleanup()
+
+    def _handle_error(self, e: Exception) -> None:
+        """Display error message in the GUI."""
+        logger.error(f"Audio test failed: {e}")
+        error_msg = str(e)
+
+        if "Invalid sample rate" in error_msg or "PaErrorCode -9997" in error_msg:
+            self.app.test_status.configure(
+                text="エラー: サンプルレート非対応（デバイス設定を確認）",
+                text_color="red",
+            )
+        elif "Invalid number of channels" in error_msg:
+            self.app.test_status.configure(
+                text="エラー: チャンネル数非対応（デバイス設定を確認）",
+                text_color="red",
+            )
+        else:
+            short_msg = error_msg[:50]
+            self.app.test_status.configure(text=f"エラー: {short_msg}", text_color="red")
+
+    def _cleanup(self) -> None:
+        """Re-enable test button and clear running flag."""
+        self._test_running = False
+        self.app.test_btn.configure(state="normal")
+        self._pending_audio = None

@@ -9,7 +9,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 import numpy as np
 
-from rcwx.audio.input import list_input_devices
+from rcwx.audio.input import list_input_devices, _auto_select_channel
 from rcwx.audio.output import list_output_devices
 
 logger = logging.getLogger(__name__)
@@ -254,7 +254,16 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.channel_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.channel_frame.grid(row=10, column=0, padx=10, pady=2, sticky="ew")
 
-        self.channel_var = ctk.StringVar(value="average")
+        self.channel_var = ctk.StringVar(value="auto")
+        self.channel_auto_radio = ctk.CTkRadioButton(
+            self.channel_frame,
+            text="自動",
+            variable=self.channel_var,
+            value="auto",
+            command=self._on_channel_change,
+        )
+        self.channel_auto_radio.grid(row=0, column=0, padx=(0, 10))
+
         self.channel_left_radio = ctk.CTkRadioButton(
             self.channel_frame,
             text="左 (L)",
@@ -262,7 +271,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
             value="left",
             command=self._on_channel_change,
         )
-        self.channel_left_radio.grid(row=0, column=0, padx=(0, 10))
+        self.channel_left_radio.grid(row=0, column=1, padx=(0, 10))
 
         self.channel_right_radio = ctk.CTkRadioButton(
             self.channel_frame,
@@ -271,7 +280,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
             value="right",
             command=self._on_channel_change,
         )
-        self.channel_right_radio.grid(row=0, column=1, padx=(0, 10))
+        self.channel_right_radio.grid(row=0, column=2, padx=(0, 10))
 
         self.channel_average_radio = ctk.CTkRadioButton(
             self.channel_frame,
@@ -280,7 +289,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
             value="average",
             command=self._on_channel_change,
         )
-        self.channel_average_radio.grid(row=0, column=2)
+        self.channel_average_radio.grid(row=0, column=3)
 
         # Initially disable if device is mono
         self._update_channel_selection_state()
@@ -618,7 +627,9 @@ class AudioSettingsFrame(ctk.CTkFrame):
             if indata.ndim > 1 and indata.shape[1] > 1:
                 # Stereo input - apply channel selection
                 channel_selection = self.get_channel_selection()
-                if channel_selection == "left":
+                if channel_selection == "auto":
+                    audio = _auto_select_channel(indata)
+                elif channel_selection == "left":
                     audio = indata[:, 0]
                 elif channel_selection == "right":
                     audio = indata[:, 1]
@@ -796,15 +807,17 @@ class AudioSettingsFrame(ctk.CTkFrame):
         """Enable/disable channel selection based on device channels."""
         if self.input_channels > 1:
             # Stereo device - enable selection
+            self.channel_auto_radio.configure(state="normal")
             self.channel_left_radio.configure(state="normal")
             self.channel_right_radio.configure(state="normal")
             self.channel_average_radio.configure(state="normal")
         else:
-            # Mono device - disable selection and default to left (only channel)
+            # Mono device - disable selection and default to auto
+            self.channel_auto_radio.configure(state="disabled")
             self.channel_left_radio.configure(state="disabled")
             self.channel_right_radio.configure(state="disabled")
             self.channel_average_radio.configure(state="disabled")
-            self.channel_var.set("left")  # Mono only has one channel
+            self.channel_var.set("auto")
 
     def get_channel_selection(self) -> str:
         """Get the currently selected channel mode."""

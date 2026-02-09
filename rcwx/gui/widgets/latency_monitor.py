@@ -6,7 +6,7 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from rcwx.pipeline.realtime import RealtimeStats
+from rcwx.pipeline.realtime_unified import RealtimeStats
 
 
 class LatencyMonitor(ctk.CTkFrame):

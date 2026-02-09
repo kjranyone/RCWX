@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Optional
 
 import customtkinter as ctk
 import sounddevice as sd
 
-from rcwx.pipeline.realtime import RealtimeConfig, RealtimeStats, RealtimeVoiceChanger
-from rcwx.pipeline.realtime_v2 import RealtimeVoiceChangerV2
+from rcwx.pipeline.realtime_unified import (
+    RealtimeConfig,
+    RealtimeStats,
+    RealtimeVoiceChangerUnified,
+)
 
 if TYPE_CHECKING:
     from rcwx.gui.app import RCWXApp
@@ -38,7 +40,7 @@ class RealtimeController:
             app: Reference to main application
         """
         self.app = app
-        self.voice_changer: Optional[RealtimeVoiceChanger | RealtimeVoiceChangerV2] = None
+        self.voice_changer: Optional[RealtimeVoiceChangerUnified] = None
         self._buffer_warning_shown = {'underrun': False, 'overrun': False}
 
     def toggle(self) -> None:
@@ -82,7 +84,7 @@ class RealtimeController:
             # Get latency settings
             latency = self.app.latency_settings.get_settings()
 
-            # Create realtime config with auto-detected sample rates and channels
+            # Create unified realtime config
             rt_config = RealtimeConfig(
                 input_device=self.app.audio_settings.input_device,
                 output_device=self.app.audio_settings.output_device,
@@ -91,13 +93,14 @@ class RealtimeController:
                 input_channels=self.app.audio_settings.input_channels,
                 output_channels=self.app.audio_settings.output_channels,
                 input_channel_selection=self.app.audio_settings.get_channel_selection(),
-                # Latency settings (from LatencySettingsFrame)
+                # Latency settings
                 chunk_sec=latency["chunk_sec"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
                 buffer_margin=latency["buffer_margin"],
-                context_sec=latency["context_sec"],
+                overlap_sec=latency["context_sec"],  # context_sec -> overlap_sec
                 crossfade_sec=latency["crossfade_sec"],
-                chunking_mode=latency["chunking_mode"],
+                lookahead_sec=latency["lookahead_sec"],
+                use_sola=latency["use_sola"],
                 # Pitch settings
                 pitch_shift=self.app.pitch_control.pitch,
                 use_f0=self.app.pitch_control.use_f0,
@@ -109,24 +112,10 @@ class RealtimeController:
                 denoise_method=self.app.denoise_method_var.get(),
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
-                use_feature_cache=self.app.use_feature_cache_var.get(),
-                # w-okada style processing (from LatencySettingsFrame)
-                extra_sec=self.app.config.inference.extra_sec,
-                lookahead_sec=latency["lookahead_sec"],
-                use_sola=latency["use_sola"],
             )
 
-            engine = os.getenv(
-                "RCWX_REALTIME_ENGINE",
-                getattr(self.app.config.inference, "realtime_engine", "v1"),
-            )
-            if engine == "v2":
-                VoiceChanger = RealtimeVoiceChangerV2
-            else:
-                VoiceChanger = RealtimeVoiceChanger
-
-            # Create voice changer with warmup progress callback
-            self.voice_changer = VoiceChanger(
+            # Create unified voice changer
+            self.voice_changer = RealtimeVoiceChangerUnified(
                 self.app.pipeline,
                 config=rt_config,
                 on_warmup_progress=self._on_warmup_progress,
