@@ -171,16 +171,19 @@ class RCWXApp(ctk.CTk):
             on_f0_mode_changed=self._on_f0_mode_changed,
             on_f0_method_changed=self._on_f0_method_changed,
             on_pre_hubert_pitch_changed=self._on_pre_hubert_pitch_changed,
+            on_moe_boost_changed=self._on_moe_boost_changed,
         )
         self.pitch_control.pack(fill="x", pady=(0, 5))
 
         # Restore saved F0 method
         self.pitch_control.set_f0_method(self.config.inference.f0_method)
+        self.pitch_control.set_pitch(self.config.inference.pitch_shift)
 
         # Restore saved pre-HuBERT pitch setting
         self.pitch_control.set_pre_hubert_pitch_ratio(
             self.config.inference.pre_hubert_pitch_ratio
         )
+        self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
 
         # Index control
         self.index_frame = ctk.CTkFrame(self.left_column)
@@ -770,6 +773,7 @@ class RCWXApp(ctk.CTk):
 
     def _on_pitch_changed(self, value: int) -> None:
         """Handle pitch change."""
+        self._save_config()
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_pitch_shift(value)
 
@@ -789,6 +793,12 @@ class RCWXApp(ctk.CTk):
         self._save_config()
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_pre_hubert_pitch_ratio(ratio)
+
+    def _on_moe_boost_changed(self, strength: float) -> None:
+        """Handle moe boost change."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_moe_boost(strength)
 
     def _on_index_changed(self) -> None:
         """Handle index checkbox change."""
@@ -901,8 +911,10 @@ class RCWXApp(ctk.CTk):
             self.config.inference.use_compile = self.compile_var.get()
             self.config.inference.use_index = self.use_index_var.get()
             self.config.inference.index_ratio = self.index_ratio_slider.get()
+            self.config.inference.pitch_shift = self.pitch_control.pitch
             self.config.inference.f0_method = self.pitch_control.f0_method
             self.config.inference.pre_hubert_pitch_ratio = self.pitch_control.pre_hubert_pitch_ratio
+            self.config.inference.moe_boost = self.pitch_control.moe_boost
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()

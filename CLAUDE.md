@@ -131,6 +131,8 @@ rcwx/
 | `use_sola` | `true` | SOLA有効化 |
 | `sola_search_ms` | `10.0` | SOLA探索窓 |
 | `pre_hubert_pitch_ratio` | `0.0` | プレHuBERTシフト比率 (0.0-1.0) |
+| `noise_scale` | `0.4` | 合成ノイズスケール (0.0-1.0) |
+| `f0_lowpass_cutoff_hz` | `16.0` | F0ローパスカットオフ (Hz) |
 | `denoise.enabled` | `false` | ノイズ除去 |
 | `denoise.method` | `auto` | `auto` / `ml` / `spectral` |
 
@@ -149,6 +151,8 @@ rcwx/
 - `buffer_margin` (既定 0.3)
 - `f0_method` (既定 `fcpe`)
 - `pre_hubert_pitch_ratio` (既定 0.0)
+- `noise_scale` (既定 0.4)
+- `f0_lowpass_cutoff_hz` (既定 16.0)
 - `max_queue_size` (既定 8)
 
 ## GUI Latency Model (Current)

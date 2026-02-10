@@ -187,7 +187,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     pipeline.load()
 
     # Run inference
-    print(f"Processing (pitch shift: {args.pitch}, index_rate: {args.index_rate})...")
+    print(
+        "Processing "
+        f"(pitch shift: {args.pitch}, index_rate: {args.index_rate}, "
+        f"pre_hubert: {args.pre_hubert_pitch}, moe_boost: {args.moe_boost})..."
+    )
     output = pipeline.infer(
         audio,
         input_sr=sr,
@@ -195,6 +199,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         f0_method="rmvpe" if not args.no_f0 else "none",
         index_rate=args.index_rate,
         pre_hubert_pitch_ratio=args.pre_hubert_pitch,
+        moe_boost=args.moe_boost,
     )
 
     # Save output
@@ -381,6 +386,12 @@ def main() -> int:
         type=float,
         default=0.0,
         help="Pre-HuBERT pitch shift ratio (0.0=off, 1.0=full pitch shift before HuBERT)",
+    )
+    run_parser.add_argument(
+        "--moe-boost",
+        type=float,
+        default=0.0,
+        help="Moe voice style strength for F0 contour (0.0=off, 1.0=strong)",
     )
     run_parser.set_defaults(func=cmd_run)
 

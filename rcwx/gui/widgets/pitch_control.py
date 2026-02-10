@@ -21,6 +21,7 @@ class PitchControl(ctk.CTkFrame):
         on_f0_mode_changed: Optional[Callable[[bool], None]] = None,
         on_f0_method_changed: Optional[Callable[[str], None]] = None,
         on_pre_hubert_pitch_changed: Optional[Callable[[float], None]] = None,
+        on_moe_boost_changed: Optional[Callable[[float], None]] = None,
         **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -29,11 +30,13 @@ class PitchControl(ctk.CTkFrame):
         self.on_f0_mode_changed = on_f0_mode_changed
         self.on_f0_method_changed = on_f0_method_changed
         self.on_pre_hubert_pitch_changed = on_pre_hubert_pitch_changed
+        self.on_moe_boost_changed = on_moe_boost_changed
 
         self._pitch: int = 0
         self._use_f0: bool = True
         self._f0_method: str = "rmvpe"
         self._pre_hubert_pitch_ratio: float = 0.0
+        self._moe_boost: float = 0.0
 
         self._setup_ui()
 
@@ -159,6 +162,45 @@ class PitchControl(ctk.CTkFrame):
         )
         self.pre_hubert_hint.grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 5))
 
+        self.moe_label = ctk.CTkLabel(
+            self,
+            text="Moe Boost",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.moe_label.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(5, 2))
+
+        self.moe_min = ctk.CTkLabel(self, text="0.0", font=ctk.CTkFont(size=10))
+        self.moe_min.grid(row=10, column=0, padx=(10, 5), pady=2)
+
+        self.moe_slider = ctk.CTkSlider(
+            self,
+            from_=0.0,
+            to=1.0,
+            number_of_steps=20,
+            width=250,
+            command=self._on_moe_boost_change,
+        )
+        self.moe_slider.set(0.0)
+        self.moe_slider.grid(row=10, column=1, padx=5, pady=2, sticky="ew")
+
+        self.moe_value = ctk.CTkLabel(self, text="0.00", width=40, font=ctk.CTkFont(size=11))
+        self.moe_value.grid(row=10, column=2, padx=(5, 10), pady=2)
+
+        self.moe_hint = ctk.CTkLabel(
+            self,
+            text="Recommended: 0.40-0.80",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        )
+        self.moe_hint.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+
+        self.moe_preset_btn = ctk.CTkButton(
+            self,
+            text="Apply Moe Preset",
+            command=self.apply_moe_preset,
+        )
+        self.moe_preset_btn.grid(row=12, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="ew")
+
         self.grid_columnconfigure(1, weight=1)
 
     def _on_slider_change(self, value: float) -> None:
@@ -198,6 +240,13 @@ class PitchControl(ctk.CTkFrame):
         if self.on_pre_hubert_pitch_changed:
             self.on_pre_hubert_pitch_changed(self._pre_hubert_pitch_ratio)
 
+    def _on_moe_boost_change(self, value: float) -> None:
+        """Handle moe boost slider change."""
+        self._moe_boost = max(0.0, min(1.0, float(value)))
+        self.moe_value.configure(text=f"{self._moe_boost:.2f}")
+        if self.on_moe_boost_changed:
+            self.on_moe_boost_changed(self._moe_boost)
+
     def set_f0_enabled(self, enabled: bool) -> None:
         """Enable or disable F0 controls based on model support."""
         if enabled:
@@ -218,6 +267,12 @@ class PitchControl(ctk.CTkFrame):
         self._use_f0 = method != "none"
         self._f0_method = method
 
+    def set_pitch(self, value: int) -> None:
+        """Set pitch shift without invoking callbacks."""
+        self._pitch = max(-24, min(24, int(value)))
+        self.pitch_slider.set(self._pitch)
+        self._update_value_label()
+
     def set_pre_hubert_pitch(self, enabled: bool) -> None:
         """Backward-compatible bool setter."""
         self.set_pre_hubert_pitch_ratio(0.35 if enabled else 0.0)
@@ -227,6 +282,28 @@ class PitchControl(ctk.CTkFrame):
         self._pre_hubert_pitch_ratio = max(0.0, min(1.0, float(ratio)))
         self.pre_hubert_slider.set(self._pre_hubert_pitch_ratio)
         self.pre_hubert_value.configure(text=f"{self._pre_hubert_pitch_ratio:.2f}")
+
+    def set_moe_boost(self, strength: float) -> None:
+        """Set moe boost strength (0.0-1.0)."""
+        self._moe_boost = max(0.0, min(1.0, float(strength)))
+        self.moe_slider.set(self._moe_boost)
+        self.moe_value.configure(text=f"{self._moe_boost:.2f}")
+
+    def apply_moe_preset(self) -> None:
+        """Apply a practical cute voice preset."""
+        self._set_pitch(8)
+        self.set_f0_method("fcpe")
+        self.set_pre_hubert_pitch_ratio(0.15)
+        self.set_moe_boost(0.70)
+
+        if self.on_f0_mode_changed:
+            self.on_f0_mode_changed(True)
+        if self.on_f0_method_changed:
+            self.on_f0_method_changed("fcpe")
+        if self.on_pre_hubert_pitch_changed:
+            self.on_pre_hubert_pitch_changed(self._pre_hubert_pitch_ratio)
+        if self.on_moe_boost_changed:
+            self.on_moe_boost_changed(self._moe_boost)
 
     @property
     def pitch(self) -> int:
@@ -247,3 +324,8 @@ class PitchControl(ctk.CTkFrame):
     def pre_hubert_pitch_ratio(self) -> float:
         """Get current pre-HuBERT pitch ratio."""
         return self._pre_hubert_pitch_ratio
+
+    @property
+    def moe_boost(self) -> float:
+        """Get current moe boost."""
+        return self._moe_boost

@@ -86,6 +86,14 @@ class InferenceConfig:
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
     pre_hubert_pitch_ratio: float = 0.0
 
+    # Moe voice style strength (0.0=off, 1.0=strong)
+    moe_boost: float = 0.0
+
+    # Synthesizer noise scale (0.0=deterministic, 0.66666=original RVC default)
+    noise_scale: float = 0.4
+    # F0 lowpass cutoff frequency in Hz (higher = more pitch detail preserved)
+    f0_lowpass_cutoff_hz: float = 16.0
+
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 
 

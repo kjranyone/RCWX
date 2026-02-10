@@ -6,7 +6,7 @@ import logging
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from math import gcd
+from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +40,7 @@ MAX_HUBERT_CONTEXT_16K = 32000  # 2.0 seconds @ 16kHz
 # Keep within practical CLI/GUI pitch range.
 # GUI pitch slider is -24..+24 semitones.
 MAX_PRE_HUBERT_SHIFT_ST = 24.0
+MAX_MOE_BOOST = 1.0
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -53,39 +54,81 @@ def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
     return shift
 
 
+def compute_post_f0_shift(pitch_shift: int, pre_hubert_shift: float) -> float:
+    """Compute residual F0 shift after pre-HuBERT audio shift."""
+    return float(pitch_shift) - float(pre_hubert_shift)
+
+
+def _fit_length_center(x: np.ndarray, target_len: int) -> np.ndarray:
+    """Center-crop or symmetric-pad 1D array to target length."""
+    cur_len = len(x)
+    if cur_len == target_len:
+        return x
+    if cur_len > target_len:
+        start = (cur_len - target_len) // 2
+        return x[start : start + target_len]
+
+    pad_total = target_len - cur_len
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+    pad_mode = "reflect" if cur_len > 1 else "edge"
+    return np.pad(x, (pad_left, pad_right), mode=pad_mode)
+
+
 def pitch_shift_resample(
     audio_t: torch.Tensor, sample_rate: int, semitones: float
 ) -> torch.Tensor:
-    """Pitch-shift audio by resampling and preserve sample count."""
+    """Pitch-shift audio by resampling with boundary context and fixed length."""
     if abs(semitones) < 0.01:
         return audio_t
 
     ratio = 2.0 ** (semitones / 12.0)
 
     device = audio_t.device
+    dtype = audio_t.dtype
     shape = audio_t.shape  # e.g. (1, N) or (N,)
     audio_np = audio_t.detach().cpu().numpy().squeeze()
     orig_len = len(audio_np)
+    if orig_len < 8:
+        return audio_t
+
+    # Symmetric context reduces edge artifacts when chunks are shifted independently.
+    max_reflect = max(0, orig_len - 1)
+    context = min(int(sample_rate * 0.04), max_reflect, max(16, orig_len // 4))
+    if context > 0:
+        audio_ctx = np.pad(audio_np, (context, context), mode="reflect")
+    else:
+        audio_ctx = audio_np
 
     # resample_poly(x, up, down) => len(x) * up / down.
-    # We want output_len ~= len / ratio, so up/down ~= 1/ratio.
-    down = max(1, round(100 * ratio))
-    up = 100
-    g = gcd(up, down)
-    up //= g
-    down //= g
+    # We need output_len ~= len / ratio, so up/down ~= 1/ratio.
+    frac = Fraction(1.0 / ratio).limit_denominator(256)
+    up = frac.numerator
+    down = frac.denominator
 
-    shifted = resample_poly(audio_np, up, down).astype(np.float32)
+    shifted_ctx = resample_poly(
+        audio_ctx, up, down, window=("kaiser", 8.0)
+    ).astype(np.float32)
+    shifted_ctx = _fit_length_center(shifted_ctx, len(audio_ctx))
 
-    if len(shifted) < orig_len:
-        shifted = np.pad(shifted, (0, orig_len - len(shifted)), mode="reflect")
-    elif len(shifted) > orig_len:
-        shifted = shifted[:orig_len]
+    if context > 0:
+        shifted = shifted_ctx[context : context + orig_len]
+    else:
+        shifted = _fit_length_center(shifted_ctx, orig_len)
+    shifted = _fit_length_center(shifted, orig_len).astype(np.float32, copy=False)
+
+    # Anchor chunk edges to original audio to avoid boundary discontinuities
+    # when processing chunk-by-chunk in realtime.
+    edge = min(int(sample_rate * 0.01), orig_len // 8)
+    if edge >= 4:
+        ramp = np.linspace(0.0, 1.0, edge, dtype=np.float32)
+        shifted[:edge] = audio_np[:edge] * (1.0 - ramp) + shifted[:edge] * ramp
+        shifted[-edge:] = shifted[-edge:] * (1.0 - ramp) + audio_np[-edge:] * ramp
 
     result = torch.from_numpy(shifted)
     if len(shape) > 1:
         result = result.unsqueeze(0)
-    return result.to(device)
+    return result.to(device=device, dtype=dtype)
 
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
@@ -149,7 +192,7 @@ def smooth_f0_spikes(f0: torch.Tensor, window: int = 3) -> torch.Tensor:
     return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
 
 
-def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 8.0, sample_rate: float = 100.0) -> torch.Tensor:
+def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 16.0, sample_rate: float = 100.0) -> torch.Tensor:
     """Apply lowpass filter to F0 to remove high-frequency jitter.
 
     Phase 6: Butterworth lowpass filter for smoother F0 contour.
@@ -207,6 +250,97 @@ def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 8.0, sample_rate: float = 10
             result[batch] = f0_np[batch]
 
     return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
+
+
+def _smooth_fcpe_f0(f0: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    """Smooth FCPE F0 with avg_pool1d, preserving unvoiced (f0=0) regions."""
+    f0_smooth = torch.nn.functional.avg_pool1d(
+        f0.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+    ).squeeze(1)
+    return torch.where(f0 > 0, f0_smooth, f0)
+
+
+def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
+    """Apply a moe F0 style: clearer accents + reduced breathy dropouts."""
+    strength = max(0.0, min(MAX_MOE_BOOST, float(strength)))
+    if strength <= 0.0 or f0.numel() == 0:
+        return f0
+
+    def _fill_short_unvoiced_gaps(row: torch.Tensor, max_gap_frames: int) -> torch.Tensor:
+        """Interpolate very short unvoiced gaps to reduce F0 flicker."""
+        if max_gap_frames <= 0 or row.numel() == 0:
+            return row
+        filled = row.clone()
+        voiced = filled > 0
+        n = int(filled.shape[0])
+        i = 0
+        while i < n:
+            if voiced[i]:
+                i += 1
+                continue
+            start = i
+            while i < n and not voiced[i]:
+                i += 1
+            end = i
+            gap = end - start
+            if (
+                gap > 0
+                and gap <= max_gap_frames
+                and start > 0
+                and end < n
+                and voiced[start - 1]
+                and voiced[end]
+            ):
+                left = filled[start - 1]
+                right = filled[end]
+                w = torch.linspace(
+                    0.0, 1.0, gap + 2, device=filled.device, dtype=filled.dtype
+                )[1:-1]
+                filled[start:end] = left * (1.0 - w) + right * w
+        return filled
+
+    max_gap_frames = int(2 + 3 * strength)  # 20-50ms @ 100fps
+    accent_up = 1.0 + 0.85 * strength
+    accent_down = 1.0 + 0.15 * strength
+    bias_st = 0.9 * strength
+    max_dev_st = 18.0
+
+    styled = f0.clone()
+    for b in range(styled.shape[0]):
+        row = _fill_short_unvoiced_gaps(styled[b], max_gap_frames=max_gap_frames)
+        voiced = row > 0
+        if voiced.sum().item() < 4:
+            styled[b] = row
+            continue
+
+        voiced_f0 = torch.clamp(row[voiced], min=1e-5, max=1400.0)
+        log2_f0 = torch.log2(voiced_f0)
+        window = max(5, int(5 + 12 * strength))
+        if window % 2 == 0:
+            window += 1
+        trend_input = torch.nn.functional.pad(
+            log2_f0.view(1, 1, -1), (window // 2, window // 2), mode="replicate"
+        )
+        trend = torch.nn.functional.avg_pool1d(
+            trend_input, kernel_size=window, stride=1
+        ).view(-1)
+
+        dev_st = (log2_f0 - trend) * 12.0
+        dev_st = torch.where(dev_st >= 0, dev_st * accent_up, dev_st * accent_down)
+        dev_st = torch.clamp(dev_st + bias_st, -max_dev_st, max_dev_st)
+        shaped = torch.exp2(trend + dev_st / 12.0)
+
+        # Keep voiced floor above very low dips to avoid breathy/raspy artifacts.
+        median_hz = torch.exp2(torch.median(log2_f0))
+        floor_hz = torch.clamp(
+            median_hz * (0.48 + 0.12 * strength), min=80.0, max=320.0
+        )
+        shaped = torch.maximum(shaped, floor_hz)
+
+        row[voiced] = shaped
+        styled[b] = row
+
+    return styled
 
 
 class RVCPipeline:
@@ -527,6 +661,8 @@ class RVCPipeline:
         history_sec: float = 0.0,
         noise_scale: float = 0.66666,
         pre_hubert_pitch_ratio: float = 0.0,
+        moe_boost: float = 0.0,
+        f0_lowpass_cutoff_hz: float = 16.0,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -556,8 +692,11 @@ class RVCPipeline:
                 Set to 0 or None to disable short-input padding (test-only).
             history_sec: Prepend this many seconds of past audio for HuBERT context.
             pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
-                HuBERT (0.0=disabled, 1.0=full). HuBERT sees shifted audio
-                while F0 is extracted from original audio.
+                HuBERT (0.0=disabled, 1.0=full). HuBERT/F0 are extracted
+                from the same shifted audio for alignment, and only the
+                residual shift is applied on F0.
+            moe_boost: Moe voice style strength for F0 contour shaping
+                (0.0=off, 1.0=strong).
 
         Returns:
             Converted audio at model sample rate (usually 40kHz)
@@ -722,6 +861,9 @@ class RVCPipeline:
             audio_for_hubert = pitch_shift_resample(
                 audio, sample_rate=16000, semitones=effective_shift
             )
+        f0_source_audio = audio_for_hubert if abs(effective_shift) > 0.01 else audio
+        residual_f0_shift = compute_post_f0_shift(pitch_shift, effective_shift)
+        moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
 
         # Debug: input audio stats
         logger.info(
@@ -754,10 +896,10 @@ class RVCPipeline:
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.fcpe.infer(audio, threshold=0.006)
+                        return self.fcpe.infer(f0_source_audio, threshold=0.006)
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.rmvpe.infer(audio)
+                        return self.rmvpe.infer(f0_source_audio)
                 return None
 
             # Run HuBERT and F0 extraction in parallel threads
@@ -877,13 +1019,13 @@ class RVCPipeline:
                 # Use FCPE if requested and available
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.fcpe.infer(audio, threshold=0.006)
+                        f0 = self.fcpe.infer(f0_source_audio, threshold=0.006)
                     logger.debug("F0 extracted with FCPE (sequential)")
 
                 # Use RMVPE if requested and available (or fallback if FCPE failed)
                 elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.rmvpe.infer(audio)
+                        f0 = self.rmvpe.infer(f0_source_audio)
                     logger.debug("F0 extracted with RMVPE (sequential)")
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
@@ -900,17 +1042,15 @@ class RVCPipeline:
                 # FCPE smoothing for stability (reduce frame-to-frame jitter)
                 if f0_method == "fcpe":
                     # Light smoothing to reduce jitter without adding artifacts
-                    f0_smooth = torch.nn.functional.avg_pool1d(
-                        f0.unsqueeze(1),
-                        kernel_size=5,
-                        stride=1,
-                        padding=2,
-                    ).squeeze(1)
-                    f0 = torch.where(f0 > 0, f0_smooth, f0)
+                    f0 = _smooth_fcpe_f0(f0)
 
                 # Apply pitch shift (only to voiced regions where f0 > 0)
-                if pitch_shift != 0:
-                    f0 = torch.where(f0 > 0, f0 * (2 ** (pitch_shift / 12)), f0)
+                if abs(residual_f0_shift) > 0.01:
+                    f0 = torch.where(
+                        f0 > 0, f0 * (2 ** (residual_f0_shift / 12)), f0
+                    )
+                if moe_strength > 0.0:
+                    f0 = apply_moe_f0_style(f0, moe_strength)
 
                 # Align F0 length with features
                 # RMVPE: hop=160 (100 frames/sec), HuBERT: hop=320 (50 frames/sec)
@@ -981,8 +1121,7 @@ class RVCPipeline:
                 f0 = smooth_f0_spikes(f0, window=3)
 
                 # Phase 6: Apply lowpass filter to remove high-frequency jitter
-                # Cutoff at 8Hz removes frame-to-frame jitter while preserving natural vibrato
-                f0 = lowpass_f0(f0, cutoff_hz=8.0, sample_rate=100.0)
+                f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
 
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
@@ -1287,6 +1426,8 @@ class RVCPipeline:
         noise_scale: float = 0.66666,
         sola_extra_samples: int = 0,
         pre_hubert_pitch_ratio: float = 0.0,
+        moe_boost: float = 0.0,
+        f0_lowpass_cutoff_hz: float = 16.0,
     ) -> np.ndarray:
         """Streaming inference with audio-level overlap.
 
@@ -1311,8 +1452,11 @@ class RVCPipeline:
                 deficit. When SOLA is enabled, consecutive outputs overlap
                 by this amount so SOLA can crossfade without losing samples.
             pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
-                HuBERT (0.0=disabled, 1.0=full). HuBERT sees shifted audio
-                while F0 is extracted from original audio.
+                HuBERT (0.0=disabled, 1.0=full). HuBERT/F0 are extracted
+                from the same shifted audio for alignment, and only the
+                residual shift is applied on F0.
+            moe_boost: Moe voice style strength for F0 contour shaping
+                (0.0=off, 1.0=strong).
 
         Returns:
             Converted audio at model sample rate (usually 40kHz).
@@ -1433,6 +1577,9 @@ class RVCPipeline:
             audio_t_for_hubert = pitch_shift_resample(
                 audio_t, sample_rate=16000, semitones=effective_shift
             )
+        f0_source_audio = audio_t_for_hubert if abs(effective_shift) > 0.01 else audio_t
+        residual_f0_shift = compute_post_f0_shift(pitch_shift, effective_shift)
+        moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
         # Determine HuBERT output params
         if self.synthesizer.version == 1:
             output_dim = 256
@@ -1442,8 +1589,7 @@ class RVCPipeline:
             output_layer = 12
 
         # Parallel HuBERT + F0 extraction
-        # HuBERT uses audio_t_for_hubert (possibly shifted)
-        # F0 uses audio_t (original) for accurate pitch detection
+        # HuBERT/F0 use the same source audio to preserve alignment.
         features = None
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
@@ -1458,10 +1604,10 @@ class RVCPipeline:
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.fcpe.infer(audio_t, threshold=0.006)
+                        return self.fcpe.infer(f0_source_audio, threshold=0.006)
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.rmvpe.infer(audio_t)
+                        return self.rmvpe.infer(f0_source_audio)
                 logger.warning(
                     "[INFER] F0 parallel extraction returned None "
                     f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
@@ -1510,22 +1656,23 @@ class RVCPipeline:
                 )
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.fcpe.infer(audio_t, threshold=0.006)
+                        f0 = self.fcpe.infer(f0_source_audio, threshold=0.006)
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.rmvpe.infer(audio_t)
+                        f0 = self.rmvpe.infer(f0_source_audio)
 
             if f0 is not None and f0.numel() > 0:
                 # FCPE smoothing
                 if f0_method == "fcpe":
-                    f0_smooth = torch.nn.functional.avg_pool1d(
-                        f0.unsqueeze(1), kernel_size=5, stride=1, padding=2,
-                    ).squeeze(1)
-                    f0 = torch.where(f0 > 0, f0_smooth, f0)
+                    f0 = _smooth_fcpe_f0(f0)
 
                 # Pitch shift
-                if pitch_shift != 0:
-                    f0 = torch.where(f0 > 0, f0 * (2 ** (pitch_shift / 12)), f0)
+                if abs(residual_f0_shift) > 0.01:
+                    f0 = torch.where(
+                        f0 > 0, f0 * (2 ** (residual_f0_shift / 12)), f0
+                    )
+                if moe_strength > 0.0:
+                    f0 = apply_moe_f0_style(f0, moe_strength)
 
                 # Align F0 to feature length (F0 from same audio_t, minor hop mismatch)
                 if f0.shape[1] != features.shape[1]:
@@ -1540,7 +1687,7 @@ class RVCPipeline:
                 f0 = smooth_f0_spikes(f0, window=3)
 
                 # Lowpass filter for jitter removal
-                f0 = lowpass_f0(f0, cutoff_hz=8.0, sample_rate=100.0)
+                f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
 
                 pitchf = f0.to(self.dtype)
 

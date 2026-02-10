@@ -109,12 +109,18 @@ class RealtimeConfig:
 
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift before HuBERT)
     pre_hubert_pitch_ratio: float = 0.0
+    # Moe voice style strength (0.0=off, 1.0=strong)
+    moe_boost: float = 0.0
 
     # WAV file input (empty string = use microphone)
     wav_input_path: str = ""
 
     # Synthesizer
     synth_min_frames: int = 64
+
+    # Pitch clarity
+    noise_scale: float = 0.4
+    f0_lowpass_cutoff_hz: float = 16.0
 
     def __post_init__(self) -> None:
         # Round chunk_sec to HuBERT frame boundary (20ms)
@@ -582,6 +588,15 @@ class RealtimeVoiceChangerUnified:
     def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
         self.config.pre_hubert_pitch_ratio = max(0.0, min(1.0, ratio))
 
+    def set_moe_boost(self, strength: float) -> None:
+        self.config.moe_boost = max(0.0, min(1.0, float(strength)))
+
+    def set_noise_scale(self, scale: float) -> None:
+        self.config.noise_scale = max(0.0, min(1.0, float(scale)))
+
+    def set_f0_lowpass_cutoff_hz(self, cutoff: float) -> None:
+        self.config.f0_lowpass_cutoff_hz = max(4.0, min(30.0, float(cutoff)))
+
     # ======== Audio Callbacks ========
 
     def _on_audio_input(self, audio: np.ndarray) -> None:
@@ -779,9 +794,11 @@ class RealtimeVoiceChangerUnified:
                     voice_gate_mode=self.config.voice_gate_mode,
                     energy_threshold=self.config.energy_threshold,
                     use_parallel_extraction=self.config.use_parallel_extraction,
-                    noise_scale=0.66666,
+                    noise_scale=self.config.noise_scale,
                     sola_extra_samples=self._sola_extra_model,
                     pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
+                    moe_boost=self.config.moe_boost,
+                    f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
@@ -1002,6 +1019,7 @@ class RealtimeVoiceChangerUnified:
                     use_feature_cache=False,
                     allow_short_input=True,
                     synth_min_frames=self.config.synth_min_frames,
+                    moe_boost=self.config.moe_boost,
                 )
                 logger.info(f"[WARMUP] Warmup {i + 1}/2 complete")
             self.pipeline.clear_cache()

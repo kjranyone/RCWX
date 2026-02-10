@@ -5,8 +5,11 @@ Verifies:
 2. pitch_shift_resample preserves sample count
 3. FFT peak shifts confirm actual frequency change
 4. Performance stays within budget (<5ms for 8960 samples)
-5. Config round-trip persistence
-6. Pipeline integration (if model available)
+5. Residual F0 shift keeps HuBERT/F0 shift accounting consistent
+6. Chunk-boundary continuity is preserved for shifted chunks
+7. Moe boost shapes F0 contour upward
+8. Config round-trip persistence
+9. Pipeline integration (if model available)
 """
 
 from __future__ import annotations
@@ -141,6 +144,95 @@ def test_performance():
     logger.info("PASS: within performance budget")
 
 
+def test_post_f0_shift_residual():
+    """Residual shift should be pitch_shift - pre_hubert_shift."""
+    logger.info("=== Test: residual F0 shift math ===")
+    from rcwx.pipeline.inference import compute_post_f0_shift, compute_pre_hubert_shift
+
+    cases = [
+        (12, 0.0, 12.0),
+        (12, 0.5, 6.0),
+        (-12, 0.25, -9.0),
+        (7, 1.0, 0.0),
+    ]
+    for pitch_shift, ratio, expected in cases:
+        pre = compute_pre_hubert_shift(pitch_shift, ratio)
+        residual = compute_post_f0_shift(pitch_shift, pre)
+        assert abs(residual - expected) < 1e-6, (
+            f"residual mismatch: pitch={pitch_shift}, ratio={ratio}, "
+            f"expected={expected}, got={residual}"
+        )
+    logger.info("PASS: residual F0 shift is correct")
+
+
+def test_chunk_boundary_continuity():
+    """Shifted chunks should not introduce large sample jumps at boundaries."""
+    logger.info("=== Test: chunk boundary continuity ===")
+    from rcwx.pipeline.inference import pitch_shift_resample
+
+    sr = 16000
+    freq = 220.0
+    duration = 1.2
+    chunk_samples = 2560
+    semitones = 7.0
+
+    t = np.arange(int(sr * duration)) / sr
+    audio = np.sin(2 * np.pi * freq * t).astype(np.float32)
+
+    shifted_chunks = []
+    for i in range(0, len(audio), chunk_samples):
+        chunk = audio[i : i + chunk_samples]
+        if len(chunk) == 0:
+            continue
+        shifted = pitch_shift_resample(
+            torch.from_numpy(chunk), sample_rate=sr, semitones=semitones
+        )
+        shifted_chunks.append(shifted.cpu().numpy().squeeze())
+
+    shifted_audio = np.concatenate(shifted_chunks)[: len(audio)]
+    boundaries = list(range(chunk_samples, len(shifted_audio), chunk_samples))
+    assert boundaries, "Need at least one boundary for continuity test"
+
+    jumps = [abs(float(shifted_audio[b] - shifted_audio[b - 1])) for b in boundaries]
+    mean_jump = float(np.mean(jumps))
+    max_jump = float(np.max(jumps))
+    logger.info(f"  boundary jumps: mean={mean_jump:.4f}, max={max_jump:.4f}")
+
+    assert mean_jump < 0.15, f"Mean boundary jump too large: {mean_jump:.4f}"
+    assert max_jump < 0.25, f"Max boundary jump too large: {max_jump:.4f}"
+    logger.info("PASS: chunk boundaries are continuous")
+
+
+def test_moe_boost_f0_style():
+    """Moe boost should lift contour and fill short voiced dropouts."""
+    logger.info("=== Test: moe boost F0 style ===")
+    from rcwx.pipeline.inference import apply_moe_f0_style
+
+    f0 = torch.tensor([[200.0, 210.0, 190.0, 220.0, 0.0, 205.0, 195.0]])
+    styled = apply_moe_f0_style(f0, strength=0.8)
+
+    voiced = f0 > 0
+    base_voiced = f0[voiced]
+    styled_voiced = styled[voiced]
+
+    base_mean = float(base_voiced.mean())
+    styled_mean = float(styled_voiced.mean())
+    base_span = float(base_voiced.max() - base_voiced.min())
+    styled_span = float(styled_voiced.max() - styled_voiced.min())
+
+    logger.info(
+        f"  mean: base={base_mean:.2f}Hz -> styled={styled_mean:.2f}Hz, "
+        f"span: base={base_span:.2f}Hz -> styled={styled_span:.2f}Hz"
+    )
+    logger.info(
+        f"  short-gap frame: base={float(f0[0, 4]):.2f}Hz -> styled={float(styled[0, 4]):.2f}Hz"
+    )
+    assert styled_mean > base_mean, "Moe boost should raise average voiced F0"
+    assert styled_span > base_span, "Moe boost should widen voiced contour"
+    assert styled[0, 4] > 0, "Moe boost should fill short unvoiced F0 gap"
+    logger.info("PASS: moe boost style is applied")
+
+
 def test_config_roundtrip():
     """pre_hubert_pitch_ratio should survive config save/load."""
     logger.info("=== Test: config round-trip ===")
@@ -151,6 +243,7 @@ def test_config_roundtrip():
 
     config = RCWXConfig()
     config.inference.pre_hubert_pitch_ratio = 0.75
+    config.inference.moe_boost = 0.60
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
         tmp_path = Path(f.name)
@@ -161,9 +254,11 @@ def test_config_roundtrip():
         with open(tmp_path) as f:
             data = json.load(f)
         assert data["inference"]["pre_hubert_pitch_ratio"] == 0.75
+        assert data["inference"]["moe_boost"] == 0.60
 
         loaded = RCWXConfig.load(tmp_path)
         assert loaded.inference.pre_hubert_pitch_ratio == 0.75
+        assert loaded.inference.moe_boost == 0.60
         logger.info("PASS: config round-trip preserves pre_hubert_pitch_ratio")
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -267,6 +362,9 @@ if __name__ == "__main__":
     test_shape_preservation()
     test_frequency_shift()
     test_performance()
+    test_post_f0_shift_residual()
+    test_chunk_boundary_continuity()
+    test_moe_boost_f0_style()
     test_config_roundtrip()
     test_pipeline_integration()
     test_streaming_integration()

@@ -105,11 +105,14 @@ class RealtimeController:
                 use_f0=self.app.pitch_control.use_f0,
                 f0_method=self.app.pitch_control.f0_method,
                 pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
+                moe_boost=self.app.pitch_control.moe_boost,
                 # Audio settings
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 index_rate=self.app._get_index_rate(),
                 denoise_enabled=self.app.use_denoise_var.get(),
                 denoise_method=self.app.denoise_method_var.get(),
+                noise_scale=self.app.config.inference.noise_scale,
+                f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
                 # WAV file input
