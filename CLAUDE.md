@@ -124,12 +124,13 @@ rcwx/
 | `use_compile` | `false` | 既定OFF |
 | `resample_method` | `linear` | `linear` / `poly` |
 | `use_parallel_extraction` | `true` | HuBERT+F0並列 |
-| `voice_gate_mode` | `expand` | off/strict/expand/energy |
+| `voice_gate_mode` | `off` | off/strict/expand/energy |
 | `energy_threshold` | `0.05` | energyモード閾値 |
 | `overlap_sec` | `0.10` | 音声オーバーラップ |
 | `crossfade_sec` | `0.05` | SOLAクロスフェード長 |
 | `use_sola` | `true` | SOLA有効化 |
 | `sola_search_ms` | `10.0` | SOLA探索窓 |
+| `pre_hubert_pitch_ratio` | `0.0` | プレHuBERTシフト比率 (0.0-1.0) |
 | `denoise.enabled` | `false` | ノイズ除去 |
 | `denoise.method` | `auto` | `auto` / `ml` / `spectral` |
 
@@ -147,6 +148,7 @@ rcwx/
 - `prebuffer_chunks` (既定 1)
 - `buffer_margin` (既定 0.3)
 - `f0_method` (既定 `fcpe`)
+- `pre_hubert_pitch_ratio` (既定 0.0)
 - `max_queue_size` (既定 8)
 
 ## GUI Latency Model (Current)
@@ -219,6 +221,7 @@ uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
 uv run python tests/models/test_rmvpe.py
 uv run python tests/models/test_cumulative_context.py
+uv run python tests/integration/test_pre_hubert_pitch.py
 ```
 
 ## References

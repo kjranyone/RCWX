@@ -170,11 +170,17 @@ class RCWXApp(ctk.CTk):
             on_pitch_changed=self._on_pitch_changed,
             on_f0_mode_changed=self._on_f0_mode_changed,
             on_f0_method_changed=self._on_f0_method_changed,
+            on_pre_hubert_pitch_changed=self._on_pre_hubert_pitch_changed,
         )
         self.pitch_control.pack(fill="x", pady=(0, 5))
 
         # Restore saved F0 method
         self.pitch_control.set_f0_method(self.config.inference.f0_method)
+
+        # Restore saved pre-HuBERT pitch setting
+        self.pitch_control.set_pre_hubert_pitch_ratio(
+            self.config.inference.pre_hubert_pitch_ratio
+        )
 
         # Index control
         self.index_frame = ctk.CTkFrame(self.left_column)
@@ -432,7 +438,38 @@ class RCWXApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color="gray",
         )
-        self.test_status.pack(anchor="w", padx=10, pady=(0, 5))
+        self.test_status.pack(anchor="w", padx=10, pady=(0, 3))
+
+        # WAV file loop input (inside test frame)
+        self.use_wav_input_var = ctk.BooleanVar(value=False)
+        self.use_wav_input_cb = ctk.CTkCheckBox(
+            self.test_frame,
+            text="WAVファイルをループ再生",
+            variable=self.use_wav_input_var,
+            command=self._on_wav_input_toggled,
+        )
+        self.use_wav_input_cb.pack(anchor="w", padx=10, pady=(0, 3))
+
+        self.wav_input_file_frame = ctk.CTkFrame(
+            self.test_frame, fg_color="transparent"
+        )
+        # Initially hidden; shown when checkbox is checked
+
+        self.wav_input_path_var = ctk.StringVar(value="")
+        self.wav_input_entry = ctk.CTkEntry(
+            self.wav_input_file_frame,
+            textvariable=self.wav_input_path_var,
+            placeholder_text="WAVファイルを選択...",
+        )
+        self.wav_input_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.wav_input_browse_btn = ctk.CTkButton(
+            self.wav_input_file_frame,
+            text="参照",
+            width=50,
+            command=self._browse_wav_input,
+        )
+        self.wav_input_browse_btn.pack(side="right")
 
         # Start/Stop button
         self.control_frame = ctk.CTkFrame(self.right_column)
@@ -747,6 +784,12 @@ class RCWXApp(ctk.CTk):
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_f0_method(method)
 
+    def _on_pre_hubert_pitch_changed(self, ratio: float) -> None:
+        """Handle pre-HuBERT pitch shift toggle."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_pre_hubert_pitch_ratio(ratio)
+
     def _on_index_changed(self) -> None:
         """Handle index checkbox change."""
         self._save_config()
@@ -859,6 +902,7 @@ class RCWXApp(ctk.CTk):
             self.config.inference.use_index = self.use_index_var.get()
             self.config.inference.index_ratio = self.index_ratio_slider.get()
             self.config.inference.f0_method = self.pitch_control.f0_method
+            self.config.inference.pre_hubert_pitch_ratio = self.pitch_control.pre_hubert_pitch_ratio
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()
@@ -915,6 +959,24 @@ class RCWXApp(ctk.CTk):
     def _run_audio_test(self) -> None:
         """Run audio test: record -> convert -> playback."""
         self.audio_test_manager.run_test()
+
+    def _on_wav_input_toggled(self) -> None:
+        """Show/hide WAV file selector based on checkbox state."""
+        if self.use_wav_input_var.get():
+            self.wav_input_file_frame.pack(fill="x", padx=10, pady=(0, 5))
+        else:
+            self.wav_input_file_frame.pack_forget()
+
+    def _browse_wav_input(self) -> None:
+        """Open file dialog to select a WAV file for loop input."""
+        from tkinter import filedialog
+
+        path = filedialog.askopenfilename(
+            title="WAVファイルを選択",
+            filetypes=[("WAV files", "*.wav"), ("All files", "*.*")],
+        )
+        if path:
+            self.wav_input_path_var.set(path)
 
     def _on_close(self) -> None:
         """Handle window close."""

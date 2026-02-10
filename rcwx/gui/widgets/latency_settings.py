@@ -186,11 +186,19 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.auto_labels["margin"].configure(text=f"{auto['buffer_margin']:.1f}x")
 
     def _update_estimate(self) -> None:
-        """Update estimated latency display."""
+        """Update estimated latency display.
+
+        Latency components:
+        - Input capture: chunk_sec / 2 (average sample position in chunk)
+        - Inference: ~50ms (FCPE on XPU estimate)
+        - Output buffer: avg ring ≈ 3/8 hop (cycle: 3/4→2/4→1/4→0)
+        - SOLA hold-back: crossfade_sec
+        """
         auto = _auto_params(self.chunk_sec)
-        inference_est = 50  # ms estimate
-        buffer_est = (auto["prebuffer_chunks"] + auto["buffer_margin"]) * self.chunk_sec * 1000
-        total_est = self.chunk_sec * 1000 + inference_est + buffer_est
+        inference_est = 50  # ms
+        buffer_est = self.chunk_sec * 375  # avg ring ≈ 3/8 hop
+        sola_est = auto["crossfade_sec"] * 1000
+        total_est = self.chunk_sec * 500 + inference_est + buffer_est + sola_est
 
         self.estimate_label.configure(text=f"推定レイテンシ: ~{int(total_est)}ms")
 

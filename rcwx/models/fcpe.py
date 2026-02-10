@@ -9,6 +9,7 @@ Reference: https://github.com/CNChTu/FCPE
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import torch
@@ -58,6 +59,9 @@ class FCPE:
         self.dtype = dtype
         self.hop_length = hop_length
         self.sample_rate = 16000
+        # Throttle repetitive NaN/Inf warnings to avoid log I/O overhead.
+        self._nan_warn_last_ts: float = 0.0
+        self._nan_warn_count: int = 0
 
         # Load bundled model
         logger.info(f"Loading FCPE model on {device}")
@@ -96,6 +100,16 @@ class FCPE:
         # Large input gain can drive mel features out of expected range and cause errors.
         with torch.no_grad():
             peak = torch.max(torch.abs(audio))
+
+            # Skip inference for silence — FCPE's BatchNorm produces NaN
+            # on zero-variance mel input (all-zero audio, warmup chunks, etc.)
+            if peak < 1e-6:
+                n_frames = audio.shape[1] // self.hop_length
+                return torch.zeros(
+                    audio.shape[0], n_frames,
+                    device=audio.device, dtype=self.dtype,
+                )
+
             if peak > 1.0:
                 audio = audio * (0.97 / peak)
             else:
@@ -123,7 +137,17 @@ class FCPE:
         # Safety: Replace NaN/Inf with 0 (unvoiced)
         # FCPE can sometimes output NaN values for certain audio conditions
         if torch.any(torch.isnan(f0)) or torch.any(torch.isinf(f0)):
-            logger.warning(f"FCPE output contains NaN/Inf values, replacing with 0 (unvoiced)")
+            self._nan_warn_count += 1
+            now = time.time()
+            if now - self._nan_warn_last_ts >= 5.0:
+                logger.warning(
+                    "FCPE output contains NaN/Inf values (count=%d in last %.1fs), "
+                    "replacing with 0 (unvoiced)",
+                    self._nan_warn_count,
+                    now - self._nan_warn_last_ts if self._nan_warn_last_ts > 0 else 0.0,
+                )
+                self._nan_warn_count = 0
+                self._nan_warn_last_ts = now
             f0 = torch.where(torch.isnan(f0) | torch.isinf(f0), torch.zeros_like(f0), f0)
 
         return f0.to(self.dtype)

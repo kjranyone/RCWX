@@ -687,10 +687,10 @@ mindmap
 
 ### 11.3 RCWX に取り入れる価値のある要素
 
-| 要素 | 概要 | 難易度 |
-|---|---|---|
-| **Pitch Protection** | 無声子音で index features を元特徴量にブレンドバック | 低 |
-| **Silent Threshold** | 音量閾値以下で推論スキップ (計算節約) | 低 |
-| **cos² + margin 窓** | SOLA 窓関数のフラット区間追加 | 低 |
-| **ユーザー可変コンテキスト** | `extraConvertSize` 相当のパラメータ公開 | 中 |
-| **Quality Repeat Mode** | HuBERT reflection padding の増量オプション | 中 |
+| 要素                      | 概要                                 | 難易度 |
+| ----------------------- | ---------------------------------- | --- |
+| **Pitch Protection**    | 無声子音で index features を元特徴量にブレンドバック | 低   |
+| **Silent Threshold**    | 音量閾値以下で推論スキップ (計算節約)               | 低   |
+| **cos² + margin 窓**     | SOLA 窓関数のフラット区間追加                  | 低   |
+| **ユーザー可変コンテキスト**        | `extraConvertSize` 相当のパラメータ公開      | 中   |
+| **Quality Repeat Mode** | HuBERT reflection padding の増量オプション | 中   |

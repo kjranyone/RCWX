@@ -59,8 +59,8 @@ class RealtimeController:
         if self.app._loading:
             return
 
-        # Check for same audio interface (potential feedback)
-        if self._check_same_audio_interface():
+        # Check for same audio interface (potential feedback) — skip for WAV input
+        if not self.app.use_wav_input_var.get() and self._check_same_audio_interface():
             logger.warning("Input and output use same audio interface - feedback may occur")
             self._show_warning(
                 "フィードバック警告",
@@ -104,6 +104,7 @@ class RealtimeController:
                 pitch_shift=self.app.pitch_control.pitch,
                 use_f0=self.app.pitch_control.use_f0,
                 f0_method=self.app.pitch_control.f0_method,
+                pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
                 # Audio settings
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 index_rate=self.app._get_index_rate(),
@@ -111,6 +112,12 @@ class RealtimeController:
                 denoise_method=self.app.denoise_method_var.get(),
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
+                # WAV file input
+                wav_input_path=(
+                    self.app.wav_input_path_var.get()
+                    if self.app.use_wav_input_var.get()
+                    else ""
+                ),
             )
 
             # Create unified voice changer

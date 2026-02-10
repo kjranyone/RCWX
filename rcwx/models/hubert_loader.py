@@ -254,8 +254,16 @@ class HuBERTLoader:
 
         audio = audio.to(self.device).to(self.dtype)
 
-        outputs = self.model(audio, output_hidden_states=True)
-        features = outputs.hidden_states[output_layer]
+        if output_layer >= self.model.config.num_hidden_layers:
+            # Final layer: last_hidden_state already includes encoder.layer_norm
+            outputs = self.model(audio)
+            features = outputs.last_hidden_state
+        else:
+            # Intermediate layer: apply encoder.layer_norm manually to match
+            # fairseq TransformerEncoder.forward() which always applies layer_norm
+            outputs = self.model(audio, output_hidden_states=True)
+            features = outputs.hidden_states[output_layer]
+            features = self.model.encoder.layer_norm(features)
 
         if output_dim == 256:
             features = self.final_proj(features)

@@ -6,13 +6,14 @@ import logging
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from math import gcd
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.signal import butter, filtfilt, medfilt
+from scipy.signal import butter, filtfilt, medfilt, resample_poly
 
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
@@ -36,6 +37,55 @@ MIN_SYNTH_FEATURE_FRAMES = 64
 # only (pitch detection is local), so this doesn't affect F0 processing time.
 # 2.0s (32000 samples) gives cosine similarity ~0.60 vs batch features.
 MAX_HUBERT_CONTEXT_16K = 32000  # 2.0 seconds @ 16kHz
+# Keep within practical CLI/GUI pitch range.
+# GUI pitch slider is -24..+24 semitones.
+MAX_PRE_HUBERT_SHIFT_ST = 24.0
+
+
+def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
+    """Compute bounded pre-HuBERT shift in semitones."""
+    ratio = max(0.0, min(1.0, float(ratio)))
+    shift = float(pitch_shift) * ratio
+    if shift > MAX_PRE_HUBERT_SHIFT_ST:
+        return MAX_PRE_HUBERT_SHIFT_ST
+    if shift < -MAX_PRE_HUBERT_SHIFT_ST:
+        return -MAX_PRE_HUBERT_SHIFT_ST
+    return shift
+
+
+def pitch_shift_resample(
+    audio_t: torch.Tensor, sample_rate: int, semitones: float
+) -> torch.Tensor:
+    """Pitch-shift audio by resampling and preserve sample count."""
+    if abs(semitones) < 0.01:
+        return audio_t
+
+    ratio = 2.0 ** (semitones / 12.0)
+
+    device = audio_t.device
+    shape = audio_t.shape  # e.g. (1, N) or (N,)
+    audio_np = audio_t.detach().cpu().numpy().squeeze()
+    orig_len = len(audio_np)
+
+    # resample_poly(x, up, down) => len(x) * up / down.
+    # We want output_len ~= len / ratio, so up/down ~= 1/ratio.
+    down = max(1, round(100 * ratio))
+    up = 100
+    g = gcd(up, down)
+    up //= g
+    down //= g
+
+    shifted = resample_poly(audio_np, up, down).astype(np.float32)
+
+    if len(shifted) < orig_len:
+        shifted = np.pad(shifted, (0, orig_len - len(shifted)), mode="reflect")
+    elif len(shifted) > orig_len:
+        shifted = shifted[:orig_len]
+
+    result = torch.from_numpy(shifted)
+    if len(shape) > 1:
+        result = result.unsqueeze(0)
+    return result.to(device)
 
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
@@ -476,6 +526,7 @@ class RVCPipeline:
         synth_min_frames: int | None = MIN_SYNTH_FEATURE_FRAMES,
         history_sec: float = 0.0,
         noise_scale: float = 0.66666,
+        pre_hubert_pitch_ratio: float = 0.0,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -504,6 +555,9 @@ class RVCPipeline:
             synth_min_frames: Minimum feature frames for synthesizer decoder.
                 Set to 0 or None to disable short-input padding (test-only).
             history_sec: Prepend this many seconds of past audio for HuBERT context.
+            pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
+                HuBERT (0.0=disabled, 1.0=full). HuBERT sees shifted audio
+                while F0 is extracted from original audio.
 
         Returns:
             Converted audio at model sample rate (usually 40kHz)
@@ -662,6 +716,12 @@ class RVCPipeline:
             audio = audio.unsqueeze(0)
 
         audio = audio.to(self.device)
+        audio_for_hubert = audio
+        effective_shift = compute_pre_hubert_shift(pitch_shift, pre_hubert_pitch_ratio)
+        if abs(effective_shift) > 0.01:
+            audio_for_hubert = pitch_shift_resample(
+                audio, sample_rate=16000, semitones=effective_shift
+            )
 
         # Debug: input audio stats
         logger.info(
@@ -688,7 +748,7 @@ class RVCPipeline:
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
                     return self.hubert.extract(
-                        audio, output_layer=output_layer, output_dim=output_dim
+                        audio_for_hubert, output_layer=output_layer, output_dim=output_dim
                     )
 
             def extract_f0():
@@ -714,7 +774,7 @@ class RVCPipeline:
         if features is None:
             with torch.autocast(device_type=self.device, dtype=self.dtype):
                 features = self.hubert.extract(
-                    audio, output_layer=output_layer, output_dim=output_dim
+                    audio_for_hubert, output_layer=output_layer, output_dim=output_dim
                 )
 
         logger.info(
@@ -1226,6 +1286,7 @@ class RVCPipeline:
         use_parallel_extraction: bool = True,
         noise_scale: float = 0.66666,
         sola_extra_samples: int = 0,
+        pre_hubert_pitch_ratio: float = 0.0,
     ) -> np.ndarray:
         """Streaming inference with audio-level overlap.
 
@@ -1249,6 +1310,9 @@ class RVCPipeline:
                 (at model sample rate) to compensate for SOLA crossfade
                 deficit. When SOLA is enabled, consecutive outputs overlap
                 by this amount so SOLA can crossfade without losing samples.
+            pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
+                HuBERT (0.0=disabled, 1.0=full). HuBERT sees shifted audio
+                while F0 is extracted from original audio.
 
         Returns:
             Converted audio at model sample rate (usually 40kHz).
@@ -1363,6 +1427,12 @@ class RVCPipeline:
         audio_t = (
             torch.from_numpy(audio_padded).float().unsqueeze(0).to(self.device)
         )
+        audio_t_for_hubert = audio_t
+        effective_shift = compute_pre_hubert_shift(pitch_shift, pre_hubert_pitch_ratio)
+        if abs(effective_shift) > 0.01:
+            audio_t_for_hubert = pitch_shift_resample(
+                audio_t, sample_rate=16000, semitones=effective_shift
+            )
         # Determine HuBERT output params
         if self.synthesizer.version == 1:
             output_dim = 256
@@ -1371,7 +1441,9 @@ class RVCPipeline:
             output_dim = 768
             output_layer = 12
 
-        # Parallel HuBERT + F0 extraction (both use audio_t for frame alignment)
+        # Parallel HuBERT + F0 extraction
+        # HuBERT uses audio_t_for_hubert (possibly shifted)
+        # F0 uses audio_t (original) for accurate pitch detection
         features = None
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
@@ -1380,7 +1452,7 @@ class RVCPipeline:
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
                     return self.hubert.extract(
-                        audio_t, output_layer=output_layer, output_dim=output_dim
+                        audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
                     )
 
             def extract_f0():
@@ -1405,7 +1477,7 @@ class RVCPipeline:
         else:
             with torch.autocast(device_type=self.device, dtype=self.dtype):
                 features = self.hubert.extract(
-                    audio_t, output_layer=output_layer, output_dim=output_dim
+                    audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
                 )
 
         # FAISS index retrieval
@@ -1589,29 +1661,54 @@ class RVCPipeline:
             new_pitchf_for_cache,
         )
 
-        # Run synthesizer on FULL features (cache + padding + overlap + new_hop)
+        # --- Compute skip_head/return_length for streaming synthesis ---
+        # TextEncoder processes ALL features for rich context, but Flow +
+        # Decoder only synthesize the output region (new_hop + sola_extra).
+        # This prevents SineGen phase accumulation through varying context,
+        # which causes "a-na-na-" artifacts at chunk boundaries.
+        samples_per_frame = self.sample_rate // 100
+
+        # Total left context to skip (in model_sr samples)
+        # trim_left already includes: t_pad_tgt + overlap_tgt - sola_extra + cache_prepend
+        total_left_samples = trim_left
+        if synth_pad_frames > 0:
+            total_left_samples += (synth_pad_frames // 2) * samples_per_frame
+
+        # Total right padding to skip (in model_sr samples)
+        total_right_samples = trim_right
+        if synth_pad_frames > 0:
+            total_right_samples += (synth_pad_frames - synth_pad_frames // 2) * samples_per_frame
+
+        skip_head_feat = total_left_samples // samples_per_frame
+        trim_right_feat = total_right_samples // samples_per_frame
+
+        # Clamp to valid range
+        skip_head_feat = min(skip_head_feat, features.shape[1] - 1)
+        return_length_feat = max(
+            1, features.shape[1] - skip_head_feat - trim_right_feat
+        )
+
+        # Residual samples not covered by feature-level skip (sub-frame trim)
+        residual_left = total_left_samples - skip_head_feat * samples_per_frame
+
+        # Run synthesizer with skip_head/return_length
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             output = self.synthesizer.infer(
                 features, feature_lengths, pitch=pitch, pitchf=pitchf,
                 noise_scale=noise_scale,
+                skip_head=skip_head_feat,
+                return_length=return_length_feat,
+                return_length2=return_length_feat,
             )
 
-        # Trim synthesizer reflect-padding (only used for first chunk)
-        if synth_pad_frames > 0:
-            samples_per_frame = self.sample_rate // 100
-            sp_left = (synth_pad_frames // 2) * samples_per_frame
-            sp_right = (synth_pad_frames - synth_pad_frames // 2) * samples_per_frame
-            if output.shape[-1] > sp_left + sp_right:
-                output = (
-                    output[..., sp_left:-sp_right]
-                    if sp_right > 0
-                    else output[..., sp_left:]
-                )
-
-        # Voice gating (on full output, before trimming)
+        # Voice gating (output is already the target region)
         if voice_gate_mode != "off" and voiced_mask_for_gate is not None:
+            # Slice mask to match the synthesized output region
+            gate_mask_src = voiced_mask_for_gate[
+                :, skip_head_feat:skip_head_feat + return_length_feat
+            ]
             output_len = output.shape[-1]
-            gate_mask = voiced_mask_for_gate.clone()
+            gate_mask = gate_mask_src.clone()
 
             if voice_gate_mode == "expand":
                 expand_frames = 2
@@ -1653,20 +1750,15 @@ class RVCPipeline:
         if output.ndim == 2:
             output = output[0]
 
-        # Trim output: remove padding + overlap from left, padding from right
-        # This extracts only the new_hop portion
-        if trim_right > 0 and len(output) > trim_left + trim_right:
-            output = output[trim_left:-trim_right]
-        elif len(output) > trim_left:
-            output = output[trim_left:]
+        # Trim sub-frame residual from left (skip_head rounds to feature boundaries)
+        if residual_left > 0 and len(output) > residual_left:
+            output = output[residual_left:]
 
-        # Adjust to exact expected length (match infer() behavior)
+        # Adjust to exact expected length
         length_diff = len(output) - expected_output
         if length_diff > 0:
-            # Output too long — trim from end
             output = output[:expected_output]
         elif length_diff < 0 and abs(length_diff) > 100:
-            # Output too short — resample to stretch (consistent with batch infer)
             output = resample(output, len(output), expected_output)
 
         return output

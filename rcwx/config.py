@@ -65,7 +65,7 @@ class InferenceConfig:
     # - strict: F0-based only (original, may cut plosives)
     # - expand: expand voiced regions to include plosives
     # - energy: use energy + F0 (plosives with energy pass through)
-    voice_gate_mode: str = "expand"
+    voice_gate_mode: str = "off"
     # Energy threshold for "energy" mode (0.01-0.2, default 0.05)
     # Lower = more sensitive (catches quieter sounds but may pass noise)
     # Higher = less sensitive (better noise rejection but may cut soft sounds)
@@ -82,6 +82,9 @@ class InferenceConfig:
 
     # SOLA search window in ms
     sola_search_ms: float = 10.0
+
+    # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
+    pre_hubert_pitch_ratio: float = 0.0
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 

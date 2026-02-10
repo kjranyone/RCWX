@@ -196,7 +196,7 @@ class FileConverter:
         """Stop audio playback."""
         if self._test_playback_stream is not None:
             try:
-                self._test_playback_stream.stop()
+                self._test_playback_stream.abort()
                 self._test_playback_stream.close()
             except Exception:
                 pass

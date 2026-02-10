@@ -118,22 +118,25 @@ class LatencyMonitor(ctk.CTkFrame):
         self.inference_label.configure(text=f"推論: {stats.inference_ms:.0f}ms")
 
         # Update buffer warning display
-        if stats.buffer_underruns > 0 or stats.buffer_overruns > 0:
-            warning_parts = []
-            if stats.buffer_underruns > 0:
-                warning_parts.append(f"⚠ UNDER:{stats.buffer_underruns}")
-            if stats.buffer_overruns > 0:
-                warning_parts.append(f"DROP:{stats.buffer_overruns}")
+        warning_parts = []
+        if stats.buffer_underruns > 0:
+            warning_parts.append(f"UNDER:{stats.buffer_underruns}")
+        if stats.buffer_overruns > 0:
+            warning_parts.append(f"DROP:{stats.buffer_overruns}")
+        if stats.buffer_trims > 0:
+            warning_parts.append(f"DRIFT:{stats.buffer_trims}")
 
+        if warning_parts:
+            # Drift-only is informational (yellow), buffer issues are errors (red)
+            has_buffer_issue = stats.buffer_underruns > 0 or stats.buffer_overruns > 0
+            color = "#ff3333" if has_buffer_issue else "#ffaa00"
             self.buffer_warning_label.configure(
                 text=" ".join(warning_parts),
-                text_color="#ff3333"
+                text_color=color,
             )
-            # Hide separator when warning is shown
             self.sep5.grid_remove()
         else:
             self.buffer_warning_label.configure(text="")
-            # Show separator when no warning
             self.sep5.grid()
 
         # Update status color based on latency and buffer issues

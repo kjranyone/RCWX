@@ -275,6 +275,9 @@ class SynthesizerLoader:
         pitchf: Optional[torch.Tensor] = None,
         speaker_id: Optional[torch.Tensor] = None,
         noise_scale: float = 0.66666,
+        skip_head: int = 0,
+        return_length: int = 0,
+        return_length2: int = 0,
     ) -> torch.Tensor:
         """
         Run inference on the loaded model.
@@ -286,6 +289,11 @@ class SynthesizerLoader:
             pitchf: Pitch values in Hz (for F0 models) [B, T]
             speaker_id: Speaker ID tensor [B]
             noise_scale: VAE noise coefficient (0=deterministic, 0.66666=default)
+            skip_head: Number of feature frames to skip in Flow+Decoder.
+                TextEncoder still processes all features for context.
+            return_length: Number of feature frames to synthesize in Flow+Decoder.
+                0 means synthesize all remaining frames after skip_head.
+            return_length2: Output resolution for NSF decoder harmonic source trim.
 
         Returns:
             Generated audio [B, T_out]
@@ -313,6 +321,9 @@ class SynthesizerLoader:
                 pitch,
                 pitchf,
                 speaker_id,
+                skip_head=skip_head,
+                return_length=return_length,
+                return_length2=return_length2,
                 noise_scale=noise_scale,
             )
         else:
@@ -320,6 +331,9 @@ class SynthesizerLoader:
                 features,
                 feature_lengths,
                 speaker_id,
+                skip_head=skip_head,
+                return_length=return_length,
+                return_length2=return_length2,
                 noise_scale=noise_scale,
             )
 

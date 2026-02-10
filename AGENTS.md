@@ -124,7 +124,7 @@ rcwx/
 | `use_compile` | `false` | 既定OFF |
 | `resample_method` | `linear` | `linear` / `poly` |
 | `use_parallel_extraction` | `true` | HuBERT+F0並列 |
-| `voice_gate_mode` | `expand` | off/strict/expand/energy |
+| `voice_gate_mode` | `off` | off/strict/expand/energy |
 | `energy_threshold` | `0.05` | energyモード閾値 |
 | `overlap_sec` | `0.10` | 音声オーバーラップ |
 | `crossfade_sec` | `0.05` | SOLAクロスフェード長 |

@@ -194,6 +194,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         pitch_shift=args.pitch,
         f0_method="rmvpe" if not args.no_f0 else "none",
         index_rate=args.index_rate,
+        pre_hubert_pitch_ratio=args.pre_hubert_pitch,
     )
 
     # Save output
@@ -374,6 +375,12 @@ def main() -> int:
         type=float,
         default=0.0,
         help="FAISS index blending rate (0=disabled, 0.5=balanced, 1=index only)",
+    )
+    run_parser.add_argument(
+        "--pre-hubert-pitch",
+        type=float,
+        default=0.0,
+        help="Pre-HuBERT pitch shift ratio (0.0=off, 1.0=full pitch shift before HuBERT)",
     )
     run_parser.set_defaults(func=cmd_run)
 
