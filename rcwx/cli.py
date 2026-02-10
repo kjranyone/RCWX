@@ -198,8 +198,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         pitch_shift=args.pitch,
         f0_method="rmvpe" if not args.no_f0 else "none",
         index_rate=args.index_rate,
+        voice_gate_mode="off",
         pre_hubert_pitch_ratio=args.pre_hubert_pitch,
         moe_boost=args.moe_boost,
+        noise_scale=args.noise_scale,
     )
 
     # Save output
@@ -392,6 +394,12 @@ def main() -> int:
         type=float,
         default=0.0,
         help="Moe voice style strength for F0 contour (0.0=off, 1.0=strong)",
+    )
+    run_parser.add_argument(
+        "--noise-scale",
+        type=float,
+        default=0.4,
+        help="VAE noise coefficient (0=deterministic, 0.66666=RVC default, 0.4=RCWX default)",
     )
     run_parser.set_defaults(func=cmd_run)
 

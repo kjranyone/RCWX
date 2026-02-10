@@ -197,6 +197,13 @@ class AudioTestManager:
                 index_rate=self.app._get_index_rate(),
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
+                pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
+                moe_boost=self.app.pitch_control.moe_boost,
+                noise_scale=self.app.pitch_control.noise_scale,
+                f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
+                enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
+                enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
+                f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
                 use_feature_cache=False,
             )
             self._conversion_result["audio"] = converted

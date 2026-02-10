@@ -93,6 +93,12 @@ class InferenceConfig:
     noise_scale: float = 0.4
     # F0 lowpass cutoff frequency in Hz (higher = more pitch detail preserved)
     f0_lowpass_cutoff_hz: float = 16.0
+    # Stabilize 1-octave frame flips in F0 contour
+    enable_octave_flip_suppress: bool = True
+    # Limit frame-to-frame F0 slew in semitones
+    enable_f0_slew_limit: bool = True
+    # Max frame-to-frame F0 step (semitones) when slew limiter is enabled
+    f0_slew_max_step_st: float = 2.8
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 

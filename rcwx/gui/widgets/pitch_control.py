@@ -22,6 +22,10 @@ class PitchControl(ctk.CTkFrame):
         on_f0_method_changed: Optional[Callable[[str], None]] = None,
         on_pre_hubert_pitch_changed: Optional[Callable[[float], None]] = None,
         on_moe_boost_changed: Optional[Callable[[float], None]] = None,
+        on_noise_scale_changed: Optional[Callable[[float], None]] = None,
+        on_octave_flip_suppress_changed: Optional[Callable[[bool], None]] = None,
+        on_f0_slew_limit_changed: Optional[Callable[[bool], None]] = None,
+        on_f0_slew_max_step_changed: Optional[Callable[[float], None]] = None,
         **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -31,12 +35,20 @@ class PitchControl(ctk.CTkFrame):
         self.on_f0_method_changed = on_f0_method_changed
         self.on_pre_hubert_pitch_changed = on_pre_hubert_pitch_changed
         self.on_moe_boost_changed = on_moe_boost_changed
+        self.on_noise_scale_changed = on_noise_scale_changed
+        self.on_octave_flip_suppress_changed = on_octave_flip_suppress_changed
+        self.on_f0_slew_limit_changed = on_f0_slew_limit_changed
+        self.on_f0_slew_max_step_changed = on_f0_slew_max_step_changed
 
         self._pitch: int = 0
         self._use_f0: bool = True
         self._f0_method: str = "rmvpe"
         self._pre_hubert_pitch_ratio: float = 0.0
         self._moe_boost: float = 0.0
+        self._noise_scale: float = 0.4
+        self._enable_octave_flip_suppress: bool = True
+        self._enable_f0_slew_limit: bool = True
+        self._f0_slew_max_step_st: float = 2.8
 
         self._setup_ui()
 
@@ -201,6 +213,94 @@ class PitchControl(ctk.CTkFrame):
         )
         self.moe_preset_btn.grid(row=12, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="ew")
 
+        self.noise_scale_label = ctk.CTkLabel(
+            self,
+            text="Noise Scale",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.noise_scale_label.grid(row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+
+        self.noise_scale_min = ctk.CTkLabel(self, text="0.0", font=ctk.CTkFont(size=10))
+        self.noise_scale_min.grid(row=14, column=0, padx=(10, 5), pady=2)
+
+        self.noise_scale_slider = ctk.CTkSlider(
+            self,
+            from_=0.0,
+            to=1.0,
+            number_of_steps=20,
+            width=250,
+            command=self._on_noise_scale_change,
+        )
+        self.noise_scale_slider.set(self._noise_scale)
+        self.noise_scale_slider.grid(row=14, column=1, padx=5, pady=2, sticky="ew")
+
+        self.noise_scale_value = ctk.CTkLabel(
+            self, text=f"{self._noise_scale:.2f}", width=40, font=ctk.CTkFont(size=11)
+        )
+        self.noise_scale_value.grid(row=14, column=2, padx=(5, 10), pady=2)
+
+        self.noise_scale_hint = ctk.CTkLabel(
+            self,
+            text="Lower = cleaner/less breathy, Higher = more natural variance",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        )
+        self.noise_scale_hint.grid(row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+
+        self.f0_stabilizer_label = ctk.CTkLabel(
+            self,
+            text="F0 Stabilizer",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.f0_stabilizer_label.grid(row=16, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+
+        self.octave_flip_var = ctk.BooleanVar(value=self._enable_octave_flip_suppress)
+        self.octave_flip_cb = ctk.CTkCheckBox(
+            self,
+            text="Suppress octave flips",
+            variable=self.octave_flip_var,
+            command=self._on_octave_flip_suppress_toggle,
+        )
+        self.octave_flip_cb.grid(row=17, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+
+        self.f0_slew_limit_var = ctk.BooleanVar(value=self._enable_f0_slew_limit)
+        self.f0_slew_limit_cb = ctk.CTkCheckBox(
+            self,
+            text="Limit F0 slew",
+            variable=self.f0_slew_limit_var,
+            command=self._on_f0_slew_limit_toggle,
+        )
+        self.f0_slew_limit_cb.grid(row=18, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+
+        self.f0_slew_min = ctk.CTkLabel(self, text="1.0", font=ctk.CTkFont(size=10))
+        self.f0_slew_min.grid(row=19, column=0, padx=(10, 5), pady=2)
+
+        self.f0_slew_slider = ctk.CTkSlider(
+            self,
+            from_=1.0,
+            to=6.0,
+            number_of_steps=50,
+            width=250,
+            command=self._on_f0_slew_max_step_change,
+        )
+        self.f0_slew_slider.set(self._f0_slew_max_step_st)
+        self.f0_slew_slider.grid(row=19, column=1, padx=5, pady=2, sticky="ew")
+
+        self.f0_slew_value = ctk.CTkLabel(
+            self, text=f"{self._f0_slew_max_step_st:.2f}", width=40, font=ctk.CTkFont(size=11)
+        )
+        self.f0_slew_value.grid(row=19, column=2, padx=(5, 10), pady=2)
+
+        self.f0_slew_hint = ctk.CTkLabel(
+            self,
+            text="Lower = more stable, Higher = more expressive",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        )
+        self.f0_slew_hint.grid(row=20, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+
+        self._update_f0_slew_slider_state()
+
         self.grid_columnconfigure(1, weight=1)
 
     def _on_slider_change(self, value: float) -> None:
@@ -247,6 +347,38 @@ class PitchControl(ctk.CTkFrame):
         if self.on_moe_boost_changed:
             self.on_moe_boost_changed(self._moe_boost)
 
+    def _on_noise_scale_change(self, value: float) -> None:
+        """Handle noise scale slider change."""
+        self._noise_scale = max(0.0, min(1.0, float(value)))
+        self.noise_scale_value.configure(text=f"{self._noise_scale:.2f}")
+        if self.on_noise_scale_changed:
+            self.on_noise_scale_changed(self._noise_scale)
+
+    def _on_octave_flip_suppress_toggle(self) -> None:
+        """Handle octave-flip suppress checkbox."""
+        self._enable_octave_flip_suppress = bool(self.octave_flip_var.get())
+        if self.on_octave_flip_suppress_changed:
+            self.on_octave_flip_suppress_changed(self._enable_octave_flip_suppress)
+
+    def _on_f0_slew_limit_toggle(self) -> None:
+        """Handle F0 slew limiter checkbox."""
+        self._enable_f0_slew_limit = bool(self.f0_slew_limit_var.get())
+        self._update_f0_slew_slider_state()
+        if self.on_f0_slew_limit_changed:
+            self.on_f0_slew_limit_changed(self._enable_f0_slew_limit)
+
+    def _on_f0_slew_max_step_change(self, value: float) -> None:
+        """Handle F0 slew max-step slider."""
+        self._f0_slew_max_step_st = max(1.0, min(6.0, float(value)))
+        self.f0_slew_value.configure(text=f"{self._f0_slew_max_step_st:.2f}")
+        if self.on_f0_slew_max_step_changed:
+            self.on_f0_slew_max_step_changed(self._f0_slew_max_step_st)
+
+    def _update_f0_slew_slider_state(self) -> None:
+        """Enable/disable slew slider according to limiter toggle."""
+        state = "normal" if self._enable_f0_slew_limit else "disabled"
+        self.f0_slew_slider.configure(state=state)
+
     def set_f0_enabled(self, enabled: bool) -> None:
         """Enable or disable F0 controls based on model support."""
         if enabled:
@@ -289,12 +421,35 @@ class PitchControl(ctk.CTkFrame):
         self.moe_slider.set(self._moe_boost)
         self.moe_value.configure(text=f"{self._moe_boost:.2f}")
 
+    def set_noise_scale(self, scale: float) -> None:
+        """Set synthesizer noise scale (0.0-1.0)."""
+        self._noise_scale = max(0.0, min(1.0, float(scale)))
+        self.noise_scale_slider.set(self._noise_scale)
+        self.noise_scale_value.configure(text=f"{self._noise_scale:.2f}")
+
+    def set_enable_octave_flip_suppress(self, enabled: bool) -> None:
+        """Set octave-flip suppress toggle without invoking callbacks."""
+        self._enable_octave_flip_suppress = bool(enabled)
+        self.octave_flip_var.set(self._enable_octave_flip_suppress)
+
+    def set_enable_f0_slew_limit(self, enabled: bool) -> None:
+        """Set F0 slew limiter toggle without invoking callbacks."""
+        self._enable_f0_slew_limit = bool(enabled)
+        self.f0_slew_limit_var.set(self._enable_f0_slew_limit)
+        self._update_f0_slew_slider_state()
+
+    def set_f0_slew_max_step_st(self, value: float) -> None:
+        """Set F0 slew max step in semitones without invoking callbacks."""
+        self._f0_slew_max_step_st = max(1.0, min(6.0, float(value)))
+        self.f0_slew_slider.set(self._f0_slew_max_step_st)
+        self.f0_slew_value.configure(text=f"{self._f0_slew_max_step_st:.2f}")
+
     def apply_moe_preset(self) -> None:
         """Apply a practical cute voice preset."""
-        self._set_pitch(8)
+        self._set_pitch(6)
         self.set_f0_method("fcpe")
-        self.set_pre_hubert_pitch_ratio(0.15)
-        self.set_moe_boost(0.70)
+        self.set_pre_hubert_pitch_ratio(0.08)
+        self.set_moe_boost(0.45)
 
         if self.on_f0_mode_changed:
             self.on_f0_mode_changed(True)
@@ -329,3 +484,23 @@ class PitchControl(ctk.CTkFrame):
     def moe_boost(self) -> float:
         """Get current moe boost."""
         return self._moe_boost
+
+    @property
+    def noise_scale(self) -> float:
+        """Get current synthesizer noise scale."""
+        return self._noise_scale
+
+    @property
+    def enable_octave_flip_suppress(self) -> bool:
+        """Get octave-flip suppress toggle."""
+        return self._enable_octave_flip_suppress
+
+    @property
+    def enable_f0_slew_limit(self) -> bool:
+        """Get F0 slew limiter toggle."""
+        return self._enable_f0_slew_limit
+
+    @property
+    def f0_slew_max_step_st(self) -> float:
+        """Get F0 slew max step in semitones."""
+        return self._f0_slew_max_step_st

@@ -121,6 +121,9 @@ class RealtimeConfig:
     # Pitch clarity
     noise_scale: float = 0.4
     f0_lowpass_cutoff_hz: float = 16.0
+    enable_octave_flip_suppress: bool = True
+    enable_f0_slew_limit: bool = True
+    f0_slew_max_step_st: float = 2.8
 
     def __post_init__(self) -> None:
         # Round chunk_sec to HuBERT frame boundary (20ms)
@@ -597,6 +600,15 @@ class RealtimeVoiceChangerUnified:
     def set_f0_lowpass_cutoff_hz(self, cutoff: float) -> None:
         self.config.f0_lowpass_cutoff_hz = max(4.0, min(30.0, float(cutoff)))
 
+    def set_enable_octave_flip_suppress(self, enabled: bool) -> None:
+        self.config.enable_octave_flip_suppress = bool(enabled)
+
+    def set_enable_f0_slew_limit(self, enabled: bool) -> None:
+        self.config.enable_f0_slew_limit = bool(enabled)
+
+    def set_f0_slew_max_step_st(self, step_st: float) -> None:
+        self.config.f0_slew_max_step_st = max(1.0, min(6.0, float(step_st)))
+
     # ======== Audio Callbacks ========
 
     def _on_audio_input(self, audio: np.ndarray) -> None:
@@ -799,6 +811,9 @@ class RealtimeVoiceChangerUnified:
                     pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
                     moe_boost=self.config.moe_boost,
                     f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
+                    enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
+                    enable_f0_slew_limit=self.config.enable_f0_slew_limit,
+                    f0_slew_max_step_st=self.config.f0_slew_max_step_st,
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
@@ -1020,6 +1035,9 @@ class RealtimeVoiceChangerUnified:
                     allow_short_input=True,
                     synth_min_frames=self.config.synth_min_frames,
                     moe_boost=self.config.moe_boost,
+                    enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
+                    enable_f0_slew_limit=self.config.enable_f0_slew_limit,
+                    f0_slew_max_step_st=self.config.f0_slew_max_step_st,
                 )
                 logger.info(f"[WARMUP] Warmup {i + 1}/2 complete")
             self.pipeline.clear_cache()

@@ -172,6 +172,10 @@ class RCWXApp(ctk.CTk):
             on_f0_method_changed=self._on_f0_method_changed,
             on_pre_hubert_pitch_changed=self._on_pre_hubert_pitch_changed,
             on_moe_boost_changed=self._on_moe_boost_changed,
+            on_noise_scale_changed=self._on_noise_scale_changed,
+            on_octave_flip_suppress_changed=self._on_octave_flip_suppress_changed,
+            on_f0_slew_limit_changed=self._on_f0_slew_limit_changed,
+            on_f0_slew_max_step_changed=self._on_f0_slew_max_step_changed,
         )
         self.pitch_control.pack(fill="x", pady=(0, 5))
 
@@ -184,6 +188,16 @@ class RCWXApp(ctk.CTk):
             self.config.inference.pre_hubert_pitch_ratio
         )
         self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
+        self.pitch_control.set_noise_scale(self.config.inference.noise_scale)
+        self.pitch_control.set_enable_octave_flip_suppress(
+            self.config.inference.enable_octave_flip_suppress
+        )
+        self.pitch_control.set_enable_f0_slew_limit(
+            self.config.inference.enable_f0_slew_limit
+        )
+        self.pitch_control.set_f0_slew_max_step_st(
+            self.config.inference.f0_slew_max_step_st
+        )
 
         # Index control
         self.index_frame = ctk.CTkFrame(self.left_column)
@@ -800,6 +814,30 @@ class RCWXApp(ctk.CTk):
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_moe_boost(strength)
 
+    def _on_noise_scale_changed(self, scale: float) -> None:
+        """Handle synthesizer noise scale change."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_noise_scale(scale)
+
+    def _on_octave_flip_suppress_changed(self, enabled: bool) -> None:
+        """Handle octave-flip suppress toggle."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_enable_octave_flip_suppress(enabled)
+
+    def _on_f0_slew_limit_changed(self, enabled: bool) -> None:
+        """Handle F0 slew limiter toggle."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_enable_f0_slew_limit(enabled)
+
+    def _on_f0_slew_max_step_changed(self, value: float) -> None:
+        """Handle F0 slew max-step slider change."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_f0_slew_max_step_st(value)
+
     def _on_index_changed(self) -> None:
         """Handle index checkbox change."""
         self._save_config()
@@ -915,6 +953,14 @@ class RCWXApp(ctk.CTk):
             self.config.inference.f0_method = self.pitch_control.f0_method
             self.config.inference.pre_hubert_pitch_ratio = self.pitch_control.pre_hubert_pitch_ratio
             self.config.inference.moe_boost = self.pitch_control.moe_boost
+            self.config.inference.noise_scale = self.pitch_control.noise_scale
+            self.config.inference.enable_octave_flip_suppress = (
+                self.pitch_control.enable_octave_flip_suppress
+            )
+            self.config.inference.enable_f0_slew_limit = (
+                self.pitch_control.enable_f0_slew_limit
+            )
+            self.config.inference.f0_slew_max_step_st = self.pitch_control.f0_slew_max_step_st
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()

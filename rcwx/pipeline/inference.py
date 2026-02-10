@@ -41,6 +41,8 @@ MAX_HUBERT_CONTEXT_16K = 32000  # 2.0 seconds @ 16kHz
 # GUI pitch slider is -24..+24 semitones.
 MAX_PRE_HUBERT_SHIFT_ST = 24.0
 MAX_MOE_BOOST = 1.0
+FCPE_VOICING_THRESHOLD = 0.006
+RMVPE_VOICING_THRESHOLD = 0.015
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -300,9 +302,9 @@ def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
         return filled
 
     max_gap_frames = int(2 + 3 * strength)  # 20-50ms @ 100fps
-    accent_up = 1.0 + 0.85 * strength
-    accent_down = 1.0 + 0.15 * strength
-    bias_st = 0.9 * strength
+    accent_up = 1.0 + 0.55 * strength
+    accent_down = 1.0 + 0.08 * strength
+    bias_st = 0.5 * strength
     max_dev_st = 18.0
 
     styled = f0.clone()
@@ -333,14 +335,77 @@ def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
         # Keep voiced floor above very low dips to avoid breathy/raspy artifacts.
         median_hz = torch.exp2(torch.median(log2_f0))
         floor_hz = torch.clamp(
-            median_hz * (0.48 + 0.12 * strength), min=80.0, max=320.0
+            median_hz * (0.58 + 0.10 * strength), min=85.0, max=340.0
         )
         shaped = torch.maximum(shaped, floor_hz)
+        shaped = torch.clamp(shaped, min=0.0, max=900.0)
 
         row[voiced] = shaped
         styled[b] = row
 
     return styled
+
+
+def suppress_octave_flips(
+    f0: torch.Tensor,
+    octave_ratio_center: float = 2.0,
+    octave_ratio_tolerance: float = 0.16,
+) -> torch.Tensor:
+    """Suppress only clear +-1 octave frame-to-frame F0 flips."""
+    if f0.numel() == 0 or f0.shape[1] < 2:
+        return f0
+
+    f0_np = f0.detach().cpu().to(torch.float32).numpy()
+    corrected = f0_np.copy()
+    low = octave_ratio_center - octave_ratio_tolerance
+    high = octave_ratio_center + octave_ratio_tolerance
+    inv_low = 1.0 / high
+    inv_high = 1.0 / low
+
+    for b in range(corrected.shape[0]):
+        for i in range(1, corrected.shape[1]):
+            prev = float(corrected[b, i - 1])
+            cur = float(corrected[b, i])
+            # Only compare adjacent voiced frames.
+            # Never carry references across unvoiced gaps.
+            if prev <= 0.0 or cur <= 0.0:
+                continue
+
+            ratio = cur / max(prev, 1e-6)
+            if low <= ratio <= high:
+                cur = cur * 0.5
+                corrected[b, i] = cur
+            elif inv_low <= ratio <= inv_high:
+                cur = cur * 2.0
+                corrected[b, i] = cur
+
+    return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
+
+
+def limit_f0_slew(f0: torch.Tensor, max_step_st: float = 2.8) -> torch.Tensor:
+    """Limit frame-to-frame F0 step to suppress short flutter artifacts."""
+    if f0.numel() == 0 or f0.shape[1] < 2:
+        return f0
+
+    f0_np = f0.detach().cpu().to(torch.float32).numpy()
+    corrected = f0_np.copy()
+    max_ratio = float(2 ** (max_step_st / 12.0))
+
+    for b in range(corrected.shape[0]):
+        for i in range(1, corrected.shape[1]):
+            prev = float(corrected[b, i - 1])
+            cur = float(corrected[b, i])
+            if prev <= 0.0 or cur <= 0.0:
+                continue
+
+            upper = prev * max_ratio
+            lower = prev / max_ratio
+            if cur > upper:
+                corrected[b, i] = upper
+            elif cur < lower:
+                corrected[b, i] = lower
+
+    return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
 
 
 class RVCPipeline:
@@ -649,7 +714,7 @@ class RVCPipeline:
         f0_method: str = "rmvpe",
         index_rate: float = 0.0,
         index_k: int = 4,
-        voice_gate_mode: str = "expand",
+        voice_gate_mode: str = "off",
         energy_threshold: float = 0.05,
         denoise: bool = False,
         noise_reference: Optional[np.ndarray] = None,
@@ -663,6 +728,9 @@ class RVCPipeline:
         pre_hubert_pitch_ratio: float = 0.0,
         moe_boost: float = 0.0,
         f0_lowpass_cutoff_hz: float = 16.0,
+        enable_octave_flip_suppress: bool = True,
+        enable_f0_slew_limit: bool = True,
+        f0_slew_max_step_st: float = 2.8,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -896,10 +964,14 @@ class RVCPipeline:
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.fcpe.infer(f0_source_audio, threshold=0.006)
+                        return self.fcpe.infer(
+                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                        )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.rmvpe.infer(f0_source_audio)
+                        return self.rmvpe.infer(
+                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                        )
                 return None
 
             # Run HuBERT and F0 extraction in parallel threads
@@ -991,13 +1063,13 @@ class RVCPipeline:
                 self._feature_cache = features[:, -cache_len:, :].detach()
 
         # Interpolate features to match synthesizer expectation
-        # RVC uses bilinear (linear) interpolation for 2x upscale
+        # Linear interpolation is perceptually smoother and helps reduce metallic buzz.
         # HuBERT hop=320 @ 16kHz (50fps) -> Synthesizer needs 100fps
         original_frames = features.shape[1]
         features = torch.nn.functional.interpolate(
             features.permute(0, 2, 1),  # [B, T, C] -> [B, C, T]
             scale_factor=2,  # Fixed 2x upscale (matches original RVC)
-            mode="linear",  # RVC uses bilinear interpolation
+            mode="linear",
             align_corners=False,
         ).permute(0, 2, 1)  # [B, C, T] -> [B, T, C]
         logger.info(
@@ -1019,13 +1091,17 @@ class RVCPipeline:
                 # Use FCPE if requested and available
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.fcpe.infer(f0_source_audio, threshold=0.006)
+                        f0 = self.fcpe.infer(
+                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                        )
                     logger.debug("F0 extracted with FCPE (sequential)")
 
                 # Use RMVPE if requested and available (or fallback if FCPE failed)
                 elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.rmvpe.infer(f0_source_audio)
+                        f0 = self.rmvpe.infer(
+                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                        )
                     logger.debug("F0 extracted with RMVPE (sequential)")
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
@@ -1122,6 +1198,10 @@ class RVCPipeline:
 
                 # Phase 6: Apply lowpass filter to remove high-frequency jitter
                 f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
+                if enable_octave_flip_suppress:
+                    f0 = suppress_octave_flips(f0)
+                if enable_f0_slew_limit:
+                    f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
 
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
@@ -1420,7 +1500,7 @@ class RVCPipeline:
         f0_method: str = "fcpe",
         index_rate: float = 0.0,
         index_k: int = 4,
-        voice_gate_mode: str = "expand",
+        voice_gate_mode: str = "off",
         energy_threshold: float = 0.05,
         use_parallel_extraction: bool = True,
         noise_scale: float = 0.66666,
@@ -1428,6 +1508,9 @@ class RVCPipeline:
         pre_hubert_pitch_ratio: float = 0.0,
         moe_boost: float = 0.0,
         f0_lowpass_cutoff_hz: float = 16.0,
+        enable_octave_flip_suppress: bool = True,
+        enable_f0_slew_limit: bool = True,
+        f0_slew_max_step_st: float = 2.8,
     ) -> np.ndarray:
         """Streaming inference with audio-level overlap.
 
@@ -1604,10 +1687,14 @@ class RVCPipeline:
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.fcpe.infer(f0_source_audio, threshold=0.006)
+                        return self.fcpe.infer(
+                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                        )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.rmvpe.infer(f0_source_audio)
+                        return self.rmvpe.infer(
+                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                        )
                 logger.warning(
                     "[INFER] F0 parallel extraction returned None "
                     f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
@@ -1656,10 +1743,14 @@ class RVCPipeline:
                 )
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.fcpe.infer(f0_source_audio, threshold=0.006)
+                        f0 = self.fcpe.infer(
+                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                        )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        f0 = self.rmvpe.infer(f0_source_audio)
+                        f0 = self.rmvpe.infer(
+                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                        )
 
             if f0 is not None and f0.numel() > 0:
                 # FCPE smoothing
@@ -1688,6 +1779,10 @@ class RVCPipeline:
 
                 # Lowpass filter for jitter removal
                 f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
+                if enable_octave_flip_suppress:
+                    f0 = suppress_octave_flips(f0)
+                if enable_f0_slew_limit:
+                    f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
 
                 pitchf = f0.to(self.dtype)
 

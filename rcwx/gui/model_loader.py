@@ -57,7 +57,9 @@ class ModelLoader:
                     path,
                     device=self.app.device_var.get(),
                     dtype=self.app.dtype_var.get(),
-                    use_f0=self.app.pitch_control.use_f0,
+                    # Always load with model F0 capability enabled.
+                    # Runtime F0 on/off is controlled by f0_method/use_f0 in realtime config.
+                    use_f0=True,
                     use_compile=self.app.compile_var.get(),
                     models_dir=self.app.models_dir_entry.get(),
                 )

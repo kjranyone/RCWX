@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -156,7 +157,11 @@ class PosteriorEncoder(nn.Module):
 
 
 class SineGen(nn.Module):
-    """Sine wave generator for Neural Source Filter."""
+    """Sine wave generator for Neural Source Filter.
+
+    Matches original RVC WebUI implementation using sub-frame phase
+    accumulation (_f02sine) instead of interpolation-based approach.
+    """
 
     def __init__(
         self,
@@ -174,11 +179,94 @@ class SineGen(nn.Module):
         self.dim = self.harmonic_num + 1
         self.sampling_rate = samp_rate
         self.voiced_threshold = voiced_threshold
+        # "legacy" keeps prior interpolation-based implementation.
+        # "subframe" enables the newer phase-accumulation implementation.
+        self.phase_mode = os.getenv("RCWX_SINEGEN_MODE", "legacy").lower()
 
     def _f02uv(self, f0: torch.Tensor) -> torch.Tensor:
         uv = torch.ones_like(f0)
         uv = uv * (f0 > self.voiced_threshold)
         return uv
+
+    def _f02sine(
+        self, f0: torch.Tensor, upp: int
+    ) -> torch.Tensor:
+        """Convert F0 to sine waveforms using sub-frame phase accumulation.
+
+        This matches the original RVC WebUI algorithm exactly.
+        Uses explicit float32 for phase accumulation to avoid precision
+        loss under float16 autocast.
+
+        Args:
+            f0: [B, T, 1] F0 values per frame
+            upp: upsample factor (samples per frame)
+
+        Returns:
+            sines: [B, T*upp, dim] sine waveforms
+        """
+        # Sub-sample indices within each frame: [1, 2, ..., upp]
+        a = torch.arange(1, upp + 1, dtype=f0.dtype, device=f0.device)
+        # Phase increment for each sub-sample: [B, T, upp]
+        rad = f0 / self.sampling_rate * a
+
+        # Track inter-frame phase continuity in float32 for precision
+        # rad2: fractional phase at the end of each frame (last sub-sample)
+        rad2 = torch.fmod(rad[:, :-1, -1:].float() + 0.5, 1.0) - 0.5
+        # Accumulated phase offset across frames
+        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+        # Add accumulated offset: first frame gets 0, subsequent frames get drift
+        rad += F.pad(rad_acc, (0, 0, 1, 0), mode="constant")
+
+        # Flatten to waveform rate: [B, T*upp, 1]
+        rad = rad.reshape(f0.shape[0], -1, 1)
+
+        # Multiply by harmonic numbers for overtones: [B, T*upp, dim]
+        b = torch.arange(
+            1, self.dim + 1, dtype=f0.dtype, device=f0.device
+        ).reshape(1, 1, -1)
+        rad = rad * b
+
+        # Random initial phase per harmonic (fundamental starts at 0)
+        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
+        rand_ini[..., 0] = 0
+        rad = rad + rand_ini
+
+        sines = torch.sin(2 * np.pi * rad)
+        return sines
+
+    def _f02sine_legacy(
+        self, f0: torch.Tensor, upp: int
+    ) -> torch.Tensor:
+        """Legacy interpolation-based sine generation used by prior RCWX path."""
+        f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
+        f0_buf[:, :, 0] = f0[:, :, 0]
+        for idx in range(self.harmonic_num):
+            f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+
+        rad_values = (f0_buf / self.sampling_rate) % 1
+        rand_ini = torch.rand(
+            f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device, dtype=f0_buf.dtype
+        )
+        rand_ini[:, 0] = 0
+        rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
+        tmp_over_one = torch.cumsum(rad_values, 1)
+        tmp_over_one *= upp
+        tmp_over_one = F.interpolate(
+            tmp_over_one.transpose(2, 1),
+            scale_factor=float(upp),
+            mode="linear",
+            align_corners=True,
+        ).transpose(2, 1)
+        rad_values = F.interpolate(
+            rad_values.transpose(2, 1),
+            scale_factor=float(upp),
+            mode="nearest",
+        ).transpose(2, 1)
+        tmp_over_one %= 1
+        tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
+        cumsum_shift = torch.zeros_like(rad_values)
+        cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
+        return torch.sin(torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi)
 
     def forward(
         self,
@@ -186,41 +274,13 @@ class SineGen(nn.Module):
         upp: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.no_grad():
-            f0 = f0[:, None].transpose(1, 2)
-            f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
-            # fundamental component
-            f0_buf[:, :, 0] = f0[:, :, 0]
-            for idx in range(self.harmonic_num):
-                f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
+            # f0: [B, T] -> [B, T, 1]
+            f0 = f0.unsqueeze(-1)
 
-            # generate sine waveforms
-            rad_values = (f0_buf / self.sampling_rate) % 1
-            rand_ini = torch.rand(
-                f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device
-            )
-            rand_ini[:, 0] = 0
-            rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
-            tmp_over_one = torch.cumsum(rad_values, 1)
-            tmp_over_one *= upp
-            tmp_over_one = F.interpolate(
-                tmp_over_one.transpose(2, 1),
-                scale_factor=float(upp),
-                mode="linear",
-                align_corners=True,
-            ).transpose(2, 1)
-            rad_values = F.interpolate(
-                rad_values.transpose(2, 1),
-                scale_factor=float(upp),
-                mode="nearest",
-            ).transpose(2, 1)
-            tmp_over_one %= 1
-            tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
-            cumsum_shift = torch.zeros_like(rad_values)
-            cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-            sine_waves = torch.sin(
-                torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * np.pi
-            )
-
+            if self.phase_mode == "subframe":
+                sine_waves = self._f02sine(f0, upp)
+            else:
+                sine_waves = self._f02sine_legacy(f0, upp)
             sine_waves = sine_waves * self.sine_amp
 
             uv = self._f02uv(f0)
@@ -262,8 +322,8 @@ class SourceModuleHnNSF(nn.Module):
         upp: int = 1,
     ) -> torch.Tensor:
         sine_wavs, uv, _ = self.l_sin_gen(x, upp)
-        if self.is_half:
-            sine_wavs = sine_wavs.half()
+        # Match dtype to linear layer weights (handles float16/bfloat16/float32)
+        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         return sine_merge, None, None
 
@@ -352,8 +412,14 @@ class GeneratorNSF(nn.Module):
         har_source, _, _ = self.m_source(f0, self.upp)
         har_source = har_source.transpose(1, 2)
         if n_res is not None:
-            # Trim har_source to match input resolution
-            har_source = har_source[:, :, : n_res * self.upp]
+            # Match original RVC: interpolate both har_source and x to target length
+            n = int(n_res.item()) if isinstance(n_res, torch.Tensor) else int(n_res)
+            if n * self.upp != har_source.shape[-1]:
+                har_source = F.interpolate(
+                    har_source, size=n * self.upp, mode="linear"
+                )
+            if n != x.shape[-1]:
+                x = F.interpolate(x, size=n, mode="linear")
 
         x = self.conv_pre(x)
         if g is not None:
@@ -639,17 +705,27 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(phone, phone_lengths, pitch)
 
         # Apply skip_head and return_length for streaming
+        # Match original RVC: provide 24 extra context frames to flow model
         if skip_head > 0 or return_length > 0:
             head = skip_head
-            tail = return_length if return_length > 0 else x.shape[2] - skip_head
-            x = x[:, :, head : head + tail]
-            m_p = m_p[:, :, head : head + tail]
-            logs_p = logs_p[:, :, head : head + tail]
-            x_mask = x_mask[:, :, head : head + tail]
-            pitchf = pitchf[:, head : head + tail]
-
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
-        z = self.flow(z_p, x_mask, g=g, reverse=True)
+            length = return_length if return_length > 0 else x.shape[2] - skip_head
+            # Flow context: start up to 24 frames earlier for receptive field
+            flow_head = max(head - 24, 0)
+            dec_head = head - flow_head
+            # Slice encoder outputs with flow context
+            m_p = m_p[:, :, flow_head : flow_head + dec_head + length]
+            logs_p = logs_p[:, :, flow_head : flow_head + dec_head + length]
+            x_mask = x_mask[:, :, flow_head : flow_head + dec_head + length]
+            # Sample and run flow with extra context
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            # Slice flow output to target region (discard context)
+            z = z[:, :, dec_head : dec_head + length]
+            x_mask = x_mask[:, :, dec_head : dec_head + length]
+            pitchf = pitchf[:, head : head + length]
+        else:
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
 
         n_res = return_length2 if return_length2 > 0 else None
         o = self.dec(z * x_mask, pitchf, g=g, n_res=n_res)
@@ -782,16 +858,22 @@ class SynthesizerTrnMs256NSFsidNono(nn.Module):
         x, m_p, logs_p, x_mask = self.enc_p(phone, phone_lengths)
 
         # Apply skip_head and return_length for streaming
+        # Match original RVC: provide 24 extra context frames to flow model
         if skip_head > 0 or return_length > 0:
             head = skip_head
-            tail = return_length if return_length > 0 else x.shape[2] - skip_head
-            x = x[:, :, head : head + tail]
-            m_p = m_p[:, :, head : head + tail]
-            logs_p = logs_p[:, :, head : head + tail]
-            x_mask = x_mask[:, :, head : head + tail]
-
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
-        z = self.flow(z_p, x_mask, g=g, reverse=True)
+            length = return_length if return_length > 0 else x.shape[2] - skip_head
+            flow_head = max(head - 24, 0)
+            dec_head = head - flow_head
+            m_p = m_p[:, :, flow_head : flow_head + dec_head + length]
+            logs_p = logs_p[:, :, flow_head : flow_head + dec_head + length]
+            x_mask = x_mask[:, :, flow_head : flow_head + dec_head + length]
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
+            z = z[:, :, dec_head : dec_head + length]
+            x_mask = x_mask[:, :, dec_head : dec_head + length]
+        else:
+            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * noise_scale) * x_mask
+            z = self.flow(z_p, x_mask, g=g, reverse=True)
 
         n_res = return_length2 if return_length2 > 0 else None
         o = self.dec(z * x_mask, g=g, n_res=n_res)

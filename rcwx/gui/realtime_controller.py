@@ -111,8 +111,11 @@ class RealtimeController:
                 index_rate=self.app._get_index_rate(),
                 denoise_enabled=self.app.use_denoise_var.get(),
                 denoise_method=self.app.denoise_method_var.get(),
-                noise_scale=self.app.config.inference.noise_scale,
+                noise_scale=self.app.pitch_control.noise_scale,
                 f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
+                enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
+                enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
+                f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
                 # WAV file input

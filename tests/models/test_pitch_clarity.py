@@ -13,7 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from rcwx.pipeline.inference import lowpass_f0
+from rcwx.pipeline.inference import lowpass_f0, suppress_octave_flips, limit_f0_slew
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +149,43 @@ def test_fcpe_smoothing_preserves_voiced_mask():
 
 
 # ---------------------------------------------------------------------------
+# Tests: octave flip suppression
+# ---------------------------------------------------------------------------
+
+def test_suppress_octave_flips_halves_obvious_double():
+    """An isolated ~2x jump should be corrected back near the previous contour."""
+    f0 = torch.tensor([[220.0, 224.0, 446.0, 228.0, 232.0]], dtype=torch.float32)
+    fixed = suppress_octave_flips(f0)
+    # Frame 2 should be corrected close to ~223Hz (not stay around 446Hz)
+    assert abs(fixed[0, 2].item() - 223.0) < 8.0, (
+        f"Expected octave correction near 223Hz, got {fixed[0, 2].item():.2f}Hz"
+    )
+
+
+def test_suppress_octave_flips_keeps_natural_contour():
+    """Normal melodic movement must remain unchanged."""
+    f0 = torch.tensor([[220.0, 226.0, 234.0, 246.0, 258.0]], dtype=torch.float32)
+    fixed = suppress_octave_flips(f0)
+    assert torch.allclose(f0, fixed), "Natural contour should not be modified"
+
+
+def test_limit_f0_slew_clamps_large_step():
+    """Large single-frame jump should be clamped by slew limiter."""
+    f0 = torch.tensor([[220.0, 230.0, 420.0]], dtype=torch.float32)
+    fixed = limit_f0_slew(f0, max_step_st=2.0)
+    # 220->230 is preserved, 230->420 should be reduced significantly
+    assert fixed[0, 1].item() == 230.0
+    assert fixed[0, 2].item() < 320.0, f"Expected clamped jump, got {fixed[0,2].item():.2f}"
+
+
+def test_limit_f0_slew_keeps_small_steps():
+    """Small steps below threshold should pass unchanged."""
+    f0 = torch.tensor([[220.0, 226.0, 232.0, 239.0]], dtype=torch.float32)
+    fixed = limit_f0_slew(f0, max_step_st=3.0)
+    assert torch.allclose(f0, fixed), "Small steps should not be modified"
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -161,6 +198,10 @@ if __name__ == "__main__":
         test_lowpass_f0_short_input_passthrough,
         test_fcpe_kernel3_sharper_than_kernel5,
         test_fcpe_smoothing_preserves_voiced_mask,
+        test_suppress_octave_flips_halves_obvious_double,
+        test_suppress_octave_flips_keeps_natural_contour,
+        test_limit_f0_slew_clamps_large_step,
+        test_limit_f0_slew_keeps_small_steps,
     ]
     passed = 0
     failed = 0
