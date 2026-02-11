@@ -161,6 +161,7 @@ class RCWXApp(ctk.CTk):
         self.model_selector = ModelSelector(
             self.left_column,
             on_model_selected=self._on_model_selected,
+            models_dir=self.config.rvc_models_dir,
         )
         self.model_selector.pack(fill="x", pady=(0, 5))
 
@@ -622,10 +623,46 @@ class RCWXApp(ctk.CTk):
         )
         self.dtype_menu.pack(anchor="w", padx=20, pady=3)
 
-        # Models directory
+        # RVC models directory
+        self.rvc_models_dir_label = ctk.CTkLabel(
+            self.settings_scroll,
+            text="RVCモデルディレクトリ",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.rvc_models_dir_label.pack(anchor="w", padx=20, pady=(10, 3))
+
+        self.rvc_models_dir_frame = ctk.CTkFrame(self.settings_scroll, fg_color="transparent")
+        self.rvc_models_dir_frame.pack(fill="x", padx=20, pady=3)
+
+        self.rvc_models_dir_entry = ctk.CTkEntry(
+            self.rvc_models_dir_frame,
+            width=350,
+            placeholder_text="ディレクトリを選択...",
+        )
+        self.rvc_models_dir_entry.pack(side="left", padx=(0, 5))
+        if self.config.rvc_models_dir:
+            self.rvc_models_dir_entry.insert(0, self.config.rvc_models_dir)
+
+        self.rvc_models_dir_browse_btn = ctk.CTkButton(
+            self.rvc_models_dir_frame,
+            text="参照",
+            width=60,
+            command=self._browse_rvc_models_dir,
+        )
+        self.rvc_models_dir_browse_btn.pack(side="left")
+
+        self.rvc_models_dir_desc = ctk.CTkLabel(
+            self.settings_scroll,
+            text="指定ディレクトリ内の .pth をスキャンしてモデル選択ドロップダウンに列挙します",
+            font=ctk.CTkFont(size=10),
+            text_color="gray",
+        )
+        self.rvc_models_dir_desc.pack(anchor="w", padx=20, pady=(0, 5))
+
+        # Models directory (HuBERT/RMVPE)
         self.models_dir_label = ctk.CTkLabel(
             self.settings_scroll,
-            text="モデルディレクトリ",
+            text="HuBERT・RMVPEなど推論モデルのディレクトリ",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
         self.models_dir_label.pack(anchor="w", padx=20, pady=(10, 3))
@@ -765,6 +802,18 @@ class RCWXApp(ctk.CTk):
     def _save_converted_audio(self) -> None:
         """Save the converted audio to a file."""
         self.file_converter.save_audio()
+
+    def _browse_rvc_models_dir(self) -> None:
+        """Open folder dialog to select RVC models directory."""
+        from tkinter import filedialog
+
+        dir_path = filedialog.askdirectory(title="RVCモデルディレクトリを選択")
+        if dir_path:
+            self.rvc_models_dir_entry.delete(0, "end")
+            self.rvc_models_dir_entry.insert(0, dir_path)
+            self.config.rvc_models_dir = dir_path
+            self.config.save()
+            self.model_selector.scan_directory(dir_path)
 
     def _apply_settings(self) -> None:
         """Apply settings and reload model."""
@@ -946,6 +995,8 @@ class RCWXApp(ctk.CTk):
             self.config.device = self.device_var.get()
             self.config.dtype = self.dtype_var.get()
             self.config.models_dir = self.models_dir_entry.get()
+            rvc_dir = self.rvc_models_dir_entry.get().strip()
+            self.config.rvc_models_dir = rvc_dir if rvc_dir else None
             self.config.inference.use_compile = self.compile_var.get()
             self.config.inference.use_index = self.use_index_var.get()
             self.config.inference.index_ratio = self.index_ratio_slider.get()

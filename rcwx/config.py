@@ -108,6 +108,7 @@ class RCWXConfig:
     """Main configuration for RCWX."""
 
     models_dir: str = field(default_factory=lambda: str(_default_models_dir()))
+    rvc_models_dir: Optional[str] = None  # RVC model directory for dropdown scan
     last_model_path: Optional[str] = None
     device: str = "auto"  # auto, xpu, cuda, cpu
     dtype: str = "float16"  # float16, float32, bfloat16

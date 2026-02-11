@@ -15,6 +15,7 @@ dist/
 build/
 
 sample_data/
+rvc_models/
 test_output/
 debug_*
 
