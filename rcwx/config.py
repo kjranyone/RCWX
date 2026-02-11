@@ -22,22 +22,22 @@ class AudioConfig:
     output_hostapi_filter: str = "WASAPI"  # Host API filter for output devices
     sample_rate: int = 16000
     output_sample_rate: int = 48000
-    chunk_sec: float = 0.5  # 500ms (RVC WebUI overlap default)
-    crossfade_sec: float = 0.22
+    chunk_sec: float = 0.3
+    crossfade_sec: float = 0.05
     input_gain_db: float = 0.0  # Input gain in dB
     # Input channel selection for stereo devices: "left", "right", "average"
-    input_channel_selection: str = "average"
+    input_channel_selection: str = "auto"
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
-    buffer_margin: float = 0.3  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
+    buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
 
 
 @dataclass
 class DenoiseConfig:
     """Noise cancellation configuration."""
 
-    enabled: bool = False
-    method: str = "auto"  # auto, deepfilter, spectral, off
+    enabled: bool = True
+    method: str = "ml"  # auto, ml, spectral, off
     # Spectral gate parameters (used when method=spectral)
     threshold_db: float = 6.0
     reduction_db: float = -24.0
@@ -50,9 +50,9 @@ class InferenceConfig:
     pitch_shift: int = 0  # semitones
     use_f0: bool = True
     # F0 extraction method: "fcpe" (fast, 100ms min) or "rmvpe" (accurate, 320ms min)
-    f0_method: str = "fcpe"
-    use_index: bool = False
-    index_ratio: float = 0.5
+    f0_method: str = "rmvpe"
+    use_index: bool = True
+    index_ratio: float = 0.15
     index_k: int = 4  # FAISS neighbors to search (4=fast, 8=quality)
     # torch.compile: Disabled for Windows XPU stability (unstable performance)
     use_compile: bool = False
@@ -69,13 +69,13 @@ class InferenceConfig:
     # Energy threshold for "energy" mode (0.01-0.2, default 0.05)
     # Lower = more sensitive (catches quieter sounds but may pass noise)
     # Higher = less sensitive (better noise rejection but may cut soft sounds)
-    energy_threshold: float = 0.05
+    energy_threshold: float = 0.2
 
     # Audio-level overlap for HuBERT continuity
-    overlap_sec: float = 0.10
+    overlap_sec: float = 0.20
 
     # Crossfade length for SOLA blending
-    crossfade_sec: float = 0.05
+    crossfade_sec: float = 0.08
 
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
     use_sola: bool = True
@@ -84,13 +84,13 @@ class InferenceConfig:
     sola_search_ms: float = 10.0
 
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
-    pre_hubert_pitch_ratio: float = 0.0
+    pre_hubert_pitch_ratio: float = 0.08
 
     # Moe voice style strength (0.0=off, 1.0=strong)
-    moe_boost: float = 0.0
+    moe_boost: float = 0.45
 
     # Synthesizer noise scale (0.0=deterministic, 0.66666=original RVC default)
-    noise_scale: float = 0.4
+    noise_scale: float = 0.45
     # F0 lowpass cutoff frequency in Hz (higher = more pitch detail preserved)
     f0_lowpass_cutoff_hz: float = 16.0
     # Stabilize 1-octave frame flips in F0 contour
@@ -98,7 +98,7 @@ class InferenceConfig:
     # Limit frame-to-frame F0 slew in semitones
     enable_f0_slew_limit: bool = True
     # Max frame-to-frame F0 step (semitones) when slew limiter is enabled
-    f0_slew_max_step_st: float = 2.8
+    f0_slew_max_step_st: float = 3.6
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
 
