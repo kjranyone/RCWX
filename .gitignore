@@ -17,3 +17,6 @@ build/
 sample_data/
 test_output/
 debug_*
+
+# Obsidian
+.obsidian/

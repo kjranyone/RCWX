@@ -744,7 +744,7 @@ class RealtimeVoiceChangerUnified:
                         hop_16k,
                         sample_rate=16000,
                         method=self.config.denoise_method,
-                        device="cpu",
+                        device=self.pipeline.device,
                     )
 
                 # --- Stage 4: Assemble chunk with overlap ---
@@ -1055,7 +1055,7 @@ class RealtimeVoiceChangerUnified:
                 dummy,
                 sample_rate=16000,
                 method=self.config.denoise_method,
-                device="cpu",
+                device=self.pipeline.device,
             )
             logger.info("[WARMUP] Denoiser warmup complete")
         except Exception as e:

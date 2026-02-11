@@ -57,13 +57,13 @@ class MLDenoiser:
     Facebook Denoiser is trained to preserve human voice while removing
     background noise - similar to modern microphone noise cancellation.
 
-    Note: Facebook Denoiser only supports CPU and CUDA. XPU is not supported,
-    so it will automatically fall back to CPU on XPU systems.
+    Supports CPU, CUDA, and XPU. Falls back to CPU if the requested
+    device fails during model loading.
 
     Requires: pip install denoiser
 
     Usage:
-        denoiser = MLDenoiser()
+        denoiser = MLDenoiser(device="xpu")
         clean_audio = denoiser.process(noisy_audio, sample_rate=16000)
     """
 
@@ -71,16 +71,11 @@ class MLDenoiser:
         """Initialize Facebook Denoiser model.
 
         Args:
-            device: Requested device ("cpu", "cuda", "xpu")
-                    Note: XPU not supported, will fall back to CPU
+            device: Requested device ("cpu", "cuda", "xpu", "auto")
+                    Falls back to CPU if the requested device fails.
         """
-        # Facebook Denoiser only supports CPU and CUDA
-        # XPU is not supported, fall back to CPU
-        if device in ("xpu", "auto"):
-            self._actual_device = "cpu"
-            logger.info(f"MLDenoiser: {device} not supported, using CPU")
-        else:
-            self._actual_device = device
+        self._requested_device = device
+        self._actual_device = device if device != "auto" else "cpu"
         self._model = None
         self._loaded = False
 
@@ -97,14 +92,19 @@ class MLDenoiser:
             self._model = pretrained.dns64()
             self._model.eval()
 
-            # Move to device (only if CUDA)
-            if self._actual_device == "cuda":
+            # Move to requested device (XPU, CUDA, etc.) with CPU fallback
+            if self._actual_device != "cpu":
                 try:
                     self._model = self._model.to(self._actual_device)
+                    # Verify with a small test inference
+                    test_input = torch.zeros(1, 1, 16000, device=self._actual_device)
+                    with torch.no_grad():
+                        self._model(test_input)
                     logger.info(f"Facebook Denoiser model loaded on {self._actual_device}")
                 except Exception as e:
-                    logger.warning(f"Could not move model to {self._actual_device}, using CPU: {e}")
+                    logger.warning(f"Could not run model on {self._actual_device}, using CPU: {e}")
                     self._actual_device = "cpu"
+                    self._model = self._model.cpu()
             else:
                 logger.info("Facebook Denoiser model loaded on CPU")
 
