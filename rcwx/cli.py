@@ -196,7 +196,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         audio,
         input_sr=sr,
         pitch_shift=args.pitch,
-        f0_method="rmvpe" if not args.no_f0 else "none",
+        f0_method=args.f0_method if not args.no_f0 else "none",
         index_rate=args.index_rate,
         voice_gate_mode="off",
         pre_hubert_pitch_ratio=args.pre_hubert_pitch,
@@ -366,6 +366,12 @@ def main() -> int:
         default="float16",
         choices=["float16", "float32", "bfloat16"],
         help="Data type",
+    )
+    run_parser.add_argument(
+        "--f0-method",
+        choices=["rmvpe", "fcpe", "swiftf0"],
+        default="rmvpe",
+        help="F0 extraction method (default: rmvpe)",
     )
     run_parser.add_argument(
         "--no-f0",

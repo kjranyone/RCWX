@@ -340,8 +340,6 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._peak_db = -60.0
         self._recommended_gain = 0.0
 
-        # Auto-refresh state
-        self._auto_refresh_id: str | None = None
 
     def _on_input_api_change(self, selected_api: str) -> None:
         """Handle input API filter change."""
@@ -405,34 +403,26 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.output_api_menu.configure(values=["すべて"] + output_apis)
 
     def start_auto_refresh(self, interval_ms: int = 1000) -> None:
-        """Start auto-refreshing device list at specified interval.
+        """Enable on-open device refresh (called once at startup).
 
-        Args:
-            interval_ms: Refresh interval in milliseconds (default: 1000ms)
+        Instead of polling every N ms (which causes dropdown flicker),
+        device lists are refreshed once when a dropdown is opened.
         """
-        if self._auto_refresh_id is not None:
-            return  # Already running
+        # Bind click events to refresh devices on dropdown open
+        self.input_dropdown.bind("<Button-1>", lambda _: self._refresh_devices_quiet())
+        self.output_dropdown.bind("<Button-1>", lambda _: self._refresh_devices_quiet())
+        logger.debug("Device on-open refresh enabled")
 
-        def refresh_loop():
-            if self._auto_refresh_id is None:
-                return  # Stopped
-            try:
-                self._refresh_devices()
-            except Exception as e:
-                logger.warning(f"Auto-refresh failed: {e}")
-            # Schedule next refresh
-            self._auto_refresh_id = self.after(interval_ms, refresh_loop)
-
-        # Start the loop
-        self._auto_refresh_id = self.after(interval_ms, refresh_loop)
-        logger.debug("Device auto-refresh started")
+    def _refresh_devices_quiet(self) -> None:
+        """Refresh device lists (called when a dropdown is clicked)."""
+        try:
+            self._refresh_devices()
+        except Exception as e:
+            logger.warning(f"Device refresh failed: {e}")
 
     def stop_auto_refresh(self) -> None:
-        """Stop auto-refreshing device list."""
-        if self._auto_refresh_id is not None:
-            self.after_cancel(self._auto_refresh_id)
-            self._auto_refresh_id = None
-            logger.debug("Device auto-refresh stopped")
+        """Stop auto-refreshing device list (no-op, kept for API compat)."""
+        pass
 
     def _detect_default_sample_rates(self) -> None:
         """Detect sample rates and channels for default devices."""

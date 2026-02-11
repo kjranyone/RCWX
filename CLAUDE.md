@@ -19,20 +19,13 @@ uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available(
 # 3) 必須モデルをダウンロード（HuBERT / RMVPE）
 uv run rcwx download
 
-# 4) (推奨) FCPE低レイテンシF0を追加
-uv sync --extra lowlatency
-# または: pip install torchfcpe
-
-# 4b) (オプション) SwiftF0超高速F0を追加
-pip install swift-f0
-
-# 5) (オプション) ML Denoiser利用可否を確認
+# 4) (オプション) ML Denoiser利用可否を確認
 uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(is_ml_denoiser_available())"
 
-# 6) (推奨) フィードバック診断
+# 5) (推奨) フィードバック診断
 uv run rcwx diagnose
 
-# 7) GUI起動
+# 6) GUI起動
 uv run rcwx
 ```
 

@@ -133,6 +133,15 @@ class PitchControl(ctk.CTkFrame):
         )
         self.fcpe_rb.grid(row=0, column=1, padx=5, pady=2)
 
+        self.swiftf0_rb = ctk.CTkRadioButton(
+            self.f0_frame,
+            text="SwiftF0 (超高速)",
+            variable=self.f0_var,
+            value="swiftf0",
+            command=self._on_f0_change,
+        )
+        self.swiftf0_rb.grid(row=0, column=2, padx=5, pady=2)
+
         self.none_rb = ctk.CTkRadioButton(
             self.f0_frame,
             text="なし",
@@ -140,7 +149,7 @@ class PitchControl(ctk.CTkFrame):
             value="none",
             command=self._on_f0_change,
         )
-        self.none_rb.grid(row=0, column=2, padx=5, pady=2)
+        self.none_rb.grid(row=0, column=3, padx=5, pady=2)
 
         self.pre_hubert_label = ctk.CTkLabel(
             self,
@@ -384,12 +393,14 @@ class PitchControl(ctk.CTkFrame):
         if enabled:
             self.rmvpe_rb.configure(state="normal")
             self.fcpe_rb.configure(state="normal")
+            self.swiftf0_rb.configure(state="normal")
             if self.f0_var.get() == "none":
                 self.f0_var.set("rmvpe")
             self._use_f0 = True
         else:
             self.rmvpe_rb.configure(state="disabled")
             self.fcpe_rb.configure(state="disabled")
+            self.swiftf0_rb.configure(state="disabled")
             self.f0_var.set("none")
             self._use_f0 = False
 

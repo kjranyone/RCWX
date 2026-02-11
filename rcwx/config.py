@@ -49,7 +49,7 @@ class InferenceConfig:
 
     pitch_shift: int = 0  # semitones
     use_f0: bool = True
-    # F0 extraction method: "fcpe" (fast, 100ms min) or "rmvpe" (accurate, 320ms min)
+    # F0 extraction method: "rmvpe" (accurate), "fcpe" (fast), or "swiftf0" (ultra-fast ONNX/CPU)
     f0_method: str = "rmvpe"
     use_index: bool = True
     index_ratio: float = 0.15

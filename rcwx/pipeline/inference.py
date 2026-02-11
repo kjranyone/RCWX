@@ -21,6 +21,7 @@ from rcwx.downloader import get_hubert_path, get_rmvpe_path
 from rcwx.models.hubert_loader import HuBERTLoader
 from rcwx.models.rmvpe import RMVPE
 from rcwx.models.fcpe import FCPE, is_fcpe_available
+from rcwx.models.swiftf0 import SwiftF0 as SwiftF0Model, is_swiftf0_available
 from rcwx.models.synthesizer import SynthesizerLoader
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ MAX_PRE_HUBERT_SHIFT_ST = 24.0
 MAX_MOE_BOOST = 1.0
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
+SWIFTF0_VOICING_THRESHOLD = 0.5
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -467,6 +469,7 @@ class RVCPipeline:
         self.hubert: Optional[HuBERTFeatureExtractor] = None
         self.rmvpe: Optional[RMVPE] = None
         self.fcpe: Optional[FCPE] = None
+        self.swiftf0: Optional[SwiftF0Model] = None
         self.synthesizer: Optional[SynthesizerLoader] = None
 
         # FAISS index components
@@ -574,8 +577,21 @@ class RVCPipeline:
             else:
                 logger.info("FCPE not available (install with: pip install torchfcpe)")
 
-            # Disable F0 if neither model is available
-            if self.rmvpe is None and self.fcpe is None:
+            # Load SwiftF0 if available (lightweight ONNX/CPU alternative)
+            if is_swiftf0_available():
+                try:
+                    self.swiftf0 = SwiftF0Model(
+                        confidence_threshold=SWIFTF0_VOICING_THRESHOLD,
+                    )
+                    logger.info("SwiftF0 model loaded (ultra-fast ONNX/CPU F0 available)")
+                except Exception as e:
+                    logger.warning(f"Failed to load SwiftF0: {e}")
+                    self.swiftf0 = None
+            else:
+                logger.info("SwiftF0 not available (install with: pip install swift-f0)")
+
+            # Disable F0 if no model is available
+            if self.rmvpe is None and self.fcpe is None and self.swiftf0 is None:
                 logger.warning("No F0 model available, F0 extraction disabled")
                 self.has_f0 = False
 
@@ -675,6 +691,7 @@ class RVCPipeline:
         self.hubert = None
         self.rmvpe = None
         self.fcpe = None
+        self.swiftf0 = None
         self.synthesizer = None
         self.faiss_index = None
         self.index_features = None
@@ -965,6 +982,10 @@ class RVCPipeline:
                         return self.fcpe.infer(
                             f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
                         )
+                elif f0_method == "swiftf0" and self.swiftf0 is not None:
+                    return self.swiftf0.infer(
+                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                    )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         return self.rmvpe.infer(
@@ -1094,7 +1115,14 @@ class RVCPipeline:
                         )
                     logger.debug("F0 extracted with FCPE (sequential)")
 
-                # Use RMVPE if requested and available (or fallback if FCPE failed)
+                # Use SwiftF0 if requested and available
+                elif f0_method == "swiftf0" and self.swiftf0 is not None:
+                    f0 = self.swiftf0.infer(
+                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                    )
+                    logger.debug("F0 extracted with SwiftF0 (sequential)")
+
+                # Use RMVPE if requested and available (or fallback if others failed)
                 elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.rmvpe.infer(
@@ -1688,6 +1716,10 @@ class RVCPipeline:
                         return self.fcpe.infer(
                             f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
                         )
+                elif f0_method == "swiftf0" and self.swiftf0 is not None:
+                    return self.swiftf0.infer(
+                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                    )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         return self.rmvpe.infer(
@@ -1696,6 +1728,7 @@ class RVCPipeline:
                 logger.warning(
                     "[INFER] F0 parallel extraction returned None "
                     f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
+                    f"swiftf0={'loaded' if self.swiftf0 else 'None'}, "
                     f"rmvpe={'loaded' if self.rmvpe else 'None'})"
                 )
                 return None
@@ -1744,6 +1777,10 @@ class RVCPipeline:
                         f0 = self.fcpe.infer(
                             f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
                         )
+                elif f0_method == "swiftf0" and self.swiftf0 is not None:
+                    f0 = self.swiftf0.infer(
+                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                    )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.rmvpe.infer(
