@@ -6,31 +6,28 @@ RCWXの推論パイプラインとRVC V2オリジナル実装（RVC-Project/Retr
 
 ---
 
-## 1. HuBERT特徴量抽出 ⚠️ 要検証
+## 1. HuBERT特徴量抽出 ✅ 修正完了
 
 | 項目 | オリジナルRVC | RCWX実装 | 差異 |
 |------|-------------|----------|------|
-| モデル | fairseq HuBERT | transformers HubertModel | **異なるライブラリ** |
+| モデル | fairseq HuBERT | transformers HubertModel | ライブラリは異なるが出力一致 |
 | 出力レイヤー | v2: 12層目 | v2: 12層目 | 一致 |
 | 出力次元 | v2: 768次元 | v2: 768次元 | 一致 |
 | 入力正規化 | グループ正規化 | transformers内部で処理 | 実装依存 |
 | 入力精度 | float32 | float32 | ✅ 一致 |
+| layer_norm | fairseq: 常に適用 | v2: last_hidden_state使用 | ✅ 一致 |
 
-### 現状
+### 修正内容
 
-- transformers版 `lengyue233/content-vec-best` を使用
-- fairseq依存を回避するためこの選択をしている
-- 入力はfloat32で処理（autocastに任せる）
-
-### 潜在的問題
-
-- transformersのHubertModelとfairseqのHuBERTは内部実装が異なる可能性がある
-- ContentVec（lengyue233/content-vec-best）のウェイトがtransformersで正しくロードされているか要確認
-- 特徴量の数値的な差異が後段の処理に影響する可能性
+- transformers版 `lengyue233/content-vec-best` を使用（fairseq依存回避）
+- **layer_norm 問題を修正**: HuggingFace の `hidden_states[N]` は layer_norm **前** の出力。
+  fairseq は常に `encoder.layer_norm` を適用するため、分布不一致が生じていた。
+  - v2 (output_layer=12): `outputs.last_hidden_state` を使用（layer_norm 込み）
+  - v1 (output_layer<12): `hidden_states[N]` + `model.encoder.layer_norm()` を手動適用
 
 ### 関連ファイル
 
-- `rcwx/models/hubert.py`
+- `rcwx/models/hubert_loader.py`
 
 ---
 
@@ -266,15 +263,9 @@ class TextEncoder(nn.Module):
 | **高** | 特徴量アライメント | ✅ 完了 | 補間モードをnearestに変更 |
 | **高** | FAISS Index検索 | ✅ 完了 | index_rate対応、k=8検索実装 |
 | **中** | F0量子化 | ✅ 完了 | オリジナルRVCのロジックに一致 |
-| **中** | HuBERTモデル | ⚠️ 未検証 | transformers版使用中、fairseqとの数値的差異要確認 |
+| **中** | HuBERTモデル | ✅ 完了 | transformers版使用、layer_norm問題修正済み |
 | **高** | RMVPEアーキテクチャ | ✅ 完了 | オリジナルRVC完全一致、重み正常ロード |
 | **低** | RMVPE閾値判定 | ✅ 完了 | 全360ビンの最大salience使用 |
-
-### 残課題
-
-1. **HuBERT**
-   - transformers版とfairseq版の出力を数値的に比較検証
-   - 必要であればfairseq版に切り替えを検討
 
 ### 完了した修正
 

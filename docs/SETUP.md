@@ -192,9 +192,14 @@ pytest
 
 ## 次のステップ
 
-環境構築が完了したら、[ONBOARD.md](../ONBOARD.md) の「Phase 2: モデル移植」に進んでください。
+環境構築が完了したら、[CLAUDE.md](../CLAUDE.md) の Quick Start に従ってモデルをダウンロードしてください。
+
+```powershell
+# 必須モデル（HuBERT / RMVPE）を自動ダウンロード
+uv run rcwx download
+```
 
 必要なモデルファイル:
-- `hubert_base.pt` - [HuggingFace](https://huggingface.co/lj1995/VoiceConversionWebUI)
-- `rmvpe.pt` - 同上
-- RVCv2モデル (`.pth`)
+- `hubert_base.pt` — `~/.cache/rcwx/models/hubert/` に自動配置
+- `rmvpe.pt` — `~/.cache/rcwx/models/rmvpe/` に自動配置
+- RVCv2モデル (`.pth`) — 任意のディレクトリ

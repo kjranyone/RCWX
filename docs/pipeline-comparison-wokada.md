@@ -100,8 +100,8 @@ flowchart TB
     end
 
     subgraph process[後処理]
-        C1[FAISS Index Search<br/>optional] --> C2[Feature Interpolation<br/>2x linear 50fps->100fps]
-        C2 --> C3[F0 Smoothing<br/>median + lowpass 8Hz]
+        C1[FAISS Index Search<br/>optional] --> C2[Feature Interpolation<br/>2x nearest 50fps->100fps]
+        C2 --> C3[F0 Post-processing<br/>median + lowpass + octave flip + slew limit]
         C3 --> C4[Pitch Quantization<br/>mel scale, 256 bins]
     end
 
@@ -123,7 +123,7 @@ flowchart TB
 - HuBERT と F0 を `ThreadPoolExecutor` で**並列抽出** (~10-15% 高速化)
 - Audio History を蓄積し HuBERT に豊富なコンテキストを提供
 - 固定サイズパディングにより XPU カーネル再コンパイルを回避
-- Feature Cache により短チャンクでも実特徴量でデコーダーを補完
+- Feature Cache により短チャンク（初回2チャンク）でも実特徴量でデコーダーを補完
 
 ### 2.2 w-okada: `Pipeline.exec()` フロー
 
@@ -298,7 +298,7 @@ flowchart LR
 | コンテキスト | `_streaming_audio_history` (最大 ~560ms) | `audio_buffer` 全体 (convertSize分) |
 | パディング | **固定サイズ** (XPU カーネル再コンパイル回避) | 可変サイズ (チャンク毎に変動) |
 | 出力 layer | v2: layer 12 / 768d | 設定可 (v1: layer 9/256d, v2: layer 12/768d) |
-| 補間 | `F.interpolate(scale_factor=2, mode="linear")` | 同一 |
+| 補間 | `F.interpolate(scale_factor=2, mode="nearest")` | 同一 |
 
 **RCWX の固定サイズパディング**は Intel XPU 特有の最適化。XPU (oneAPI) はチャンク毎に入力サイズが変わるとカーネルを再コンパイルするため、初回チャンクで1回だけコンパイルし以降は再利用する設計:
 
@@ -319,10 +319,11 @@ if len(audio_padded) < fixed_hubert_input:
 flowchart TB
     subgraph rcwx[RCWX の F0 パイプライン]
         direction TB
-        R1[FCPE or RMVPE<br/>パディング含む全音声] --> R2[avg_pool1d smoothing<br/>FCPE のみ, kernel=5]
-        R2 --> R3[Median Filter<br/>window=3, スパイク除去]
-        R3 --> R4[Lowpass Filter<br/>8Hz cutoff Butterworth]
-        R4 --> R5[Pitch Shift<br/>semitone単位]
+        R1[FCPE or RMVPE<br/>パディング含む全音声] --> R3[Median Filter<br/>window=3, スパイク除去]
+        R3 --> R4[Lowpass Filter<br/>configurable cutoff Butterworth]
+        R4 --> R4b[Octave Flip Suppress<br/>1オクターブ飛び補正]
+        R4b --> R4c[Slew Rate Limiter<br/>フレーム間最大ステップ制限]
+        R4c --> R5[Pitch Shift<br/>semitone単位]
         R5 --> R6[Length Interpolation<br/>feature長に合わせる]
         R6 --> R7[Mel Quantization<br/>50-1100Hz -> 1-255]
     end
@@ -343,11 +344,11 @@ flowchart TB
 | 既定手法 | FCPE (低レイテンシ) | RMVPE |
 | 選択肢 | FCPE / RMVPE | RMVPE / Crepe / DIO / Harvest / FCPE |
 | 並列化 | HuBERT と ThreadPoolExecutor で並列 | シーケンシャル |
-| 後処理 | median filter + lowpass 8Hz + avg_pool | **なし** (生 F0 をそのまま使用) |
-| キャッシュ | `_f0_cache` でチャンク境界 sigmoid blending | `pitchf_buffer` で前チャンク値を保持 |
+| 後処理 | median + lowpass (configurable) + octave flip + slew limit | **なし** (生 F0 をそのまま使用) |
+| キャッシュ | `_f0_cache` でチャンク境界値を保持 | `pitchf_buffer` で前チャンク値を保持 |
 | 過負荷時 | `f0_method="none"` に自動退避 | なし |
 
-RCWX の多段 F0 後処理フローにより、チャンク境界でのピッチジャンプやフレーム間ジッターが大幅に軽減される。w-okada は `extraConvertSize` による大量コンテキストでF0境界品質を間接的に担保する。
+RCWX の F0 後処理（median + lowpass + octave flip suppress + slew limit）により、チャンク境界でのピッチジャンプやフレーム間ジッターが軽減される。w-okada は `extraConvertSize` による大量コンテキストでF0境界品質を間接的に担保する。
 
 ---
 
@@ -672,7 +673,7 @@ mindmap
 **RCWX が優れている点**:
 - `StatefulResampler` によるチャンク境界のリサンプリング品質
 - HuBERT + F0 並列抽出による推論高速化
-- F0 多段後処理 (median + lowpass + boundary blending) によるピッチ安定性
+- F0 後処理 (median + lowpass + octave flip suppress + slew limit) によるピッチ安定性
 - 過負荷自動退避とフィードバック検出
 - `target_len` による SOLA ドリフト防止
 - XPU 向け固定サイズパディング最適化

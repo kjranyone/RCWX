@@ -104,11 +104,11 @@ rcwx/
 |---|---:|---|
 | `sample_rate` | `16000` | 内部処理入力レート |
 | `output_sample_rate` | `48000` | 出力レート |
-| `chunk_sec` | `0.5` | 保存設定上のチャンク長 |
+| `chunk_sec` | `0.3` | 保存設定上のチャンク長 |
 | `prebuffer_chunks` | `1` | 出力プリバッファ |
-| `buffer_margin` | `0.3` | バッファ余裕 |
+| `buffer_margin` | `0.5` | バッファ余裕 |
 | `input_gain_db` | `0.0` | 入力ゲイン |
-| `input_channel_selection` | `average` | left/right/average |
+| `input_channel_selection` | `auto` | left/right/average/auto |
 | `input_hostapi_filter` | `WASAPI` | Windows向け |
 | `output_hostapi_filter` | `WASAPI` | Windows向け |
 
@@ -116,42 +116,45 @@ rcwx/
 
 | Key | Default | Notes |
 |---|---:|---|
-| `f0_method` | `fcpe` | `fcpe` / `rmvpe` |
+| `f0_method` | `rmvpe` | `fcpe` / `rmvpe` |
 | `use_f0` | `true` | F0有効化 |
-| `use_index` | `false` | FAISS有効化 |
-| `index_ratio` | `0.5` | FAISS混合率 |
+| `use_index` | `true` | FAISS有効化 |
+| `index_ratio` | `0.15` | FAISS混合率 |
 | `index_k` | `4` | 近傍数 |
 | `use_compile` | `false` | 既定OFF |
 | `resample_method` | `linear` | `linear` / `poly` |
 | `use_parallel_extraction` | `true` | HuBERT+F0並列 |
 | `voice_gate_mode` | `off` | off/strict/expand/energy |
-| `energy_threshold` | `0.05` | energyモード閾値 |
-| `overlap_sec` | `0.10` | 音声オーバーラップ |
-| `crossfade_sec` | `0.05` | SOLAクロスフェード長 |
+| `energy_threshold` | `0.2` | energyモード閾値 |
+| `overlap_sec` | `0.20` | 音声オーバーラップ |
+| `crossfade_sec` | `0.08` | SOLAクロスフェード長 |
 | `use_sola` | `true` | SOLA有効化 |
 | `sola_search_ms` | `10.0` | SOLA探索窓 |
-| `pre_hubert_pitch_ratio` | `0.0` | プレHuBERTシフト比率 (0.0-1.0) |
-| `noise_scale` | `0.4` | 合成ノイズスケール (0.0-1.0) |
+| `pre_hubert_pitch_ratio` | `0.08` | プレHuBERTシフト比率 (0.0-1.0) |
+| `moe_boost` | `0.45` | Moeボイススタイル強度 (0.0-1.0) |
+| `noise_scale` | `0.45` | 合成ノイズスケール (0.0-1.0) |
 | `f0_lowpass_cutoff_hz` | `16.0` | F0ローパスカットオフ (Hz) |
-| `denoise.enabled` | `false` | ノイズ除去 |
-| `denoise.method` | `auto` | `auto` / `ml` / `spectral` |
+| `enable_octave_flip_suppress` | `true` | 1オクターブF0飛び補正 |
+| `enable_f0_slew_limit` | `true` | フレーム間F0変化量制限 |
+| `f0_slew_max_step_st` | `3.6` | 最大F0ステップ (semitones) |
+| `denoise.enabled` | `true` | ノイズ除去 |
+| `denoise.method` | `ml` | `auto` / `ml` / `spectral` |
 
 注記:
 - `lookahead_sec` と `use_feature_cache` は **現行設定に存在しません**。
-- `denoise.method="deepfilter"` は互換エイリアスとして受理されます（内部はML扱い）。
 
 ### `RealtimeConfig` (`rcwx/pipeline/realtime_unified.py`)
 
 実行時にGUI設定から生成される主要値:
-- `chunk_sec` (既定 0.15、20ms境界に丸め)
-- `overlap_sec` (既定 0.10、20ms境界に丸め)
-- `crossfade_sec` (既定 0.05)
+- `chunk_sec` (既定 0.30、20ms境界に丸め)
+- `overlap_sec` (既定 0.20、20ms境界に丸め)
+- `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
 - `prebuffer_chunks` (既定 1)
-- `buffer_margin` (既定 0.3)
-- `f0_method` (既定 `fcpe`)
-- `pre_hubert_pitch_ratio` (既定 0.0)
-- `noise_scale` (既定 0.4)
+- `buffer_margin` (既定 0.5)
+- `f0_method` (既定 `rmvpe`)
+- `pre_hubert_pitch_ratio` (既定 0.08)
+- `noise_scale` (既定 0.45)
 - `f0_lowpass_cutoff_hz` (既定 16.0)
 - `max_queue_size` (既定 8)
 
@@ -219,13 +222,15 @@ uv run rcwx logs --open      # 最新ログを開く
 ```powershell
 uv run python tests/integration/test_diagnostic.py
 uv run python tests/integration/test_infer_streaming.py
-uv run python tests/integration/test_realtime_integration.py
-uv run python tests/integration/test_chunking_modes_comparison.py
+uv run python tests/integration/test_pre_hubert_pitch.py
+uv run python tests/integration/test_moe_clarity_scoring.py
 uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
 uv run python tests/models/test_rmvpe.py
 uv run python tests/models/test_cumulative_context.py
-uv run python tests/integration/test_pre_hubert_pitch.py
+uv run python tests/models/test_pitch_clarity.py
+uv run python tests/models/test_config_wiring.py
+uv run python tests/models/test_hubert_weight_audit.py
 ```
 
 ## References
