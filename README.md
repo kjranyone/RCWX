@@ -231,22 +231,29 @@ rcwx/
 ├── device.py              # デバイス選択 (xpu/cuda/cpu)
 ├── downloader.py          # HuggingFace モデルダウンロード
 ├── cli.py                 # CLI エントリポイント
+├── diagnose.py            # フィードバック診断
 ├── audio/
 │   ├── input.py           # マイク入力 (sounddevice)
 │   ├── output.py          # 音声出力
-│   ├── buffer.py          # クロスフェード付きバッファ
-│   ├── resample.py        # リサンプリング
-│   └── denoise.py         # ノイズキャンセリング (ML/Spectral)
+│   ├── buffer.py          # RingOutputBuffer
+│   ├── resample.py        # StatefulResampler
+│   ├── sola.py            # SOLA クロスフェード
+│   ├── denoise.py         # ノイズキャンセリング (ML/Spectral)
+│   └── wav_input.py       # WAVファイルループ入力
 ├── models/
-│   ├── hubert.py          # ContentVec 特徴抽出 (transformers)
+│   ├── hubert_loader.py   # ContentVec 特徴抽出 (transformers)
 │   ├── rmvpe.py           # RMVPE F0抽出
-│   ├── synthesizer.py     # モデルローダー
+│   ├── fcpe.py            # FCPE F0抽出 (低レイテンシ)
+│   ├── synthesizer.py     # RVC合成器
 │   └── infer_pack/        # RVC コアモジュール
 ├── pipeline/
-│   ├── inference.py       # 推論パイプライン
-│   └── realtime.py        # リアルタイム処理
+│   ├── inference.py       # infer / infer_streaming
+│   └── realtime_unified.py # リアルタイム処理
 └── gui/
     ├── app.py             # メインアプリケーション
+    ├── realtime_controller.py
+    ├── model_loader.py    # 非同期モデルロード
+    ├── file_converter.py  # ファイル変換テスト
     └── widgets/           # UIコンポーネント
 ```
 
@@ -309,26 +316,15 @@ explicit = true
 
 ## Testing
 
-### チャンク処理統合テスト
-
-リアルタイム変換のチャンク処理がバッチ処理と一致するかを検証：
-
 ```powershell
-# バッチ vs ストリーミング比較テスト
-uv run python tests/test_realtime_chunk_processing.py
+# 主なテスト
+uv run python tests/integration/test_diagnostic.py
+uv run python tests/integration/test_infer_streaming.py
+uv run python tests/integration/test_pre_hubert_pitch.py
+uv run python tests/crossfade/test_sola_compensation.py
+uv run python tests/models/test_inference.py
+uv run python tests/models/test_rmvpe.py
 ```
-
-**テスト内容**:
-- 同じ音声をバッチ処理とストリーミング処理で変換
-- 実際の`RealtimeVoiceChanger`モジュールを使用（シミュレーションではない）
-- 出力の相関係数・MAE・エネルギー比を比較
-
-**期待結果**:
-- 相関係数 ≥ 0.93（実用上十分なレベル）
-- MAE ≤ 0.05
-- エネルギー比 ≈ 1.0
-
-詳細は`CLAUDE.md`の「テスト実装の重要ポイント」を参照。
 
 ## Development
 

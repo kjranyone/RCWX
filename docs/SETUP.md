@@ -43,32 +43,21 @@ cd rcwx
 
 ---
 
-## Step 3: Python 環境構築
+## Step 3: 依存関係のインストール
 
 ```powershell
-# Python 3.12 で仮想環境を作成
-uv venv --python 3.12
+# PyTorch XPU版を含む全依存関係をインストール
+uv sync
 
-# 仮想環境を有効化
-.venv\Scripts\activate
+# (推奨) 低レイテンシF0抽出を追加
+uv sync --extra lowlatency
 ```
+
+> `pyproject.toml` で PyTorch XPU インデックスが設定済みのため、`uv sync` だけで XPU 版がインストールされます。
 
 ---
 
-## Step 4: 依存関係のインストール
-
-```powershell
-# PyTorch XPU版 + 依存関係
-uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
-uv pip install sounddevice numpy scipy
-
-# または pyproject.toml から一括インストール
-uv pip install -e .
-```
-
----
-
-## Step 5: 動作確認
+## Step 4: 動作確認
 
 ### XPU が認識されているか確認
 ```powershell
@@ -97,7 +86,7 @@ python -c "import torch; x = torch.randn(1000, 1000, device='xpu'); print(f'Tens
 
 ---
 
-## Step 6: torch.compile の確認（オプション）
+## Step 5: torch.compile の確認（オプション）
 
 ```powershell
 python -c "
@@ -129,8 +118,9 @@ print(f'torch.compile OK: {y.device}')
 
 2. **PyTorch再インストール**
    ```powershell
-   uv pip uninstall torch torchvision torchaudio
-   uv pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+   # uv.lock を再生成して再インストール
+   del uv.lock
+   uv sync
    ```
 
 3. **Python バージョン確認**
@@ -174,7 +164,7 @@ torch.xpu.empty_cache()
 
 ### 開発用依存関係
 ```powershell
-uv pip install -e ".[dev]"
+uv sync --extra dev
 ```
 
 ### Ruff（リンター）

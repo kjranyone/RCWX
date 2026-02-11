@@ -23,6 +23,9 @@ uv run rcwx download
 uv sync --extra lowlatency
 # または: pip install torchfcpe
 
+# 4b) (オプション) SwiftF0超高速F0を追加
+pip install swift-f0
+
 # 5) (オプション) ML Denoiser利用可否を確認
 uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(is_ml_denoiser_available())"
 
@@ -70,16 +73,19 @@ rcwx/
 ├── diagnose.py
 ├── downloader.py
 ├── audio/
-│   ├── input.py
-│   ├── output.py
-│   ├── buffer.py          # RingOutputBuffer など
+│   ├── input.py           # AudioInput (マイク入力)
+│   ├── output.py          # AudioOutput
+│   ├── buffer.py          # RingOutputBuffer
 │   ├── resample.py        # StatefulResampler
 │   ├── sola.py            # simple SOLA
-│   └── denoise.py         # auto/ml/spectral
+│   ├── denoise.py         # auto/ml/spectral
+│   ├── wav_input.py       # WAVファイルループ入力
+│   └── stream_base.py     # ストリーム基底
 ├── models/
 │   ├── hubert_loader.py
 │   ├── rmvpe.py
 │   ├── fcpe.py
+│   ├── swiftf0.py         # SwiftF0 (ONNX/CPU)
 │   ├── synthesizer.py
 │   └── infer_pack/
 ├── pipeline/
@@ -88,6 +94,9 @@ rcwx/
 └── gui/
     ├── app.py
     ├── realtime_controller.py
+    ├── model_loader.py    # 非同期モデルロード
+    ├── audio_test.py      # オーディオテスト
+    ├── file_converter.py  # ファイル変換
     └── widgets/
         ├── audio_settings.py
         ├── latency_settings.py
@@ -116,7 +125,7 @@ rcwx/
 
 | Key | Default | Notes |
 |---|---:|---|
-| `f0_method` | `rmvpe` | `fcpe` / `rmvpe` |
+| `f0_method` | `rmvpe` | `rmvpe` / `fcpe` / `swiftf0` |
 | `use_f0` | `true` | F0有効化 |
 | `use_index` | `true` | FAISS有効化 |
 | `index_ratio` | `0.15` | FAISS混合率 |
@@ -140,8 +149,15 @@ rcwx/
 | `denoise.enabled` | `true` | ノイズ除去 |
 | `denoise.method` | `ml` | `auto` / `ml` / `spectral` |
 
-注記:
-- `lookahead_sec` と `use_feature_cache` は **現行設定に存在しません**。
+### `RCWXConfig` (`rcwx/config.py`) トップレベル
+
+| Key | Default | Notes |
+|---|---:|---|
+| `models_dir` | `~/.cache/rcwx/models` | HuBERT・RMVPEモデルディレクトリ |
+| `rvc_models_dir` | `None` | RVCモデルディレクトリ（ドロップダウンスキャン用） |
+| `last_model_path` | `None` | 最後に使用したモデルパス |
+| `device` | `auto` | auto/xpu/cuda/cpu |
+| `dtype` | `float16` | float16/float32/bfloat16 |
 
 ### `RealtimeConfig` (`rcwx/pipeline/realtime_unified.py`)
 
@@ -181,7 +197,7 @@ uv run rcwx                  # GUI起動（command省略時デフォルト）
 uv run rcwx gui              # GUI起動
 uv run rcwx devices          # デバイス一覧
 uv run rcwx download         # 必須モデルダウンロード
-uv run rcwx run in.wav model.pth -o out.wav --pitch 5
+uv run rcwx run in.wav model.pth -o out.wav --pitch 5 --f0-method rmvpe
 uv run rcwx info model.pth   # モデル情報
 uv run rcwx diagnose         # フィードバック診断
 uv run rcwx logs             # ログ一覧
