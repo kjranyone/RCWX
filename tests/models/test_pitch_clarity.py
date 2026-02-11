@@ -61,14 +61,6 @@ def _modulation_power_ratio(
     return filt_spec[idx].item() / orig_power
 
 
-def _smooth_fcpe_f0(f0: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    """Reference FCPE smoothing (matches pipeline implementation)."""
-    f0_smooth = torch.nn.functional.avg_pool1d(
-        f0.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
-    ).squeeze(1)
-    return torch.where(f0 > 0, f0_smooth, f0)
-
-
 # ---------------------------------------------------------------------------
 # Tests: lowpass_f0 cutoff behavior
 # ---------------------------------------------------------------------------
@@ -120,35 +112,6 @@ def test_lowpass_f0_short_input_passthrough():
 
 
 # ---------------------------------------------------------------------------
-# Tests: FCPE smoothing kernel
-# ---------------------------------------------------------------------------
-
-def test_fcpe_kernel3_sharper_than_kernel5():
-    """kernel=3 should preserve step transitions better than kernel=5."""
-    # Create a step function: low pitch -> high pitch
-    f0 = torch.ones(1, 100) * 200.0
-    f0[0, 50:] = 400.0
-
-    smooth3 = _smooth_fcpe_f0(f0, kernel_size=3)
-    smooth5 = _smooth_fcpe_f0(f0, kernel_size=5)
-
-    # Measure transition sharpness: diff at step boundary
-    diff3 = abs(smooth3[0, 50].item() - smooth3[0, 49].item())
-    diff5 = abs(smooth5[0, 50].item() - smooth5[0, 49].item())
-    print(f"  Step diff: kernel3={diff3:.1f}Hz, kernel5={diff5:.1f}Hz")
-    assert diff3 > diff5, f"kernel=3 should be sharper: diff3={diff3:.1f} vs diff5={diff5:.1f}"
-
-
-def test_fcpe_smoothing_preserves_voiced_mask():
-    """Smoothing should preserve unvoiced=0 regions."""
-    f0 = torch.ones(1, 50) * 250.0
-    f0[0, 20:30] = 0.0  # unvoiced gap
-
-    smoothed = _smooth_fcpe_f0(f0, kernel_size=3)
-    assert torch.all(smoothed[0, 20:30] == 0.0), "Unvoiced gap should remain 0"
-
-
-# ---------------------------------------------------------------------------
 # Tests: octave flip suppression
 # ---------------------------------------------------------------------------
 
@@ -196,8 +159,6 @@ if __name__ == "__main__":
         test_lowpass_f0_16hz_preserves_12hz,
         test_lowpass_f0_preserves_unvoiced,
         test_lowpass_f0_short_input_passthrough,
-        test_fcpe_kernel3_sharper_than_kernel5,
-        test_fcpe_smoothing_preserves_voiced_mask,
         test_suppress_octave_flips_halves_obvious_double,
         test_suppress_octave_flips_keeps_natural_contour,
         test_limit_f0_slew_clamps_large_step,

@@ -1,6 +1,6 @@
 """Audio I/O and processing modules."""
 
-from rcwx.audio.buffer import ChunkBuffer
+from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.audio.denoise import (
     DenoiseConfig,
     MLDenoiser,
@@ -15,7 +15,7 @@ from rcwx.audio.resample import resample
 __all__ = [
     "AudioInput",
     "AudioOutput",
-    "ChunkBuffer",
+    "RingOutputBuffer",
     "DenoiseConfig",
     "MLDenoiser",
     "SpectralGateDenoiser",

@@ -359,110 +359,8 @@ def test_sola_crossfade():
 # 4. Chunk Boundary Diagnostic
 # ============================================================================
 
-def test_chunk_boundary():
-    """
-    チャンク境界での処理を検証。
-
-    問題点:
-    - 第一チャンクのreflection padding
-    - コンテキストトリミングの精度
-    """
-    from rcwx.audio.buffer import ChunkBuffer
-
-    logger.info("=" * 60)
-    logger.info("TEST: Chunk Boundary Processing")
-    logger.info("=" * 60)
-
-    # パラメータ
-    chunk_samples = 7200  # 150ms @ 48kHz
-    context_samples = 4800  # 100ms @ 48kHz
-    crossfade_samples = 2400  # 50ms @ 48kHz
-
-    # テスト信号
-    sample_rate = 48000
-    duration = 1.0
-    t = np.linspace(0, duration, int(sample_rate * duration), dtype=np.float32)
-    test_signal = 0.5 * np.sin(2 * np.pi * 440 * t)
-
-    # ChunkBuffer作成
-    buffer = ChunkBuffer(
-        chunk_samples=chunk_samples,
-        crossfade_samples=0,
-        context_samples=context_samples,
-        lookahead_samples=0,
-    )
-
-    # 入力を追加
-    buffer.add_input(test_signal)
-
-    # チャンク抽出
-    chunks = []
-    chunk_info = []
-
-    while buffer.has_chunk():
-        chunk = buffer.get_chunk()
-        if chunk is not None:
-            chunks.append(chunk)
-            chunk_info.append({
-                'len': len(chunk),
-                'expected_len': chunk_samples + context_samples,
-                'start_sample': chunk[0],
-                'end_sample': chunk[-1],
-            })
-
-    logger.info(f"Extracted {len(chunks)} chunks")
-
-    # 第一チャンクの検証
-    if len(chunks) > 0:
-        first_chunk = chunks[0]
-        logger.info(f"\nFirst chunk analysis:")
-        logger.info(f"  Length: {len(first_chunk)}")
-        logger.info(f"  Expected: {chunk_samples + context_samples}")
-
-        # Reflection paddingの検証
-        if context_samples > 0:
-            reflection_part = first_chunk[:context_samples]
-            main_start = first_chunk[context_samples:context_samples + context_samples]
-
-            # Reflectionは元の先頭のリバース
-            expected_reflection = test_signal[:context_samples][::-1]
-
-            reflection_match = np.allclose(reflection_part, expected_reflection, atol=1e-6)
-            logger.info(f"  Reflection padding correct: {reflection_match}")
-
-            if not reflection_match:
-                logger.warning("  WARNING: Reflection padding mismatch")
-
-    # チャンク間の連続性検証
-    if len(chunks) > 1:
-        logger.info(f"\nChunk continuity analysis:")
-        for i in range(1, len(chunks)):
-            prev_chunk = chunks[i - 1]
-            curr_chunk = chunks[i]
-
-            # コンテキスト部分は前のチャンクの一部と重複するはず
-            if context_samples > 0:
-                prev_main_end = prev_chunk[-(chunk_samples):]  # 前チャンクのmain部分の末尾
-                curr_context = curr_chunk[:context_samples]  # 現チャンクのcontext部分
-
-                # 重複部分の確認
-                overlap_len = min(len(prev_main_end), len(curr_context))
-                if overlap_len > 0:
-                    expected_overlap = prev_main_end[-overlap_len:]
-                    actual_overlap = curr_context[:overlap_len]
-
-                    overlap_match = np.allclose(expected_overlap, actual_overlap, atol=1e-6)
-                    if not overlap_match:
-                        logger.warning(f"  Chunk {i}: Context does not match previous main!")
-
-    return {
-        'num_chunks': len(chunks),
-        'chunk_lengths': [len(c) for c in chunks],
-    }
-
-
 # ============================================================================
-# 5. End-to-End Latency Analysis
+# 4. End-to-End Latency Analysis
 # ============================================================================
 
 def test_latency_accumulation():
@@ -561,7 +459,7 @@ def main():
     parser = argparse.ArgumentParser(description="Diagnostic Analysis Tool")
     parser.add_argument(
         "--component",
-        choices=["resampler", "feature_cache", "sola", "chunk_boundary", "latency", "all"],
+        choices=["resampler", "feature_cache", "sola", "latency", "all"],
         default="all",
         help="Component to test",
     )
@@ -578,9 +476,6 @@ def main():
 
     if args.component in ["sola", "all"]:
         results["sola"] = test_sola_crossfade()
-
-    if args.component in ["chunk_boundary", "all"]:
-        results["chunk_boundary"] = test_chunk_boundary()
 
     if args.component in ["latency", "all"]:
         results["latency"] = test_latency_accumulation()

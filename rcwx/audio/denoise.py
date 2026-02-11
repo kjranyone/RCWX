@@ -459,7 +459,7 @@ def denoise(
     # Select method
     use_ml = False
 
-    if method == "ml" or method == "deepfilter":  # Accept both names for compatibility
+    if method == "ml":
         use_ml = True
     elif method == "auto":
         # Try ML denoiser first
@@ -493,20 +493,3 @@ def is_ml_denoiser_available() -> bool:
         return True
     except ImportError:
         return False
-
-
-# Backwards compatibility alias (deprecated)
-def is_deepfilter_available() -> bool:
-    """Check if ML denoiser is available.
-
-    .. deprecated::
-        Use :func:`is_ml_denoiser_available` instead.
-        This alias will be removed in a future version.
-    """
-    import warnings
-    warnings.warn(
-        "is_deepfilter_available() is deprecated, use is_ml_denoiser_available() instead",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return is_ml_denoiser_available()

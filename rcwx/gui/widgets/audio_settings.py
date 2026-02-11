@@ -194,15 +194,6 @@ class AudioSettingsFrame(ctk.CTkFrame):
         )
         self.output_dropdown.grid(row=5, column=0, padx=10, pady=2, sticky="ew")
 
-        # Note: Chunk size is now managed by LatencySettingsFrame
-        # Keep chunk_sec and chunk_options for backwards compatibility
-        self.chunk_sec: float = 0.5
-        self.chunk_options = [
-            ("200ms (低遅延/F0なし)", 0.2),
-            ("350ms (バランス)", 0.35),
-            ("500ms (高品質)", 0.5),
-        ]
-
         # Input level meter section
         self.level_label = ctk.CTkLabel(
             self,

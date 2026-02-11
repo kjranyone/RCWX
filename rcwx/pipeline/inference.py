@@ -12,7 +12,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.signal import butter, filtfilt, medfilt, resample_poly
 
 from rcwx.audio.denoise import denoise as denoise_audio
@@ -36,7 +35,6 @@ MIN_SYNTH_FEATURE_FRAMES = 64
 # benefits from seeing more audio).  F0 is extracted on the current chunk
 # only (pitch detection is local), so this doesn't affect F0 processing time.
 # 2.0s (32000 samples) gives cosine similarity ~0.60 vs batch features.
-MAX_HUBERT_CONTEXT_16K = 32000  # 2.0 seconds @ 16kHz
 # Keep within practical CLI/GUI pitch range.
 # GUI pitch slider is -24..+24 semitones.
 MAX_PRE_HUBERT_SHIFT_ST = 24.0

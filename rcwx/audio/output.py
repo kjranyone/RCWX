@@ -69,16 +69,6 @@ class AudioOutput(AudioStreamBase):
         else:
             outdata.fill(0)
 
-    def set_callback(self, callback: Callable[[int], NDArray[np.float32]]) -> None:
-        """Set the audio callback function."""
-        self._callback = callback
-
-
 def list_output_devices(wasapi_only: bool = False) -> list[dict]:
     """List available audio output devices (all drivers by default)."""
     return list_devices("output", wasapi_only)
-
-
-def get_default_output_device() -> Optional[int]:
-    """Get the default output device index."""
-    return get_default_device("output")
