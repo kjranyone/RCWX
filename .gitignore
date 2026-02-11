@@ -18,5 +18,10 @@ sample_data/
 test_output/
 debug_*
 
+# Test artifacts
+*.wav
+*.log
+*.csv
+
 # Obsidian
 .obsidian/
