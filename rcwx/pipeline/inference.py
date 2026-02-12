@@ -40,6 +40,7 @@ MIN_SYNTH_FEATURE_FRAMES = 64
 # GUI pitch slider is -24..+24 semitones.
 MAX_PRE_HUBERT_SHIFT_ST = 24.0
 MAX_MOE_BOOST = 1.0
+F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
 SWIFTF0_VOICING_THRESHOLD = 0.35
@@ -941,6 +942,8 @@ class RVCPipeline:
         self._streaming_feat_cache = None
         # HuBERT audio context buffer (accumulates 16kHz audio for richer context)
         self._streaming_audio_history = None
+        # F0 pre-filter tail for cross-chunk filter continuity
+        self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
 
     @torch.no_grad()
     def infer(
@@ -2106,15 +2109,48 @@ class RVCPipeline:
                         align_corners=False,
                     ).squeeze(1)
 
-                # Median filter for spike removal
-                f0 = smooth_f0_spikes(f0, window=3)
+                # --- F0 cross-chunk filter continuity ---
+                # Cache the output-region tail BEFORE filtering, then prepend
+                # previous chunk's tail so filters see continuous context.
+                samples_per_frame_f0 = self.sample_rate // 100
+                trim_right_feat_f0 = max(
+                    0,
+                    (t_pad_tgt + extra_pad_tgt - hubert_deficit)
+                    // samples_per_frame_f0,
+                )
+                output_rightmost_feat = f0.shape[1] - trim_right_feat_f0
+                cache_end = max(0, output_rightmost_feat)
+                cache_start = max(0, cache_end - F0_HISTORY_FRAMES)
+                new_f0_tail = f0[:, cache_start:cache_end].clone()
 
-                # Lowpass filter for jitter removal
-                f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
+                # Prepend history for filter warmup
+                f0_history_len = 0
+                if self._streaming_f0_pre_filter_tail is not None:
+                    history = self._streaming_f0_pre_filter_tail
+                    f0_history_len = history.shape[1]
+                    f0_extended = torch.cat([history, f0], dim=1)
+                else:
+                    f0_extended = f0
+
+                # Apply filters on extended F0
+                f0_extended = smooth_f0_spikes(f0_extended, window=3)
+                f0_extended = lowpass_f0(
+                    f0_extended,
+                    cutoff_hz=f0_lowpass_cutoff_hz,
+                    sample_rate=100.0,
+                )
                 if enable_octave_flip_suppress:
-                    f0 = suppress_octave_flips(f0)
+                    f0_extended = suppress_octave_flips(f0_extended)
                 if enable_f0_slew_limit:
-                    f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
+                    f0_extended = limit_f0_slew(
+                        f0_extended, max_step_st=f0_slew_max_step_st
+                    )
+
+                # Strip history prefix to restore original size
+                f0 = f0_extended[:, f0_history_len:]
+
+                # Update cache (pre-filter F0)
+                self._streaming_f0_pre_filter_tail = new_f0_tail
 
                 pitchf = f0.to(self.dtype)
 
