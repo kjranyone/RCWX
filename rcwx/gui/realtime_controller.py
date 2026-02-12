@@ -106,6 +106,7 @@ class RealtimeController:
                 f0_method=self.app.pitch_control.f0_method,
                 pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
                 moe_boost=self.app.pitch_control.moe_boost,
+                hubert_context_sec=self.app.config.inference.hubert_context_sec,
                 # Audio settings
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 index_rate=self.app._get_index_rate(),

@@ -83,6 +83,9 @@ class InferenceConfig:
     # SOLA search window in ms
     sola_search_ms: float = 10.0
 
+    # HuBERT context window in seconds (longer = more stable timbre across chunks)
+    hubert_context_sec: float = 1.0
+
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
     pre_hubert_pitch_ratio: float = 0.08
 

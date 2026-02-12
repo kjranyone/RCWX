@@ -77,7 +77,6 @@ class StatefulResampler:
             orig_sr: Original sample rate
             target_sr: Target sample rate
             overlap_samples: Overlap size in input samples (auto-calculated if None)
-                Default: 10 * down_factor (sufficient for scipy's default filter)
         """
         self.orig_sr = orig_sr
         self.target_sr = target_sr
@@ -89,12 +88,13 @@ class StatefulResampler:
         self.up = target_sr // g
         self.down = orig_sr // g
 
-        # Overlap size: default to 20x down factor (improved filter transient coverage)
-        # scipy.signal.resample_poly uses a Kaiser window with beta=5.0
-        # Filter length ≈ 2 * down * 10 samples (empirical)
-        # Increased from 10x to 20x for better phase continuity
+        # Overlap size: based on polyphase filter half-length in input samples.
+        # scipy resample_poly default Kaiser filter has ~10*max(up,down) taps
+        # at the upsampled rate.  In input samples: 10*max(up,down)/up.
+        # Double for safety, minimum 20 samples.
         if overlap_samples is None:
-            overlap_samples = 20 * self.down
+            filter_half_input = 10 * max(self.up, self.down) // self.up + 1
+            overlap_samples = max(20, 2 * filter_half_input)
         self.overlap_samples = overlap_samples
 
         # Overlap buffer: stores tail of previous chunk
@@ -116,17 +116,19 @@ class StatefulResampler:
         if self.orig_sr == self.target_sr:
             return chunk
 
+        actual_overlap = min(self.overlap_samples, len(chunk))
+
         # First chunk: no overlap
         if self.overlap_buffer is None:
             # Resample with extra tail for next overlap
-            extended = np.concatenate([chunk, np.zeros(self.overlap_samples, dtype=np.float32)])
+            extended = np.concatenate([chunk, np.zeros(actual_overlap, dtype=np.float32)])
             resampled_extended = resample_poly(extended, self.up, self.down).astype(np.float32)
 
             # Calculate output length for this chunk (without overlap)
             expected_output_len = int(len(chunk) * self.up / self.down)
 
             # Save overlap for next chunk
-            self.overlap_buffer = chunk[-self.overlap_samples :].copy()
+            self.overlap_buffer = chunk[-actual_overlap:].copy()
 
             # Return main output (trim the extra tail)
             return resampled_extended[:expected_output_len]
@@ -138,14 +140,15 @@ class StatefulResampler:
         # Resample extended input
         resampled_extended = resample_poly(extended_input, self.up, self.down).astype(np.float32)
 
-        # Calculate overlap length in output samples
-        overlap_output_len = int(self.overlap_samples * self.up / self.down)
+        # Calculate overlap length in output samples using ACTUAL buffer length
+        actual_buf_len = len(self.overlap_buffer)
+        overlap_output_len = int(actual_buf_len * self.up / self.down)
 
         # Calculate expected output length for this chunk
         expected_output_len = int(len(chunk) * self.up / self.down)
 
         # Save new overlap for next chunk
-        self.overlap_buffer = chunk[-self.overlap_samples :].copy()
+        self.overlap_buffer = chunk[-actual_overlap:].copy()
 
         # Trim overlap from beginning and return
         # The overlap region absorbs filter transient, main output is phase-aligned

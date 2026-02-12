@@ -202,6 +202,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         pre_hubert_pitch_ratio=args.pre_hubert_pitch,
         moe_boost=args.moe_boost,
         noise_scale=args.noise_scale,
+        pad_mode="batch",
+        use_feature_cache=False,
     )
 
     # Save output

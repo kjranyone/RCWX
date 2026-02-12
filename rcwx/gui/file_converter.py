@@ -115,6 +115,9 @@ class FileConverter:
                     enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
                     enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
                     f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
+                    denoise=self.app.use_denoise_var.get(),
+                    use_feature_cache=False,
+                    pad_mode="batch",
                 )
 
                 self._converted_audio = output

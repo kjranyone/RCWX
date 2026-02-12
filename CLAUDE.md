@@ -132,6 +132,7 @@ rcwx/
 | `crossfade_sec` | `0.08` | SOLAクロスフェード長 |
 | `use_sola` | `true` | SOLA有効化 |
 | `sola_search_ms` | `10.0` | SOLA探索窓 |
+| `hubert_context_sec` | `1.0` | HuBERTコンテキスト窓 (秒) |
 | `pre_hubert_pitch_ratio` | `0.08` | プレHuBERTシフト比率 (0.0-1.0) |
 | `moe_boost` | `0.45` | Moeボイススタイル強度 (0.0-1.0) |
 | `noise_scale` | `0.45` | 合成ノイズスケール (0.0-1.0) |
@@ -159,6 +160,7 @@ rcwx/
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
+- `hubert_context_sec` (既定 1.0)
 - `prebuffer_chunks` (既定 1)
 - `buffer_margin` (既定 0.5)
 - `f0_method` (既定 `rmvpe`)

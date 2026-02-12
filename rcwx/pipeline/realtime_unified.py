@@ -82,7 +82,7 @@ class RealtimeConfig:
     crossfade_sec: float = 0.05
     sola_search_ms: float = 10.0  # SOLA search window in ms
     prebuffer_chunks: int = 1
-    buffer_margin: float = 0.3
+    buffer_margin: float = 0.5
 
     # Pitch / F0
     pitch_shift: int = 0
@@ -106,6 +106,9 @@ class RealtimeConfig:
 
     # SOLA
     use_sola: bool = True
+
+    # HuBERT context window in seconds (longer = more stable timbre across chunks)
+    hubert_context_sec: float = 1.0
 
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift before HuBERT)
     pre_hubert_pitch_ratio: float = 0.0
@@ -241,14 +244,21 @@ class RealtimeVoiceChangerUnified:
 
         # SOLA extra: produce additional output samples (at model_sr) so
         # SOLA has a full crossfade+search region that overlaps with the
-        # previous chunk's tail.  This matches w-okada's approach where the
-        # synthesizer output includes room for SOLA to crossfade without
-        # clipping into non-overlapping audio.  The ring buffer absorbs the
-        # resulting small surplus (~crossfade_sec per chunk) via overflow.
-        sola_extra_out = crossfade_samples_out + search_samples_out
-        self._sola_extra_model = int(
+        # previous chunk's tail.  Worst-case SOLA needs cf+search+target_len
+        # from the audio, and we produce hop+sola_extra.  Add an extra
+        # search_samples_out as margin so SOLA target_len always succeeds
+        # even at the maximum search offset.
+        # Round up to model's zc boundary (= sample_rate // 100) so that
+        # trim_left in infer_streaming is always a multiple of
+        # samples_per_frame, eliminating sub-frame residual trim.
+        sola_extra_out = crossfade_samples_out + 2 * search_samples_out
+        zc_model = self.pipeline.sample_rate // 100
+        sola_extra_raw = int(
             sola_extra_out * self.pipeline.sample_rate
             / self._runtime_output_sample_rate
+        )
+        self._sola_extra_model = (
+            (sola_extra_raw + zc_model - 1) // zc_model * zc_model
         )
 
         # Output buffer: 4x chunk capacity (physical ring size)
@@ -271,7 +281,7 @@ class RealtimeVoiceChangerUnified:
         # resample (np.interp) to the requested frame count.  This speeds
         # up playback by an imperceptible amount (≤1.5%) instead of
         # skipping audio, which would cause clicks.
-        self._drain_target = self._hop_samples_out * 3 // 4
+        self._drain_target = self._compute_drain_target()
 
         # Input accumulator (ring buffer at mic rate)
         self._input_buf = np.array([], dtype=np.float32)
@@ -301,7 +311,7 @@ class RealtimeVoiceChangerUnified:
         self._feedback_check_interval = 10
         self._feedback_warning_shown = False
 
-        # Volume envelope continuity across chunks
+        # Boundary gain continuity across emitted chunks (post-SOLA).
         self._prev_tail_rms: float = 0.0
 
         # Cached arrays for adaptive drift np.interp (avoid per-callback alloc)
@@ -317,6 +327,21 @@ class RealtimeVoiceChangerUnified:
     def _align_to_hop(samples: int, hop: int) -> int:
         """Round sample count up to nearest multiple of hop."""
         return ((samples + hop - 1) // hop) * hop
+
+    def _compute_drain_target_for_frames(self, frames: int) -> int:
+        """Compute drift-control target for the current callback frame size."""
+        frame_count = max(1, int(frames))
+        # Natural post-callback level after one hop-sized enqueue.
+        base_target = max(0, self._hop_samples_out - frame_count)
+        margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
+        # 0.5 = neutral (natural target), <0.5 tighter, >0.5 more relaxed.
+        margin_offset = int((margin - 0.5) * self._hop_samples_out)
+        return max(0, base_target + margin_offset)
+
+    def _compute_drain_target(self) -> int:
+        """Compute nominal drift-control target (for non-callback contexts)."""
+        nominal_frames = max(1, self._hop_samples_out // 4)
+        return self._compute_drain_target_for_frames(nominal_frames)
 
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
@@ -345,14 +370,18 @@ class RealtimeVoiceChangerUnified:
         self._sola_state.search_samples = search_samples_out
         self._sola_state._hann_fade_in = None
         self._sola_state._hann_fade_out = None
-        sola_extra_out = crossfade_samples_out + search_samples_out
-        self._sola_extra_model = int(
+        sola_extra_out = crossfade_samples_out + 2 * search_samples_out
+        zc_model = self.pipeline.sample_rate // 100
+        sola_extra_raw = int(
             sola_extra_out * self.pipeline.sample_rate
             / self._runtime_output_sample_rate
         )
+        self._sola_extra_model = (
+            (sola_extra_raw + zc_model - 1) // zc_model * zc_model
+        )
 
-        # Adaptive drift control target (natural steady-state peak)
-        self._drain_target = self._hop_samples_out * 3 // 4
+        # Adaptive drift control target
+        self._drain_target = self._compute_drain_target()
 
     def _apply_runtime_sample_rates(self, mic_rate: int, output_rate: int) -> None:
         """Apply actual stream sample rates and rebuild dependent state."""
@@ -396,6 +425,7 @@ class RealtimeVoiceChangerUnified:
         self.output_buffer.clear()
         self._input_buf = np.array([], dtype=np.float32)
         self._overlap_buf = None
+        self._reset_boundary_continuity_state()
         self._chunks_ready = 0
         self._output_started = False
         self.input_resampler.reset()
@@ -464,6 +494,7 @@ class RealtimeVoiceChangerUnified:
         self._sola_state.buffer = None
         self._input_buf = np.array([], dtype=np.float32)
         self._overlap_buf = None
+        self._reset_boundary_continuity_state()
         self._chunks_ready = 0
         self._output_started = False
         self._clear_queues()
@@ -563,6 +594,7 @@ class RealtimeVoiceChangerUnified:
 
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
+        self._drain_target = self._compute_drain_target()
 
     def set_overlap(self, overlap_sec: float) -> None:
         self.config.overlap_sec = max(0.0, float(overlap_sec))
@@ -652,10 +684,12 @@ class RealtimeVoiceChangerUnified:
         # samples from the ring and linearly interpolate back to `frames`.
         # This speeds up playback by ≤1.5% — inaudible — while smoothly
         # converging the buffer level toward the natural steady-state peak.
+        drain_target = self._compute_drain_target_for_frames(frames)
+        threshold = drain_target + frames
         avail = self.output_buffer.available
         extra = 0
-        if avail > self._drain_target + frames:
-            excess = avail - self._drain_target
+        if avail > threshold:
+            excess = avail - threshold
             # Cap extra at ~1.5% of frames to keep pitch shift inaudible
             max_extra = max(1, frames // 64)
             extra = min(max_extra, excess)
@@ -679,7 +713,7 @@ class RealtimeVoiceChangerUnified:
                     extra,
                     extra * 1000.0 / self._runtime_output_sample_rate,
                     avail,
-                    self._drain_target,
+                    drain_target,
                     self.stats.buffer_trims,
                 )
         else:
@@ -713,6 +747,7 @@ class RealtimeVoiceChangerUnified:
                     self.input_resampler.reset()
                     self.output_resampler.reset()
                     self._sola_state.buffer = None
+                    self._reset_boundary_continuity_state()
                     logger.warning(
                         "[CATCHUP] Dropped %d stale input chunk(s) to bound latency",
                         stale_dropped,
@@ -721,6 +756,7 @@ class RealtimeVoiceChangerUnified:
                 continue
             except Exception as e:
                 logger.error(f"Inference error: {e}", exc_info=True)
+                self._reset_boundary_continuity_state()
                 if self.on_error:
                     self.on_error(f"推論エラー: {e}")
                 continue
@@ -814,40 +850,11 @@ class RealtimeVoiceChangerUnified:
                     enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
                     enable_f0_slew_limit=self.config.enable_f0_slew_limit,
                     f0_slew_max_step_st=self.config.f0_slew_max_step_st,
+                    hubert_context_sec=self.config.hubert_context_sec,
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
                 output_48k = self.output_resampler.resample_chunk(output_model)
-
-                # --- Stage 6.5: Volume envelope continuity ---
-                # Each synthesis run produces slightly different amplitude
-                # due to HuBERT context shift.  Match the boundary amplitude
-                # to the previous chunk's tail, then ramp to natural level.
-                # This prevents the 5Hz pumping effect on sustained sounds.
-                if len(output_48k) > 0:
-                    boundary = min(len(output_48k) // 4, 2400)
-                    head_rms = np.sqrt(
-                        np.mean(output_48k[:boundary] ** 2) + 1e-10
-                    )
-                    if self._prev_tail_rms > 0.001 and head_rms > 0.001:
-                        ratio = np.clip(
-                            self._prev_tail_rms / head_rms, 0.7, 1.4
-                        )
-                        if abs(ratio - 1.0) > 0.05:
-                            ramp_len = min(len(output_48k) // 4, 4800)
-                            ramp = np.linspace(
-                                ratio, 1.0, ramp_len, dtype=np.float32
-                            )
-                            output_48k = output_48k.copy()
-                            output_48k[:ramp_len] *= ramp
-                    self._prev_tail_rms = np.sqrt(
-                        np.mean(output_48k[-boundary:] ** 2) + 1e-10
-                    )
-
-                # Soft clip
-                max_val = np.max(np.abs(output_48k)) if len(output_48k) else 0.0
-                if max_val > 1.0:
-                    output_48k = np.tanh(output_48k)
 
                 # --- Stage 7: SOLA crossfade ---
                 # target_len = hop_out: forces output to exactly output-hop
@@ -858,6 +865,15 @@ class RealtimeVoiceChangerUnified:
                         output_48k, self._sola_state,
                         target_len=self._hop_samples_out,
                     )
+
+                # --- Stage 7.5: Boundary gain continuity ---
+                # Keep this after SOLA so splice alignment is unaffected.
+                output_48k = self._apply_output_boundary_gain(output_48k)
+
+                # Soft clip final output
+                max_val = np.max(np.abs(output_48k)) if len(output_48k) else 0.0
+                if max_val > 1.0:
+                    output_48k = np.tanh(output_48k)
 
                 # --- Stage 8: Feedback detection ---
                 if not self.config.wav_input_path:
@@ -922,6 +938,7 @@ class RealtimeVoiceChangerUnified:
 
             except Exception as e:
                 logger.error(f"Inference error: {e}", exc_info=True)
+                self._reset_boundary_continuity_state()
                 if self.on_error:
                     self.on_error(f"推論エラー: {e}")
 
@@ -1062,14 +1079,97 @@ class RealtimeVoiceChangerUnified:
             logger.warning(f"[WARMUP] Denoiser warmup failed (non-fatal): {e}")
 
     def _run_runtime_warmup(self) -> None:
-        """Placeholder — no longer needed.
+        """Warm up streaming inference path with runtime chunk shape.
 
-        The old torchaudio.pitch_shift required kernel compilation warmup.
-        pitch_shift_resample (scipy) is instant (~1 ms) and needs no warmup.
+        This pre-builds shape-dependent kernels before streams start,
+        avoiding first-chunk stalls that can overflow input queues.
         """
-        pass
+        try:
+            hop_16k = self._hop_samples_16k
+            overlap_16k = min(self._overlap_samples_16k, hop_16k)
+            warmup_hop = np.random.randn(hop_16k).astype(np.float32) * 0.001
+            if overlap_16k > 0:
+                reflection = warmup_hop[:overlap_16k][::-1].copy()
+                chunk_16k = np.concatenate([reflection, warmup_hop])
+            else:
+                chunk_16k = warmup_hop
+
+            f0_method = self.config.f0_method if self.config.use_f0 else "none"
+            output_model = self.pipeline.infer_streaming(
+                audio_16k=chunk_16k,
+                overlap_samples=overlap_16k,
+                pitch_shift=self.config.pitch_shift,
+                f0_method=f0_method,
+                index_rate=0.0,
+                index_k=self.config.index_k,
+                voice_gate_mode="off",
+                energy_threshold=self.config.energy_threshold,
+                use_parallel_extraction=self.config.use_parallel_extraction,
+                noise_scale=self.config.noise_scale,
+                sola_extra_samples=self._sola_extra_model,
+                pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
+                moe_boost=self.config.moe_boost,
+                f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
+                enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
+                enable_f0_slew_limit=self.config.enable_f0_slew_limit,
+                f0_slew_max_step_st=self.config.f0_slew_max_step_st,
+                hubert_context_sec=self.config.hubert_context_sec,
+            )
+            _ = self.output_resampler.resample_chunk(output_model)
+
+            # Reset warmup side-effects so first real chunk starts cleanly.
+            self.pipeline.clear_cache()
+            self.input_resampler.reset()
+            self.output_resampler.reset()
+            self._sola_state.buffer = None
+            self._overlap_buf = None
+            self._reset_boundary_continuity_state()
+            logger.info("[WARMUP] Streaming path warmup complete")
+        except Exception as e:
+            self._reset_boundary_continuity_state()
+            logger.warning(f"[WARMUP] Streaming path warmup failed (non-fatal): {e}")
 
     # ======== Helpers ========
+
+    def _reset_boundary_continuity_state(self) -> None:
+        """Reset chunk-boundary gain continuity state."""
+        self._prev_tail_rms = 0.0
+
+    def _apply_output_boundary_gain(self, output: np.ndarray) -> np.ndarray:
+        """Apply a mild post-SOLA gain ramp to smooth boundary loudness.
+
+        The adjustment is intentionally conservative:
+        - short analysis window (5ms),
+        - tight gain clamp (0.9x..1.1x),
+        - short ramp (10ms),
+        - disabled for quiet heads (e.g., breaths).
+        """
+        if len(output) == 0:
+            return output
+
+        boundary = min(
+            len(output),
+            max(1, int(self._runtime_output_sample_rate * 0.005)),
+        )
+        head_rms = float(np.sqrt(np.mean(output[:boundary] ** 2) + 1e-10))
+        min_rms = 2e-3
+
+        if self._prev_tail_rms >= min_rms and head_rms >= min_rms:
+            ratio = float(np.clip(self._prev_tail_rms / head_rms, 0.9, 1.1))
+            if abs(ratio - 1.0) >= 0.02:
+                ramp_len = min(
+                    len(output),
+                    max(boundary, int(self._runtime_output_sample_rate * 0.010)),
+                )
+                ramp = np.linspace(ratio, 1.0, ramp_len, dtype=np.float32)
+                adjusted = output.copy()
+                adjusted[:ramp_len] *= ramp
+                output = adjusted
+
+        self._prev_tail_rms = float(
+            np.sqrt(np.mean(output[-boundary:] ** 2) + 1e-10)
+        )
+        return output
 
     def _clear_queues(self) -> None:
         while not self._input_queue.empty():
