@@ -3,6 +3,7 @@ name = "rcwx"
 version = "0.1.0"
 description = "RVC Real-time Voice Changer on Intel Arc (XPU)"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch>=2.7",
@@ -15,12 +16,14 @@ dependencies = [
     "huggingface-hub>=0.20",
     "transformers>=4.36",
     "faiss-cpu>=1.7.4",
-    "denoiser>=0.1",  # Facebook's ML noise suppression (PyTorch-based)
     "swift-f0>=0.1.2",  # Ultra-fast ONNX/CPU F0 extraction
     "torchfcpe>=0.0.1",  # Fast F0 extraction (FCPE)
 ]
 
 [project.optional-dependencies]
+ml-denoise = [
+    "denoiser>=0.1",  # Facebook's ML noise suppression (CC BY-NC 4.0)
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
