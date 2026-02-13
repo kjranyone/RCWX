@@ -4,11 +4,11 @@ RVC Real-time Voice Changer on Intel Arc (XPU)
 
 ## Features
 
-- **Intel Arc GPU対応** - PyTorch XPU + torch.compile による高速推論
+- **Intel Arc GPU対応** - PyTorch XPU による高速推論
 - **RVC v1/v2両対応** - 256次元・768次元特徴量モデルに対応
 - **F0あり/なしモデル対応** - RMVPE F0抽出または低遅延モード
 - **リアルタイム変換** - クロスフェード処理による低遅延・高品質変換
-- **ノイズキャンセリング** - ML (Facebook Denoiser) / Spectral Gate 切替可能
+- **ノイズキャンセリング** - ML (Facebook Denoiser, オプション) / Spectral Gate 切替可能
 - **ASIO対応** - プロオーディオインターフェース対応（WASAPI/DirectSound/MMEも利用可能）
 - **CustomTkinter GUI** - モダンなダークテーマUI
 - **フルスクラッチ実装** - rvc-python等の依存なし
@@ -72,8 +72,8 @@ uv run python -c "import torch; print(torch.__version__)"
 # 1. 依存関係インストール
 uv sync
 
-# 2. (推奨) 低レイテンシF0抽出をインストール
-uv sync --extra lowlatency
+# 2. (オプション) ML Denoiser をインストール (CC BY-NC 4.0)
+uv sync --extra ml-denoise
 
 # 3. 必要モデル (HuBERT, RMVPE) のダウンロード
 uv run rcwx download
@@ -85,7 +85,7 @@ uv run rcwx
 **デフォルト設定** (最適化済み):
 - F0方式: **RMVPE** (高品質)
 - チャンクサイズ: **300ms**
-- ノイズ除去: **ML** (Facebook Denoiser)
+- ノイズ除去: **ML** (Facebook Denoiser, 要 `--extra ml-denoise`) / Spectral (標準)
 - FAISS インデックス: **有効** (ratio=0.15)
 - 詳細は [Inference Settings](#inference-settings) 参照
 
@@ -163,8 +163,8 @@ uv run rcwx info model.pth
 | `ml` | Facebook Denoiser (PyTorch) | 高品質、人声保持 |
 | `spectral` | Spectral Gate (DSP) | 軽量、低遅延 |
 
-- **ML方式**: 機械学習ベースで人間の声を認識・保持しながらノイズを除去
-- **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去
+- **ML方式**: 機械学習ベースで人間の声を認識・保持しながらノイズを除去（要 `uv sync --extra ml-denoise`、CC BY-NC 4.0）
+- **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去（標準同梱）
 
 ## Inference Settings
 
@@ -444,7 +444,7 @@ This project is licensed under the MIT License.
 | ContentVec | MIT | [auspicious3000/contentvec](https://github.com/auspicious3000/contentvec) |
 | fairseq / HuBERT | MIT | [facebookresearch/fairseq](https://github.com/facebookresearch/fairseq) |
 | RMVPE | Apache 2.0 | [Dream-High/RMVPE](https://github.com/Dream-High/RMVPE) |
-| Facebook Denoiser | CC BY-NC 4.0 | [facebookresearch/denoiser](https://github.com/facebookresearch/denoiser) |
+| Facebook Denoiser (optional) | CC BY-NC 4.0 | [facebookresearch/denoiser](https://github.com/facebookresearch/denoiser) |
 | sounddevice | MIT | [spatialaudio/python-sounddevice](https://github.com/spatialaudio/python-sounddevice) |
 | PyTorch | BSD | [pytorch/pytorch](https://github.com/pytorch/pytorch) |
 | CustomTkinter | MIT | [TomSchimansky/CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) |
