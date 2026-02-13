@@ -379,19 +379,6 @@ class RCWXApp(ctk.CTk):
         )
         self.voice_gate_desc.pack(anchor="w", padx=10, pady=(0, 5))
 
-        # Chunk processing options
-        self.chunk_frame = ctk.CTkFrame(self.left_column)
-        self.chunk_frame.pack(fill="x", pady=(0, 5))
-
-        self.chunk_label = ctk.CTkLabel(
-            self.chunk_frame,
-            text="■ チャンク処理",
-            font=ctk.CTkFont(size=12, weight="bold"),
-        )
-        self.chunk_label.pack(anchor="w", padx=10, pady=(5, 3))
-
-        # Note: Overlap/Crossfade/SOLA settings are in the Latency Settings panel (Audio tab)
-
         # === Right column ===
         self.right_column = ctk.CTkFrame(self.main_columns, fg_color="transparent")
         self.right_column.grid(row=0, column=1, sticky="nsew", padx=3, pady=3)
