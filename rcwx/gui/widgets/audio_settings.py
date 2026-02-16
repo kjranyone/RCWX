@@ -340,6 +340,10 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._peak_db = -60.0
         self._recommended_gain = 0.0
 
+        # Device list cache (for change detection in auto-refresh)
+        self._cached_input_names: list[str] | None = None
+        self._cached_output_names: list[str] | None = None
+
 
     def _on_input_api_change(self, selected_api: str) -> None:
         """Handle input API filter change."""
@@ -347,6 +351,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._input_devices = self._filter_devices_by_hostapi(
             self._all_input_devices, selected_api
         )
+        self._cached_input_names = None  # force update
         self._refresh_input_dropdown()
 
     def _on_output_api_change(self, selected_api: str) -> None:
@@ -355,6 +360,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._output_devices = self._filter_devices_by_hostapi(
             self._all_output_devices, selected_api
         )
+        self._cached_output_names = None  # force update
         self._refresh_output_dropdown()
 
     def _refresh_input_dropdown(self) -> None:
@@ -362,20 +368,24 @@ class AudioSettingsFrame(ctk.CTkFrame):
         input_names = ["デフォルト"] + [
             self._format_device_name(d) for d in self._input_devices
         ]
-        self.input_dropdown.configure(values=input_names)
-        # Reset to default if current selection is not in new list
-        if self.input_var.get() not in input_names:
-            self.input_var.set("デフォルト")
+        if input_names != self._cached_input_names:
+            self._cached_input_names = input_names
+            self.input_dropdown.configure(values=input_names)
+            # Reset to default if current selection is not in new list
+            if self.input_var.get() not in input_names:
+                self.input_var.set("デフォルト")
 
     def _refresh_output_dropdown(self) -> None:
         """Refresh output device dropdown with current filter."""
         output_names = ["デフォルト"] + [
             self._format_device_name(d) for d in self._output_devices
         ]
-        self.output_dropdown.configure(values=output_names)
-        # Reset to default if current selection is not in new list
-        if self.output_var.get() not in output_names:
-            self.output_var.set("デフォルト")
+        if output_names != self._cached_output_names:
+            self._cached_output_names = output_names
+            self.output_dropdown.configure(values=output_names)
+            # Reset to default if current selection is not in new list
+            if self.output_var.get() not in output_names:
+                self.output_var.set("デフォルト")
 
     def _refresh_devices(self) -> None:
         """Refresh all device lists."""
@@ -402,27 +412,29 @@ class AudioSettingsFrame(ctk.CTkFrame):
         output_apis = self._get_available_hostapis(self._all_output_devices)
         self.output_api_menu.configure(values=["すべて"] + output_apis)
 
-    def start_auto_refresh(self, interval_ms: int = 1000) -> None:
-        """Enable on-open device refresh (called once at startup).
+    def start_auto_refresh(self, interval_ms: int = 2000) -> None:
+        """Start polling device list at specified interval.
 
-        Instead of polling every N ms (which causes dropdown flicker),
-        device lists are refreshed once when a dropdown is opened.
+        Only updates dropdown widgets when the device list actually changes,
+        so there is no flicker during normal operation.
         """
-        # Bind click events to refresh devices on dropdown open
-        self.input_dropdown.bind("<Button-1>", lambda _: self._refresh_devices_quiet())
-        self.output_dropdown.bind("<Button-1>", lambda _: self._refresh_devices_quiet())
-        logger.debug("Device on-open refresh enabled")
+        self._auto_refresh_id: str | None = None
 
-    def _refresh_devices_quiet(self) -> None:
-        """Refresh device lists (called when a dropdown is clicked)."""
-        try:
-            self._refresh_devices()
-        except Exception as e:
-            logger.warning(f"Device refresh failed: {e}")
+        def refresh_loop():
+            try:
+                self._refresh_devices()
+            except Exception as e:
+                logger.warning(f"Device refresh failed: {e}")
+            self._auto_refresh_id = self.after(interval_ms, refresh_loop)
+
+        self._auto_refresh_id = self.after(interval_ms, refresh_loop)
+        logger.debug("Device auto-refresh started (interval=%dms)", interval_ms)
 
     def stop_auto_refresh(self) -> None:
-        """Stop auto-refreshing device list (no-op, kept for API compat)."""
-        pass
+        """Stop auto-refreshing device list."""
+        if getattr(self, "_auto_refresh_id", None) is not None:
+            self.after_cancel(self._auto_refresh_id)
+            self._auto_refresh_id = None
 
     def _detect_default_sample_rates(self) -> None:
         """Detect sample rates and channels for default devices."""
