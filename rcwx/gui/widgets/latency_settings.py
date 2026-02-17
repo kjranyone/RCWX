@@ -10,12 +10,12 @@ import customtkinter as ctk
 def _auto_params(chunk_sec: float) -> dict:
     """Derive latency parameters automatically from chunk_sec.
 
-    Returns dict with overlap_sec, crossfade_sec, prebuffer_chunks,
-    buffer_margin, use_sola.
+    Returns dict with overlap_sec, crossfade_sec, sola_search_ms,
+    prebuffer_chunks, buffer_margin, use_sola.
     """
     # overlap: 100% of chunk for maximum HuBERT context continuity,
-    # clamped [60ms, 200ms], rounded to 20ms (HuBERT frame boundary)
-    overlap_ms = max(60, min(200, chunk_sec * 1000))
+    # clamped [60ms, 300ms], rounded to 20ms (HuBERT frame boundary)
+    overlap_ms = max(60, min(300, chunk_sec * 1000))
     overlap_ms = round(overlap_ms / 20) * 20
 
     # crossfade: 25% of chunk, clamped [10ms, 80ms], rounded to 10ms
@@ -23,9 +23,13 @@ def _auto_params(chunk_sec: float) -> dict:
     crossfade_ms = round(crossfade_ms / 10) * 10
     crossfade_ms = max(10, crossfade_ms)
 
+    # SOLA search window = chunk length (doesn't affect latency)
+    sola_search_ms = chunk_sec * 1000
+
     return {
         "overlap_sec": overlap_ms / 1000,
         "crossfade_sec": crossfade_ms / 1000,
+        "sola_search_ms": sola_search_ms,
         "prebuffer_chunks": 1,
         "buffer_margin": 0.5,
         "use_sola": True,
@@ -219,6 +223,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             "buffer_margin": auto["buffer_margin"],
             "overlap_sec": auto["overlap_sec"],
             "crossfade_sec": auto["crossfade_sec"],
+            "sola_search_ms": auto["sola_search_ms"],
             "use_sola": auto["use_sola"],
         }
 
