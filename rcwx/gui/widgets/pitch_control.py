@@ -23,6 +23,7 @@ class PitchControl(ctk.CTkFrame):
         on_pre_hubert_pitch_changed: Optional[Callable[[float], None]] = None,
         on_moe_boost_changed: Optional[Callable[[float], None]] = None,
         on_noise_scale_changed: Optional[Callable[[float], None]] = None,
+        on_fixed_harmonics_changed: Optional[Callable[[bool], None]] = None,
         on_octave_flip_suppress_changed: Optional[Callable[[bool], None]] = None,
         on_f0_slew_limit_changed: Optional[Callable[[bool], None]] = None,
         on_f0_slew_max_step_changed: Optional[Callable[[float], None]] = None,
@@ -36,6 +37,7 @@ class PitchControl(ctk.CTkFrame):
         self.on_pre_hubert_pitch_changed = on_pre_hubert_pitch_changed
         self.on_moe_boost_changed = on_moe_boost_changed
         self.on_noise_scale_changed = on_noise_scale_changed
+        self.on_fixed_harmonics_changed = on_fixed_harmonics_changed
         self.on_octave_flip_suppress_changed = on_octave_flip_suppress_changed
         self.on_f0_slew_limit_changed = on_f0_slew_limit_changed
         self.on_f0_slew_max_step_changed = on_f0_slew_max_step_changed
@@ -46,6 +48,7 @@ class PitchControl(ctk.CTkFrame):
         self._pre_hubert_pitch_ratio: float = 0.0
         self._moe_boost: float = 0.0
         self._noise_scale: float = 0.4
+        self._fixed_harmonics: bool = True
         self._enable_octave_flip_suppress: bool = True
         self._enable_f0_slew_limit: bool = True
         self._f0_slew_max_step_st: float = 2.8
@@ -256,12 +259,21 @@ class PitchControl(ctk.CTkFrame):
         )
         self.noise_scale_hint.grid(row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
+        self.fixed_harmonics_var = ctk.BooleanVar(value=self._fixed_harmonics)
+        self.fixed_harmonics_cb = ctk.CTkCheckBox(
+            self,
+            text="倍音位相固定 (チャンク連続性向上)",
+            variable=self.fixed_harmonics_var,
+            command=self._on_fixed_harmonics_toggle,
+        )
+        self.fixed_harmonics_cb.grid(row=16, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+
         self.f0_stabilizer_label = ctk.CTkLabel(
             self,
             text="F0 Stabilizer",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.f0_stabilizer_label.grid(row=16, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        self.f0_stabilizer_label.grid(row=17, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
 
         self.octave_flip_var = ctk.BooleanVar(value=self._enable_octave_flip_suppress)
         self.octave_flip_cb = ctk.CTkCheckBox(
@@ -270,7 +282,7 @@ class PitchControl(ctk.CTkFrame):
             variable=self.octave_flip_var,
             command=self._on_octave_flip_suppress_toggle,
         )
-        self.octave_flip_cb.grid(row=17, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+        self.octave_flip_cb.grid(row=18, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
 
         self.f0_slew_limit_var = ctk.BooleanVar(value=self._enable_f0_slew_limit)
         self.f0_slew_limit_cb = ctk.CTkCheckBox(
@@ -279,10 +291,10 @@ class PitchControl(ctk.CTkFrame):
             variable=self.f0_slew_limit_var,
             command=self._on_f0_slew_limit_toggle,
         )
-        self.f0_slew_limit_cb.grid(row=18, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+        self.f0_slew_limit_cb.grid(row=19, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
 
         self.f0_slew_min = ctk.CTkLabel(self, text="1.0", font=ctk.CTkFont(size=10))
-        self.f0_slew_min.grid(row=19, column=0, padx=(10, 5), pady=2)
+        self.f0_slew_min.grid(row=20, column=0, padx=(10, 5), pady=2)
 
         self.f0_slew_slider = ctk.CTkSlider(
             self,
@@ -293,12 +305,12 @@ class PitchControl(ctk.CTkFrame):
             command=self._on_f0_slew_max_step_change,
         )
         self.f0_slew_slider.set(self._f0_slew_max_step_st)
-        self.f0_slew_slider.grid(row=19, column=1, padx=5, pady=2, sticky="ew")
+        self.f0_slew_slider.grid(row=20, column=1, padx=5, pady=2, sticky="ew")
 
         self.f0_slew_value = ctk.CTkLabel(
             self, text=f"{self._f0_slew_max_step_st:.2f}", width=40, font=ctk.CTkFont(size=11)
         )
-        self.f0_slew_value.grid(row=19, column=2, padx=(5, 10), pady=2)
+        self.f0_slew_value.grid(row=20, column=2, padx=(5, 10), pady=2)
 
         self.f0_slew_hint = ctk.CTkLabel(
             self,
@@ -306,7 +318,7 @@ class PitchControl(ctk.CTkFrame):
             font=ctk.CTkFont(size=10),
             text_color="gray",
         )
-        self.f0_slew_hint.grid(row=20, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.f0_slew_hint.grid(row=21, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         self._update_f0_slew_slider_state()
 
@@ -362,6 +374,12 @@ class PitchControl(ctk.CTkFrame):
         self.noise_scale_value.configure(text=f"{self._noise_scale:.2f}")
         if self.on_noise_scale_changed:
             self.on_noise_scale_changed(self._noise_scale)
+
+    def _on_fixed_harmonics_toggle(self) -> None:
+        """Handle fixed harmonics checkbox."""
+        self._fixed_harmonics = bool(self.fixed_harmonics_var.get())
+        if self.on_fixed_harmonics_changed:
+            self.on_fixed_harmonics_changed(self._fixed_harmonics)
 
     def _on_octave_flip_suppress_toggle(self) -> None:
         """Handle octave-flip suppress checkbox."""
@@ -438,6 +456,11 @@ class PitchControl(ctk.CTkFrame):
         self.noise_scale_slider.set(self._noise_scale)
         self.noise_scale_value.configure(text=f"{self._noise_scale:.2f}")
 
+    def set_fixed_harmonics(self, enabled: bool) -> None:
+        """Set fixed harmonics toggle without invoking callbacks."""
+        self._fixed_harmonics = bool(enabled)
+        self.fixed_harmonics_var.set(self._fixed_harmonics)
+
     def set_enable_octave_flip_suppress(self, enabled: bool) -> None:
         """Set octave-flip suppress toggle without invoking callbacks."""
         self._enable_octave_flip_suppress = bool(enabled)
@@ -500,6 +523,11 @@ class PitchControl(ctk.CTkFrame):
     def noise_scale(self) -> float:
         """Get current synthesizer noise scale."""
         return self._noise_scale
+
+    @property
+    def fixed_harmonics(self) -> bool:
+        """Get fixed harmonics toggle."""
+        return self._fixed_harmonics
 
     @property
     def enable_octave_flip_suppress(self) -> bool:

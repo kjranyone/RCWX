@@ -113,6 +113,7 @@ class RealtimeController:
                 denoise_enabled=self.app.use_denoise_var.get(),
                 denoise_method=self.app.denoise_method_var.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
+                fixed_harmonics=self.app.pitch_control.fixed_harmonics,
                 f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
                 enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
                 enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,

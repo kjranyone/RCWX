@@ -182,6 +182,9 @@ class SineGen(nn.Module):
         # "legacy" keeps prior interpolation-based implementation.
         # "subframe" enables the newer phase-accumulation implementation.
         self.phase_mode = os.getenv("RCWX_SINEGEN_MODE", "legacy").lower()
+        # When True, harmonic initial phases are fixed to zero for streaming
+        # continuity (eliminates per-chunk tonal colour shift).
+        self.fixed_harmonics = False
 
     def _f02uv(self, f0: torch.Tensor) -> torch.Tensor:
         uv = torch.ones_like(f0)
@@ -227,8 +230,11 @@ class SineGen(nn.Module):
         rad = rad * b
 
         # Random initial phase per harmonic (fundamental starts at 0)
-        rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
-        rand_ini[..., 0] = 0
+        if self.fixed_harmonics:
+            rand_ini = torch.zeros(1, 1, self.dim, device=f0.device)
+        else:
+            rand_ini = torch.rand(1, 1, self.dim, device=f0.device)
+            rand_ini[..., 0] = 0
         rad = rad + rand_ini
 
         sines = torch.sin(2 * np.pi * rad)
@@ -244,10 +250,15 @@ class SineGen(nn.Module):
             f0_buf[:, :, idx + 1] = f0_buf[:, :, 0] * (idx + 2)
 
         rad_values = (f0_buf / self.sampling_rate) % 1
-        rand_ini = torch.rand(
-            f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device, dtype=f0_buf.dtype
-        )
-        rand_ini[:, 0] = 0
+        if self.fixed_harmonics:
+            rand_ini = torch.zeros(
+                f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device, dtype=f0_buf.dtype
+            )
+        else:
+            rand_ini = torch.rand(
+                f0_buf.shape[0], f0_buf.shape[2], device=f0_buf.device, dtype=f0_buf.dtype
+            )
+            rand_ini[:, 0] = 0
         rad_values[:, 0, :] = rad_values[:, 0, :] + rand_ini
         tmp_over_one = torch.cumsum(rad_values, 1)
         tmp_over_one *= upp

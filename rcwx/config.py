@@ -94,6 +94,8 @@ class InferenceConfig:
 
     # Synthesizer noise scale (0.0=deterministic, 0.66666=original RVC default)
     noise_scale: float = 0.45
+    # Fix harmonic initial phase to zero (improves streaming chunk continuity)
+    fixed_harmonics: bool = True
     # F0 lowpass cutoff frequency in Hz (higher = more pitch detail preserved)
     f0_lowpass_cutoff_hz: float = 16.0
     # Stabilize 1-octave frame flips in F0 contour

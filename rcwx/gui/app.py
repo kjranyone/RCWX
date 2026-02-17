@@ -174,6 +174,7 @@ class RCWXApp(ctk.CTk):
             on_pre_hubert_pitch_changed=self._on_pre_hubert_pitch_changed,
             on_moe_boost_changed=self._on_moe_boost_changed,
             on_noise_scale_changed=self._on_noise_scale_changed,
+            on_fixed_harmonics_changed=self._on_fixed_harmonics_changed,
             on_octave_flip_suppress_changed=self._on_octave_flip_suppress_changed,
             on_f0_slew_limit_changed=self._on_f0_slew_limit_changed,
             on_f0_slew_max_step_changed=self._on_f0_slew_max_step_changed,
@@ -190,6 +191,7 @@ class RCWXApp(ctk.CTk):
         )
         self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
         self.pitch_control.set_noise_scale(self.config.inference.noise_scale)
+        self.pitch_control.set_fixed_harmonics(self.config.inference.fixed_harmonics)
         self.pitch_control.set_enable_octave_flip_suppress(
             self.config.inference.enable_octave_flip_suppress
         )
@@ -856,6 +858,12 @@ class RCWXApp(ctk.CTk):
         if self.realtime_controller.voice_changer:
             self.realtime_controller.voice_changer.set_noise_scale(scale)
 
+    def _on_fixed_harmonics_changed(self, enabled: bool) -> None:
+        """Handle fixed harmonics toggle."""
+        self._save_config()
+        if self.realtime_controller.voice_changer:
+            self.realtime_controller.voice_changer.set_fixed_harmonics(enabled)
+
     def _on_octave_flip_suppress_changed(self, enabled: bool) -> None:
         """Handle octave-flip suppress toggle."""
         self._save_config()
@@ -992,6 +1000,7 @@ class RCWXApp(ctk.CTk):
             self.config.inference.pre_hubert_pitch_ratio = self.pitch_control.pre_hubert_pitch_ratio
             self.config.inference.moe_boost = self.pitch_control.moe_boost
             self.config.inference.noise_scale = self.pitch_control.noise_scale
+            self.config.inference.fixed_harmonics = self.pitch_control.fixed_harmonics
             self.config.inference.enable_octave_flip_suppress = (
                 self.pitch_control.enable_octave_flip_suppress
             )

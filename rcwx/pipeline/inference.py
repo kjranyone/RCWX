@@ -945,6 +945,21 @@ class RVCPipeline:
         # F0 pre-filter tail for cross-chunk filter continuity
         self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
 
+    def _set_fixed_harmonics(self, enabled: bool) -> None:
+        """Set SineGen harmonic initial phase mode (fixed=zero or random)."""
+        model = getattr(self.synthesizer, "model", None)
+        if model is None:
+            return
+        dec = getattr(model, "dec", None)
+        if dec is None:
+            return
+        m_source = getattr(dec, "m_source", None)
+        if m_source is None:
+            return  # non-F0 model — no SineGen
+        sin_gen = getattr(m_source, "l_sin_gen", None)
+        if sin_gen is not None:
+            sin_gen.fixed_harmonics = enabled
+
     @torch.no_grad()
     def infer(
         self,
@@ -1806,6 +1821,7 @@ class RVCPipeline:
         enable_f0_slew_limit: bool = True,
         f0_slew_max_step_st: float = 2.8,
         hubert_context_sec: float = 1.0,
+        fixed_harmonics: bool = False,
     ) -> np.ndarray:
         """Streaming inference with audio-level overlap.
 
@@ -2300,6 +2316,9 @@ class RVCPipeline:
 
         # Residual samples not covered by feature-level skip (sub-frame trim)
         residual_left = total_left_samples - skip_head_feat * samples_per_frame
+
+        # Set SineGen harmonic phase mode before synthesis
+        self._set_fixed_harmonics(fixed_harmonics)
 
         # Run synthesizer with skip_head/return_length
         with torch.autocast(device_type=self.device, dtype=self.dtype):

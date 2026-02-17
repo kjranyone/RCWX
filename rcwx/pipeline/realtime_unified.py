@@ -123,6 +123,7 @@ class RealtimeConfig:
 
     # Pitch clarity
     noise_scale: float = 0.4
+    fixed_harmonics: bool = True
     f0_lowpass_cutoff_hz: float = 16.0
     enable_octave_flip_suppress: bool = True
     enable_f0_slew_limit: bool = True
@@ -629,6 +630,9 @@ class RealtimeVoiceChangerUnified:
     def set_noise_scale(self, scale: float) -> None:
         self.config.noise_scale = max(0.0, min(1.0, float(scale)))
 
+    def set_fixed_harmonics(self, enabled: bool) -> None:
+        self.config.fixed_harmonics = bool(enabled)
+
     def set_f0_lowpass_cutoff_hz(self, cutoff: float) -> None:
         self.config.f0_lowpass_cutoff_hz = max(4.0, min(30.0, float(cutoff)))
 
@@ -851,6 +855,7 @@ class RealtimeVoiceChangerUnified:
                     enable_f0_slew_limit=self.config.enable_f0_slew_limit,
                     f0_slew_max_step_st=self.config.f0_slew_max_step_st,
                     hubert_context_sec=self.config.hubert_context_sec,
+                    fixed_harmonics=self.config.fixed_harmonics,
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
