@@ -50,6 +50,7 @@ AudioInput (mic rate)
 ```
 
 実装上の要点:
+
 - リアルタイム経路は `pipeline/realtime_unified.py` のみを使用
 - チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
 - 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
@@ -102,60 +103,61 @@ rcwx/
 
 ### `AudioConfig` (`rcwx/config.py`)
 
-| Key | Default | Notes |
-|---|---:|---|
-| `sample_rate` | `16000` | 内部処理入力レート |
-| `output_sample_rate` | `48000` | 出力レート |
-| `chunk_sec` | `0.3` | 保存設定上のチャンク長 |
-| `prebuffer_chunks` | `1` | 出力プリバッファ |
-| `buffer_margin` | `0.5` | バッファ余裕 |
-| `input_gain_db` | `0.0` | 入力ゲイン |
-| `input_channel_selection` | `auto` | left/right/average/auto |
-| `input_hostapi_filter` | `WASAPI` | Windows向け |
-| `output_hostapi_filter` | `WASAPI` | Windows向け |
+| Key                       |  Default | Notes                   |
+| ------------------------- | -------: | ----------------------- |
+| `sample_rate`             |  `16000` | 内部処理入力レート      |
+| `output_sample_rate`      |  `48000` | 出力レート              |
+| `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
+| `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
+| `buffer_margin`           |    `0.5` | バッファ余裕            |
+| `input_gain_db`           |    `0.0` | 入力ゲイン              |
+| `input_channel_selection` |   `auto` | left/right/average/auto |
+| `input_hostapi_filter`    | `WASAPI` | Windows向け             |
+| `output_hostapi_filter`   | `WASAPI` | Windows向け             |
 
 ### `InferenceConfig` (`rcwx/config.py`)
 
-| Key | Default | Notes |
-|---|---:|---|
-| `f0_method` | `rmvpe` | `rmvpe` / `fcpe` / `swiftf0` |
-| `use_f0` | `true` | F0有効化 |
-| `use_index` | `true` | FAISS有効化 |
-| `index_ratio` | `0.15` | FAISS混合率 |
-| `index_k` | `4` | 近傍数 |
-| `use_compile` | `false` | 既定OFF |
-| `resample_method` | `linear` | `linear` / `poly` |
-| `use_parallel_extraction` | `true` | HuBERT+F0並列 |
-| `voice_gate_mode` | `off` | off/strict/expand/energy |
-| `energy_threshold` | `0.2` | energyモード閾値 |
-| `overlap_sec` | `0.20` | 音声オーバーラップ |
-| `crossfade_sec` | `0.08` | SOLAクロスフェード長 |
-| `use_sola` | `true` | SOLA有効化 |
-| `sola_search_ms` | `10.0` | SOLA探索窓 |
-| `hubert_context_sec` | `1.0` | HuBERTコンテキスト窓 (秒) |
-| `pre_hubert_pitch_ratio` | `0.08` | プレHuBERTシフト比率 (0.0-1.0) |
-| `moe_boost` | `0.45` | Moeボイススタイル強度 (0.0-1.0) |
-| `noise_scale` | `0.45` | 合成ノイズスケール (0.0-1.0) |
-| `f0_lowpass_cutoff_hz` | `16.0` | F0ローパスカットオフ (Hz) |
-| `enable_octave_flip_suppress` | `true` | 1オクターブF0飛び補正 |
-| `enable_f0_slew_limit` | `true` | フレーム間F0変化量制限 |
-| `f0_slew_max_step_st` | `3.6` | 最大F0ステップ (semitones) |
-| `denoise.enabled` | `true` | ノイズ除去 |
-| `denoise.method` | `ml` | `auto` / `ml` / `spectral` |
+| Key                           |  Default | Notes                           |
+| ----------------------------- | -------: | ------------------------------- |
+| `f0_method`                   |  `rmvpe` | `rmvpe` / `fcpe` / `swiftf0`    |
+| `use_f0`                      |   `true` | F0有効化                        |
+| `use_index`                   |   `true` | FAISS有効化                     |
+| `index_ratio`                 |   `0.15` | FAISS混合率                     |
+| `index_k`                     |      `4` | 近傍数                          |
+| `use_compile`                 |  `false` | 既定OFF                         |
+| `resample_method`             | `linear` | `linear` / `poly`               |
+| `use_parallel_extraction`     |   `true` | HuBERT+F0並列                   |
+| `voice_gate_mode`             |    `off` | off/strict/expand/energy        |
+| `energy_threshold`            |    `0.2` | energyモード閾値                |
+| `overlap_sec`                 |   `0.20` | 音声オーバーラップ              |
+| `crossfade_sec`               |   `0.08` | SOLAクロスフェード長            |
+| `use_sola`                    |   `true` | SOLA有効化                      |
+| `sola_search_ms`              |   `10.0` | SOLA探索窓                      |
+| `hubert_context_sec`          |    `1.0` | HuBERTコンテキスト窓 (秒)       |
+| `pre_hubert_pitch_ratio`      |   `0.08` | プレHuBERTシフト比率 (0.0-1.0)  |
+| `moe_boost`                   |   `0.45` | Moeボイススタイル強度 (0.0-1.0) |
+| `noise_scale`                 |   `0.45` | 合成ノイズスケール (0.0-1.0)    |
+| `f0_lowpass_cutoff_hz`        |   `16.0` | F0ローパスカットオフ (Hz)       |
+| `enable_octave_flip_suppress` |   `true` | 1オクターブF0飛び補正           |
+| `enable_f0_slew_limit`        |   `true` | フレーム間F0変化量制限          |
+| `f0_slew_max_step_st`         |    `3.6` | 最大F0ステップ (semitones)      |
+| `denoise.enabled`             |   `true` | ノイズ除去                      |
+| `denoise.method`              |     `ml` | `auto` / `ml` / `spectral`      |
 
 ### `RCWXConfig` (`rcwx/config.py`) トップレベル
 
-| Key | Default | Notes |
-|---|---:|---|
-| `models_dir` | `~/.cache/rcwx/models` | HuBERT・RMVPEモデルディレクトリ |
-| `rvc_models_dir` | `None` | RVCモデルディレクトリ（ドロップダウンスキャン用） |
-| `last_model_path` | `None` | 最後に使用したモデルパス |
-| `device` | `auto` | auto/xpu/cuda/cpu |
-| `dtype` | `float16` | float16/float32/bfloat16 |
+| Key               |                Default | Notes                                             |
+| ----------------- | ---------------------: | ------------------------------------------------- |
+| `models_dir`      | `~/.cache/rcwx/models` | HuBERT・RMVPEモデルディレクトリ                   |
+| `rvc_models_dir`  |                 `None` | RVCモデルディレクトリ（ドロップダウンスキャン用） |
+| `last_model_path` |                 `None` | 最後に使用したモデルパス                          |
+| `device`          |                 `auto` | auto/xpu/cuda/cpu                                 |
+| `dtype`           |              `float16` | float16/float32/bfloat16                          |
 
 ### `RealtimeConfig` (`rcwx/pipeline/realtime_unified.py`)
 
 実行時にGUI設定から生成される主要値:
+
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
@@ -175,6 +177,7 @@ rcwx/
 他は自動導出されます。
 
 自動導出ルール (`rcwx/gui/widgets/latency_settings.py`):
+
 - `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
 - `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
 - `prebuffer_chunks` = 1
@@ -182,6 +185,7 @@ rcwx/
 - `use_sola` = true
 
 補足:
+
 - GUI起動時は `config.audio.chunk_sec` を復元し、上記の自動値を再計算します。
 - 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
 
@@ -203,9 +207,11 @@ uv run rcwx logs --open      # 最新ログを開く
 ## Logs & Diagnostics
 
 ログ保存先:
+
 - `~/.config/rcwx/logs/rcwx_YYYYMMDD_HHMMSS.log`
 
 よく出るログ:
+
 - `[INPUT] Queue full, dropping chunk`
 - `[INFER] Chunk #...`
 - `[PERF] Inference slow ...`
@@ -213,6 +219,7 @@ uv run rcwx logs --open      # 最新ログを開く
 - `[WARMUP] ...`
 
 トラブルシュート:
+
 - Queue full が頻発: `chunk_sec` 増、デノイズOFF、F0方式見直し
 - 遅延増加: `chunk_sec`/`buffer_margin` 見直し、出力デバイス設定確認
 - フィードバック警告: `uv run rcwx diagnose` 実施、入出力ループ回避
@@ -221,6 +228,7 @@ uv run rcwx logs --open      # 最新ログを開く
 ## Models
 
 既定配置:
+
 - `~/.cache/rcwx/models/hubert/hubert_base.pt`
 - `~/.cache/rcwx/models/rmvpe/rmvpe.pt`
 - RVC本体モデル: 任意の `*.pth`
@@ -246,7 +254,6 @@ uv run python tests/models/test_hubert_weight_audit.py
 
 ## References
 
-- w-okada/voice-changer
 - RVC WebUI
 - PyTorch XPU
 - Facebook Denoiser (`denoiser`)

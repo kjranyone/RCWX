@@ -41,7 +41,7 @@ class RealtimeController:
         """
         self.app = app
         self.voice_changer: Optional[RealtimeVoiceChangerUnified] = None
-        self._buffer_warning_shown = {'underrun': False, 'overrun': False}
+        self._buffer_warning_shown = {"underrun": False, "overrun": False}
 
     def toggle(self) -> None:
         """Toggle voice changer on/off."""
@@ -120,11 +120,15 @@ class RealtimeController:
                 f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
+                # Post-processing
+                postprocess_enabled=self.app.config.inference.postprocess.enabled,
+                treble_boost_db=self.app.config.inference.postprocess.treble_boost_db,
+                treble_cutoff_hz=self.app.config.inference.postprocess.treble_cutoff_hz,
+                limiter_threshold_db=self.app.config.inference.postprocess.limiter_threshold_db,
+                limiter_release_ms=self.app.config.inference.postprocess.limiter_release_ms,
                 # WAV file input
                 wav_input_path=(
-                    self.app.wav_input_path_var.get()
-                    if self.app.use_wav_input_var.get()
-                    else ""
+                    self.app.wav_input_path_var.get() if self.app.use_wav_input_var.get() else ""
                 ),
             )
 
@@ -204,7 +208,7 @@ class RealtimeController:
         self.app.status_bar.set_running(False)
 
         # Reset buffer warning flags so warnings show again on next start
-        self._buffer_warning_shown = {'underrun': False, 'overrun': False}
+        self._buffer_warning_shown = {"underrun": False, "overrun": False}
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
@@ -216,13 +220,19 @@ class RealtimeController:
         BUFFER_WARNING_THRESHOLD = 5
 
         # Buffer underrun warning
-        if stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['underrun']:
-            self._buffer_warning_shown['underrun'] = True
+        if (
+            stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD
+            and not self._buffer_warning_shown["underrun"]
+        ):
+            self._buffer_warning_shown["underrun"] = True
             self.app.after(0, self._show_buffer_underrun_warning)
 
         # Buffer overrun warning
-        if stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['overrun']:
-            self._buffer_warning_shown['overrun'] = True
+        if (
+            stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD
+            and not self._buffer_warning_shown["overrun"]
+        ):
+            self._buffer_warning_shown["overrun"] = True
             self.app.after(0, self._show_buffer_overrun_warning)
 
     def _on_inference_error(self, error_msg: str) -> None:
@@ -244,7 +254,7 @@ class RealtimeController:
             "   • または F0なしモード\n\n"
             "3. ノイズキャンセリングを無効化\n\n"
             "4. バッファマージンを増やす (オーディオタブ)\n"
-            "   • 0.5 → 1.0"
+            "   • 0.5 → 1.0",
         )
 
     def _show_buffer_overrun_warning(self) -> None:
@@ -261,7 +271,7 @@ class RealtimeController:
             "3. 出力デバイスを確認\n"
             "   • サンプルレートが正しいか確認\n"
             "   • 別のデバイスを試す\n\n"
-            "4. デノイズを無効化してテスト"
+            "4. デノイズを無効化してテスト",
         )
 
     def _check_same_audio_interface(self) -> bool:

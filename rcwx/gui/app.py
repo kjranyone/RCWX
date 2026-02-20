@@ -22,6 +22,7 @@ from rcwx.gui.widgets.latency_settings import LatencySettingsFrame
 from rcwx.gui.widgets.latency_monitor import LatencyMonitor
 from rcwx.gui.widgets.model_selector import ModelSelector
 from rcwx.gui.widgets.pitch_control import PitchControl
+from rcwx.gui.widgets.postprocess_settings import PostprocessSettingsFrame
 from rcwx.pipeline.inference import RVCPipeline
 
 # Set PortAudio API preference for Windows (WASAPI for better compatibility)
@@ -186,21 +187,15 @@ class RCWXApp(ctk.CTk):
         self.pitch_control.set_pitch(self.config.inference.pitch_shift)
 
         # Restore saved pre-HuBERT pitch setting
-        self.pitch_control.set_pre_hubert_pitch_ratio(
-            self.config.inference.pre_hubert_pitch_ratio
-        )
+        self.pitch_control.set_pre_hubert_pitch_ratio(self.config.inference.pre_hubert_pitch_ratio)
         self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
         self.pitch_control.set_noise_scale(self.config.inference.noise_scale)
         self.pitch_control.set_fixed_harmonics(self.config.inference.fixed_harmonics)
         self.pitch_control.set_enable_octave_flip_suppress(
             self.config.inference.enable_octave_flip_suppress
         )
-        self.pitch_control.set_enable_f0_slew_limit(
-            self.config.inference.enable_f0_slew_limit
-        )
-        self.pitch_control.set_f0_slew_max_step_st(
-            self.config.inference.f0_slew_max_step_st
-        )
+        self.pitch_control.set_enable_f0_slew_limit(self.config.inference.enable_f0_slew_limit)
+        self.pitch_control.set_f0_slew_max_step_st(self.config.inference.f0_slew_max_step_st)
 
         # Index control
         self.index_frame = ctk.CTkFrame(self.left_column)
@@ -457,9 +452,7 @@ class RCWXApp(ctk.CTk):
         )
         self.use_wav_input_cb.pack(anchor="w", padx=10, pady=(0, 3))
 
-        self.wav_input_file_frame = ctk.CTkFrame(
-            self.test_frame, fg_color="transparent"
-        )
+        self.wav_input_file_frame = ctk.CTkFrame(self.test_frame, fg_color="transparent")
         # Initially hidden; shown when checkbox is checked
 
         self.wav_input_path_var = ctk.StringVar(value="")
@@ -504,6 +497,14 @@ class RCWXApp(ctk.CTk):
         )
         self.audio_settings.pack(fill="x", padx=10, pady=5)
 
+        # Post-processing settings (treble boost + limiter)
+        self.postprocess_settings = PostprocessSettingsFrame(
+            self.audio_scroll,
+            config=self.config.inference.postprocess,
+            on_settings_changed=self._on_postprocess_settings_changed,
+        )
+        self.postprocess_settings.pack(fill="x", padx=10, pady=5)
+
         # Latency settings (mode selection + advanced controls)
         self.latency_settings = LatencySettingsFrame(
             self.audio_scroll,
@@ -527,7 +528,7 @@ class RCWXApp(ctk.CTk):
 
         # Restore saved API filters and devices
         # Important: Set API filter first without triggering device reset
-        if hasattr(self.config.audio, 'input_hostapi_filter'):
+        if hasattr(self.config.audio, "input_hostapi_filter"):
             # Set filter directly and update device list only
             self.audio_settings._input_hostapi_filter = self.config.audio.input_hostapi_filter
             self.audio_settings.input_api_var.set(self.config.audio.input_hostapi_filter)
@@ -536,11 +537,12 @@ class RCWXApp(ctk.CTk):
             )
             # Update dropdown without resetting selection
             input_names = ["デフォルト"] + [
-                self.audio_settings._format_device_name(d) for d in self.audio_settings._input_devices
+                self.audio_settings._format_device_name(d)
+                for d in self.audio_settings._input_devices
             ]
             self.audio_settings.input_dropdown.configure(values=input_names)
 
-        if hasattr(self.config.audio, 'output_hostapi_filter'):
+        if hasattr(self.config.audio, "output_hostapi_filter"):
             # Set filter directly and update device list only
             self.audio_settings._output_hostapi_filter = self.config.audio.output_hostapi_filter
             self.audio_settings.output_api_var.set(self.config.audio.output_hostapi_filter)
@@ -549,7 +551,8 @@ class RCWXApp(ctk.CTk):
             )
             # Update dropdown without resetting selection
             output_names = ["デフォルト"] + [
-                self.audio_settings._format_device_name(d) for d in self.audio_settings._output_devices
+                self.audio_settings._format_device_name(d)
+                for d in self.audio_settings._output_devices
             ]
             self.audio_settings.output_dropdown.configure(values=output_names)
 
@@ -979,6 +982,14 @@ class RCWXApp(ctk.CTk):
             vc.set_crossfade(settings["crossfade_sec"])
             vc.set_chunk_sec(settings["chunk_sec"])
 
+    def _on_postprocess_settings_changed(self) -> None:
+        """Handle post-processing settings change."""
+        self._save_config()
+        if hasattr(self, "postprocess_settings") and self.realtime_controller.voice_changer:
+            cfg = self.postprocess_settings.get_config()
+            vc = self.realtime_controller.voice_changer
+            if hasattr(vc, "set_postprocess_config"):
+                vc.set_postprocess_config(cfg)
 
     def _save_config(self) -> None:
         """Save all config settings immediately."""
@@ -1004,9 +1015,7 @@ class RCWXApp(ctk.CTk):
             self.config.inference.enable_octave_flip_suppress = (
                 self.pitch_control.enable_octave_flip_suppress
             )
-            self.config.inference.enable_f0_slew_limit = (
-                self.pitch_control.enable_f0_slew_limit
-            )
+            self.config.inference.enable_f0_slew_limit = self.pitch_control.enable_f0_slew_limit
             self.config.inference.f0_slew_max_step_st = self.pitch_control.f0_slew_max_step_st
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()

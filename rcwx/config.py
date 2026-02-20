@@ -44,6 +44,23 @@ class DenoiseConfig:
 
 
 @dataclass
+class PostprocessConfig:
+    """Post-processing for output audio (treble boost + normalizer + limiter)."""
+
+    enabled: bool = True
+    treble_boost_db: float = 4.0
+    treble_cutoff_hz: float = 2800.0
+    limiter_threshold_db: float = -1.0
+    limiter_release_ms: float = 80.0
+    # RMS Normalizer (EMA-smoothed AGC)
+    normalizer_enabled: bool = True
+    normalizer_target_rms: float = 0.1
+    normalizer_ema_alpha: float = 0.15
+    normalizer_max_gain_db: float = 12.0
+    normalizer_min_gain_db: float = -12.0
+
+
+@dataclass
 class InferenceConfig:
     """Inference configuration."""
 
@@ -106,6 +123,7 @@ class InferenceConfig:
     f0_slew_max_step_st: float = 3.6
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
+    postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
 
 
 @dataclass
@@ -146,14 +164,28 @@ class RCWXConfig:
         denoise_data = inference_data.pop("denoise", {})
         denoise_config = DenoiseConfig(**denoise_data) if denoise_data else DenoiseConfig()
 
+        # Handle nested postprocess config
+        postprocess_data = inference_data.pop("postprocess", {})
+        postprocess_config = (
+            PostprocessConfig(**postprocess_data) if postprocess_data else PostprocessConfig()
+        )
+
         # Filter out any unknown keys to prevent TypeError
         import dataclasses
-        valid_fields = {f.name for f in dataclasses.fields(InferenceConfig)} - {"denoise"}
+
+        valid_fields = {f.name for f in dataclasses.fields(InferenceConfig)} - {
+            "denoise",
+            "postprocess",
+        }
         filtered_inference = {k: v for k, v in inference_data.items() if k in valid_fields}
 
         return cls(
             audio=AudioConfig(**audio_data),
-            inference=InferenceConfig(denoise=denoise_config, **filtered_inference),
+            inference=InferenceConfig(
+                denoise=denoise_config,
+                postprocess=postprocess_config,
+                **filtered_inference,
+            ),
             **data,
         )
 
