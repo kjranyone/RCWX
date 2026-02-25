@@ -88,6 +88,11 @@ class AudioStreamBase(ABC):
                     pass
                 api_preferences.append(("WASAPI", wasapi_hostapi, None))
 
+            # NOTE: ASIO is intentionally excluded from the fallback list.
+            # ASIO drivers are exclusive full-duplex — opening a single
+            # InputStream or OutputStream claims the driver, blocking the
+            # other direction.  ASIO is used only via AsioDuplexStream.
+
             if ds_hostapi is not None:
                 api_preferences.append(("DirectSound", ds_hostapi, None))
 
@@ -324,5 +329,118 @@ def get_default_device(stream_type: str) -> Optional[int]:
     """Get the default device index."""
     try:
         return sd.query_devices(kind=stream_type)["index"]
+    except Exception:
+        return None
+
+
+def query_asio_channel_names(
+    device_index: int,
+    stream_type: str = "input",
+) -> list[str]:
+    """Return ASIO channel names for a device via PortAudio's ASIO extension.
+
+    Uses ``PaAsio_GetInputChannelName`` / ``PaAsio_GetOutputChannelName``
+    from the PortAudio DLL via ctypes.  Returns an empty list if the
+    functions are unavailable or the device is not ASIO.
+
+    Example return: ``["MIC/LINE/INST 1", "MIC/LINE/INST 2", "LOOPBACK Left", ...]``
+    """
+    import ctypes
+    import re
+
+    if not is_device_on_asio(device_index, stream_type):
+        return []
+
+    try:
+        info = sd.query_devices(device_index)
+        channel_key = f"max_{stream_type}_channels"
+        n_channels = int(info[channel_key])
+        if n_channels == 0:
+            return []
+
+        # Load the PortAudio DLL via ctypes to access ASIO-specific functions
+        # that are not exposed through sounddevice's cffi declarations.
+        m = re.search(r"'([^']+)'", repr(sd._lib))
+        if not m:
+            return []
+        pa = ctypes.CDLL(m.group(1))
+
+        func_name = (
+            "PaAsio_GetInputChannelName"
+            if stream_type == "input"
+            else "PaAsio_GetOutputChannelName"
+        )
+        func = getattr(pa, func_name)
+        func.restype = ctypes.c_int
+        func.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_char_p),
+        ]
+
+        names: list[str] = []
+        for ch in range(n_channels):
+            name_ptr = ctypes.c_char_p()
+            err = func(device_index, ch, ctypes.byref(name_ptr))
+            if err == 0 and name_ptr.value:
+                names.append(name_ptr.value.decode())
+            else:
+                names.append(f"Ch {ch + 1}")
+        return names
+    except Exception as e:
+        logger.debug("Failed to query ASIO channel names: %s", e)
+        return []
+
+
+def get_asio_hostapi_index() -> Optional[int]:
+    """Return the hostapi index for ASIO, or None if unavailable."""
+    try:
+        for i, hostapi in enumerate(sd.query_hostapis()):
+            if "ASIO" in hostapi["name"]:
+                return i
+    except Exception:
+        pass
+    return None
+
+
+def is_device_on_asio(device_index: Optional[int], stream_type: str = "output") -> bool:
+    """Check whether a device is on the ASIO host API.
+
+    If *device_index* is None, the system default for *stream_type* is queried.
+    """
+    asio_idx = get_asio_hostapi_index()
+    if asio_idx is None:
+        return False
+    try:
+        if device_index is not None:
+            info = sd.query_devices(device_index)
+        else:
+            info = sd.query_devices(kind=stream_type)
+        return info["hostapi"] == asio_idx
+    except Exception:
+        return False
+
+
+def query_asio_native_sample_rate(
+    device_index: Optional[int],
+    stream_type: str = "output",
+) -> Optional[int]:
+    """Return the ASIO device's native (default) sample rate, or None.
+
+    ASIO drivers typically operate at a fixed sample rate configured in the
+    driver's control panel.  ``sd.query_devices()["default_samplerate"]``
+    reflects this value.
+
+    Buffer size is *not* exposed by the sounddevice Python API, so callers
+    should pass ``blocksize=0`` to let PortAudio use the ASIO-preferred value.
+    """
+    if not is_device_on_asio(device_index, stream_type):
+        return None
+    try:
+        if device_index is not None:
+            info = sd.query_devices(device_index)
+        else:
+            info = sd.query_devices(kind=stream_type)
+        return int(info["default_samplerate"])
     except Exception:
         return None

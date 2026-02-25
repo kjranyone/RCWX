@@ -93,6 +93,7 @@ class RealtimeController:
                 input_channels=self.app.audio_settings.input_channels,
                 output_channels=self.app.audio_settings.output_channels,
                 input_channel_selection=self.app.audio_settings.get_channel_selection(),
+                output_channel_selection=self.app.audio_settings.get_output_channel_selection(),
                 # Latency settings
                 chunk_sec=latency["chunk_sec"],
                 prebuffer_chunks=latency["prebuffer_chunks"],

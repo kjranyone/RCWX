@@ -21,11 +21,13 @@ import numpy as np
 
 from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.audio.denoise import denoise as denoise_audio
+from rcwx.audio.duplex import AsioDuplexStream
 from rcwx.audio.input import AudioInput
 from rcwx.audio.output import AudioOutput
 from rcwx.audio.postprocess import Postprocessor, PostprocessConfig
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
+from rcwx.audio.stream_base import is_device_on_asio
 from rcwx.pipeline.inference import RVCPipeline
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,7 @@ class RealtimeConfig:
     input_channels: int = 1
     output_channels: int = 1
     input_channel_selection: str = "auto"
+    output_channel_selection: str = "auto"  # "auto", "0,1", "2,3", ...
 
     # Core parameters
     chunk_sec: float = 0.15
@@ -132,6 +135,9 @@ class RealtimeConfig:
     enable_octave_flip_suppress: bool = True
     enable_f0_slew_limit: bool = True
     f0_slew_max_step_st: float = 2.8
+
+    # Decoder overlap for cross-chunk continuity (feature frames, 1 frame = 10ms)
+    decoder_overlap_frames: int = 5
 
     # Post-processing (treble boost + limiter)
     postprocess_enabled: bool = True
@@ -271,7 +277,13 @@ class RealtimeVoiceChangerUnified:
         sola_extra_raw = int(
             sola_extra_out * self.pipeline.sample_rate / self._runtime_output_sample_rate
         )
-        self._sola_extra_model = (sola_extra_raw + zc_model - 1) // zc_model * zc_model
+        # Decoder overlap: extra context frames so decoder Conv/SineGen
+        # have warm start, preventing cold-start discontinuity at chunk edges.
+        decoder_overlap_model = self.config.decoder_overlap_frames * zc_model
+        self._sola_extra_model = (
+            (sola_extra_raw + decoder_overlap_model + zc_model - 1)
+            // zc_model * zc_model
+        )
 
         # Output buffer: 4x chunk capacity (physical ring size)
         chunk_output_samples = int(self._runtime_output_sample_rate * self.config.chunk_sec)
@@ -310,9 +322,9 @@ class RealtimeVoiceChangerUnified:
         self._chunks_ready = 0
         self._output_started = False
 
-        # Audio streams (AudioInput or WavFileInput)
+        # Audio streams (AudioInput, WavFileInput, or AsioDuplexStream)
         self._input_stream = None
-        self._output_stream: Optional[AudioOutput] = None
+        self._output_stream = None
 
         # Feedback detection
         self._output_history_size = self._runtime_mic_sample_rate  # 1 second
@@ -382,7 +394,11 @@ class RealtimeVoiceChangerUnified:
         sola_extra_raw = int(
             sola_extra_out * self.pipeline.sample_rate / self._runtime_output_sample_rate
         )
-        self._sola_extra_model = (sola_extra_raw + zc_model - 1) // zc_model * zc_model
+        decoder_overlap_model = self.config.decoder_overlap_frames * zc_model
+        self._sola_extra_model = (
+            (sola_extra_raw + decoder_overlap_model + zc_model - 1)
+            // zc_model * zc_model
+        )
 
         # Adaptive drift control target
         self._drain_target = self._compute_drain_target()
@@ -442,50 +458,112 @@ class RealtimeVoiceChangerUnified:
         output_chunk_sec = self.config.chunk_sec / 4
         output_blocksize = int(self.config.output_sample_rate * output_chunk_sec)
 
-        # Start output stream FIRST so its callback is active before any
-        # audio arrives.  AudioOutput.start() may take time due to API
-        # fallback (WASAPI → DirectSound → MME), and during that time the
-        # input stream would queue audio with no output drain — causing a
-        # burst of buffered audio and large initial trims.
-        self._output_stream = AudioOutput(
-            device=self.config.output_device,
-            sample_rate=self.config.output_sample_rate,
-            channels=self.config.output_channels,
-            blocksize=output_blocksize,
-            callback=self._on_audio_output,
+        # --- ASIO duplex detection ---
+        # ASIO drivers are exclusive full-duplex: opening separate streams
+        # fails with "Device unavailable".  Use a single sd.Stream instead.
+        use_asio_duplex = (
+            not self.config.wav_input_path
+            and is_device_on_asio(self.config.input_device, "input")
+            and is_device_on_asio(self.config.output_device, "output")
         )
-        self._output_stream.start()
 
-        if self.config.wav_input_path:
-            from rcwx.audio.wav_input import WavFileInput
+        if use_asio_duplex:
+            logger.info("Both devices are ASIO — using duplex stream")
+            in_dev = self.config.input_device
+            out_dev = self.config.output_device
+            # Resolve None → default device index for sd.Stream(device=(...))
+            if in_dev is None:
+                from rcwx.audio.stream_base import get_default_device
+                in_dev = get_default_device("input")
+            if out_dev is None:
+                from rcwx.audio.stream_base import get_default_device
+                out_dev = get_default_device("output")
+            if in_dev is None or out_dev is None:
+                logger.warning(
+                    "ASIO duplex: default device not found (in=%s, out=%s), "
+                    "falling back to separate streams",
+                    in_dev, out_dev,
+                )
+                use_asio_duplex = False
 
-            self._input_stream = WavFileInput(
-                path=self.config.wav_input_path,
-                sample_rate=self.config.mic_sample_rate,
-                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                callback=self._on_audio_input,
-            )
+        # Voice changer output is mono — only a stereo pair is needed.
+        # When ASIO with specific channel pair selection, open all channels.
+        if use_asio_duplex and self.config.output_channel_selection != "auto":
+            output_channels = self.config.output_channels
         else:
-            self._input_stream = AudioInput(
-                device=self.config.input_device,
-                sample_rate=self.config.mic_sample_rate,
-                channels=self.config.input_channels,
-                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                callback=self._on_audio_input,
+            output_channels = min(2, self.config.output_channels)
+
+        if use_asio_duplex:
+            duplex = AsioDuplexStream(
+                input_device=in_dev,
+                output_device=out_dev,
+                sample_rate=self.config.output_sample_rate,
+                input_channels=self.config.input_channels,
+                output_channels=output_channels,
+                blocksize=0,  # let ASIO driver choose preferred buffer size
+                input_callback=self._on_audio_input,
+                output_callback=self._on_audio_output,
                 channel_selection=self.config.input_channel_selection,
+                output_channel_selection=self.config.output_channel_selection,
             )
-        self._input_stream.start()
+            duplex.start()
+            # Both references point to the same object so stop() only closes once.
+            self._input_stream = duplex
+            self._output_stream = duplex
+        else:
+            # --- Separate streams (WASAPI / DirectSound / MME) ---
+            # Start output stream FIRST so its callback is active before any
+            # audio arrives.  AudioOutput.start() may take time due to API
+            # fallback (WASAPI → DirectSound → MME), and during that time the
+            # input stream would queue audio with no output drain — causing a
+            # burst of buffered audio and large initial trims.
+            self._output_stream = AudioOutput(
+                device=self.config.output_device,
+                sample_rate=self.config.output_sample_rate,
+                channels=output_channels,
+                blocksize=output_blocksize,
+                callback=self._on_audio_output,
+                output_channel_selection=self.config.output_channel_selection,
+            )
+            self._output_stream.start()
+
+            if self.config.wav_input_path:
+                from rcwx.audio.wav_input import WavFileInput
+
+                self._input_stream = WavFileInput(
+                    path=self.config.wav_input_path,
+                    sample_rate=self.config.mic_sample_rate,
+                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                    callback=self._on_audio_input,
+                )
+            else:
+                self._input_stream = AudioInput(
+                    device=self.config.input_device,
+                    sample_rate=self.config.mic_sample_rate,
+                    channels=self.config.input_channels,
+                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                    callback=self._on_audio_input,
+                    channel_selection=self.config.input_channel_selection,
+                )
+            self._input_stream.start()
 
         actual_output_rate = int(round(self._output_stream.actual_sample_rate))
-        actual_mic_rate = int(round(self._input_stream.actual_sample_rate))
+        # For ASIO duplex, input and output share a single stream at one rate.
+        if use_asio_duplex:
+            actual_mic_rate = actual_output_rate
+        else:
+            actual_mic_rate = int(round(self._input_stream.actual_sample_rate))
         if (
             actual_output_rate != self.config.output_sample_rate
             or actual_mic_rate != self.config.mic_sample_rate
         ):
+            reason = " (ASIO native)" if use_asio_duplex else ""
             logger.warning(
-                "Using runtime sample rates different from config: "
-                f"mic {self.config.mic_sample_rate}->{actual_mic_rate}, "
-                f"output {self.config.output_sample_rate}->{actual_output_rate}"
+                "Using runtime sample rates different from config%s: "
+                "mic %d->%d, output %d->%d",
+                reason,
+                self.config.mic_sample_rate, actual_mic_rate,
+                self.config.output_sample_rate, actual_output_rate,
             )
 
         self._apply_runtime_sample_rates(actual_mic_rate, actual_output_rate)
@@ -530,12 +608,20 @@ class RealtimeVoiceChangerUnified:
             self._thread.join(timeout=1.0)
             self._thread = None
 
-        if self._input_stream:
-            self._input_stream.stop()
-            self._input_stream = None
-        if self._output_stream:
-            self._output_stream.stop()
-            self._output_stream = None
+        # When using ASIO duplex, both references point to the same object.
+        # Stop only once to avoid double-close.
+        if self._input_stream is self._output_stream:
+            if self._input_stream is not None:
+                self._input_stream.stop()
+                self._input_stream = None
+                self._output_stream = None
+        else:
+            if self._input_stream:
+                self._input_stream.stop()
+                self._input_stream = None
+            if self._output_stream:
+                self._output_stream.stop()
+                self._output_stream = None
 
         self._clear_queues()
 

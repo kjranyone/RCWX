@@ -27,6 +27,8 @@ class AudioConfig:
     input_gain_db: float = 0.0  # Input gain in dB
     # Input channel selection for stereo devices: "left", "right", "average"
     input_channel_selection: str = "auto"
+    # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
+    output_channel_selection: str = "auto"
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)

@@ -1,4 +1,4 @@
-# デコーダ出力クロスオーバーによる長音ブツ切り修正
+# デコーダ出力クロスオーバーによる長音ブツ切り修正 [DONE]
 
 ## Context
 
@@ -77,3 +77,4 @@ self._sola_extra_model = (
 2. チャンク境界での音色不連続・ブツ切りが解消されていること
 3. 推論時間の増加が chunk_sec の 80% 以内に収まること（ステータスバー確認）
 4. 既存テスト: `uv run python tests/integration/test_realtime_chunk_boundary_gain.py`
+5. 数学検証テスト: `uv run python tests/integration/test_decoder_overlap.py`

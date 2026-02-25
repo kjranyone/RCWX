@@ -562,6 +562,12 @@ class RCWXApp(ctk.CTk):
         if self.config.audio.output_device_name:
             self.audio_settings.set_output_device(self.config.audio.output_device_name)
 
+        # Restore output channel selection (after output device is set)
+        if hasattr(self.config.audio, "output_channel_selection"):
+            saved_out_ch = self.config.audio.output_channel_selection
+            self.audio_settings.output_channel_var.set(saved_out_ch)
+            self.audio_settings._update_output_channel_selection_state()
+
     def _setup_settings_tab(self) -> None:
         """Setup the advanced settings tab."""
         # Scrollable container
@@ -1032,6 +1038,7 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.use_sola = latency["use_sola"]
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
+            self.config.audio.output_channel_selection = self.audio_settings.get_output_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()
             self.config.audio.output_hostapi_filter = self.audio_settings.output_api_var.get()
             self.config.audio.input_device_name = self.audio_settings.get_input_device_name()

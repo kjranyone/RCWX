@@ -37,9 +37,20 @@ class AudioOutput(AudioStreamBase):
         channels: int = 1,
         blocksize: int = 1024,
         callback: Optional[Callable[[int], NDArray[np.float32]]] = None,
+        output_channel_selection: str = "auto",
     ):
         super().__init__(device, sample_rate, channels, blocksize)
         self._callback = callback
+
+        # Parse output channel selection into index pair
+        self._output_ch_indices: Optional[tuple[int, int]] = None
+        if output_channel_selection != "auto":
+            try:
+                parts = output_channel_selection.split(",")
+                if len(parts) == 2:
+                    self._output_ch_indices = (int(parts[0]), int(parts[1]))
+            except (ValueError, IndexError):
+                pass
 
     def _audio_callback(
         self,
@@ -61,8 +72,15 @@ class AudioOutput(AudioStreamBase):
                 if len(audio) > 0:
                     mono[: len(audio)] = audio
 
-            # Write mono to all output channels
-            if outdata.ndim > 1 and outdata.shape[1] > 1:
+            # Route mono to selected output channels
+            if self._output_ch_indices is not None and outdata.ndim > 1:
+                outdata.fill(0)
+                ch_a, ch_b = self._output_ch_indices
+                if ch_a < outdata.shape[1]:
+                    outdata[:, ch_a] = mono
+                if ch_b < outdata.shape[1]:
+                    outdata[:, ch_b] = mono
+            elif outdata.ndim > 1 and outdata.shape[1] > 1:
                 outdata[:] = mono[:, np.newaxis]
             else:
                 outdata[:, 0] = mono

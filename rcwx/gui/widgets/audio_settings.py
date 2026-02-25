@@ -9,8 +9,9 @@ from typing import Callable, Optional
 import customtkinter as ctk
 import numpy as np
 
-from rcwx.audio.input import list_input_devices, _auto_select_channel
+from rcwx.audio.input import list_input_devices, select_channel
 from rcwx.audio.output import list_output_devices
+from rcwx.audio.stream_base import is_device_on_asio, query_asio_channel_names
 
 logger = logging.getLogger(__name__)
 
@@ -194,16 +195,44 @@ class AudioSettingsFrame(ctk.CTkFrame):
         )
         self.output_dropdown.grid(row=5, column=0, padx=10, pady=2, sticky="ew")
 
+        # Output channel selection (for ASIO multi-channel devices)
+        self.output_channel_label = ctk.CTkLabel(
+            self,
+            text="出力チャンネル選択",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.output_channel_label.grid(row=6, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        self.output_channel_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.output_channel_frame.grid(row=7, column=0, padx=10, pady=2, sticky="ew")
+
+        self.output_channel_var = ctk.StringVar(value="auto")
+        self.output_channel_dropdown = ctk.CTkOptionMenu(
+            self.output_channel_frame,
+            variable=self.output_channel_var,
+            values=["自動 (Ch 1-2)"],
+            width=300,
+            command=self._on_output_channel_dropdown_change,
+        )
+        self.output_channel_dropdown.grid(row=0, column=0)
+
+        # Initially hidden — shown when ASIO output with >2 channels is selected
+        self.output_channel_label.grid_remove()
+        self.output_channel_frame.grid_remove()
+
+        # Build initial output channel options
+        self._update_output_channel_selection_state()
+
         # Input level meter section
         self.level_label = ctk.CTkLabel(
             self,
             text="入力レベル",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.level_label.grid(row=6, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.level_label.grid(row=8, column=0, sticky="w", padx=10, pady=(8, 2))
 
         self.level_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.level_frame.grid(row=7, column=0, padx=10, pady=2, sticky="ew")
+        self.level_frame.grid(row=9, column=0, padx=10, pady=2, sticky="ew")
         self.level_frame.grid_columnconfigure(0, weight=1)
 
         self.level_bar = ctk.CTkProgressBar(self.level_frame, width=280, height=20)
@@ -215,7 +244,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
         # Monitor controls
         self.monitor_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.monitor_frame.grid(row=8, column=0, padx=10, pady=(2, 5), sticky="ew")
+        self.monitor_frame.grid(row=10, column=0, padx=10, pady=(2, 5), sticky="ew")
 
         self.monitor_btn = ctk.CTkButton(
             self.monitor_frame,
@@ -234,55 +263,30 @@ class AudioSettingsFrame(ctk.CTkFrame):
         )
         self.loopback_check.grid(row=0, column=1)
 
-        # Channel selection section (for stereo devices)
+        # Channel selection section
         self.channel_label = ctk.CTkLabel(
             self,
             text="入力チャンネル選択",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.channel_label.grid(row=9, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.channel_label.grid(row=11, column=0, sticky="w", padx=10, pady=(8, 2))
 
         self.channel_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.channel_frame.grid(row=10, column=0, padx=10, pady=2, sticky="ew")
+        self.channel_frame.grid(row=12, column=0, padx=10, pady=2, sticky="ew")
 
+        # Internal value: "auto", "average", "0", "1", "2", ...
         self.channel_var = ctk.StringVar(value="auto")
-        self.channel_auto_radio = ctk.CTkRadioButton(
-            self.channel_frame,
-            text="自動",
-            variable=self.channel_var,
-            value="auto",
-            command=self._on_channel_change,
-        )
-        self.channel_auto_radio.grid(row=0, column=0, padx=(0, 10))
 
-        self.channel_left_radio = ctk.CTkRadioButton(
+        self.channel_dropdown = ctk.CTkOptionMenu(
             self.channel_frame,
-            text="左 (L)",
             variable=self.channel_var,
-            value="left",
-            command=self._on_channel_change,
+            values=["自動"],
+            width=200,
+            command=self._on_channel_dropdown_change,
         )
-        self.channel_left_radio.grid(row=0, column=1, padx=(0, 10))
+        self.channel_dropdown.grid(row=0, column=0)
 
-        self.channel_right_radio = ctk.CTkRadioButton(
-            self.channel_frame,
-            text="右 (R)",
-            variable=self.channel_var,
-            value="right",
-            command=self._on_channel_change,
-        )
-        self.channel_right_radio.grid(row=0, column=2, padx=(0, 10))
-
-        self.channel_average_radio = ctk.CTkRadioButton(
-            self.channel_frame,
-            text="両方（平均）",
-            variable=self.channel_var,
-            value="average",
-            command=self._on_channel_change,
-        )
-        self.channel_average_radio.grid(row=0, column=3)
-
-        # Initially disable if device is mono
+        # Build initial channel options
         self._update_channel_selection_state()
 
         # Input gain section
@@ -291,10 +295,10 @@ class AudioSettingsFrame(ctk.CTkFrame):
             text="入力ゲイン補正",
             font=ctk.CTkFont(size=12, weight="bold"),
         )
-        self.gain_label.grid(row=11, column=0, sticky="w", padx=10, pady=(8, 2))
+        self.gain_label.grid(row=13, column=0, sticky="w", padx=10, pady=(8, 2))
 
         self.gain_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.gain_frame.grid(row=12, column=0, padx=10, pady=2, sticky="ew")
+        self.gain_frame.grid(row=14, column=0, padx=10, pady=2, sticky="ew")
 
         self.gain_slider = ctk.CTkSlider(
             self.gain_frame,
@@ -312,7 +316,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
         # Recommended gain display
         self.recommended_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.recommended_frame.grid(row=13, column=0, padx=10, pady=(2, 5), sticky="ew")
+        self.recommended_frame.grid(row=15, column=0, padx=10, pady=(2, 5), sticky="ew")
 
         self.recommended_label = ctk.CTkLabel(
             self.recommended_frame,
@@ -499,6 +503,9 @@ class AudioSettingsFrame(ctk.CTkFrame):
                     self.output_channels = int(device["channels"])
                     break
 
+        # Update output channel selection UI
+        self._update_output_channel_selection_state()
+
         if self.on_settings_changed:
             self.on_settings_changed()
 
@@ -617,20 +624,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
                 return
 
             # Convert to mono based on channel selection
-            if indata.ndim > 1 and indata.shape[1] > 1:
-                # Stereo input - apply channel selection
-                channel_selection = self.get_channel_selection()
-                if channel_selection == "auto":
-                    audio = _auto_select_channel(indata)
-                elif channel_selection == "left":
-                    audio = indata[:, 0]
-                elif channel_selection == "right":
-                    audio = indata[:, 1]
-                else:  # "average"
-                    audio = np.mean(indata, axis=1)
-            else:
-                # Mono input
-                audio = indata[:, 0] if indata.ndim > 1 else indata
+            audio = select_channel(indata, self.get_channel_selection())
 
             # Apply gain
             if self.input_gain_db != 0.0:
@@ -791,30 +785,185 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.gain_slider.set(self._recommended_gain)
         self._on_gain_change(self._recommended_gain)
 
-    def _on_channel_change(self) -> None:
-        """Handle channel selection change."""
+    # --- Channel display ↔ internal value mapping ---
+
+    _CHANNEL_DISPLAY_AUTO = "自動"
+    _CHANNEL_DISPLAY_AVERAGE = "平均"
+
+    def _channel_display_to_value(self, display: str) -> str:
+        """Convert dropdown display text to internal value."""
+        if display == self._CHANNEL_DISPLAY_AUTO:
+            return "auto"
+        if display == self._CHANNEL_DISPLAY_AVERAGE:
+            return "average"
+        # "Ch 1" or "Ch 1: ASIO Name" → "0"
+        if display.startswith("Ch "):
+            try:
+                # Extract number before optional ": name" suffix
+                num_part = display[3:].split(":")[0].strip()
+                return str(int(num_part) - 1)
+            except ValueError:
+                pass
+        return "auto"
+
+    def _channel_value_to_display(self, value: str) -> str:
+        """Convert internal value to dropdown display text."""
+        if value == "auto":
+            return self._CHANNEL_DISPLAY_AUTO
+        if value == "average":
+            return self._CHANNEL_DISPLAY_AVERAGE
+        # Legacy compat
+        if value == "left":
+            return "Ch 1"
+        if value == "right":
+            return "Ch 2"
+        # "0" → "Ch 1", "1" → "Ch 2", ...
+        try:
+            return f"Ch {int(value) + 1}"
+        except ValueError:
+            return self._CHANNEL_DISPLAY_AUTO
+
+    def _on_channel_dropdown_change(self, display_value: str) -> None:
+        """Handle channel dropdown selection."""
+        internal = self._channel_display_to_value(display_value)
+        self.channel_var.set(internal)
+        # Restore display text (variable trace may overwrite with internal value)
+        self.channel_dropdown.set(display_value)
         if self.on_settings_changed:
             self.on_settings_changed()
 
     def _update_channel_selection_state(self) -> None:
-        """Enable/disable channel selection based on device channels."""
-        if self.input_channels > 1:
-            # Stereo device - enable selection
-            self.channel_auto_radio.configure(state="normal")
-            self.channel_left_radio.configure(state="normal")
-            self.channel_right_radio.configure(state="normal")
-            self.channel_average_radio.configure(state="normal")
-        else:
-            # Mono device - disable selection and default to auto
-            self.channel_auto_radio.configure(state="disabled")
-            self.channel_left_radio.configure(state="disabled")
-            self.channel_right_radio.configure(state="disabled")
-            self.channel_average_radio.configure(state="disabled")
+        """Rebuild channel dropdown options based on device channel count."""
+        n = self.input_channels
+        if n <= 1:
+            options = [self._CHANNEL_DISPLAY_AUTO]
+            self.channel_dropdown.configure(values=options, state="disabled")
+            self.channel_dropdown.set(self._CHANNEL_DISPLAY_AUTO)
             self.channel_var.set("auto")
+        else:
+            options = [self._CHANNEL_DISPLAY_AUTO]
+            # Try to get ASIO channel names
+            asio_names: list[str] = []
+            if self.input_device is not None:
+                asio_names = query_asio_channel_names(self.input_device, "input")
+            for i in range(n):
+                if i < len(asio_names) and asio_names[i]:
+                    options.append(f"Ch {i + 1}: {asio_names[i]}")
+                else:
+                    options.append(f"Ch {i + 1}")
+            options.append(self._CHANNEL_DISPLAY_AVERAGE)
+            self.channel_dropdown.configure(values=options, state="normal")
+            # Keep current selection if still valid, else reset to auto
+            current = self.channel_var.get()
+            current_display = self._channel_value_to_display(current)
+            # Check if display matches any option (prefix match for ASIO names)
+            matched = False
+            for opt in options:
+                if opt == current_display or opt.startswith(current_display + ":"):
+                    self.channel_dropdown.set(opt)
+                    matched = True
+                    break
+            if not matched:
+                self.channel_dropdown.set(self._CHANNEL_DISPLAY_AUTO)
+                self.channel_var.set("auto")
 
     def get_channel_selection(self) -> str:
-        """Get the currently selected channel mode."""
+        """Get the currently selected input channel mode."""
         return self.channel_var.get()
+
+    # --- Output channel selection ---
+
+    _OUTPUT_CHANNEL_DISPLAY_AUTO = "自動 (Ch 1-2)"
+
+    def _on_output_channel_dropdown_change(self, display_value: str) -> None:
+        """Handle output channel dropdown selection."""
+        internal = self._output_channel_display_to_value(display_value)
+        self.output_channel_var.set(internal)
+        # Restore display text (variable trace may overwrite with internal value)
+        self.output_channel_dropdown.set(display_value)
+        if self.on_settings_changed:
+            self.on_settings_changed()
+
+    def _output_channel_display_to_value(self, display: str) -> str:
+        """Convert output channel dropdown text to internal value."""
+        if display.startswith("自動"):
+            return "auto"
+        # "Ch 1-2" or "Ch 1-2: Name A / Name B" → "0,1"
+        if display.startswith("Ch "):
+            try:
+                # Extract "N-M" before optional ": ..."
+                pair_part = display[3:].split(":")[0].strip()
+                parts = pair_part.split("-")
+                if len(parts) == 2:
+                    a = int(parts[0]) - 1
+                    b = int(parts[1]) - 1
+                    return f"{a},{b}"
+            except (ValueError, IndexError):
+                pass
+        return "auto"
+
+    def _output_channel_value_to_display(self, value: str) -> str:
+        """Convert internal output channel value to display text."""
+        if value == "auto":
+            return self._OUTPUT_CHANNEL_DISPLAY_AUTO
+        try:
+            parts = value.split(",")
+            if len(parts) == 2:
+                a, b = int(parts[0]), int(parts[1])
+                return f"Ch {a + 1}-{b + 1}"
+        except (ValueError, IndexError):
+            pass
+        return self._OUTPUT_CHANNEL_DISPLAY_AUTO
+
+    def _update_output_channel_selection_state(self) -> None:
+        """Rebuild output channel dropdown based on output device."""
+        n = self.output_channels
+        is_asio = (
+            self.output_device is not None
+            and is_device_on_asio(self.output_device, "output")
+        )
+
+        if not is_asio or n <= 2:
+            # Hide output channel selection for non-ASIO or <=2ch devices
+            self.output_channel_label.grid_remove()
+            self.output_channel_frame.grid_remove()
+            self.output_channel_var.set("auto")
+            return
+
+        # Show output channel selection
+        self.output_channel_label.grid()
+        self.output_channel_frame.grid()
+
+        # Get ASIO channel names
+        asio_names = query_asio_channel_names(self.output_device, "output")
+
+        options = [self._OUTPUT_CHANNEL_DISPLAY_AUTO]
+        for i in range(0, n - 1, 2):
+            a, b = i, i + 1
+            if a < len(asio_names) and b < len(asio_names):
+                label = f"Ch {a + 1}-{b + 1}: {asio_names[a]} / {asio_names[b]}"
+            else:
+                label = f"Ch {a + 1}-{b + 1}"
+            options.append(label)
+
+        self.output_channel_dropdown.configure(values=options)
+
+        # Keep current selection if still valid
+        current = self.output_channel_var.get()
+        current_display = self._output_channel_value_to_display(current)
+        matched = False
+        for opt in options:
+            if opt == current_display or opt.startswith(current_display + ":"):
+                self.output_channel_dropdown.set(opt)
+                matched = True
+                break
+        if not matched:
+            self.output_channel_dropdown.set(self._OUTPUT_CHANNEL_DISPLAY_AUTO)
+            self.output_channel_var.set("auto")
+
+    def get_output_channel_selection(self) -> str:
+        """Get the currently selected output channel pair."""
+        return self.output_channel_var.get()
 
     def stop_monitor(self) -> None:
         """Public method to stop monitoring (called when closing app)."""
