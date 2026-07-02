@@ -28,7 +28,7 @@ from rcwx.audio.postprocess import Postprocessor, PostprocessConfig
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
 from rcwx.audio.stream_base import is_device_on_asio
-from rcwx.pipeline.inference import RVCPipeline
+from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 
 logger = logging.getLogger(__name__)
 
@@ -656,6 +656,9 @@ class RealtimeVoiceChangerUnified:
     def set_index_rate(self, rate: float) -> None:
         self.config.index_rate = rate
 
+    def set_input_gain_db(self, gain_db: float) -> None:
+        self.config.input_gain_db = float(gain_db)
+
     def set_denoise(self, enabled: bool, method: str = "auto") -> None:
         self.config.denoise_enabled = enabled
         self.config.denoise_method = method
@@ -929,29 +932,14 @@ class RealtimeVoiceChangerUnified:
 
                 # --- Stage 5: Inference ---
                 preprocess_ms = (time.perf_counter() - start_time) * 1000
-                f0_method = self.config.f0_method if self.config.use_f0 else "none"
-                index_rate = self.config.index_rate
 
                 output_model = self.pipeline.infer_streaming(
-                    audio_16k=chunk_16k,
-                    overlap_samples=overlap_samples,
-                    pitch_shift=self.config.pitch_shift,
-                    f0_method=f0_method,
-                    index_rate=index_rate,
-                    index_k=self.config.index_k,
-                    voice_gate_mode=self.config.voice_gate_mode,
-                    energy_threshold=self.config.energy_threshold,
-                    use_parallel_extraction=self.config.use_parallel_extraction,
-                    noise_scale=self.config.noise_scale,
-                    sola_extra_samples=self._sola_extra_model,
-                    pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
-                    moe_boost=self.config.moe_boost,
-                    f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
-                    enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
-                    enable_f0_slew_limit=self.config.enable_f0_slew_limit,
-                    f0_slew_max_step_st=self.config.f0_slew_max_step_st,
-                    hubert_context_sec=self.config.hubert_context_sec,
-                    fixed_harmonics=self.config.fixed_harmonics,
+                    chunk_16k,
+                    overlap_samples,
+                    self._build_streaming_params(
+                        index_rate=self.config.index_rate,
+                        voice_gate_mode=self.config.voice_gate_mode,
+                    ),
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
@@ -1215,26 +1203,12 @@ class RealtimeVoiceChangerUnified:
             else:
                 chunk_16k = warmup_hop
 
-            f0_method = self.config.f0_method if self.config.use_f0 else "none"
+            # Warm up with the same params as production (index/gate disabled)
+            # so shape-dependent kernels match the real path.
             output_model = self.pipeline.infer_streaming(
-                audio_16k=chunk_16k,
-                overlap_samples=overlap_16k,
-                pitch_shift=self.config.pitch_shift,
-                f0_method=f0_method,
-                index_rate=0.0,
-                index_k=self.config.index_k,
-                voice_gate_mode="off",
-                energy_threshold=self.config.energy_threshold,
-                use_parallel_extraction=self.config.use_parallel_extraction,
-                noise_scale=self.config.noise_scale,
-                sola_extra_samples=self._sola_extra_model,
-                pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
-                moe_boost=self.config.moe_boost,
-                f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
-                enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
-                enable_f0_slew_limit=self.config.enable_f0_slew_limit,
-                f0_slew_max_step_st=self.config.f0_slew_max_step_st,
-                hubert_context_sec=self.config.hubert_context_sec,
+                chunk_16k,
+                overlap_16k,
+                self._build_streaming_params(index_rate=0.0, voice_gate_mode="off"),
             )
             _ = self.output_resampler.resample_chunk(output_model)
 
@@ -1251,6 +1225,40 @@ class RealtimeVoiceChangerUnified:
             logger.warning(f"[WARMUP] Streaming path warmup failed (non-fatal): {e}")
 
     # ======== Helpers ========
+
+    def _build_streaming_params(
+        self,
+        *,
+        index_rate: float,
+        voice_gate_mode: str,
+    ) -> StreamingParams:
+        """Build a StreamingParams bundle from the current config.
+
+        Centralizes the config -> infer_streaming() mapping so the production
+        and warmup call sites don't each transcribe every field. ``index_rate``
+        and ``voice_gate_mode`` are passed explicitly because warmup overrides
+        them (0.0 / "off").
+        """
+        cfg = self.config
+        return StreamingParams(
+            pitch_shift=cfg.pitch_shift,
+            f0_method=cfg.f0_method if cfg.use_f0 else "none",
+            index_rate=index_rate,
+            index_k=cfg.index_k,
+            voice_gate_mode=voice_gate_mode,
+            energy_threshold=cfg.energy_threshold,
+            use_parallel_extraction=cfg.use_parallel_extraction,
+            noise_scale=cfg.noise_scale,
+            sola_extra_samples=self._sola_extra_model,
+            pre_hubert_pitch_ratio=cfg.pre_hubert_pitch_ratio,
+            moe_boost=cfg.moe_boost,
+            f0_lowpass_cutoff_hz=cfg.f0_lowpass_cutoff_hz,
+            enable_octave_flip_suppress=cfg.enable_octave_flip_suppress,
+            enable_f0_slew_limit=cfg.enable_f0_slew_limit,
+            f0_slew_max_step_st=cfg.f0_slew_max_step_st,
+            hubert_context_sec=cfg.hubert_context_sec,
+            fixed_harmonics=cfg.fixed_harmonics,
+        )
 
     def _reset_boundary_continuity_state(self) -> None:
         """Reset chunk-boundary gain continuity state."""

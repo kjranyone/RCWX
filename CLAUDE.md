@@ -55,7 +55,7 @@ AudioInput (mic rate)
 - チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
 - 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
 - 旧GUIトグルの `use_feature_cache` は廃止
-- 過負荷時は一時的に `f0_method="none"` と `index_rate=0.0` に自動退避
+- 過負荷時（直近1秒で `Queue full` が3回以上）は一時的に **denoise をバイパス**（`f0_method` / `index_rate` は変更しない）。2秒後に自動復帰。
 
 ## Directory Structure
 
@@ -69,10 +69,12 @@ rcwx/
 ├── audio/
 │   ├── input.py           # AudioInput (マイク入力)
 │   ├── output.py          # AudioOutput
+│   ├── duplex.py          # ASIO 全二重ストリーム (input+output 単一)
 │   ├── buffer.py          # RingOutputBuffer
 │   ├── resample.py        # StatefulResampler
 │   ├── sola.py            # simple SOLA
 │   ├── denoise.py         # auto/ml/spectral
+│   ├── postprocess.py     # treble boost + RMS normalizer + limiter
 │   ├── wav_input.py       # WAVファイルループ入力
 │   └── stream_base.py     # ストリーム基底
 ├── models/
@@ -96,7 +98,8 @@ rcwx/
         ├── latency_settings.py
         ├── latency_monitor.py
         ├── model_selector.py
-        └── pitch_control.py
+        ├── pitch_control.py
+        └── postprocess_settings.py
 ```
 
 ## Configuration (Current)
@@ -169,6 +172,9 @@ rcwx/
 - `pre_hubert_pitch_ratio` (既定 0.08)
 - `noise_scale` (既定 0.45)
 - `f0_lowpass_cutoff_hz` (既定 16.0)
+- `fixed_harmonics` (既定 true)
+- `decoder_overlap_frames` (既定 5、1フレーム=10ms、チャンク境界のデコーダ連続性用)
+- `postprocess_enabled` (既定 true) / `treble_boost_db` (既定 4.0) / `treble_cutoff_hz` (既定 2800.0) / `limiter_threshold_db` (既定 -1.0) / `limiter_release_ms` (既定 80.0)
 - `max_queue_size` (既定 8)
 
 ## GUI Latency Model (Current)

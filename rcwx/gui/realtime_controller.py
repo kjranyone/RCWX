@@ -211,6 +211,96 @@ class RealtimeController:
         # Reset buffer warning flags so warnings show again on next start
         self._buffer_warning_shown = {"underrun": False, "overrun": False}
 
+    # ======== Runtime parameter passthrough ========
+    # Forward live parameter changes to the running voice changer, guarding on
+    # whether one exists. app.py calls these instead of reaching through
+    # `.voice_changer.set_*()` directly (Law of Demeter): the controller owns
+    # the voice changer lifecycle, so it owns the runtime-update surface too.
+
+    @property
+    def is_running(self) -> bool:
+        """True when a voice changer is active."""
+        return self.voice_changer is not None
+
+    def set_pitch_shift(self, semitones: int) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_pitch_shift(semitones)
+
+    def set_f0_mode(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_mode(enabled)
+
+    def set_f0_method(self, method: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_method(method)
+
+    def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_pre_hubert_pitch_ratio(ratio)
+
+    def set_moe_boost(self, strength: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_moe_boost(strength)
+
+    def set_noise_scale(self, scale: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_noise_scale(scale)
+
+    def set_fixed_harmonics(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_fixed_harmonics(enabled)
+
+    def set_enable_octave_flip_suppress(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_enable_octave_flip_suppress(enabled)
+
+    def set_enable_f0_slew_limit(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_enable_f0_slew_limit(enabled)
+
+    def set_f0_slew_max_step_st(self, step_st: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_slew_max_step_st(step_st)
+
+    def set_index_rate(self, rate: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_index_rate(rate)
+
+    def set_denoise(self, enabled: bool, method: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_denoise(enabled, method)
+
+    def set_voice_gate_mode(self, mode: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_voice_gate_mode(mode)
+
+    def set_energy_threshold(self, value: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_energy_threshold(value)
+
+    def set_input_gain_db(self, gain_db: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_input_gain_db(gain_db)
+
+    def apply_latency_settings(self, settings: dict) -> None:
+        """Apply latency settings in the required order.
+
+        ``set_chunk_sec()`` restarts the pipeline, so overlap/crossfade/
+        prebuffer/margin must be set first to take effect.
+        """
+        if not self.voice_changer:
+            return
+        vc = self.voice_changer
+        vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
+        vc.set_buffer_margin(settings["buffer_margin"])
+        vc.set_overlap(settings["overlap_sec"])
+        vc.set_crossfade(settings["crossfade_sec"])
+        vc.set_chunk_sec(settings["chunk_sec"])
+
+    def apply_postprocess_config(self, cfg) -> None:
+        if self.voice_changer and hasattr(self.voice_changer, "set_postprocess_config"):
+            self.voice_changer.set_postprocess_config(cfg)
+
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
         # Update UI from main thread

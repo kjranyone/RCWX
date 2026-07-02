@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
 
 def _default_models_dir() -> Path:
     return Path.home() / ".cache" / "rcwx" / "models"
+
+
+def _filter_known(dc_cls: type, data: dict) -> dict:
+    """Keep only keys that are fields of ``dc_cls``.
+
+    Tolerates renamed/removed config keys from older versions so that loading
+    an out-of-date config file never raises ``TypeError`` on unexpected keys.
+    """
+    valid = {f.name for f in fields(dc_cls)}
+    return {k: v for k, v in data.items() if k in valid}
 
 
 @dataclass
@@ -156,39 +166,24 @@ class RCWXConfig:
         audio_data = data.pop("audio", {})
         inference_data = data.pop("inference", {})
 
-        # Migrate old config keys
-        if "input_device" in audio_data:
-            audio_data.pop("input_device")  # Remove old key (was int, now using name)
-        if "output_device" in audio_data:
-            audio_data.pop("output_device")  # Remove old key (was int, now using name)
-
-        # Handle nested denoise config
+        # Nested configs are constructed separately; pop them so they are not
+        # passed twice into InferenceConfig below.
         denoise_data = inference_data.pop("denoise", {})
-        denoise_config = DenoiseConfig(**denoise_data) if denoise_data else DenoiseConfig()
-
-        # Handle nested postprocess config
         postprocess_data = inference_data.pop("postprocess", {})
-        postprocess_config = (
-            PostprocessConfig(**postprocess_data) if postprocess_data else PostprocessConfig()
-        )
 
-        # Filter out any unknown keys to prevent TypeError
-        import dataclasses
-
-        valid_fields = {f.name for f in dataclasses.fields(InferenceConfig)} - {
-            "denoise",
-            "postprocess",
-        }
-        filtered_inference = {k: v for k, v in inference_data.items() if k in valid_fields}
-
+        # Every section is filtered against its dataclass fields so that
+        # unknown/removed keys from an older config never raise TypeError
+        # (e.g. the legacy int-valued audio.input_device / output_device keys).
         return cls(
-            audio=AudioConfig(**audio_data),
+            audio=AudioConfig(**_filter_known(AudioConfig, audio_data)),
             inference=InferenceConfig(
-                denoise=denoise_config,
-                postprocess=postprocess_config,
-                **filtered_inference,
+                denoise=DenoiseConfig(**_filter_known(DenoiseConfig, denoise_data)),
+                postprocess=PostprocessConfig(
+                    **_filter_known(PostprocessConfig, postprocess_data)
+                ),
+                **_filter_known(InferenceConfig, inference_data),
             ),
-            **data,
+            **_filter_known(RCWXConfig, data),
         )
 
     def save(self, path: Optional[Path] = None) -> None:

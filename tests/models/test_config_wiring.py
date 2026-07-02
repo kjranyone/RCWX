@@ -47,10 +47,10 @@ def test_realtime_config_custom_values():
 # ---------------------------------------------------------------------------
 
 def test_inference_config_has_noise_scale():
-    """InferenceConfig should have noise_scale=0.4 by default."""
+    """InferenceConfig should have noise_scale=0.45 by default."""
     cfg = InferenceConfig()
     assert hasattr(cfg, "noise_scale"), "InferenceConfig missing noise_scale"
-    assert cfg.noise_scale == 0.4, f"Expected 0.4, got {cfg.noise_scale}"
+    assert cfg.noise_scale == 0.45, f"Expected 0.45, got {cfg.noise_scale}"
 
 
 def test_inference_config_has_f0_lowpass_cutoff():
@@ -103,8 +103,8 @@ def test_config_backward_compat():
 
     try:
         loaded = RCWXConfig.load(tmp_path)
-        assert loaded.inference.noise_scale == 0.4, (
-            f"Expected default 0.4, got {loaded.inference.noise_scale}"
+        assert loaded.inference.noise_scale == 0.45, (
+            f"Expected default 0.45, got {loaded.inference.noise_scale}"
         )
         assert loaded.inference.f0_lowpass_cutoff_hz == 16.0, (
             f"Expected default 16.0, got {loaded.inference.f0_lowpass_cutoff_hz}"

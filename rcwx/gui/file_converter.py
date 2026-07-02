@@ -82,6 +82,10 @@ class FileConverter:
         self.app.test_convert_btn.configure(state="disabled")
         self.app.test_status_label.configure(text="変換中...", text_color="white")
 
+        # Snapshot all Tk-bound settings on the main thread; the worker
+        # thread must never touch Tcl/Tk state (not thread-safe).
+        infer_params = self.app.capture_infer_params()
+
         def convert_thread():
             try:
                 # Read WAV file
@@ -103,21 +107,9 @@ class FileConverter:
                 output = self.app.pipeline.infer(
                     audio,
                     input_sr=sr_in,
-                    pitch_shift=self.app.pitch_control.pitch,
-                    f0_method=self.app.pitch_control.f0_method,
-                    index_rate=self.app._get_index_rate(),
-                    voice_gate_mode=self.app.voice_gate_mode_var.get(),
-                    energy_threshold=self.app.energy_threshold_slider.get(),
-                    pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
-                    moe_boost=self.app.pitch_control.moe_boost,
-                    noise_scale=self.app.pitch_control.noise_scale,
-                    f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
-                    enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
-                    enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
-                    f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
-                    denoise=self.app.use_denoise_var.get(),
                     use_feature_cache=False,
                     pad_mode="batch",
+                    **infer_params,
                 )
 
                 self._converted_audio = output

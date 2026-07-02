@@ -272,9 +272,12 @@ class SpectralGateDenoiser:
             logger.info("Auto noise learning enabled")
 
     def reset(self) -> None:
-        """Reset internal state."""
-        self.input_buffer.fill(0)
-        self.output_buffer.fill(0)
+        """Reset internal state.
+
+        ``process()`` performs a self-contained overlap-add per call, so the
+        only state carried across calls is the temporal gain smoothing and the
+        (optional) auto-learned noise profile.
+        """
         self.prev_gain.fill(1)
         if self.auto_learn_enabled:
             self.noise_profile = None
