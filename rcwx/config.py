@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
 
 def _default_models_dir() -> Path:
     return Path.home() / ".cache" / "rcwx" / "models"
+
+
+def _filter_known(dc_cls: type, data: dict) -> dict:
+    """Keep only keys that are fields of ``dc_cls``.
+
+    Tolerates renamed/removed config keys from older versions so that loading
+    an out-of-date config file never raises ``TypeError`` on unexpected keys.
+    """
+    valid = {f.name for f in fields(dc_cls)}
+    return {k: v for k, v in data.items() if k in valid}
 
 
 @dataclass
@@ -27,6 +37,8 @@ class AudioConfig:
     input_gain_db: float = 0.0  # Input gain in dB
     # Input channel selection for stereo devices: "left", "right", "average"
     input_channel_selection: str = "auto"
+    # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
+    output_channel_selection: str = "auto"
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
@@ -41,6 +53,23 @@ class DenoiseConfig:
     # Spectral gate parameters (used when method=spectral)
     threshold_db: float = 6.0
     reduction_db: float = -24.0
+
+
+@dataclass
+class PostprocessConfig:
+    """Post-processing for output audio (treble boost + normalizer + limiter)."""
+
+    enabled: bool = True
+    treble_boost_db: float = 4.0
+    treble_cutoff_hz: float = 2800.0
+    limiter_threshold_db: float = -1.0
+    limiter_release_ms: float = 80.0
+    # RMS Normalizer (EMA-smoothed AGC)
+    normalizer_enabled: bool = True
+    normalizer_target_rms: float = 0.1
+    normalizer_ema_alpha: float = 0.15
+    normalizer_max_gain_db: float = 12.0
+    normalizer_min_gain_db: float = -12.0
 
 
 @dataclass
@@ -106,6 +135,7 @@ class InferenceConfig:
     f0_slew_max_step_st: float = 3.6
 
     denoise: DenoiseConfig = field(default_factory=DenoiseConfig)
+    postprocess: PostprocessConfig = field(default_factory=PostprocessConfig)
 
 
 @dataclass
@@ -136,25 +166,24 @@ class RCWXConfig:
         audio_data = data.pop("audio", {})
         inference_data = data.pop("inference", {})
 
-        # Migrate old config keys
-        if "input_device" in audio_data:
-            audio_data.pop("input_device")  # Remove old key (was int, now using name)
-        if "output_device" in audio_data:
-            audio_data.pop("output_device")  # Remove old key (was int, now using name)
-
-        # Handle nested denoise config
+        # Nested configs are constructed separately; pop them so they are not
+        # passed twice into InferenceConfig below.
         denoise_data = inference_data.pop("denoise", {})
-        denoise_config = DenoiseConfig(**denoise_data) if denoise_data else DenoiseConfig()
+        postprocess_data = inference_data.pop("postprocess", {})
 
-        # Filter out any unknown keys to prevent TypeError
-        import dataclasses
-        valid_fields = {f.name for f in dataclasses.fields(InferenceConfig)} - {"denoise"}
-        filtered_inference = {k: v for k, v in inference_data.items() if k in valid_fields}
-
+        # Every section is filtered against its dataclass fields so that
+        # unknown/removed keys from an older config never raise TypeError
+        # (e.g. the legacy int-valued audio.input_device / output_device keys).
         return cls(
-            audio=AudioConfig(**audio_data),
-            inference=InferenceConfig(denoise=denoise_config, **filtered_inference),
-            **data,
+            audio=AudioConfig(**_filter_known(AudioConfig, audio_data)),
+            inference=InferenceConfig(
+                denoise=DenoiseConfig(**_filter_known(DenoiseConfig, denoise_data)),
+                postprocess=PostprocessConfig(
+                    **_filter_known(PostprocessConfig, postprocess_data)
+                ),
+                **_filter_known(InferenceConfig, inference_data),
+            ),
+            **_filter_known(RCWXConfig, data),
         )
 
     def save(self, path: Optional[Path] = None) -> None:

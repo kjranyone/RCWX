@@ -686,7 +686,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "customtkinter", marker = "sys_platform == 'win32'" },
-    { name = "denoiser", marker = "sys_platform == 'win32'" },
     { name = "faiss-cpu", marker = "sys_platform == 'win32'" },
     { name = "huggingface-hub", marker = "sys_platform == 'win32'" },
     { name = "numpy", marker = "sys_platform == 'win32'" },
@@ -705,11 +704,14 @@ dev = [
     { name = "pytest", marker = "sys_platform == 'win32'" },
     { name = "ruff", marker = "sys_platform == 'win32'" },
 ]
+ml-denoise = [
+    { name = "denoiser", marker = "sys_platform == 'win32'" },
+]
 
 [package.metadata]
 requires-dist = [
     { name = "customtkinter", specifier = ">=5.2" },
-    { name = "denoiser", specifier = ">=0.1" },
+    { name = "denoiser", marker = "extra == 'ml-denoise'", specifier = ">=0.1" },
     { name = "faiss-cpu", specifier = ">=1.7.4" },
     { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "numpy", specifier = ">=1.24" },
@@ -724,7 +726,7 @@ requires-dist = [
     { name = "torchfcpe", specifier = ">=0.0.1" },
     { name = "transformers", specifier = ">=4.36" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["ml-denoise", "dev"]
 
 [[package]]
 name = "regex"

@@ -22,6 +22,7 @@ from rcwx.gui.widgets.latency_settings import LatencySettingsFrame
 from rcwx.gui.widgets.latency_monitor import LatencyMonitor
 from rcwx.gui.widgets.model_selector import ModelSelector
 from rcwx.gui.widgets.pitch_control import PitchControl
+from rcwx.gui.widgets.postprocess_settings import PostprocessSettingsFrame
 from rcwx.pipeline.inference import RVCPipeline
 
 # Set PortAudio API preference for Windows (WASAPI for better compatibility)
@@ -186,21 +187,15 @@ class RCWXApp(ctk.CTk):
         self.pitch_control.set_pitch(self.config.inference.pitch_shift)
 
         # Restore saved pre-HuBERT pitch setting
-        self.pitch_control.set_pre_hubert_pitch_ratio(
-            self.config.inference.pre_hubert_pitch_ratio
-        )
+        self.pitch_control.set_pre_hubert_pitch_ratio(self.config.inference.pre_hubert_pitch_ratio)
         self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
         self.pitch_control.set_noise_scale(self.config.inference.noise_scale)
         self.pitch_control.set_fixed_harmonics(self.config.inference.fixed_harmonics)
         self.pitch_control.set_enable_octave_flip_suppress(
             self.config.inference.enable_octave_flip_suppress
         )
-        self.pitch_control.set_enable_f0_slew_limit(
-            self.config.inference.enable_f0_slew_limit
-        )
-        self.pitch_control.set_f0_slew_max_step_st(
-            self.config.inference.f0_slew_max_step_st
-        )
+        self.pitch_control.set_enable_f0_slew_limit(self.config.inference.enable_f0_slew_limit)
+        self.pitch_control.set_f0_slew_max_step_st(self.config.inference.f0_slew_max_step_st)
 
         # Index control
         self.index_frame = ctk.CTkFrame(self.left_column)
@@ -457,9 +452,7 @@ class RCWXApp(ctk.CTk):
         )
         self.use_wav_input_cb.pack(anchor="w", padx=10, pady=(0, 3))
 
-        self.wav_input_file_frame = ctk.CTkFrame(
-            self.test_frame, fg_color="transparent"
-        )
+        self.wav_input_file_frame = ctk.CTkFrame(self.test_frame, fg_color="transparent")
         # Initially hidden; shown when checkbox is checked
 
         self.wav_input_path_var = ctk.StringVar(value="")
@@ -504,6 +497,14 @@ class RCWXApp(ctk.CTk):
         )
         self.audio_settings.pack(fill="x", padx=10, pady=5)
 
+        # Post-processing settings (treble boost + limiter)
+        self.postprocess_settings = PostprocessSettingsFrame(
+            self.audio_scroll,
+            config=self.config.inference.postprocess,
+            on_settings_changed=self._on_postprocess_settings_changed,
+        )
+        self.postprocess_settings.pack(fill="x", padx=10, pady=5)
+
         # Latency settings (mode selection + advanced controls)
         self.latency_settings = LatencySettingsFrame(
             self.audio_scroll,
@@ -527,7 +528,7 @@ class RCWXApp(ctk.CTk):
 
         # Restore saved API filters and devices
         # Important: Set API filter first without triggering device reset
-        if hasattr(self.config.audio, 'input_hostapi_filter'):
+        if hasattr(self.config.audio, "input_hostapi_filter"):
             # Set filter directly and update device list only
             self.audio_settings._input_hostapi_filter = self.config.audio.input_hostapi_filter
             self.audio_settings.input_api_var.set(self.config.audio.input_hostapi_filter)
@@ -536,11 +537,12 @@ class RCWXApp(ctk.CTk):
             )
             # Update dropdown without resetting selection
             input_names = ["デフォルト"] + [
-                self.audio_settings._format_device_name(d) for d in self.audio_settings._input_devices
+                self.audio_settings._format_device_name(d)
+                for d in self.audio_settings._input_devices
             ]
             self.audio_settings.input_dropdown.configure(values=input_names)
 
-        if hasattr(self.config.audio, 'output_hostapi_filter'):
+        if hasattr(self.config.audio, "output_hostapi_filter"):
             # Set filter directly and update device list only
             self.audio_settings._output_hostapi_filter = self.config.audio.output_hostapi_filter
             self.audio_settings.output_api_var.set(self.config.audio.output_hostapi_filter)
@@ -549,7 +551,8 @@ class RCWXApp(ctk.CTk):
             )
             # Update dropdown without resetting selection
             output_names = ["デフォルト"] + [
-                self.audio_settings._format_device_name(d) for d in self.audio_settings._output_devices
+                self.audio_settings._format_device_name(d)
+                for d in self.audio_settings._output_devices
             ]
             self.audio_settings.output_dropdown.configure(values=output_names)
 
@@ -558,6 +561,12 @@ class RCWXApp(ctk.CTk):
             self.audio_settings.set_input_device(self.config.audio.input_device_name)
         if self.config.audio.output_device_name:
             self.audio_settings.set_output_device(self.config.audio.output_device_name)
+
+        # Restore output channel selection (after output device is set)
+        if hasattr(self.config.audio, "output_channel_selection"):
+            saved_out_ch = self.config.audio.output_channel_selection
+            self.audio_settings.output_channel_var.set(saved_out_ch)
+            self.audio_settings._update_output_channel_selection_state()
 
     def _setup_settings_tab(self) -> None:
         """Setup the advanced settings tab."""
@@ -826,68 +835,57 @@ class RCWXApp(ctk.CTk):
     def _on_pitch_changed(self, value: int) -> None:
         """Handle pitch change."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_pitch_shift(value)
+        self.realtime_controller.set_pitch_shift(value)
 
     def _on_f0_mode_changed(self, use_f0: bool) -> None:
         """Handle F0 mode change."""
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_f0_mode(use_f0)
+        self.realtime_controller.set_f0_mode(use_f0)
 
     def _on_f0_method_changed(self, method: str) -> None:
         """Handle F0 method change (rmvpe/fcpe/none)."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_f0_method(method)
+        self.realtime_controller.set_f0_method(method)
 
     def _on_pre_hubert_pitch_changed(self, ratio: float) -> None:
         """Handle pre-HuBERT pitch shift toggle."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_pre_hubert_pitch_ratio(ratio)
+        self.realtime_controller.set_pre_hubert_pitch_ratio(ratio)
 
     def _on_moe_boost_changed(self, strength: float) -> None:
         """Handle moe boost change."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_moe_boost(strength)
+        self.realtime_controller.set_moe_boost(strength)
 
     def _on_noise_scale_changed(self, scale: float) -> None:
         """Handle synthesizer noise scale change."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_noise_scale(scale)
+        self.realtime_controller.set_noise_scale(scale)
 
     def _on_fixed_harmonics_changed(self, enabled: bool) -> None:
         """Handle fixed harmonics toggle."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_fixed_harmonics(enabled)
+        self.realtime_controller.set_fixed_harmonics(enabled)
 
     def _on_octave_flip_suppress_changed(self, enabled: bool) -> None:
         """Handle octave-flip suppress toggle."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_enable_octave_flip_suppress(enabled)
+        self.realtime_controller.set_enable_octave_flip_suppress(enabled)
 
     def _on_f0_slew_limit_changed(self, enabled: bool) -> None:
         """Handle F0 slew limiter toggle."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_enable_f0_slew_limit(enabled)
+        self.realtime_controller.set_enable_f0_slew_limit(enabled)
 
     def _on_f0_slew_max_step_changed(self, value: float) -> None:
         """Handle F0 slew max-step slider change."""
         self._save_config()
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_f0_slew_max_step_st(value)
+        self.realtime_controller.set_f0_slew_max_step_st(value)
 
     def _on_index_changed(self) -> None:
         """Handle index checkbox change."""
         self._save_config()
         # Update voice changer if running
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_index_rate(self._get_index_rate())
+        self.realtime_controller.set_index_rate(self._get_index_rate())
         # Update status bar
         index_loaded = self.pipeline is not None and self.pipeline.faiss_index is not None
         self.status_bar.set_index_status(index_loaded, self._get_index_rate())
@@ -896,19 +894,17 @@ class RCWXApp(ctk.CTk):
         """Handle denoise settings change."""
         self._save_config()
         # Update voice changer if running
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_denoise(
-                self.use_denoise_var.get(),
-                self.denoise_method_var.get(),
-            )
+        self.realtime_controller.set_denoise(
+            self.use_denoise_var.get(),
+            self.denoise_method_var.get(),
+        )
 
     def _on_index_ratio_changed(self, value: float) -> None:
         """Handle index ratio slider change."""
         self.index_ratio_value.configure(text=f"{value:.2f}")
         self._save_config()
         # Update voice changer if running
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_index_rate(self._get_index_rate())
+        self.realtime_controller.set_index_rate(self._get_index_rate())
         # Update status bar
         index_loaded = self.pipeline is not None and self.pipeline.faiss_index is not None
         self.status_bar.set_index_status(index_loaded, self._get_index_rate())
@@ -926,22 +922,44 @@ class RCWXApp(ctk.CTk):
             self.energy_threshold_frame.pack_forget()
         self._save_config()
         # Update voice changer if running
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_voice_gate_mode(mode)
+        self.realtime_controller.set_voice_gate_mode(mode)
 
     def _on_energy_threshold_changed(self, value: float) -> None:
         """Handle energy threshold slider change."""
         self.energy_threshold_value.configure(text=f"{value:.2f}")
         self._save_config()
         # Update voice changer if running
-        if self.realtime_controller.voice_changer:
-            self.realtime_controller.voice_changer.set_energy_threshold(value)
+        self.realtime_controller.set_energy_threshold(value)
 
     def _get_index_rate(self) -> float:
         """Get current index rate (0 if disabled)."""
         if self.use_index_var.get():
             return self.index_ratio_slider.get()
         return 0.0
+
+    def capture_infer_params(self) -> dict:
+        """Snapshot all Tk-bound inference settings into a plain dict.
+
+        MUST be called on the main (GUI) thread. Background conversion
+        threads (audio test / file converter) pass the returned dict straight
+        to ``pipeline.infer()`` so they never touch Tcl/Tk state — StringVar
+        ``.get()``, slider ``.get()``, etc. are not thread-safe.
+        """
+        return {
+            "pitch_shift": self.pitch_control.pitch,
+            "f0_method": self.pitch_control.f0_method,
+            "index_rate": self._get_index_rate(),
+            "voice_gate_mode": self.voice_gate_mode_var.get(),
+            "energy_threshold": self.energy_threshold_slider.get(),
+            "pre_hubert_pitch_ratio": self.pitch_control.pre_hubert_pitch_ratio,
+            "moe_boost": self.pitch_control.moe_boost,
+            "noise_scale": self.pitch_control.noise_scale,
+            "f0_lowpass_cutoff_hz": self.config.inference.f0_lowpass_cutoff_hz,
+            "enable_octave_flip_suppress": self.pitch_control.enable_octave_flip_suppress,
+            "enable_f0_slew_limit": self.pitch_control.enable_f0_slew_limit,
+            "f0_slew_max_step_st": self.pitch_control.f0_slew_max_step_st,
+            "denoise": self.use_denoise_var.get(),
+        }
 
     def _restore_latency_settings(self) -> None:
         """Restore latency settings from config.
@@ -959,26 +977,31 @@ class RCWXApp(ctk.CTk):
         self._update_audio_device_display()
         # Save immediately
         self._save_config()
+        # Push input gain to running voice changer via its setter (keeps parity
+        # with the other runtime parameter updates instead of poking config).
+        # Guard on _initializing: during startup this handler can fire from the
+        # device-restore write traces (set_input_device -> input_var trace)
+        # before self.realtime_controller has been created.
+        if not self._initializing:
+            self.realtime_controller.set_input_gain_db(self.audio_settings.input_gain_db)
 
     def _on_latency_settings_changed(self) -> None:
         """Handle latency settings change."""
         # Save immediately
         self._save_config()
         # Apply changes in real-time if voice changer is running
-        if hasattr(self, "latency_settings") and self.realtime_controller.voice_changer:
+        if hasattr(self, "latency_settings") and self.realtime_controller.is_running:
             settings = self.latency_settings.get_settings()
             logger.debug(f"Latency settings changed: {settings}")
+            self.realtime_controller.apply_latency_settings(settings)
 
-            # Update all config values BEFORE triggering restart.
-            # set_chunk_sec() restarts the pipeline, so overlap/crossfade/
-            # prebuffer/margin must be set first to take effect.
-            vc = self.realtime_controller.voice_changer
-            vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
-            vc.set_buffer_margin(settings["buffer_margin"])
-            vc.set_overlap(settings["overlap_sec"])
-            vc.set_crossfade(settings["crossfade_sec"])
-            vc.set_chunk_sec(settings["chunk_sec"])
-
+    def _on_postprocess_settings_changed(self) -> None:
+        """Handle post-processing settings change."""
+        self._save_config()
+        if hasattr(self, "postprocess_settings") and self.realtime_controller.is_running:
+            self.realtime_controller.apply_postprocess_config(
+                self.postprocess_settings.get_config()
+            )
 
     def _save_config(self) -> None:
         """Save all config settings immediately."""
@@ -1004,9 +1027,7 @@ class RCWXApp(ctk.CTk):
             self.config.inference.enable_octave_flip_suppress = (
                 self.pitch_control.enable_octave_flip_suppress
             )
-            self.config.inference.enable_f0_slew_limit = (
-                self.pitch_control.enable_f0_slew_limit
-            )
+            self.config.inference.enable_f0_slew_limit = self.pitch_control.enable_f0_slew_limit
             self.config.inference.f0_slew_max_step_st = self.pitch_control.f0_slew_max_step_st
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()
@@ -1023,6 +1044,7 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.use_sola = latency["use_sola"]
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
+            self.config.audio.output_channel_selection = self.audio_settings.get_output_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()
             self.config.audio.output_hostapi_filter = self.audio_settings.output_api_var.get()
             self.config.audio.input_device_name = self.audio_settings.get_input_device_name()

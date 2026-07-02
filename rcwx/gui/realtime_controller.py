@@ -41,7 +41,7 @@ class RealtimeController:
         """
         self.app = app
         self.voice_changer: Optional[RealtimeVoiceChangerUnified] = None
-        self._buffer_warning_shown = {'underrun': False, 'overrun': False}
+        self._buffer_warning_shown = {"underrun": False, "overrun": False}
 
     def toggle(self) -> None:
         """Toggle voice changer on/off."""
@@ -93,6 +93,7 @@ class RealtimeController:
                 input_channels=self.app.audio_settings.input_channels,
                 output_channels=self.app.audio_settings.output_channels,
                 input_channel_selection=self.app.audio_settings.get_channel_selection(),
+                output_channel_selection=self.app.audio_settings.get_output_channel_selection(),
                 # Latency settings
                 chunk_sec=latency["chunk_sec"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
@@ -120,11 +121,15 @@ class RealtimeController:
                 f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
+                # Post-processing
+                postprocess_enabled=self.app.config.inference.postprocess.enabled,
+                treble_boost_db=self.app.config.inference.postprocess.treble_boost_db,
+                treble_cutoff_hz=self.app.config.inference.postprocess.treble_cutoff_hz,
+                limiter_threshold_db=self.app.config.inference.postprocess.limiter_threshold_db,
+                limiter_release_ms=self.app.config.inference.postprocess.limiter_release_ms,
                 # WAV file input
                 wav_input_path=(
-                    self.app.wav_input_path_var.get()
-                    if self.app.use_wav_input_var.get()
-                    else ""
+                    self.app.wav_input_path_var.get() if self.app.use_wav_input_var.get() else ""
                 ),
             )
 
@@ -204,7 +209,97 @@ class RealtimeController:
         self.app.status_bar.set_running(False)
 
         # Reset buffer warning flags so warnings show again on next start
-        self._buffer_warning_shown = {'underrun': False, 'overrun': False}
+        self._buffer_warning_shown = {"underrun": False, "overrun": False}
+
+    # ======== Runtime parameter passthrough ========
+    # Forward live parameter changes to the running voice changer, guarding on
+    # whether one exists. app.py calls these instead of reaching through
+    # `.voice_changer.set_*()` directly (Law of Demeter): the controller owns
+    # the voice changer lifecycle, so it owns the runtime-update surface too.
+
+    @property
+    def is_running(self) -> bool:
+        """True when a voice changer is active."""
+        return self.voice_changer is not None
+
+    def set_pitch_shift(self, semitones: int) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_pitch_shift(semitones)
+
+    def set_f0_mode(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_mode(enabled)
+
+    def set_f0_method(self, method: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_method(method)
+
+    def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_pre_hubert_pitch_ratio(ratio)
+
+    def set_moe_boost(self, strength: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_moe_boost(strength)
+
+    def set_noise_scale(self, scale: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_noise_scale(scale)
+
+    def set_fixed_harmonics(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_fixed_harmonics(enabled)
+
+    def set_enable_octave_flip_suppress(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_enable_octave_flip_suppress(enabled)
+
+    def set_enable_f0_slew_limit(self, enabled: bool) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_enable_f0_slew_limit(enabled)
+
+    def set_f0_slew_max_step_st(self, step_st: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_f0_slew_max_step_st(step_st)
+
+    def set_index_rate(self, rate: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_index_rate(rate)
+
+    def set_denoise(self, enabled: bool, method: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_denoise(enabled, method)
+
+    def set_voice_gate_mode(self, mode: str) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_voice_gate_mode(mode)
+
+    def set_energy_threshold(self, value: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_energy_threshold(value)
+
+    def set_input_gain_db(self, gain_db: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_input_gain_db(gain_db)
+
+    def apply_latency_settings(self, settings: dict) -> None:
+        """Apply latency settings in the required order.
+
+        ``set_chunk_sec()`` restarts the pipeline, so overlap/crossfade/
+        prebuffer/margin must be set first to take effect.
+        """
+        if not self.voice_changer:
+            return
+        vc = self.voice_changer
+        vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
+        vc.set_buffer_margin(settings["buffer_margin"])
+        vc.set_overlap(settings["overlap_sec"])
+        vc.set_crossfade(settings["crossfade_sec"])
+        vc.set_chunk_sec(settings["chunk_sec"])
+
+    def apply_postprocess_config(self, cfg) -> None:
+        if self.voice_changer and hasattr(self.voice_changer, "set_postprocess_config"):
+            self.voice_changer.set_postprocess_config(cfg)
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
@@ -216,13 +311,19 @@ class RealtimeController:
         BUFFER_WARNING_THRESHOLD = 5
 
         # Buffer underrun warning
-        if stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['underrun']:
-            self._buffer_warning_shown['underrun'] = True
+        if (
+            stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD
+            and not self._buffer_warning_shown["underrun"]
+        ):
+            self._buffer_warning_shown["underrun"] = True
             self.app.after(0, self._show_buffer_underrun_warning)
 
         # Buffer overrun warning
-        if stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD and not self._buffer_warning_shown['overrun']:
-            self._buffer_warning_shown['overrun'] = True
+        if (
+            stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD
+            and not self._buffer_warning_shown["overrun"]
+        ):
+            self._buffer_warning_shown["overrun"] = True
             self.app.after(0, self._show_buffer_overrun_warning)
 
     def _on_inference_error(self, error_msg: str) -> None:
@@ -244,7 +345,7 @@ class RealtimeController:
             "   • または F0なしモード\n\n"
             "3. ノイズキャンセリングを無効化\n\n"
             "4. バッファマージンを増やす (オーディオタブ)\n"
-            "   • 0.5 → 1.0"
+            "   • 0.5 → 1.0",
         )
 
     def _show_buffer_overrun_warning(self) -> None:
@@ -261,7 +362,7 @@ class RealtimeController:
             "3. 出力デバイスを確認\n"
             "   • サンプルレートが正しいか確認\n"
             "   • 別のデバイスを試す\n\n"
-            "4. デノイズを無効化してテスト"
+            "4. デノイズを無効化してテスト",
         )
 
     def _check_same_audio_interface(self) -> bool:

@@ -80,6 +80,19 @@ class LatencyMonitor(ctk.CTkFrame):
         self.sep4 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
         self.sep4.grid(row=0, column=7, padx=5, pady=5)
 
+        # GPU memory label
+        self.gpu_label = ctk.CTkLabel(
+            self,
+            text="GPU: --",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self.gpu_label.grid(row=0, column=8, padx=10, pady=5)
+
+        # Separator
+        self.sep5 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
+        self.sep5.grid(row=0, column=9, padx=5, pady=5)
+
         # Buffer warning label
         self.buffer_warning_label = ctk.CTkLabel(
             self,
@@ -87,11 +100,11 @@ class LatencyMonitor(ctk.CTkFrame):
             font=ctk.CTkFont(size=11),
             text_color="gray",
         )
-        self.buffer_warning_label.grid(row=0, column=8, padx=10, pady=5)
+        self.buffer_warning_label.grid(row=0, column=10, padx=10, pady=5)
 
         # Separator
-        self.sep5 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
-        self.sep5.grid(row=0, column=9, padx=5, pady=5)
+        self.sep6 = ctk.CTkLabel(self, text="|", font=ctk.CTkFont(size=11))
+        self.sep6.grid(row=0, column=11, padx=5, pady=5)
 
         # Status indicator
         self.status_indicator = ctk.CTkLabel(
@@ -100,10 +113,10 @@ class LatencyMonitor(ctk.CTkFrame):
             font=ctk.CTkFont(size=14),
             text_color="gray",
         )
-        self.status_indicator.grid(row=0, column=10, padx=10, pady=5, sticky="e")
+        self.status_indicator.grid(row=0, column=12, padx=10, pady=5, sticky="e")
 
         # Configure grid
-        self.grid_columnconfigure(10, weight=1)
+        self.grid_columnconfigure(12, weight=1)
 
     def set_device(self, name: str) -> None:
         """Set the device name."""
@@ -116,6 +129,12 @@ class LatencyMonitor(ctk.CTkFrame):
 
         self.latency_label.configure(text=f"レイテンシ: {stats.latency_ms:.0f}ms")
         self.inference_label.configure(text=f"推論: {stats.inference_ms:.0f}ms")
+
+        # Update GPU memory display
+        pct = stats.gpu_memory_percent
+        if pct > 0:
+            color = "#ff3333" if pct > 80 else "#ffaa00" if pct > 60 else "#88ff88"
+            self.gpu_label.configure(text=f"GPU: {pct:.0f}%", text_color=color)
 
         # Update buffer warning display
         warning_parts = []
@@ -134,10 +153,10 @@ class LatencyMonitor(ctk.CTkFrame):
                 text=" ".join(warning_parts),
                 text_color=color,
             )
-            self.sep5.grid_remove()
+            self.sep6.grid_remove()
         else:
             self.buffer_warning_label.configure(text="")
-            self.sep5.grid()
+            self.sep6.grid()
 
         # Update status color based on latency and buffer issues
         if stats.buffer_underruns > 0 or stats.buffer_overruns > 0:
@@ -159,16 +178,18 @@ class LatencyMonitor(ctk.CTkFrame):
             self.status_indicator.configure(text="●", text_color="gray")
             self.latency_label.configure(text="レイテンシ: --ms")
             self.inference_label.configure(text="推論: --ms")
+            self.gpu_label.configure(text="GPU: --", text_color="gray")
             self.buffer_warning_label.configure(text="")
-            self.sep5.grid()  # Show separator when stopped
+            self.sep6.grid()  # Show separator when stopped
 
     def set_loading(self) -> None:
         """Set loading status."""
         self.status_indicator.configure(text="◐", text_color="#ffff00")
         self.latency_label.configure(text="レイテンシ: 読込中...")
         self.inference_label.configure(text="推論: --ms")
+        self.gpu_label.configure(text="GPU: --", text_color="gray")
         self.buffer_warning_label.configure(text="")
-        self.sep5.grid()  # Show separator when loading
+        self.sep6.grid()  # Show separator when loading
 
     def set_index_status(self, loaded: bool, index_rate: float = 0.0) -> None:
         """Set the index status.

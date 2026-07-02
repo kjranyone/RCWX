@@ -39,6 +39,7 @@ class AudioTestManager:
         self._pending_audio: np.ndarray | None = None
         self._pending_out_sr: int = 0
         self._pending_debug_dir: Path | None = None
+        self._pending_infer_params: dict = {}
 
     def run_test(self) -> None:
         """
@@ -163,6 +164,10 @@ class AudioTestManager:
                 self._pending_out_sr = out_sr
                 self._pending_debug_dir = debug_dir
 
+                # Snapshot all Tk-bound settings on the main thread; the worker
+                # thread must never touch Tcl/Tk state (not thread-safe).
+                self._pending_infer_params = self.app.capture_infer_params()
+
                 # Run conversion in background thread
                 self._conversion_done.clear()
                 self._conversion_result = {"audio": None, "error": None, "model_sr": None}
@@ -192,21 +197,9 @@ class AudioTestManager:
             audio_tensor = torch.from_numpy(self._pending_audio).float()
             converted = self.app.pipeline.infer(
                 audio_tensor,
-                pitch_shift=self.app.pitch_control.pitch,
-                f0_method=self.app.pitch_control.f0_method,
-                index_rate=self.app._get_index_rate(),
-                voice_gate_mode=self.app.voice_gate_mode_var.get(),
-                energy_threshold=self.app.energy_threshold_slider.get(),
-                pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
-                moe_boost=self.app.pitch_control.moe_boost,
-                noise_scale=self.app.pitch_control.noise_scale,
-                f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
-                enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
-                enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
-                f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
-                denoise=self.app.use_denoise_var.get(),
                 use_feature_cache=False,
                 pad_mode="batch",
+                **self._pending_infer_params,
             )
             self._conversion_result["audio"] = converted
             self._conversion_result["model_sr"] = self.app.pipeline.sample_rate

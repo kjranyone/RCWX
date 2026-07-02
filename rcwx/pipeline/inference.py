@@ -6,6 +6,7 @@ import logging
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Optional
@@ -44,6 +45,37 @@ F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
 SWIFTF0_VOICING_THRESHOLD = 0.35
+
+
+@dataclass
+class StreamingParams:
+    """Tunable parameters for :meth:`RVCPipeline.infer_streaming`.
+
+    Folds the (previously 17) per-call keyword arguments into a single object
+    so callers can build one config-derived params bundle instead of
+    transcribing every argument at each call site. Defaults mirror the
+    historical ``infer_streaming`` keyword defaults, so existing callers that
+    pass individual keywords keep working unchanged (they are collected into
+    ``**overrides`` and used to build a ``StreamingParams``).
+    """
+
+    pitch_shift: int = 0
+    f0_method: str = "fcpe"
+    index_rate: float = 0.0
+    index_k: int = 4
+    voice_gate_mode: str = "off"
+    energy_threshold: float = 0.05
+    use_parallel_extraction: bool = True
+    noise_scale: float = 0.66666
+    sola_extra_samples: int = 0
+    pre_hubert_pitch_ratio: float = 0.0
+    moe_boost: float = 0.0
+    f0_lowpass_cutoff_hz: float = 16.0
+    enable_octave_flip_suppress: bool = True
+    enable_f0_slew_limit: bool = True
+    f0_slew_max_step_st: float = 2.8
+    hubert_context_sec: float = 1.0
+    fixed_harmonics: bool = False
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -612,6 +644,128 @@ def stabilize_f0_boundaries(
     return corrected
 
 
+def apply_f0_filter_chain(
+    f0: torch.Tensor,
+    *,
+    f0_lowpass_cutoff_hz: float,
+    enable_octave_flip_suppress: bool,
+    enable_f0_slew_limit: bool,
+    f0_slew_max_step_st: float,
+) -> torch.Tensor:
+    """Apply the shared F0 post-processing chain.
+
+    median spike removal -> lowpass -> (optional) octave-flip suppression ->
+    (optional) slew limiting. Used identically by ``infer`` (on the final F0)
+    and ``infer_streaming`` (on the history-extended F0).
+    """
+    f0 = smooth_f0_spikes(f0, window=3)
+    f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
+    if enable_octave_flip_suppress:
+        f0 = suppress_octave_flips(f0)
+    if enable_f0_slew_limit:
+        f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
+    return f0
+
+
+def quantize_f0_to_pitch(f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize continuous F0 (Hz) to RVC's 256-bin mel pitch index.
+
+    Mirrors the original RVC WebUI quantization exactly: F0 -> mel scale ->
+    normalize voiced frames (f0_mel > 0) to 1..255; unvoiced stays 0 pre-clamp
+    and becomes 1 after the final clamp (RVC's unvoiced marker).
+
+    Returns:
+        (pitch, voiced_mask) where ``pitch`` is int64 [B, T] in 1..255 and
+        ``voiced_mask`` is float [B, T] (1.0 where voiced, else 0.0).
+    """
+    f0_mel_min = 1127 * math.log(1 + 50 / 700)  # ~69.07 (50Hz)
+    f0_mel_max = 1127 * math.log(1 + 1100 / 700)  # ~942.46 (1100Hz)
+    f0_mel = 1127 * torch.log(1 + f0 / 700)
+    voiced_mask = f0_mel > 0
+    f0_mel_normalized = torch.where(
+        voiced_mask,
+        (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
+        f0_mel,  # Keep 0 for unvoiced
+    )
+    pitch = torch.clamp(f0_mel_normalized, 1, 255).round().long()
+    return pitch, voiced_mask.float()
+
+
+def apply_voice_gate(
+    output: torch.Tensor,
+    gate_mask_src: torch.Tensor,
+    *,
+    voice_gate_mode: str,
+    energy_threshold: float,
+    sample_rate: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply the shared voice gate to synthesized output.
+
+    ``gate_mask_src`` is the per-feature-frame voiced mask, already sliced by
+    the caller to the region that ``output`` covers (batch ``infer`` passes the
+    full mask; ``infer_streaming`` passes the output-region slice).
+
+    Modes:
+        - "expand": dilate voiced regions (~30ms) to include adjacent plosives.
+        - "energy": OR the voiced mask with an energy-threshold mask.
+        - anything else (e.g. "strict"): use the F0 voiced mask as-is.
+
+    The mask is upsampled to ``output`` length and given a 5ms attack/release
+    smooth to avoid clicks.
+
+    Returns:
+        (gated_output, gate_mask) — ``gate_mask`` is returned so the caller can
+        compute the passed ratio for logging without this helper forcing a
+        GPU->CPU sync on the hot streaming path.
+    """
+    output_len = output.shape[-1]
+    gate_mask = gate_mask_src.clone()
+
+    if voice_gate_mode == "expand":
+        # Expand by ~30ms on each side (covers most plosives); at feature rate
+        # (~50fps) that's ~1-2 frames. Max pooling dilates the mask.
+        expand_frames = 2
+        gate_mask = torch.nn.functional.max_pool1d(
+            gate_mask.unsqueeze(1),
+            kernel_size=expand_frames * 2 + 1,
+            stride=1,
+            padding=expand_frames,
+        ).squeeze(1)
+    elif voice_gate_mode == "energy":
+        # Combine F0 voicing with short-time energy at the feature frame rate.
+        frame_size = output_len // gate_mask.shape[-1]
+        if frame_size > 0:
+            output_frames = output.unfold(-1, frame_size, frame_size)
+            frame_energy = (output_frames ** 2).mean(dim=-1)
+            energy_max = frame_energy.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+            energy_mask = (frame_energy / energy_max > energy_threshold).float()
+            if energy_mask.shape[-1] == gate_mask.shape[-1]:
+                gate_mask = torch.maximum(gate_mask, energy_mask)
+
+    # Upsample mask to match output length
+    gate_mask = torch.nn.functional.interpolate(
+        gate_mask.unsqueeze(1),
+        size=output_len,
+        mode="linear",
+        align_corners=False,
+    ).squeeze(1)
+
+    # Smooth attack/release (5ms) to avoid clicks
+    smooth_samples = int(sample_rate * 0.005)
+    if smooth_samples > 1:
+        kernel = torch.ones(1, 1, smooth_samples, device=gate_mask.device) / smooth_samples
+        gate_mask = torch.nn.functional.conv1d(
+            gate_mask.unsqueeze(1),
+            kernel,
+            padding=smooth_samples // 2,
+        ).squeeze(1)
+        if gate_mask.shape[-1] != output_len:
+            gate_mask = gate_mask[..., :output_len]
+        gate_mask = torch.clamp(gate_mask, 0, 1)
+
+    return output * gate_mask, gate_mask
+
+
 def apply_output_edge_fade(
     audio: np.ndarray,
     sample_rate: int,
@@ -689,7 +843,7 @@ class RVCPipeline:
             self.models_dir = Path.home() / ".cache" / "rcwx" / "models"
 
         # Components (initialized lazily)
-        self.hubert: Optional[HuBERTFeatureExtractor] = None
+        self.hubert: Optional[HuBERTLoader] = None
         self.rmvpe: Optional[RMVPE] = None
         self.fcpe: Optional[FCPE] = None
         self.swiftf0: Optional[SwiftF0Model] = None
@@ -725,6 +879,13 @@ class RVCPipeline:
         # This enables overlap-add blending at the audio output level
         self._output_cache: Optional[np.ndarray] = None  # [T_output] at model sample rate
         self._output_overlap_len: int = 0  # Set dynamically based on crossfade_sec
+
+        # Streaming caches used exclusively by infer_streaming().  These are
+        # (re)set by clear_cache(); initialize them here too so infer_streaming
+        # works even if called before the first clear_cache()/warmup.
+        self._streaming_feat_cache = None
+        self._streaming_audio_history: Optional[np.ndarray] = None
+        self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
 
     def load(self) -> None:
         """Load all models."""
@@ -1487,15 +1648,15 @@ class RVCPipeline:
                         blended = prev_tail * alpha + cur_head * (1.0 - alpha)
                         f0[:, :blend_len] = torch.where(blend_mask, blended, f0[:, :blend_len])
 
-                # Apply median filter to remove F0 spikes
-                f0 = smooth_f0_spikes(f0, window=3)
-
-                # Phase 6: Apply lowpass filter to remove high-frequency jitter
-                f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
-                if enable_octave_flip_suppress:
-                    f0 = suppress_octave_flips(f0)
-                if enable_f0_slew_limit:
-                    f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
+                # Shared F0 post-processing chain
+                # (median spike removal -> lowpass -> octave -> slew)
+                f0 = apply_f0_filter_chain(
+                    f0,
+                    f0_lowpass_cutoff_hz=f0_lowpass_cutoff_hz,
+                    enable_octave_flip_suppress=enable_octave_flip_suppress,
+                    enable_f0_slew_limit=enable_f0_slew_limit,
+                    f0_slew_max_step_st=f0_slew_max_step_st,
+                )
 
                 # Batch boundary stabilization to suppress start/end F0 flutter.
                 f0 = stabilize_f0_boundaries(f0, edge_frames=10)
@@ -1503,35 +1664,14 @@ class RVCPipeline:
                 # pitchf: continuous F0 values for NSF decoder
                 pitchf = f0.to(self.dtype)
 
-                # pitch: quantized F0 for pitch embedding (256 bins)
-                # Match original RVC WebUI pitch quantization exactly:
-                # 1. Convert F0 to mel scale
-                # 2. Normalize to 1-255 range (for voiced frames with f0_mel > 0)
-                # 3. Set unvoiced/low values to 1 (NOT 0 - original RVC convention)
-                f0_mel_min = 1127 * math.log(1 + 50 / 700)  # ~69.07 (50Hz)
-                f0_mel_max = 1127 * math.log(1 + 1100 / 700)  # ~942.46 (1100Hz)
-
-                # Convert F0 to mel scale (f0=0 -> f0_mel=0)
-                f0_mel = 1127 * torch.log(1 + f0 / 700)
-
-                # Only normalize voiced frames (f0_mel > 0)
-                # Original: f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1
-                voiced_mask = f0_mel > 0
-                f0_mel_normalized = torch.where(
-                    voiced_mask,
-                    (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
-                    f0_mel,  # Keep 0 for unvoiced
-                )
-
-                # Clamp to valid range and set low values to 1
-                # Original: f0_mel[f0_mel <= 1] = 1; f0_mel[f0_mel > 255] = 255
-                pitch = torch.clamp(f0_mel_normalized, 1, 255).round().long()
+                # pitch: quantized F0 for the 256-bin pitch embedding, plus the
+                # voiced mask reused for post-synthesis gating.
+                pitch, voiced_mask_for_gate = quantize_f0_to_pitch(f0)
                 logger.info(
-                    f"F0: shape={f0.shape}, min={f0.min():.1f}, max={f0.max():.1f}, voiced={voiced_mask.sum().item()}/{f0.numel()}, pitch_range=[{pitch.min().item()}, {pitch.max().item()}]"
+                    f"F0: shape={f0.shape}, min={f0.min():.1f}, max={f0.max():.1f}, "
+                    f"voiced={int(voiced_mask_for_gate.sum().item())}/{f0.numel()}, "
+                    f"pitch_range=[{pitch.min().item()}, {pitch.max().item()}]"
                 )
-
-                # Store voiced mask for gating (will be used after synthesis)
-                voiced_mask_for_gate = voiced_mask.float()  # [B, T]
 
                 # Update F0 cache (store tail for next chunk)
                 # Extended cache length for better boundary blending
@@ -1659,67 +1799,15 @@ class RVCPipeline:
                     f"Trimmed synth padding: {trim_left} + {trim_right} samples (synth_total={synth_total}, synth_tail_rms={synth_tail_rms:.4f})"
                 )
 
-        # Apply voice gating based on mode
+        # Apply voice gating based on mode (shared with infer_streaming)
         if voice_gate_mode != "off" and voiced_mask_for_gate is not None:
-            output_len = output.shape[-1]
-            gate_mask = voiced_mask_for_gate.clone()  # [B, T_feat]
-
-            # Mode: expand - dilate voiced regions to include adjacent plosives
-            if voice_gate_mode == "expand":
-                # Expand by ~30ms on each side (covers most plosives)
-                # At feature rate (~50fps), that's about 1-2 frames
-                expand_frames = 2
-                # Use max pooling to dilate the mask
-                gate_mask = torch.nn.functional.max_pool1d(
-                    gate_mask.unsqueeze(1),
-                    kernel_size=expand_frames * 2 + 1,
-                    stride=1,
-                    padding=expand_frames,
-                ).squeeze(1)
-
-            # Mode: energy - combine F0 with energy-based detection
-            elif voice_gate_mode == "energy":
-                # Compute frame-level energy from output (already synthesized)
-                # Use short-time energy at feature frame rate
-                frame_size = output_len // gate_mask.shape[-1]
-                if frame_size > 0:
-                    output_frames = output.unfold(
-                        -1, frame_size, frame_size
-                    )  # [B, num_frames, frame_size]
-                    frame_energy = (output_frames**2).mean(dim=-1)  # [B, num_frames]
-                    # Normalize energy to 0-1
-                    energy_max = frame_energy.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
-                    energy_mask = frame_energy / energy_max
-                    # Threshold: keep frames with energy above threshold
-                    energy_mask = (energy_mask > energy_threshold).float()
-                    # Combine: voiced OR has energy
-                    if energy_mask.shape[-1] == gate_mask.shape[-1]:
-                        gate_mask = torch.maximum(gate_mask, energy_mask)
-
-            # Upsample mask to match output length
-            gate_mask = torch.nn.functional.interpolate(
-                gate_mask.unsqueeze(1),  # [B, 1, T_feat]
-                size=output_len,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)  # [B, T_out]
-
-            # Apply smooth attack/release to avoid clicks (5ms)
-            smooth_samples = int(self.sample_rate * 0.005)
-            if smooth_samples > 1:
-                kernel = torch.ones(1, 1, smooth_samples, device=gate_mask.device) / smooth_samples
-                gate_mask = torch.nn.functional.conv1d(
-                    gate_mask.unsqueeze(1),
-                    kernel,
-                    padding=smooth_samples // 2,
-                ).squeeze(1)
-                # Ensure exact size match after convolution
-                if gate_mask.shape[-1] != output_len:
-                    gate_mask = gate_mask[..., :output_len]
-                gate_mask = torch.clamp(gate_mask, 0, 1)
-
-            # Apply gate
-            output = output * gate_mask
+            output, gate_mask = apply_voice_gate(
+                output,
+                voiced_mask_for_gate,
+                voice_gate_mode=voice_gate_mode,
+                energy_threshold=energy_threshold,
+                sample_rate=self.sample_rate,
+            )
             voiced_ratio = gate_mask.mean().item()
             logger.info(f"Voice gate ({voice_gate_mode}): {voiced_ratio * 100:.1f}% passed")
 
@@ -1805,23 +1893,8 @@ class RVCPipeline:
         self,
         audio_16k: np.ndarray,
         overlap_samples: int,
-        pitch_shift: int = 0,
-        f0_method: str = "fcpe",
-        index_rate: float = 0.0,
-        index_k: int = 4,
-        voice_gate_mode: str = "off",
-        energy_threshold: float = 0.05,
-        use_parallel_extraction: bool = True,
-        noise_scale: float = 0.66666,
-        sola_extra_samples: int = 0,
-        pre_hubert_pitch_ratio: float = 0.0,
-        moe_boost: float = 0.0,
-        f0_lowpass_cutoff_hz: float = 16.0,
-        enable_octave_flip_suppress: bool = True,
-        enable_f0_slew_limit: bool = True,
-        f0_slew_max_step_st: float = 2.8,
-        hubert_context_sec: float = 1.0,
-        fixed_harmonics: bool = False,
+        params: Optional[StreamingParams] = None,
+        **overrides,
     ) -> np.ndarray:
         """Streaming inference with audio-level overlap.
 
@@ -1834,25 +1907,23 @@ class RVCPipeline:
                        Length MUST be a multiple of 320 (HuBERT hop).
                        overlap_samples MUST also be a multiple of 320.
             overlap_samples: Number of overlap samples from previous chunk.
-            pitch_shift: Pitch shift in semitones.
-            f0_method: F0 extraction method ("fcpe", "rmvpe", "none").
-            index_rate: FAISS index blending ratio (0=off).
-            index_k: Number of FAISS neighbors.
-            voice_gate_mode: Voice gate mode (off/strict/expand/energy).
-            energy_threshold: Energy threshold for "energy" gate mode.
-            use_parallel_extraction: Enable parallel HuBERT+F0 extraction.
-            sola_extra_samples: Extra samples to keep from overlap region
+            params: Tunable parameters bundle (:class:`StreamingParams`).
+                When ``None``, one is built from ``**overrides`` so legacy
+                callers passing individual keyword arguments keep working.
+            **overrides: Individual :class:`StreamingParams` fields. Merged
+                onto ``params`` when both are given.
+
+        StreamingParams fields of note:
+            sola_extra_samples: Extra samples to keep from the overlap region
                 (at model sample rate) to compensate for SOLA crossfade
-                deficit. When SOLA is enabled, consecutive outputs overlap
-                by this amount so SOLA can crossfade without losing samples.
-            pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
-                HuBERT (0.0=disabled, 1.0=full). HuBERT/F0 are extracted
-                from the same shifted audio for alignment, and only the
-                residual shift is applied on F0. When moe_boost>0 and
-                pitch_shift>0, low-register input gets adaptive upward
-                assist based on an autocorrelation median-F0 estimate.
-            moe_boost: Moe voice style strength for F0 contour shaping
-                (0.0=off, 1.0=strong).
+                deficit — consecutive outputs overlap by this amount so SOLA
+                can crossfade without losing samples.
+            pre_hubert_pitch_ratio: Ratio of pitch_shift applied before HuBERT
+                (0.0=disabled, 1.0=full); only the residual shift is applied on
+                F0. When moe_boost>0 and pitch_shift>0, low-register input gets
+                adaptive upward assist from an autocorrelation median-F0
+                estimate.
+            moe_boost: Moe voice style strength for F0 contour shaping.
 
         Returns:
             Converted audio at model sample rate (usually 40kHz).
@@ -1860,6 +1931,32 @@ class RVCPipeline:
         """
         if not self._loaded:
             self.load()
+
+        # Accept either a StreamingParams bundle or legacy per-call keyword
+        # arguments (collected into **overrides), then unpack into locals so
+        # the body below reads exactly as it did before the refactor.
+        if params is None:
+            params = StreamingParams(**overrides)
+        elif overrides:
+            params = replace(params, **overrides)
+
+        pitch_shift = params.pitch_shift
+        f0_method = params.f0_method
+        index_rate = params.index_rate
+        index_k = params.index_k
+        voice_gate_mode = params.voice_gate_mode
+        energy_threshold = params.energy_threshold
+        use_parallel_extraction = params.use_parallel_extraction
+        noise_scale = params.noise_scale
+        sola_extra_samples = params.sola_extra_samples
+        pre_hubert_pitch_ratio = params.pre_hubert_pitch_ratio
+        moe_boost = params.moe_boost
+        f0_lowpass_cutoff_hz = params.f0_lowpass_cutoff_hz
+        enable_octave_flip_suppress = params.enable_octave_flip_suppress
+        enable_f0_slew_limit = params.enable_f0_slew_limit
+        f0_slew_max_step_st = params.f0_slew_max_step_st
+        hubert_context_sec = params.hubert_context_sec
+        fixed_harmonics = params.fixed_harmonics
 
         hubert_hop = 320
 
@@ -2148,19 +2245,15 @@ class RVCPipeline:
                 else:
                     f0_extended = f0
 
-                # Apply filters on extended F0
-                f0_extended = smooth_f0_spikes(f0_extended, window=3)
-                f0_extended = lowpass_f0(
+                # Apply the shared F0 post-processing chain on extended F0
+                # (same median->lowpass->octave->slew chain as batch infer).
+                f0_extended = apply_f0_filter_chain(
                     f0_extended,
-                    cutoff_hz=f0_lowpass_cutoff_hz,
-                    sample_rate=100.0,
+                    f0_lowpass_cutoff_hz=f0_lowpass_cutoff_hz,
+                    enable_octave_flip_suppress=enable_octave_flip_suppress,
+                    enable_f0_slew_limit=enable_f0_slew_limit,
+                    f0_slew_max_step_st=f0_slew_max_step_st,
                 )
-                if enable_octave_flip_suppress:
-                    f0_extended = suppress_octave_flips(f0_extended)
-                if enable_f0_slew_limit:
-                    f0_extended = limit_f0_slew(
-                        f0_extended, max_step_st=f0_slew_max_step_st
-                    )
 
                 # Strip history prefix to restore original size
                 f0 = f0_extended[:, f0_history_len:]
@@ -2170,18 +2263,8 @@ class RVCPipeline:
 
                 pitchf = f0.to(self.dtype)
 
-                # Quantized pitch for embedding
-                f0_mel_min = 1127 * math.log(1 + 50 / 700)
-                f0_mel_max = 1127 * math.log(1 + 1100 / 700)
-                f0_mel = 1127 * torch.log(1 + f0 / 700)
-                voiced_mask = f0_mel > 0
-                f0_mel_normalized = torch.where(
-                    voiced_mask,
-                    (f0_mel - f0_mel_min) * 254 / (f0_mel_max - f0_mel_min) + 1,
-                    f0_mel,
-                )
-                pitch = torch.clamp(f0_mel_normalized, 1, 255).round().long()
-                voiced_mask_for_gate = voiced_mask.float()
+                # Quantized pitch for embedding (shared with batch infer)
+                pitch, voiced_mask_for_gate = quantize_f0_to_pitch(f0)
 
             if pitch is None:
                 logger.warning(
@@ -2330,49 +2413,19 @@ class RVCPipeline:
                 return_length2=return_length_feat,
             )
 
-        # Voice gating (output is already the target region)
+        # Voice gating (output is already the target region; shared with infer)
         if voice_gate_mode != "off" and voiced_mask_for_gate is not None:
             # Slice mask to match the synthesized output region
             gate_mask_src = voiced_mask_for_gate[
                 :, skip_head_feat:skip_head_feat + return_length_feat
             ]
-            output_len = output.shape[-1]
-            gate_mask = gate_mask_src.clone()
-
-            if voice_gate_mode == "expand":
-                expand_frames = 2
-                gate_mask = torch.nn.functional.max_pool1d(
-                    gate_mask.unsqueeze(1),
-                    kernel_size=expand_frames * 2 + 1,
-                    stride=1,
-                    padding=expand_frames,
-                ).squeeze(1)
-            elif voice_gate_mode == "energy":
-                frame_size = output_len // gate_mask.shape[-1]
-                if frame_size > 0:
-                    output_frames = output.unfold(-1, frame_size, frame_size)
-                    frame_energy = (output_frames ** 2).mean(dim=-1)
-                    energy_max = frame_energy.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
-                    energy_mask = (frame_energy / energy_max > energy_threshold).float()
-                    if energy_mask.shape[-1] == gate_mask.shape[-1]:
-                        gate_mask = torch.maximum(gate_mask, energy_mask)
-
-            gate_mask = torch.nn.functional.interpolate(
-                gate_mask.unsqueeze(1), size=output_len,
-                mode="linear", align_corners=False,
-            ).squeeze(1)
-
-            smooth_samples = int(self.sample_rate * 0.005)
-            if smooth_samples > 1:
-                kernel = torch.ones(1, 1, smooth_samples, device=gate_mask.device) / smooth_samples
-                gate_mask = torch.nn.functional.conv1d(
-                    gate_mask.unsqueeze(1), kernel, padding=smooth_samples // 2,
-                ).squeeze(1)
-                if gate_mask.shape[-1] != output_len:
-                    gate_mask = gate_mask[..., :output_len]
-                gate_mask = torch.clamp(gate_mask, 0, 1)
-
-            output = output * gate_mask
+            output, _ = apply_voice_gate(
+                output,
+                gate_mask_src,
+                voice_gate_mode=voice_gate_mode,
+                energy_threshold=energy_threshold,
+                sample_rate=self.sample_rate,
+            )
 
         # Convert to numpy
         output = output.cpu().float().numpy()

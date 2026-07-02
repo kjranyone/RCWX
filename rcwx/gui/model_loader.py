@@ -51,17 +51,24 @@ class ModelLoader:
         self.app.status_bar.set_loading()
         self.app.start_btn.configure(state="disabled")
 
+        # Snapshot all Tk-bound settings on the main thread; the worker
+        # thread must never touch Tcl/Tk state (not thread-safe).
+        device = self.app.device_var.get()
+        dtype = self.app.dtype_var.get()
+        use_compile = self.app.compile_var.get()
+        models_dir = self.app.models_dir_entry.get()
+
         def load_thread():
             try:
                 self.app.pipeline = RVCPipeline(
                     path,
-                    device=self.app.device_var.get(),
-                    dtype=self.app.dtype_var.get(),
+                    device=device,
+                    dtype=dtype,
                     # Always load with model F0 capability enabled.
                     # Runtime F0 on/off is controlled by f0_method/use_f0 in realtime config.
                     use_f0=True,
-                    use_compile=self.app.compile_var.get(),
-                    models_dir=self.app.models_dir_entry.get(),
+                    use_compile=use_compile,
+                    models_dir=models_dir,
                 )
                 self.app.pipeline.load()
 

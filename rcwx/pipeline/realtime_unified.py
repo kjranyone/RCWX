@@ -21,11 +21,14 @@ import numpy as np
 
 from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.audio.denoise import denoise as denoise_audio
+from rcwx.audio.duplex import AsioDuplexStream
 from rcwx.audio.input import AudioInput
 from rcwx.audio.output import AudioOutput
+from rcwx.audio.postprocess import Postprocessor, PostprocessConfig
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
-from rcwx.pipeline.inference import RVCPipeline
+from rcwx.audio.stream_base import is_device_on_asio
+from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # RealtimeConfig / RealtimeStats
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RealtimeStats:
@@ -46,6 +50,7 @@ class RealtimeStats:
     frames_processed: int = 0
     feedback_detected: bool = False
     feedback_correlation: float = 0.0
+    gpu_memory_percent: float = 0.0
 
     def reset(self) -> None:
         self.latency_ms = 0.0
@@ -56,6 +61,7 @@ class RealtimeStats:
         self.frames_processed = 0
         self.feedback_detected = False
         self.feedback_correlation = 0.0
+        self.gpu_memory_percent = 0.0
 
 
 @dataclass
@@ -75,6 +81,7 @@ class RealtimeConfig:
     input_channels: int = 1
     output_channels: int = 1
     input_channel_selection: str = "auto"
+    output_channel_selection: str = "auto"  # "auto", "0,1", "2,3", ...
 
     # Core parameters
     chunk_sec: float = 0.15
@@ -129,6 +136,16 @@ class RealtimeConfig:
     enable_f0_slew_limit: bool = True
     f0_slew_max_step_st: float = 2.8
 
+    # Decoder overlap for cross-chunk continuity (feature frames, 1 frame = 10ms)
+    decoder_overlap_frames: int = 5
+
+    # Post-processing (treble boost + limiter)
+    postprocess_enabled: bool = True
+    treble_boost_db: float = 4.0
+    treble_cutoff_hz: float = 2800.0
+    limiter_threshold_db: float = -1.0
+    limiter_release_ms: float = 80.0
+
     def __post_init__(self) -> None:
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
@@ -158,6 +175,7 @@ class RealtimeConfig:
 # ---------------------------------------------------------------------------
 # Unified Voice Changer
 # ---------------------------------------------------------------------------
+
 
 class RealtimeVoiceChangerUnified:
     """Unified real-time voice changer.
@@ -208,33 +226,35 @@ class RealtimeVoiceChangerUnified:
 
         # Calculate sample counts (all at 16kHz for model input)
         hubert_hop = 320
-        self._hop_samples_16k = self._align_to_hop(
-            int(self.config.chunk_sec * 16000), hubert_hop
-        )
+        self._hop_samples_16k = self._align_to_hop(int(self.config.chunk_sec * 16000), hubert_hop)
         self._overlap_samples_16k = self._align_to_hop(
             int(self.config.overlap_sec * 16000), hubert_hop
         )
 
         # Corresponding counts at runtime stream rates
-        self._hop_samples_mic = int(
-            self._hop_samples_16k * self._runtime_mic_sample_rate / 16000
-        )
+        self._hop_samples_mic = int(self._hop_samples_16k * self._runtime_mic_sample_rate / 16000)
         self._hop_samples_out = int(
             self._hop_samples_16k * self._runtime_output_sample_rate / 16000
         )
 
         # Resamplers
-        self.input_resampler = StatefulResampler(
-            self._runtime_mic_sample_rate, 16000
-        )
+        self.input_resampler = StatefulResampler(self._runtime_mic_sample_rate, 16000)
         self.output_resampler = StatefulResampler(
             self.pipeline.sample_rate, self._runtime_output_sample_rate
         )
 
-        # SOLA state
-        crossfade_samples_out = int(
-            self._runtime_output_sample_rate * self.config.crossfade_sec
+        # Postprocessor (treble boost + limiter)
+        pp_cfg = PostprocessConfig(
+            enabled=getattr(self.config, "postprocess_enabled", True),
+            treble_boost_db=getattr(self.config, "treble_boost_db", 4.0),
+            treble_cutoff_hz=getattr(self.config, "treble_cutoff_hz", 2800.0),
+            limiter_threshold_db=getattr(self.config, "limiter_threshold_db", -1.0),
+            limiter_release_ms=getattr(self.config, "limiter_release_ms", 80.0),
         )
+        self._postprocessor = Postprocessor(self._runtime_output_sample_rate, pp_cfg)
+
+        # SOLA state
+        crossfade_samples_out = int(self._runtime_output_sample_rate * self.config.crossfade_sec)
         search_samples_out = int(
             self._runtime_output_sample_rate * self.config.sola_search_ms / 1000
         )
@@ -255,17 +275,18 @@ class RealtimeVoiceChangerUnified:
         sola_extra_out = crossfade_samples_out + 2 * search_samples_out
         zc_model = self.pipeline.sample_rate // 100
         sola_extra_raw = int(
-            sola_extra_out * self.pipeline.sample_rate
-            / self._runtime_output_sample_rate
+            sola_extra_out * self.pipeline.sample_rate / self._runtime_output_sample_rate
         )
+        # Decoder overlap: extra context frames so decoder Conv/SineGen
+        # have warm start, preventing cold-start discontinuity at chunk edges.
+        decoder_overlap_model = self.config.decoder_overlap_frames * zc_model
         self._sola_extra_model = (
-            (sola_extra_raw + zc_model - 1) // zc_model * zc_model
+            (sola_extra_raw + decoder_overlap_model + zc_model - 1)
+            // zc_model * zc_model
         )
 
         # Output buffer: 4x chunk capacity (physical ring size)
-        chunk_output_samples = int(
-            self._runtime_output_sample_rate * self.config.chunk_sec
-        )
+        chunk_output_samples = int(self._runtime_output_sample_rate * self.config.chunk_sec)
         self.output_buffer = RingOutputBuffer(
             capacity_samples=chunk_output_samples * 4,
             fade_samples=256,
@@ -301,9 +322,9 @@ class RealtimeVoiceChangerUnified:
         self._chunks_ready = 0
         self._output_started = False
 
-        # Audio streams (AudioInput or WavFileInput)
+        # Audio streams (AudioInput, WavFileInput, or AsioDuplexStream)
         self._input_stream = None
-        self._output_stream: Optional[AudioOutput] = None
+        self._output_stream = None
 
         # Feedback detection
         self._output_history_size = self._runtime_mic_sample_rate  # 1 second
@@ -312,12 +333,15 @@ class RealtimeVoiceChangerUnified:
         self._feedback_check_interval = 10
         self._feedback_warning_shown = False
 
-        # Boundary gain continuity across emitted chunks (post-SOLA).
-        self._prev_tail_rms: float = 0.0
-
         # Cached arrays for adaptive drift np.interp (avoid per-callback alloc)
         self._interp_cache_frames: int = 0
         self._interp_cache_x_base: Optional[np.ndarray] = None
+
+        # Boundary gain continuity across emitted chunks (post-SOLA).
+        self._prev_tail_rms: float = 0.0
+
+        # GPU total memory cache (bytes); fetched once on first use.
+        self._gpu_total_memory: int = 0
 
         # Overload protection
         self._queue_full_times: deque[float] = deque(maxlen=50)
@@ -347,23 +371,17 @@ class RealtimeVoiceChangerUnified:
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
         hubert_hop = 320
-        self._hop_samples_16k = self._align_to_hop(
-            int(self.config.chunk_sec * 16000), hubert_hop
-        )
+        self._hop_samples_16k = self._align_to_hop(int(self.config.chunk_sec * 16000), hubert_hop)
         self._overlap_samples_16k = self._align_to_hop(
             int(self.config.overlap_sec * 16000), hubert_hop
         )
-        self._hop_samples_mic = int(
-            self._hop_samples_16k * self._runtime_mic_sample_rate / 16000
-        )
+        self._hop_samples_mic = int(self._hop_samples_16k * self._runtime_mic_sample_rate / 16000)
         self._hop_samples_out = int(
             self._hop_samples_16k * self._runtime_output_sample_rate / 16000
         )
 
         # SOLA extra samples
-        crossfade_samples_out = int(
-            self._runtime_output_sample_rate * self.config.crossfade_sec
-        )
+        crossfade_samples_out = int(self._runtime_output_sample_rate * self.config.crossfade_sec)
         search_samples_out = int(
             self._runtime_output_sample_rate * self.config.sola_search_ms / 1000
         )
@@ -374,11 +392,12 @@ class RealtimeVoiceChangerUnified:
         sola_extra_out = crossfade_samples_out + 2 * search_samples_out
         zc_model = self.pipeline.sample_rate // 100
         sola_extra_raw = int(
-            sola_extra_out * self.pipeline.sample_rate
-            / self._runtime_output_sample_rate
+            sola_extra_out * self.pipeline.sample_rate / self._runtime_output_sample_rate
         )
+        decoder_overlap_model = self.config.decoder_overlap_frames * zc_model
         self._sola_extra_model = (
-            (sola_extra_raw + zc_model - 1) // zc_model * zc_model
+            (sola_extra_raw + decoder_overlap_model + zc_model - 1)
+            // zc_model * zc_model
         )
 
         # Adaptive drift control target
@@ -390,16 +409,12 @@ class RealtimeVoiceChangerUnified:
         self._runtime_output_sample_rate = int(output_rate)
         self._recalculate_sizes()
 
-        self.input_resampler = StatefulResampler(
-            self._runtime_mic_sample_rate, 16000
-        )
+        self.input_resampler = StatefulResampler(self._runtime_mic_sample_rate, 16000)
         self.output_resampler = StatefulResampler(
             self.pipeline.sample_rate, self._runtime_output_sample_rate
         )
 
-        chunk_output_samples = max(
-            1, int(self._runtime_output_sample_rate * self.config.chunk_sec)
-        )
+        chunk_output_samples = max(1, int(self._runtime_output_sample_rate * self.config.chunk_sec))
         self.output_buffer = RingOutputBuffer(
             capacity_samples=chunk_output_samples * 4,
             fade_samples=256,
@@ -443,50 +458,112 @@ class RealtimeVoiceChangerUnified:
         output_chunk_sec = self.config.chunk_sec / 4
         output_blocksize = int(self.config.output_sample_rate * output_chunk_sec)
 
-        # Start output stream FIRST so its callback is active before any
-        # audio arrives.  AudioOutput.start() may take time due to API
-        # fallback (WASAPI → DirectSound → MME), and during that time the
-        # input stream would queue audio with no output drain — causing a
-        # burst of buffered audio and large initial trims.
-        self._output_stream = AudioOutput(
-            device=self.config.output_device,
-            sample_rate=self.config.output_sample_rate,
-            channels=self.config.output_channels,
-            blocksize=output_blocksize,
-            callback=self._on_audio_output,
+        # --- ASIO duplex detection ---
+        # ASIO drivers are exclusive full-duplex: opening separate streams
+        # fails with "Device unavailable".  Use a single sd.Stream instead.
+        use_asio_duplex = (
+            not self.config.wav_input_path
+            and is_device_on_asio(self.config.input_device, "input")
+            and is_device_on_asio(self.config.output_device, "output")
         )
-        self._output_stream.start()
 
-        if self.config.wav_input_path:
-            from rcwx.audio.wav_input import WavFileInput
+        if use_asio_duplex:
+            logger.info("Both devices are ASIO — using duplex stream")
+            in_dev = self.config.input_device
+            out_dev = self.config.output_device
+            # Resolve None → default device index for sd.Stream(device=(...))
+            if in_dev is None:
+                from rcwx.audio.stream_base import get_default_device
+                in_dev = get_default_device("input")
+            if out_dev is None:
+                from rcwx.audio.stream_base import get_default_device
+                out_dev = get_default_device("output")
+            if in_dev is None or out_dev is None:
+                logger.warning(
+                    "ASIO duplex: default device not found (in=%s, out=%s), "
+                    "falling back to separate streams",
+                    in_dev, out_dev,
+                )
+                use_asio_duplex = False
 
-            self._input_stream = WavFileInput(
-                path=self.config.wav_input_path,
-                sample_rate=self.config.mic_sample_rate,
-                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                callback=self._on_audio_input,
-            )
+        # Voice changer output is mono — only a stereo pair is needed.
+        # When ASIO with specific channel pair selection, open all channels.
+        if use_asio_duplex and self.config.output_channel_selection != "auto":
+            output_channels = self.config.output_channels
         else:
-            self._input_stream = AudioInput(
-                device=self.config.input_device,
-                sample_rate=self.config.mic_sample_rate,
-                channels=self.config.input_channels,
-                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                callback=self._on_audio_input,
+            output_channels = min(2, self.config.output_channels)
+
+        if use_asio_duplex:
+            duplex = AsioDuplexStream(
+                input_device=in_dev,
+                output_device=out_dev,
+                sample_rate=self.config.output_sample_rate,
+                input_channels=self.config.input_channels,
+                output_channels=output_channels,
+                blocksize=0,  # let ASIO driver choose preferred buffer size
+                input_callback=self._on_audio_input,
+                output_callback=self._on_audio_output,
                 channel_selection=self.config.input_channel_selection,
+                output_channel_selection=self.config.output_channel_selection,
             )
-        self._input_stream.start()
+            duplex.start()
+            # Both references point to the same object so stop() only closes once.
+            self._input_stream = duplex
+            self._output_stream = duplex
+        else:
+            # --- Separate streams (WASAPI / DirectSound / MME) ---
+            # Start output stream FIRST so its callback is active before any
+            # audio arrives.  AudioOutput.start() may take time due to API
+            # fallback (WASAPI → DirectSound → MME), and during that time the
+            # input stream would queue audio with no output drain — causing a
+            # burst of buffered audio and large initial trims.
+            self._output_stream = AudioOutput(
+                device=self.config.output_device,
+                sample_rate=self.config.output_sample_rate,
+                channels=output_channels,
+                blocksize=output_blocksize,
+                callback=self._on_audio_output,
+                output_channel_selection=self.config.output_channel_selection,
+            )
+            self._output_stream.start()
+
+            if self.config.wav_input_path:
+                from rcwx.audio.wav_input import WavFileInput
+
+                self._input_stream = WavFileInput(
+                    path=self.config.wav_input_path,
+                    sample_rate=self.config.mic_sample_rate,
+                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                    callback=self._on_audio_input,
+                )
+            else:
+                self._input_stream = AudioInput(
+                    device=self.config.input_device,
+                    sample_rate=self.config.mic_sample_rate,
+                    channels=self.config.input_channels,
+                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                    callback=self._on_audio_input,
+                    channel_selection=self.config.input_channel_selection,
+                )
+            self._input_stream.start()
 
         actual_output_rate = int(round(self._output_stream.actual_sample_rate))
-        actual_mic_rate = int(round(self._input_stream.actual_sample_rate))
+        # For ASIO duplex, input and output share a single stream at one rate.
+        if use_asio_duplex:
+            actual_mic_rate = actual_output_rate
+        else:
+            actual_mic_rate = int(round(self._input_stream.actual_sample_rate))
         if (
             actual_output_rate != self.config.output_sample_rate
             or actual_mic_rate != self.config.mic_sample_rate
         ):
+            reason = " (ASIO native)" if use_asio_duplex else ""
             logger.warning(
-                "Using runtime sample rates different from config: "
-                f"mic {self.config.mic_sample_rate}->{actual_mic_rate}, "
-                f"output {self.config.output_sample_rate}->{actual_output_rate}"
+                "Using runtime sample rates different from config%s: "
+                "mic %d->%d, output %d->%d",
+                reason,
+                self.config.mic_sample_rate, actual_mic_rate,
+                self.config.output_sample_rate, actual_output_rate,
             )
 
         self._apply_runtime_sample_rates(actual_mic_rate, actual_output_rate)
@@ -531,12 +608,20 @@ class RealtimeVoiceChangerUnified:
             self._thread.join(timeout=1.0)
             self._thread = None
 
-        if self._input_stream:
-            self._input_stream.stop()
-            self._input_stream = None
-        if self._output_stream:
-            self._output_stream.stop()
-            self._output_stream = None
+        # When using ASIO duplex, both references point to the same object.
+        # Stop only once to avoid double-close.
+        if self._input_stream is self._output_stream:
+            if self._input_stream is not None:
+                self._input_stream.stop()
+                self._input_stream = None
+                self._output_stream = None
+        else:
+            if self._input_stream:
+                self._input_stream.stop()
+                self._input_stream = None
+            if self._output_stream:
+                self._output_stream.stop()
+                self._output_stream = None
 
         self._clear_queues()
 
@@ -571,6 +656,9 @@ class RealtimeVoiceChangerUnified:
     def set_index_rate(self, rate: float) -> None:
         self.config.index_rate = rate
 
+    def set_input_gain_db(self, gain_db: float) -> None:
+        self.config.input_gain_db = float(gain_db)
+
     def set_denoise(self, enabled: bool, method: str = "auto") -> None:
         self.config.denoise_enabled = enabled
         self.config.denoise_method = method
@@ -580,6 +668,21 @@ class RealtimeVoiceChangerUnified:
 
     def set_energy_threshold(self, value: float) -> None:
         self.config.energy_threshold = value
+
+    def set_postprocess_config(self, cfg) -> None:
+        from rcwx.audio.postprocess import PostprocessConfig
+
+        if hasattr(self, "_postprocessor"):
+            self._postprocessor.config.enabled = cfg.enabled
+            self._postprocessor.config.treble_boost_db = cfg.treble_boost_db
+            self._postprocessor.config.treble_cutoff_hz = cfg.treble_cutoff_hz
+            self._postprocessor.config.limiter_threshold_db = cfg.limiter_threshold_db
+            self._postprocessor.config.limiter_release_ms = cfg.limiter_release_ms
+            self._postprocessor._treble._design_filter()
+            self._postprocessor._limiter._threshold = 10 ** (cfg.limiter_threshold_db / 20)
+            self._postprocessor._limiter._release_coeff = np.exp(
+                -1.0 / (cfg.limiter_release_ms * self._postprocessor._limiter.sample_rate / 1000)
+            )
 
     def set_chunk_sec(self, chunk_sec: float) -> None:
         old = self.config.chunk_sec
@@ -600,16 +703,12 @@ class RealtimeVoiceChangerUnified:
     def set_overlap(self, overlap_sec: float) -> None:
         self.config.overlap_sec = max(0.0, float(overlap_sec))
         # Recompute derived sample count
-        self._overlap_samples_16k = self._align_to_hop(
-            int(self.config.overlap_sec * 16000), 320
-        )
+        self._overlap_samples_16k = self._align_to_hop(int(self.config.overlap_sec * 16000), 320)
 
     def set_crossfade(self, crossfade_sec: float) -> None:
         self.config.crossfade_sec = max(0.0, crossfade_sec)
         # Rebuild SOLA state with new crossfade length
-        crossfade_samples_out = int(
-            self._runtime_output_sample_rate * self.config.crossfade_sec
-        )
+        crossfade_samples_out = int(self._runtime_output_sample_rate * self.config.crossfade_sec)
         search_samples_out = int(
             self._runtime_output_sample_rate * self.config.sola_search_ms / 1000
         )
@@ -655,8 +754,8 @@ class RealtimeVoiceChangerUnified:
         self._input_buf = np.concatenate([self._input_buf, audio])
 
         while len(self._input_buf) >= self._hop_samples_mic:
-            hop = self._input_buf[:self._hop_samples_mic].copy()
-            self._input_buf = self._input_buf[self._hop_samples_mic:]
+            hop = self._input_buf[: self._hop_samples_mic].copy()
+            self._input_buf = self._input_buf[self._hop_samples_mic :]
             try:
                 self._input_queue.put_nowait(hop)
             except Exception:
@@ -824,7 +923,7 @@ class RealtimeVoiceChangerUnified:
                 if self._overlap_samples_16k > 0:
                     if self._overlap_buf is not None:
                         combined = np.concatenate([self._overlap_buf, hop_16k])
-                        self._overlap_buf = combined[-self._overlap_samples_16k:]
+                        self._overlap_buf = combined[-self._overlap_samples_16k :]
                     else:
                         tail = min(self._overlap_samples_16k, len(hop_16k))
                         self._overlap_buf = hop_16k[-tail:].copy()
@@ -833,29 +932,14 @@ class RealtimeVoiceChangerUnified:
 
                 # --- Stage 5: Inference ---
                 preprocess_ms = (time.perf_counter() - start_time) * 1000
-                f0_method = self.config.f0_method if self.config.use_f0 else "none"
-                index_rate = self.config.index_rate
 
                 output_model = self.pipeline.infer_streaming(
-                    audio_16k=chunk_16k,
-                    overlap_samples=overlap_samples,
-                    pitch_shift=self.config.pitch_shift,
-                    f0_method=f0_method,
-                    index_rate=index_rate,
-                    index_k=self.config.index_k,
-                    voice_gate_mode=self.config.voice_gate_mode,
-                    energy_threshold=self.config.energy_threshold,
-                    use_parallel_extraction=self.config.use_parallel_extraction,
-                    noise_scale=self.config.noise_scale,
-                    sola_extra_samples=self._sola_extra_model,
-                    pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
-                    moe_boost=self.config.moe_boost,
-                    f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
-                    enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
-                    enable_f0_slew_limit=self.config.enable_f0_slew_limit,
-                    f0_slew_max_step_st=self.config.f0_slew_max_step_st,
-                    hubert_context_sec=self.config.hubert_context_sec,
-                    fixed_harmonics=self.config.fixed_harmonics,
+                    chunk_16k,
+                    overlap_samples,
+                    self._build_streaming_params(
+                        index_rate=self.config.index_rate,
+                        voice_gate_mode=self.config.voice_gate_mode,
+                    ),
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
@@ -867,7 +951,8 @@ class RealtimeVoiceChangerUnified:
                 # the output boundary, preventing latency drift.
                 if self.config.use_sola:
                     output_48k = sola_crossfade(
-                        output_48k, self._sola_state,
+                        output_48k,
+                        self._sola_state,
                         target_len=self._hop_samples_out,
                     )
 
@@ -875,10 +960,11 @@ class RealtimeVoiceChangerUnified:
                 # Keep this after SOLA so splice alignment is unaffected.
                 output_48k = self._apply_output_boundary_gain(output_48k)
 
-                # Soft clip final output
-                max_val = np.max(np.abs(output_48k)) if len(output_48k) else 0.0
-                if max_val > 1.0:
-                    output_48k = np.tanh(output_48k)
+                # --- Stage 7.6: Post-processing (treble boost + limiter) ---
+                output_48k = self._postprocessor.process(output_48k)
+
+                # Hard clip final output (safety net after limiter)
+                output_48k = np.clip(output_48k, -1.0, 1.0)
 
                 # --- Stage 8: Feedback detection ---
                 if not self.config.wav_input_path:
@@ -889,32 +975,48 @@ class RealtimeVoiceChangerUnified:
                 inference_ms = (time.perf_counter() - start_time) * 1000
                 self.stats.inference_ms = inference_ms
                 self.stats.frames_processed += 1
+
+                # --- GPU memory usage ---
+                try:
+                    import torch
+
+                    device = self.pipeline.device
+                    device_str = str(device)
+                    if "xpu" in device_str:
+                        if self._gpu_total_memory == 0:
+                            self._gpu_total_memory = (
+                                torch.xpu.get_device_properties(device).total_memory
+                            )
+                        if self._gpu_total_memory > 0:
+                            alloc = torch.xpu.memory_allocated(device)
+                            self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
+                    elif "cuda" in device_str:
+                        if self._gpu_total_memory == 0:
+                            self._gpu_total_memory = (
+                                torch.cuda.get_device_properties(device).total_memory
+                            )
+                        if self._gpu_total_memory > 0:
+                            alloc = torch.cuda.memory_allocated(device)
+                            self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
+                except Exception:
+                    pass
+
                 # Estimated E2E latency (display):
                 # - input capture delay: average sample in a chunk ~= chunk/2
                 # - processing delay: measured inference thread time
                 # - playback delay: ring buffer + pending output-queue chunks
                 # - SOLA hold-back delay
                 capture_ms = self.config.chunk_sec * 500.0
-                buffer_ms = (
-                    self.output_buffer.available
-                    / self._runtime_output_sample_rate * 1000
-                )
+                buffer_ms = self.output_buffer.available / self._runtime_output_sample_rate * 1000
                 try:
                     queued_chunks = self._output_queue.qsize()
                 except Exception:
                     queued_chunks = 0
                 queue_ms = (
-                    queued_chunks * self._hop_samples_out
-                    / self._runtime_output_sample_rate * 1000
+                    queued_chunks * self._hop_samples_out / self._runtime_output_sample_rate * 1000
                 )
                 sola_ms = self.config.crossfade_sec * 1000 if self.config.use_sola else 0
-                self.stats.latency_ms = (
-                    capture_ms
-                    + inference_ms
-                    + buffer_ms
-                    + queue_ms
-                    + sola_ms
-                )
+                self.stats.latency_ms = capture_ms + inference_ms + buffer_ms + queue_ms + sola_ms
 
                 try:
                     self._output_queue.put_nowait(output_48k)
@@ -969,25 +1071,25 @@ class RealtimeVoiceChangerUnified:
             )
         out_len = len(output)
         if out_len >= self._output_history_size:
-            self._output_history[:] = output[-self._output_history_size:]
+            self._output_history[:] = output[-self._output_history_size :]
             self._output_history_pos = 0
             return
         end_pos = self._output_history_pos + out_len
         if end_pos <= self._output_history_size:
-            self._output_history[self._output_history_pos:end_pos] = output
+            self._output_history[self._output_history_pos : end_pos] = output
         else:
             first = self._output_history_size - self._output_history_pos
-            self._output_history[self._output_history_pos:] = output[:first]
-            self._output_history[:out_len - first] = output[first:]
+            self._output_history[self._output_history_pos :] = output[:first]
+            self._output_history[: out_len - first] = output[first:]
         self._output_history_pos = end_pos % self._output_history_size
 
     def _check_feedback(self, input_audio: np.ndarray) -> float:
         if len(input_audio) < 1000:
             return 0.0
-        input_rms = np.sqrt(np.mean(input_audio ** 2))
+        input_rms = np.sqrt(np.mean(input_audio**2))
         if input_rms < 0.01:
             return 0.0
-        output_rms = np.sqrt(np.mean(self._output_history ** 2))
+        output_rms = np.sqrt(np.mean(self._output_history**2))
         if output_rms < 0.01:
             return 0.0
         input_norm = input_audio - np.mean(input_audio)
@@ -1014,7 +1116,9 @@ class RealtimeVoiceChangerUnified:
                 self._feedback_warning_shown = True
                 logger.warning(f"[FEEDBACK] Detected feedback (corr={corr:.2f})")
                 if self.on_error:
-                    self.on_error("フィードバック検出: 入力と出力が接続されている可能性があります。")
+                    self.on_error(
+                        "フィードバック検出: 入力と出力が接続されている可能性があります。"
+                    )
 
     # ======== Overload Protection ========
 
@@ -1099,26 +1203,12 @@ class RealtimeVoiceChangerUnified:
             else:
                 chunk_16k = warmup_hop
 
-            f0_method = self.config.f0_method if self.config.use_f0 else "none"
+            # Warm up with the same params as production (index/gate disabled)
+            # so shape-dependent kernels match the real path.
             output_model = self.pipeline.infer_streaming(
-                audio_16k=chunk_16k,
-                overlap_samples=overlap_16k,
-                pitch_shift=self.config.pitch_shift,
-                f0_method=f0_method,
-                index_rate=0.0,
-                index_k=self.config.index_k,
-                voice_gate_mode="off",
-                energy_threshold=self.config.energy_threshold,
-                use_parallel_extraction=self.config.use_parallel_extraction,
-                noise_scale=self.config.noise_scale,
-                sola_extra_samples=self._sola_extra_model,
-                pre_hubert_pitch_ratio=self.config.pre_hubert_pitch_ratio,
-                moe_boost=self.config.moe_boost,
-                f0_lowpass_cutoff_hz=self.config.f0_lowpass_cutoff_hz,
-                enable_octave_flip_suppress=self.config.enable_octave_flip_suppress,
-                enable_f0_slew_limit=self.config.enable_f0_slew_limit,
-                f0_slew_max_step_st=self.config.f0_slew_max_step_st,
-                hubert_context_sec=self.config.hubert_context_sec,
+                chunk_16k,
+                overlap_16k,
+                self._build_streaming_params(index_rate=0.0, voice_gate_mode="off"),
             )
             _ = self.output_resampler.resample_chunk(output_model)
 
@@ -1136,9 +1226,44 @@ class RealtimeVoiceChangerUnified:
 
     # ======== Helpers ========
 
+    def _build_streaming_params(
+        self,
+        *,
+        index_rate: float,
+        voice_gate_mode: str,
+    ) -> StreamingParams:
+        """Build a StreamingParams bundle from the current config.
+
+        Centralizes the config -> infer_streaming() mapping so the production
+        and warmup call sites don't each transcribe every field. ``index_rate``
+        and ``voice_gate_mode`` are passed explicitly because warmup overrides
+        them (0.0 / "off").
+        """
+        cfg = self.config
+        return StreamingParams(
+            pitch_shift=cfg.pitch_shift,
+            f0_method=cfg.f0_method if cfg.use_f0 else "none",
+            index_rate=index_rate,
+            index_k=cfg.index_k,
+            voice_gate_mode=voice_gate_mode,
+            energy_threshold=cfg.energy_threshold,
+            use_parallel_extraction=cfg.use_parallel_extraction,
+            noise_scale=cfg.noise_scale,
+            sola_extra_samples=self._sola_extra_model,
+            pre_hubert_pitch_ratio=cfg.pre_hubert_pitch_ratio,
+            moe_boost=cfg.moe_boost,
+            f0_lowpass_cutoff_hz=cfg.f0_lowpass_cutoff_hz,
+            enable_octave_flip_suppress=cfg.enable_octave_flip_suppress,
+            enable_f0_slew_limit=cfg.enable_f0_slew_limit,
+            f0_slew_max_step_st=cfg.f0_slew_max_step_st,
+            hubert_context_sec=cfg.hubert_context_sec,
+            fixed_harmonics=cfg.fixed_harmonics,
+        )
+
     def _reset_boundary_continuity_state(self) -> None:
         """Reset chunk-boundary gain continuity state."""
         self._prev_tail_rms = 0.0
+        self._postprocessor.reset()
 
     def _apply_output_boundary_gain(self, output: np.ndarray) -> np.ndarray:
         """Apply a mild post-SOLA gain ramp to smooth boundary loudness.
@@ -1171,9 +1296,7 @@ class RealtimeVoiceChangerUnified:
                 adjusted[:ramp_len] *= ramp
                 output = adjusted
 
-        self._prev_tail_rms = float(
-            np.sqrt(np.mean(output[-boundary:] ** 2) + 1e-10)
-        )
+        self._prev_tail_rms = float(np.sqrt(np.mean(output[-boundary:] ** 2) + 1e-10))
         return output
 
     def _clear_queues(self) -> None:

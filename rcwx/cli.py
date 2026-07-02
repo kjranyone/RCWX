@@ -162,18 +162,24 @@ def cmd_download(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     """Run voice conversion on a file."""
     import numpy as np
-    import torchaudio
+    import scipy.io.wavfile as wavfile
 
     from rcwx.pipeline.inference import RVCPipeline
 
     # Load input audio
     print(f"Loading: {args.input}")
-    audio, sr = torchaudio.load(args.input)
-    audio = audio.numpy()
+    sr, audio = wavfile.read(args.input)
+    # Normalise to float32 [-1, 1]
+    if audio.dtype == np.int16:
+        audio = audio.astype(np.float32) / 32768.0
+    elif audio.dtype == np.int32:
+        audio = audio.astype(np.float32) / 2147483648.0
+    elif audio.dtype != np.float32:
+        audio = audio.astype(np.float32)
 
     # Convert to mono if stereo
     if audio.ndim == 2:
-        audio = audio.mean(axis=0)
+        audio = audio.mean(axis=1)
 
     # Create pipeline
     print(f"Loading model: {args.model}")
@@ -210,10 +216,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     output_path = args.output or args.input.replace(".wav", "_converted.wav")
     print(f"Saving: {output_path}")
 
-    import torch
-
-    output_tensor = torch.from_numpy(output).unsqueeze(0)
-    torchaudio.save(output_path, output_tensor, pipeline.sample_rate)
+    output_int16 = np.clip(output, -1.0, 1.0)
+    output_int16 = (output_int16 * 32767).astype(np.int16)
+    wavfile.write(output_path, pipeline.sample_rate, output_int16)
 
     print("Done!")
     return 0
