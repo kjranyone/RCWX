@@ -23,7 +23,7 @@ class PostprocessConfig:
     # RMS Normalizer (EMA-smoothed AGC)
     normalizer_enabled: bool = True
     normalizer_target_rms: float = 0.1       # -20dBFS target
-    normalizer_ema_alpha: float = 0.15       # ~1s time constant
+    normalizer_ema_alpha: float = 0.15       # per 0.3s ref chunk (tau ~1.8s, chunk-invariant)
     normalizer_max_gain_db: float = 12.0     # max 4x boost
     normalizer_min_gain_db: float = -12.0    # max 4x cut
 
@@ -80,6 +80,10 @@ class RmsNormalizer:
     """
 
     MIN_RMS = 0.005  # below this, treat as silence
+    # config.normalizer_ema_alpha is defined for a chunk of this duration;
+    # the per-chunk alpha is rescaled so the EMA time constant stays the
+    # same regardless of chunk_sec (0.15 @ 0.3s chunks -> tau ~1.8s).
+    ALPHA_REF_CHUNK_SEC = 0.3
 
     def __init__(self, sample_rate: int, config: PostprocessConfig):
         self.sample_rate = sample_rate
@@ -107,11 +111,13 @@ class RmsNormalizer:
         if rms < self.MIN_RMS:
             return audio
 
-        # Update EMA
+        # Update EMA (chunk-length-invariant time constant)
         if self._ema_rms <= 0.0:
             self._ema_rms = rms  # initialise on first voiced chunk
         else:
-            self._ema_rms += self._alpha * (rms - self._ema_rms)
+            chunk_sec = len(audio) / self.sample_rate
+            alpha = 1.0 - (1.0 - self._alpha) ** (chunk_sec / self.ALPHA_REF_CHUNK_SEC)
+            self._ema_rms += alpha * (rms - self._ema_rms)
 
         # Compute gain
         if self._ema_rms > self.MIN_RMS:

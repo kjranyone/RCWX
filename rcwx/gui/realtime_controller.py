@@ -111,6 +111,7 @@ class RealtimeController:
                 buffer_margin=latency["buffer_margin"],
                 overlap_sec=latency["overlap_sec"],
                 crossfade_sec=latency["crossfade_sec"],
+                sola_search_ms=latency["sola_search_ms"],
                 use_sola=latency["use_sola"],
                 # Pitch settings
                 pitch_shift=self.app.pitch_control.pitch,

@@ -135,7 +135,7 @@ rcwx/
 | `overlap_sec`                 |   `0.20` | 音声オーバーラップ              |
 | `crossfade_sec`               |   `0.08` | SOLAクロスフェード長            |
 | `use_sola`                    |   `true` | SOLA有効化                      |
-| `sola_search_ms`              |   `10.0` | SOLA探索窓                      |
+| `sola_search_ms`              |   `15.0` | SOLA探索窓（最低出力F0 70Hzの1周期+マージン） |
 | `hubert_context_sec`          |    `1.0` | HuBERTコンテキスト窓 (秒)       |
 | `f0_context_sec`              |   `0.32` | F0抽出窓の先行コンテキスト (秒、<=0で全コンテキスト抽出) |
 | `pre_hubert_pitch_ratio`      |   `0.08` | プレHuBERTシフト比率 (0.0-1.0)  |
@@ -165,7 +165,7 @@ rcwx/
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
-- `sola_search_ms` (既定 10.0)
+- `sola_search_ms` (既定 15.0、最低出力F0 70Hzの1周期+マージン)
 - `hubert_context_sec` (既定 1.0)
 - `f0_context_sec` (既定 0.32、F0抽出を [コンテキスト+新規ホップ] 窓に限定。過去フレームはF0履歴キャッシュで補完。<=0で旧来の全コンテキスト抽出)
 - `prebuffer_chunks` (既定 1)
@@ -188,6 +188,7 @@ rcwx/
 
 - `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
 - `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
+- `sola_search_ms` = 15ms固定（最低出力F0 70Hzの1周期+マージン。レイテンシには影響しない）
 - `prebuffer_chunks` = 1
 - `buffer_margin` = 0.5
 - `use_sola` = true

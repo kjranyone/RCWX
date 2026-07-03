@@ -23,8 +23,10 @@ def _auto_params(chunk_sec: float) -> dict:
     crossfade_ms = round(crossfade_ms / 10) * 10
     crossfade_ms = max(10, crossfade_ms)
 
-    # SOLA search window = chunk length (doesn't affect latency)
-    sola_search_ms = chunk_sec * 1000
+    # SOLA search window: must cover one period of the lowest expected
+    # output F0 so the splice can phase-align (70Hz -> 14.3ms, + margin).
+    # Doesn't affect latency; larger windows only add sola_extra compute.
+    sola_search_ms = 15.0
 
     return {
         "overlap_sec": overlap_ms / 1000,

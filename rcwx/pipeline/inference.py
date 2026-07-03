@@ -55,6 +55,16 @@ STAGE_PROFILE_INTERVAL = 10
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
 SWIFTF0_VOICING_THRESHOLD = 0.35
+# F0 correction hysteresis: corrections sustained this many consecutive
+# frames are treated as genuine pitch transitions and accepted (the raw
+# values are restored), so single-frame glitch suppression never latches
+# onto real octave jumps or fast slides.
+F0_CORRECTION_SUSTAIN_FRAMES = 3
+# Adaptive pre-HuBERT shift stabilization: a per-hop median-F0 estimate is
+# noisy, and a time-varying resample ratio warps the shared audio history
+# differently every chunk (feature flutter at chunk boundaries).
+ADAPTIVE_SHIFT_DEADBAND_ST = 0.25
+ADAPTIVE_SHIFT_SLEW_ST_PER_SEC = 2.0
 
 
 class _StageProfiler:
@@ -471,26 +481,25 @@ def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 16.0, sample_rate: float = 1
         voiced = f0_np[batch] > 0
 
         if np.sum(voiced) > 10:  # Need enough voiced samples
-            # Extract voiced regions and interpolate gaps for filtering
-            f0_interp = f0_np[batch].copy()
+            # Build a gap-free contour in log2 domain (pitch is log-scale):
+            # np.interp fills interior unvoiced gaps AND extends the leading/
+            # trailing unvoiced regions with the first/last voiced value.
+            # Leaving those edges at 0 Hz would feed a 0->F0 step into the
+            # zero-phase filter, smearing an onset scoop / offset droop tens
+            # of ms into the voiced region.
+            idx = np.arange(f0_np.shape[1])
+            voiced_indices = idx[voiced]
+            log_contour = np.interp(
+                idx, voiced_indices, np.log2(f0_np[batch, voiced_indices])
+            )
 
-            # Simple linear interpolation for unvoiced gaps
-            voiced_indices = np.where(voiced)[0]
-            if len(voiced_indices) > 1:
-                # Interpolate between voiced regions
-                for i in range(len(voiced_indices) - 1):
-                    start = voiced_indices[i]
-                    end = voiced_indices[i + 1]
-                    if end - start > 1:  # There's a gap
-                        f0_interp[start:end + 1] = np.linspace(
-                            f0_np[batch, start], f0_np[batch, end], end - start + 1
-                        )
-
-            # Apply lowpass filter
+            # Apply lowpass filter on the log contour
             try:
-                filtered = filtfilt(b, a, f0_interp).astype(np.float32)
+                filtered = filtfilt(b, a, log_contour)
                 # Only keep filtered values in voiced regions
-                result[batch] = np.where(voiced, filtered, 0.0)
+                result[batch] = np.where(
+                    voiced, np.exp2(filtered).astype(np.float32), 0.0
+                )
             except ValueError:
                 # Filter failed, return original
                 result[batch] = f0_np[batch]
@@ -501,11 +510,76 @@ def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 16.0, sample_rate: float = 1
 
 
 def _smooth_fcpe_f0(f0: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    """Smooth FCPE F0 with avg_pool1d, preserving unvoiced (f0=0) regions."""
-    f0_smooth = torch.nn.functional.avg_pool1d(
-        f0.unsqueeze(1), kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+    """Smooth FCPE F0 with a voiced-mask-aware log-domain moving average.
+
+    Unvoiced frames (f0=0) mean "no pitch", not "0 Hz": including them in a
+    plain average drags boundary frames down by several semitones (and FCPE
+    NaN->0 holes make this constant).  Averaging only voiced neighbors, in
+    log2 domain (pitch is log-scale), fixes both.
+    """
+    voiced = (f0 > 0).to(f0.dtype)
+    log_f0 = torch.where(
+        f0 > 0, torch.log2(torch.clamp(f0, min=1e-3)), torch.zeros_like(f0)
+    )
+    num = torch.nn.functional.avg_pool1d(
+        (log_f0 * voiced).unsqueeze(1),
+        kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
     ).squeeze(1)
+    den = torch.nn.functional.avg_pool1d(
+        voiced.unsqueeze(1),
+        kernel_size=kernel_size, stride=1, padding=kernel_size // 2,
+    ).squeeze(1)
+    f0_smooth = torch.exp2(num / torch.clamp(den, min=1e-6))
     return torch.where(f0 > 0, f0_smooth, f0)
+
+
+def _resize_f0_track(f0: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Resize an F0 track to a new frame count, voiced-mask aware.
+
+    Values are interpolated in log2 domain over a gap-free contour (interior
+    gaps and edges filled from the nearest voiced values), so no frame is
+    ever averaged with an unvoiced 0.  The voiced mask is resized separately
+    and re-applied, so boundary frames never become spurious low pitches.
+    """
+    if f0.shape[1] == target_frames:
+        return f0
+
+    f0_np = f0.detach().cpu().to(torch.float32).numpy()
+    n = f0_np.shape[1]
+    out = np.zeros((f0_np.shape[0], target_frames), dtype=np.float32)
+    src_pos = np.arange(n, dtype=np.float64)
+    dst_pos = np.linspace(0.0, n - 1, target_frames)
+
+    for b in range(f0_np.shape[0]):
+        voiced = f0_np[b] > 0
+        if not voiced.any():
+            continue
+        voiced_idx = src_pos[voiced]
+        log_contour = np.interp(src_pos, voiced_idx, np.log2(f0_np[b][voiced]))
+        resized = np.exp2(np.interp(dst_pos, src_pos, log_contour))
+        mask = np.interp(dst_pos, src_pos, voiced.astype(np.float64)) >= 0.5
+        out[b] = np.where(mask, resized, 0.0).astype(np.float32)
+
+    return torch.from_numpy(out).to(f0.device, dtype=f0.dtype)
+
+
+def _align_f0_frames(f0: torch.Tensor, target_frames: int) -> torch.Tensor:
+    """Align an F0 track to a target frame count without a timeline squeeze.
+
+    When the counts differ by only a few frames the track has the SAME frame
+    rate as the target grid (the difference is edge frames), so a uniform
+    resize would compress the whole timeline and misplace pitch near the
+    tail; instead crop / edge-pad on the right so frame k stays at time k.
+    A genuine rate mismatch (>5%) is resized mask-aware in log domain.
+    """
+    cur = f0.shape[1]
+    if cur == target_frames:
+        return f0
+    if abs(cur - target_frames) > max(2, target_frames // 20):
+        return _resize_f0_track(f0, target_frames)
+    if cur > target_frames:
+        return f0[:, :target_frames]
+    return torch.cat([f0, f0[:, -1:].expand(-1, target_frames - cur)], dim=1)
 
 
 def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
@@ -619,8 +693,17 @@ def suppress_octave_flips(
     f0: torch.Tensor,
     octave_ratio_center: float = 2.0,
     octave_ratio_tolerance: float = 0.16,
+    sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
 ) -> torch.Tensor:
-    """Suppress only clear +-1 octave frame-to-frame F0 flips."""
+    """Suppress transient +-1 octave frame-to-frame F0 flips.
+
+    Corrections are made relative to the previous *corrected* frame, so a
+    genuine octave transition would keep matching the flip band forever and
+    get halved/doubled indefinitely.  The sustain counter breaks that latch:
+    once the correction persists ``sustain_frames`` consecutive frames in
+    the same direction, the raw values are restored and tracking resumes at
+    the new octave.
+    """
     if f0.numel() == 0 or f0.shape[1] < 2:
         return f0
 
@@ -632,27 +715,60 @@ def suppress_octave_flips(
     inv_high = 1.0 / low
 
     for b in range(corrected.shape[0]):
+        streak_dir = 0
+        streak_start = 0
+        streak_len = 0
         for i in range(1, corrected.shape[1]):
             prev = float(corrected[b, i - 1])
-            cur = float(corrected[b, i])
+            cur = float(f0_np[b, i])
             # Only compare adjacent voiced frames.
             # Never carry references across unvoiced gaps.
             if prev <= 0.0 or cur <= 0.0:
+                streak_dir = 0
+                streak_len = 0
                 continue
 
             ratio = cur / max(prev, 1e-6)
             if low <= ratio <= high:
-                cur = cur * 0.5
-                corrected[b, i] = cur
+                direction = 1
+                corrected[b, i] = cur * 0.5
             elif inv_low <= ratio <= inv_high:
-                cur = cur * 2.0
-                corrected[b, i] = cur
+                direction = -1
+                corrected[b, i] = cur * 2.0
+            else:
+                streak_dir = 0
+                streak_len = 0
+                continue
+
+            if direction == streak_dir:
+                streak_len += 1
+            else:
+                streak_dir = direction
+                streak_start = i
+                streak_len = 1
+
+            if streak_len >= sustain_frames:
+                # Sustained -> genuine transition: accept the raw octave.
+                corrected[b, streak_start : i + 1] = f0_np[b, streak_start : i + 1]
+                streak_dir = 0
+                streak_len = 0
 
     return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
 
 
-def limit_f0_slew(f0: torch.Tensor, max_step_st: float = 2.8) -> torch.Tensor:
-    """Limit frame-to-frame F0 step to suppress short flutter artifacts."""
+def limit_f0_slew(
+    f0: torch.Tensor,
+    max_step_st: float = 2.8,
+    sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
+) -> torch.Tensor:
+    """Limit frame-to-frame F0 step to suppress short flutter artifacts.
+
+    A genuine pitch jump would otherwise be turned into a multi-frame
+    portamento (clamped max_step_st per frame until it catches up).  When
+    the clamp persists ``sustain_frames`` consecutive frames in the same
+    direction, the raw values are restored — flutter is 1-2 frames; anything
+    longer is the singer actually moving.
+    """
     if f0.numel() == 0 or f0.shape[1] < 2:
         return f0
 
@@ -661,18 +777,43 @@ def limit_f0_slew(f0: torch.Tensor, max_step_st: float = 2.8) -> torch.Tensor:
     max_ratio = float(2 ** (max_step_st / 12.0))
 
     for b in range(corrected.shape[0]):
+        streak_dir = 0
+        streak_start = 0
+        streak_len = 0
         for i in range(1, corrected.shape[1]):
             prev = float(corrected[b, i - 1])
-            cur = float(corrected[b, i])
+            cur = float(f0_np[b, i])
             if prev <= 0.0 or cur <= 0.0:
+                streak_dir = 0
+                streak_len = 0
                 continue
 
             upper = prev * max_ratio
             lower = prev / max_ratio
             if cur > upper:
+                direction = 1
                 corrected[b, i] = upper
             elif cur < lower:
+                direction = -1
                 corrected[b, i] = lower
+            else:
+                corrected[b, i] = cur
+                streak_dir = 0
+                streak_len = 0
+                continue
+
+            if direction == streak_dir:
+                streak_len += 1
+            else:
+                streak_dir = direction
+                streak_start = i
+                streak_len = 1
+
+            if streak_len >= sustain_frames:
+                # Sustained -> genuine jump: accept the raw values.
+                corrected[b, streak_start : i + 1] = f0_np[b, streak_start : i + 1]
+                streak_dir = 0
+                streak_len = 0
 
     return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
 
@@ -977,6 +1118,10 @@ class RVCPipeline:
         # Windowed-F0 history: post-shift/moe, pre-filter F0 (Hz) @100fps,
         # kept in lockstep with the tail of _streaming_audio_history.
         self._streaming_f0_hz_history: Optional[torch.Tensor] = None
+        # Stabilized adaptive pre-HuBERT shift (streaming): value + the
+        # (pitch_shift, ratio, moe) key it was computed under.
+        self._adaptive_shift_state: Optional[float] = None
+        self._adaptive_shift_key: Optional[tuple] = None
 
         # Per-stage times (ms) of the last profiled infer_streaming() call.
         self.stage_times: dict = {}
@@ -1204,6 +1349,9 @@ class RVCPipeline:
         self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
         # Windowed-F0 history (Hz @100fps, aligned with _streaming_audio_history)
         self._streaming_f0_hz_history = None
+        # Stabilized adaptive pre-HuBERT shift state
+        self._adaptive_shift_state = None
+        self._adaptive_shift_key = None
 
     def _sync_device_for_profile(self) -> None:
         """Synchronize the device so stage wall-times reflect real GPU work.
@@ -1243,17 +1391,13 @@ class RVCPipeline:
         samples_per_frame = 160  # 100fps @ 16kHz
         pad_frames = t_pad // samples_per_frame
 
-        # Interpolate model output onto the padded-slice frame grid, then keep
-        # only the frames that map 1:1 onto the window's real audio (the slice
-        # may extend past it into reflect padding to keep its size fixed).
+        # Align model output onto the padded-slice frame grid (crop same-rate
+        # edge-frame differences, mask-aware log resize for genuine rate
+        # mismatches), then keep only the frames that map 1:1 onto the
+        # window's real audio (the slice may extend past it into reflect
+        # padding to keep its size fixed).
         win_grid = (slice_samples + 2 * t_pad) // samples_per_frame
-        if f0_win.shape[1] != win_grid:
-            f0_win = torch.nn.functional.interpolate(
-                f0_win.unsqueeze(1).float(),
-                size=win_grid,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(1)
+        f0_win = _align_f0_frames(f0_win, win_grid)
         f0_win = f0_win[
             :, pad_frames : pad_frames + window_samples // samples_per_frame
         ]
@@ -1758,16 +1902,15 @@ class RVCPipeline:
                 if moe_strength > 0.0:
                     f0 = apply_moe_f0_style(f0, moe_strength)
 
-                # Align F0 length with features
-                # RMVPE: hop=160 (100 frames/sec), HuBERT: hop=320 (50 frames/sec)
-                # F0 length is approximately 2x feature length
+                # Align F0 length with features.
+                # Features are ~2 frames short at the RIGHT edge (HuBERT
+                # frame deficit — the same convention as the right trim), so
+                # a uniform resize would squeeze the whole F0 timeline and
+                # misplace pitch by up to ~20ms at the tail.  Rate-normalize
+                # to the 100fps grid, then crop the deficit on the right.
                 if f0.shape[1] != features.shape[1]:
-                    f0 = torch.nn.functional.interpolate(
-                        f0.unsqueeze(1),
-                        size=features.shape[1],
-                        mode="linear",
-                        align_corners=False,
-                    ).squeeze(1)
+                    f0 = _align_f0_frames(f0, features.shape[1] + 2)
+                    f0 = f0[:, : features.shape[1]]
 
                 # F0 cache blending for chunk continuity (100fps F0)
                 # Phase 1 improvement: Extended cache, sigmoid blending, jump detection
@@ -2278,6 +2421,25 @@ class RVCPipeline:
             voiced_ratio=source_voiced_ratio,
             periodicity=source_periodicity,
         )
+        # --- Stabilize the adaptive shift across chunks ---
+        # The per-hop median-F0 estimate is noisy, and the resample ratio it
+        # drives warps the SHARED audio history: a ratio that jitters chunk
+        # to chunk regenerates different shifted context every time (feature
+        # flutter, SOLA misalignment).  Deadband + per-second slew keeps the
+        # ratio quasi-static while still tracking register changes.
+        shift_key = (pitch_shift, pre_hubert_pitch_ratio, moe_boost)
+        if self._adaptive_shift_state is None or self._adaptive_shift_key != shift_key:
+            self._adaptive_shift_key = shift_key
+            self._adaptive_shift_state = float(effective_shift)
+        else:
+            state = self._adaptive_shift_state
+            delta = float(effective_shift) - state
+            if abs(delta) > ADAPTIVE_SHIFT_DEADBAND_ST:
+                max_step = ADAPTIVE_SHIFT_SLEW_ST_PER_SEC * (new_samples / 16000.0)
+                state += max(-max_step, min(max_step, delta))
+                self._adaptive_shift_state = state
+        effective_shift = self._adaptive_shift_state
+
         if (
             source_median_f0_hz is not None
             and abs(effective_shift - base_pre_shift) > 0.1
@@ -2475,14 +2637,13 @@ class RVCPipeline:
                         input_length=input_length,
                         t_pad=t_pad,
                     )
-                # Align F0 to feature length (F0 from same audio_t, minor hop mismatch)
+                # Align F0 to feature length.  Same deficit-at-right
+                # convention as the batch path: rate-normalize to the 100fps
+                # grid, then crop — a uniform resize would squeeze the
+                # timeline and misplace pitch at the output region.
                 elif f0.shape[1] != features.shape[1]:
-                    f0 = torch.nn.functional.interpolate(
-                        f0.unsqueeze(1),
-                        size=features.shape[1],
-                        mode="linear",
-                        align_corners=False,
-                    ).squeeze(1)
+                    f0 = _align_f0_frames(f0, features.shape[1] + 2)
+                    f0 = f0[:, : features.shape[1]]
 
                 # --- F0 cross-chunk filter continuity ---
                 # Cache the output-region tail BEFORE filtering, then prepend

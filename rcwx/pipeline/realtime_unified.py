@@ -166,7 +166,9 @@ class RealtimeConfig:
     chunk_sec: float = 0.15
     overlap_sec: float = 0.10  # audio-level overlap for HuBERT continuity
     crossfade_sec: float = 0.05
-    sola_search_ms: float = 10.0  # SOLA search window in ms
+    # SOLA search window (ms): one period of the lowest expected output F0
+    # (70Hz -> 14.3ms) + margin, so the splice can always phase-align.
+    sola_search_ms: float = 15.0
     prebuffer_chunks: int = 1
     buffer_margin: float = 0.5
 

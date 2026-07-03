@@ -200,8 +200,9 @@ class InferenceConfig:
     # Enable SOLA (Synchronized Overlap-Add) for optimal crossfade position
     use_sola: bool = True
 
-    # SOLA search window in ms
-    sola_search_ms: float = 10.0
+    # SOLA search window in ms: one period of the lowest expected output F0
+    # (70Hz -> 14.3ms) + margin, so the splice can always phase-align
+    sola_search_ms: float = 15.0
 
     # HuBERT context window in seconds (longer = more stable timbre across chunks)
     hubert_context_sec: float = 1.0
