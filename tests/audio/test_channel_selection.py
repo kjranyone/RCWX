@@ -64,6 +64,13 @@ def test_normalize_input_garbage_falls_back_to_auto():
         assert normalize_input_channel_selection(v) == "auto", v
 
 
+def test_normalize_none_and_empty_are_auto():
+    # None / empty / whitespace are "unset" and must normalize to auto
+    for v in [None, "", "   ", "\t"]:
+        assert normalize_input_channel_selection(v) == "auto", repr(v)
+        assert normalize_output_channel_selection(v) == "auto", repr(v)
+
+
 def test_normalize_output_canonical_passthrough():
     assert normalize_output_channel_selection("auto") == "auto"
     assert normalize_output_channel_selection("0,1") == "0,1"
@@ -227,6 +234,7 @@ if __name__ == "__main__":
         test_normalize_input_canonical_passthrough,
         test_normalize_input_display_strings,
         test_normalize_input_garbage_falls_back_to_auto,
+        test_normalize_none_and_empty_are_auto,
         test_normalize_output_canonical_passthrough,
         test_normalize_output_display_strings,
         test_normalize_output_garbage_falls_back_to_auto,

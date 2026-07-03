@@ -40,9 +40,14 @@ def normalize_input_channel_selection(value: str) -> str:
 
     Accepts canonical values ("auto", "average", "left", "right", "0", ...)
     and GUI display strings ("自動", "平均", "Ch 3", "Ch 1: MIC/LINE/INST 1").
-    Unrecognized values fall back to "auto" with a warning.
+    None / empty are treated as "unset" → "auto" silently; other
+    unrecognized values fall back to "auto" with a warning.
     """
+    if value is None:
+        return "auto"
     value = str(value).strip()
+    if not value:
+        return "auto"
     if value in _INPUT_CHANNEL_KEYWORDS:
         return value
     if value in _INPUT_DISPLAY_MAP:
@@ -64,9 +69,14 @@ def normalize_output_channel_selection(value: str) -> str:
 
     Accepts canonical values ("auto", "0,1", "2,3", ...) and GUI display
     strings ("自動 (Ch 1-2)", "Ch 3-4", "Ch 1-2: Main L / Main R").
-    Unrecognized values fall back to "auto" with a warning.
+    None / empty are treated as "unset" → "auto" silently; other
+    unrecognized values fall back to "auto" with a warning.
     """
+    if value is None:
+        return "auto"
     value = str(value).strip()
+    if not value:
+        return "auto"
     if value == "auto" or value.startswith("自動"):
         return "auto"
     # Canonical "a,b" pair (0-based)
