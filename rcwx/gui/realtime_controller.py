@@ -209,6 +209,7 @@ class RealtimeController:
         self.app.start_btn.configure(text="▶ 開始", fg_color=["#3B8ED0", "#1F6AA5"])
         self.app.status_bar.set_running(False)
         self.app.reset_output_meter()
+        self.app.audio_settings.reset_input_meter()
 
         # Resume always-on input monitoring (delayed so the voice changer's
         # streams fully release the input device before we reopen it).

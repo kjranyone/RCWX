@@ -54,6 +54,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._load_device_lists()
         self._setup_ui()
         self._detect_default_sample_rates()
+        self._update_monitor_controls_visibility()
 
     def _load_device_lists(self) -> None:
         """Load device lists before UI setup."""
@@ -269,6 +270,18 @@ class AudioSettingsFrame(ctk.CTkFrame):
             command=self._on_loopback_toggle,
         )
         self.loopback_check.grid(row=0, column=1)
+
+        # Shown instead of the monitor button/loopback for exclusive ASIO
+        # devices, which cannot be opened by a standalone InputStream. The
+        # input level is fed from the running voice changer's stats instead.
+        self.monitor_hint_label = ctk.CTkLabel(
+            self.monitor_frame,
+            text="入力レベルは変換の実行中に表示されます (ASIO)",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self.monitor_hint_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.monitor_hint_label.grid_remove()
 
         # Channel selection section
         self.channel_label = ctk.CTkLabel(
@@ -489,6 +502,9 @@ class AudioSettingsFrame(ctk.CTkFrame):
         # Update channel selection UI state
         self._update_channel_selection_state()
 
+        # ASIO devices can't use the standalone monitor controls; toggle them.
+        self._update_monitor_controls_visibility()
+
         # Keep the always-on input monitor pointed at the newly selected device
         if self._monitoring:
             self._stop_monitor()
@@ -622,16 +638,15 @@ class AudioSettingsFrame(ctk.CTkFrame):
         # ASIO devices are exclusive and full-duplex: a standalone InputStream
         # cannot open them (PaErrorCode -9985 "Device unavailable"). For these,
         # the input meter is fed from the running voice changer's stats instead
-        # (see set_input_level_db), so skip the doomed open attempt entirely.
+        # (see set_input_level_db). The monitor button/loopback are hidden for
+        # ASIO (see _update_monitor_controls_visibility), so skip quietly and
+        # leave the meter untouched.
         if is_device_on_asio(self.input_device, "input"):
             self._monitoring = False
-            self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
-            self.level_bar.set(0)
-            self.level_value.configure(text="ASIO")
-            self.recommended_label.configure(text="ASIO: 変換の実行中に入力レベルを表示します")
-            logger.info(
-                f"Standalone input monitor skipped for ASIO device={self.input_device}; "
-                "meter is driven by voice-changer stats."
+            logger.debug(
+                "Standalone input monitor skipped for ASIO device=%s; "
+                "meter is driven by voice-changer stats.",
+                self.input_device,
             )
             return
 
@@ -989,6 +1004,32 @@ class AudioSettingsFrame(ctk.CTkFrame):
     def get_output_channel_selection(self) -> str:
         """Get the currently selected output channel pair (canonical form)."""
         return normalize_output_channel_selection(self.output_channel_var.get())
+
+    def _update_monitor_controls_visibility(self) -> None:
+        """Show the standalone-monitor button/loopback only for devices that
+        support a separate InputStream. ASIO devices are exclusive and
+        full-duplex, so those controls are non-functional there — hide them and
+        show a hint that the input level appears while the voice changer runs.
+        """
+        if not hasattr(self, "monitor_btn"):
+            return
+        is_asio = is_device_on_asio(self.input_device, "input")
+        if is_asio:
+            self.monitor_btn.grid_remove()
+            self.loopback_check.grid_remove()
+            self.monitor_hint_label.grid()
+        else:
+            self.monitor_hint_label.grid_remove()
+            self.monitor_btn.grid()
+            self.loopback_check.grid()
+
+    def reset_input_meter(self) -> None:
+        """Reset the input level meter to silence (e.g. when the voice changer
+        stops and no standalone monitor is running)."""
+        if self._monitoring:
+            return
+        self.level_bar.set(0)
+        self.level_value.configure(text="-∞ dB")
 
     def start_monitor(self) -> None:
         """Public method to (re)start input level monitoring if idle.
