@@ -533,7 +533,9 @@ class RCWXApp(ctk.CTk):
         self.output_level_bar.set(0)
 
         self.output_level_value = ctk.CTkLabel(
-            self.output_level_frame, text="-∞ dB", width=56
+            self.output_level_frame,
+            text=f"≤{self.OUTPUT_METER_FLOOR_DB:.0f} dB",
+            width=56,
         )
         self.output_level_value.grid(row=0, column=1)
 
@@ -1022,15 +1024,19 @@ class RCWXApp(ctk.CTk):
         if not self._initializing:
             self.realtime_controller.set_output_gain_db(float(gain))
 
+    # Output meter scale: bar spans OUTPUT_METER_FLOOR_DB (empty) .. 0 dB (full).
+    OUTPUT_METER_FLOOR_DB = -24.0
+
     def update_output_meter(self, stats) -> None:
         """Update the output level meter from realtime stats (main thread)."""
         if not hasattr(self, "output_level_bar"):
             return
+        floor = self.OUTPUT_METER_FLOOR_DB
         rms_db = getattr(stats, "output_rms_db", -60.0)
-        level = max(0.0, min(1.0, (rms_db + 60.0) / 60.0))
+        level = max(0.0, min(1.0, (rms_db - floor) / (0.0 - floor)))
         self.output_level_bar.set(level)
-        if rms_db <= -60.0:
-            self.output_level_value.configure(text="-∞ dB")
+        if rms_db <= floor:
+            self.output_level_value.configure(text=f"≤{floor:.0f} dB")
         else:
             self.output_level_value.configure(text=f"{rms_db:.0f} dB")
 
@@ -1039,7 +1045,7 @@ class RCWXApp(ctk.CTk):
         if not hasattr(self, "output_level_bar"):
             return
         self.output_level_bar.set(0)
-        self.output_level_value.configure(text="-∞ dB")
+        self.output_level_value.configure(text=f"≤{self.OUTPUT_METER_FLOOR_DB:.0f} dB")
 
     def _get_index_rate(self) -> float:
         """Get current index rate (0 if disabled)."""
