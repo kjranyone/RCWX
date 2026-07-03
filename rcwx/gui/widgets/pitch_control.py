@@ -218,13 +218,6 @@ class PitchControl(ctk.CTkFrame):
         )
         self.moe_hint.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
 
-        self.moe_preset_btn = ctk.CTkButton(
-            self,
-            text="Apply Moe Preset",
-            command=self.apply_moe_preset,
-        )
-        self.moe_preset_btn.grid(row=12, column=0, columnspan=3, padx=10, pady=(0, 6), sticky="ew")
-
         self.noise_scale_label = ctk.CTkLabel(
             self,
             text="Noise Scale",
@@ -477,22 +470,6 @@ class PitchControl(ctk.CTkFrame):
         self._f0_slew_max_step_st = max(1.0, min(6.0, float(value)))
         self.f0_slew_slider.set(self._f0_slew_max_step_st)
         self.f0_slew_value.configure(text=f"{self._f0_slew_max_step_st:.2f}")
-
-    def apply_moe_preset(self) -> None:
-        """Apply a practical cute voice preset."""
-        self._set_pitch(6)
-        self.set_f0_method("fcpe")
-        self.set_pre_hubert_pitch_ratio(0.08)
-        self.set_moe_boost(0.45)
-
-        if self.on_f0_mode_changed:
-            self.on_f0_mode_changed(True)
-        if self.on_f0_method_changed:
-            self.on_f0_method_changed("fcpe")
-        if self.on_pre_hubert_pitch_changed:
-            self.on_pre_hubert_pitch_changed(self._pre_hubert_pitch_ratio)
-        if self.on_moe_boost_changed:
-            self.on_moe_boost_changed(self._moe_boost)
 
     @property
     def pitch(self) -> int:

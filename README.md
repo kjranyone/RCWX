@@ -308,17 +308,6 @@ uv run rcwx info model.pth
 - 適応ミックス: `(0.25 + 0.55s) × confidence`（声の有声率・周期性に応じた信頼度で重み付け）
 - 高音域の声（既にターゲット付近）では追加シフトはほぼゼロ
 
-### GUIプリセット
-
-「Apply Moe Preset」ボタンで以下を一括設定:
-
-| 項目 | プリセット値 |
-|------|------------|
-| pitch_shift | +6 半音 |
-| f0_method | fcpe |
-| pre_hubert_pitch_ratio | 0.08 |
-| moe_boost | 0.45 |
-
 ### CLI
 
 ```powershell
