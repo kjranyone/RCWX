@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import logging
-import threading
 from typing import Callable, Optional
 
 import customtkinter as ctk
-import numpy as np
 
-from rcwx.audio.input import list_input_devices, select_channel
+from rcwx.audio.input import list_input_devices
 from rcwx.audio.output import list_output_devices
 from rcwx.audio.stream_base import is_device_on_asio, query_asio_channel_names
 from rcwx.config import (
@@ -54,7 +52,6 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._load_device_lists()
         self._setup_ui()
         self._detect_default_sample_rates()
-        self._update_monitor_controls_visibility()
 
     def _load_device_lists(self) -> None:
         """Load device lists before UI setup."""
@@ -247,41 +244,19 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.level_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.level_bar.set(0)
 
-        self.level_value = ctk.CTkLabel(self.level_frame, text="-∞ dB", width=60)
+        self.level_value = ctk.CTkLabel(self.level_frame, text="—", width=60)
         self.level_value.grid(row=0, column=1)
 
-        # Monitor controls
-        self.monitor_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.monitor_frame.grid(row=10, column=0, padx=10, pady=(2, 5), sticky="ew")
-
-        self.monitor_btn = ctk.CTkButton(
-            self.monitor_frame,
-            text="モニター開始",
-            width=120,
-            command=self._toggle_monitor,
-        )
-        self.monitor_btn.grid(row=0, column=0, padx=(0, 10))
-
-        self.loopback_var = ctk.BooleanVar(value=False)
-        self.loopback_check = ctk.CTkCheckBox(
-            self.monitor_frame,
-            text="ループバック出力",
-            variable=self.loopback_var,
-            command=self._on_loopback_toggle,
-        )
-        self.loopback_check.grid(row=0, column=1)
-
-        # Shown instead of the monitor button/loopback for exclusive ASIO
-        # devices, which cannot be opened by a standalone InputStream. The
-        # input level is fed from the running voice changer's stats instead.
-        self.monitor_hint_label = ctk.CTkLabel(
-            self.monitor_frame,
-            text="入力レベルは変換の実行中に表示されます (ASIO)",
+        # The input meter is driven by the running voice changer (single source
+        # of truth, identical to the output meter). No standalone monitor stream
+        # is opened, so this works uniformly on ASIO/WASAPI/etc.
+        self.level_caption = ctk.CTkLabel(
+            self,
+            text="変換の実行中に入力レベルを表示します",
             font=ctk.CTkFont(size=11),
             text_color="gray",
         )
-        self.monitor_hint_label.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.monitor_hint_label.grid_remove()
+        self.level_caption.grid(row=10, column=0, sticky="w", padx=10, pady=(0, 5))
 
         # Channel selection section
         self.channel_label = ctk.CTkLabel(
@@ -356,11 +331,8 @@ class AudioSettingsFrame(ctk.CTkFrame):
         # Configure grid
         self.grid_columnconfigure(0, weight=1)
 
-        # Monitor state
-        self._monitoring = False
-        self._monitor_stream = None
-        self._monitor_output_stream = None  # For loopback
-        self._monitor_queue = None  # For loopback
+        # Input level meter state (meter is driven by the running voice changer
+        # via set_input_level_db(); no standalone monitor stream is opened).
         self._peak_db = -60.0
         self._recommended_gain = 0.0
 
@@ -502,14 +474,6 @@ class AudioSettingsFrame(ctk.CTkFrame):
         # Update channel selection UI state
         self._update_channel_selection_state()
 
-        # ASIO devices can't use the standalone monitor controls; toggle them.
-        self._update_monitor_controls_visibility()
-
-        # Keep the always-on input monitor pointed at the newly selected device
-        if self._monitoring:
-            self._stop_monitor()
-            self.start_monitor()
-
         if self.on_settings_changed:
             self.on_settings_changed()
 
@@ -537,289 +501,13 @@ class AudioSettingsFrame(ctk.CTkFrame):
         if self.on_settings_changed:
             self.on_settings_changed()
 
-    def _toggle_monitor(self) -> None:
-        """Toggle input level monitoring."""
-        if self._monitoring:
-            self._stop_monitor()
-        else:
-            self._start_monitor()
-
-    def _on_loopback_toggle(self) -> None:
-        """Handle loopback checkbox toggle during monitoring."""
-        if not self._monitoring:
-            return  # Not monitoring, nothing to do
-
-        import sounddevice as sd
-
-        enable_loopback = self.loopback_var.get()
-        logger.info(f"Loopback toggle: enable={enable_loopback}")
-
-        if enable_loopback:
-            # Start loopback output
-            if self._monitor_queue is None:
-                import queue
-                self._monitor_queue = queue.Queue(maxsize=10)
-
-            if self._monitor_output_stream is None and self._monitor_stream is not None:
-                try:
-                    # Get current monitoring parameters
-                    sr = self._monitor_stream.samplerate
-                    blocksize = self._monitor_stream.blocksize
-
-                    # Create output callback (same as in _start_monitor)
-                    output_callback_count = [0]
-
-                    def output_callback(outdata, frames, time_info, status):
-                        output_callback_count[0] += 1
-                        if output_callback_count[0] <= 3:
-                            logger.info(f"Output callback #{output_callback_count[0]}: queue_size={self._monitor_queue.qsize() if self._monitor_queue else 'None'}, frames={frames}")
-
-                        if self._monitor_queue is None:
-                            outdata.fill(0)
-                            return
-                        try:
-                            audio = self._monitor_queue.get_nowait()
-                            if output_callback_count[0] <= 3:
-                                logger.info(f"  Got audio from queue: len={len(audio)}")
-                            if len(audio) < len(outdata):
-                                padded = np.zeros(len(outdata), dtype=np.float32)
-                                padded[:len(audio)] = audio
-                                audio = padded
-                            elif len(audio) > len(outdata):
-                                audio = audio[:len(outdata)]
-                            outdata[:] = audio.reshape(-1, 1)
-                        except Exception:
-                            if output_callback_count[0] <= 3:
-                                logger.info(f"  Queue empty, outputting silence")
-                            outdata.fill(0)
-
-                    device_name = "default" if self.output_device is None else str(self.output_device)
-                    logger.info(f"Starting loopback output: device={device_name}, sr={sr}Hz, blocksize={blocksize}")
-
-                    self._monitor_output_stream = sd.OutputStream(
-                        device=self.output_device,
-                        channels=1,
-                        samplerate=sr,
-                        blocksize=blocksize,
-                        dtype=np.float32,
-                        callback=output_callback,
-                    )
-                    self._monitor_output_stream.start()
-                    logger.info(f"Loopback output started successfully on {device_name}")
-                except Exception as e:
-                    logger.error(f"Failed to start loopback output: {e}", exc_info=True)
-        else:
-            # Stop loopback output
-            if self._monitor_output_stream is not None:
-                try:
-                    self._monitor_output_stream.stop()
-                    self._monitor_output_stream.close()
-                    logger.info("Loopback output stopped")
-                except Exception as e:
-                    logger.warning(f"Error stopping loopback output: {e}")
-                finally:
-                    self._monitor_output_stream = None
-
-            # Clear queue
-            if self._monitor_queue is not None:
-                import queue
-                while not self._monitor_queue.empty():
-                    try:
-                        self._monitor_queue.get_nowait()
-                    except queue.Empty:
-                        break
-                self._monitor_queue = None
-
-    def _start_monitor(self) -> None:
-        """Start input level monitoring."""
-        import sounddevice as sd
-        import queue
-
-        # ASIO devices are exclusive and full-duplex: a standalone InputStream
-        # cannot open them (PaErrorCode -9985 "Device unavailable"). For these,
-        # the input meter is fed from the running voice changer's stats instead
-        # (see set_input_level_db). The monitor button/loopback are hidden for
-        # ASIO (see _update_monitor_controls_visibility), so skip quietly and
-        # leave the meter untouched.
-        if is_device_on_asio(self.input_device, "input"):
-            self._monitoring = False
-            logger.debug(
-                "Standalone input monitor skipped for ASIO device=%s; "
-                "meter is driven by voice-changer stats.",
-                self.input_device,
-            )
-            return
-
-        self._monitoring = True
-        self.monitor_btn.configure(text="モニター停止", fg_color="#cc3333")
-
-        # Initialize loopback queue if enabled
-        enable_loopback = self.loopback_var.get()
-        logger.info(f"Monitor starting: loopback={enable_loopback}, input_device={self.input_device}, output_device={self.output_device}")
-        if enable_loopback:
-            self._monitor_queue = queue.Queue(maxsize=10)
-
-        input_callback_count = [0]  # Mutable counter for closure
-
-        def audio_callback(indata, frames, time, status):
-            input_callback_count[0] += 1
-            if not self._monitoring:
-                return
-
-            # Convert to mono based on channel selection
-            audio = select_channel(indata, self.get_channel_selection())
-
-            # Apply gain
-            if self.input_gain_db != 0.0:
-                gain_linear = 10 ** (self.input_gain_db / 20)
-                audio = audio * gain_linear
-
-            # Calculate RMS level
-            rms = np.sqrt(np.mean(audio ** 2))
-            # Calculate peak level
-            peak = np.max(np.abs(audio))
-            # Convert to dB (with floor at -60 dB)
-            rms_db = 20 * np.log10(max(rms, 1e-6))
-            peak_db = 20 * np.log10(max(peak, 1e-6))
-            rms_db = max(rms_db, -60)
-            peak_db = max(peak_db, -60)
-            # Normalize to 0-1 range (-60 to 0 dB)
-            level = (rms_db + 60) / 60
-            # Update UI from main thread
-            self.after(0, lambda l=level, r=rms_db, p=peak_db: self._update_level(l, r, p))
-
-            # Send to loopback output if enabled
-            if enable_loopback and self._monitor_queue is not None:
-                try:
-                    self._monitor_queue.put_nowait(audio.copy())
-                    if input_callback_count[0] <= 3:
-                        logger.info(f"Input callback #{input_callback_count[0]}: Added to queue, size={self._monitor_queue.qsize()}")
-                except queue.Full:
-                    if input_callback_count[0] <= 3:
-                        logger.warning(f"Input callback #{input_callback_count[0]}: Queue full, dropping audio")
-                    pass  # Drop if queue is full
-
-        output_callback_count = [0]  # Mutable counter for closure
-
-        def output_callback(outdata, frames, time_info, status):
-            output_callback_count[0] += 1
-            if output_callback_count[0] <= 3:
-                logger.info(f"Output callback #{output_callback_count[0]}: queue_size={self._monitor_queue.qsize() if self._monitor_queue else 'None'}, frames={frames}")
-
-            if self._monitor_queue is None:
-                outdata.fill(0)
-                return
-            try:
-                audio = self._monitor_queue.get_nowait()
-                if output_callback_count[0] <= 3:
-                    logger.info(f"  Got audio from queue: len={len(audio)}")
-                # Ensure correct length
-                if len(audio) < len(outdata):
-                    padded = np.zeros(len(outdata), dtype=np.float32)
-                    padded[:len(audio)] = audio
-                    audio = padded
-                elif len(audio) > len(outdata):
-                    audio = audio[:len(outdata)]
-                outdata[:] = audio.reshape(-1, 1)
-            except queue.Empty:
-                if output_callback_count[0] <= 3:
-                    logger.info(f"  Queue empty, outputting silence")
-                outdata.fill(0)  # Output silence if no data
-
-        # Try the configured device across common rates. If the device's native
-        # channel count fails, retry mono. Every failure is logged so the real
-        # reason behind a "デバイスエラー" is visible in the logs.
-        rates: list[int] = []
-        for r in (self.input_sample_rate, 48000, 44100, 16000):
-            if r not in rates:
-                rates.append(r)
-
-        channel_options = [self.input_channels]
-        if self.input_channels != 1:
-            channel_options.append(1)  # mono fallback
-
-        started = False
-        last_error: Optional[Exception] = None
-        for ch in channel_options:
-            for try_sr in rates:
-                try:
-                    blocksize = int(try_sr * 0.1)  # 100ms blocks
-                    self._monitor_stream = sd.InputStream(
-                        device=self.input_device,
-                        channels=ch,
-                        samplerate=try_sr,
-                        blocksize=blocksize,
-                        callback=audio_callback,
-                    )
-                    self._monitor_stream.start()
-                    started = True
-                    self.input_channels = ch
-                    self.input_sample_rate = try_sr
-
-                    # Start loopback output stream if enabled
-                    if enable_loopback:
-                        device_name = "default" if self.output_device is None else str(self.output_device)
-                        logger.info(f"Starting loopback output: device={device_name}, sr={try_sr}Hz, blocksize={blocksize}")
-                        try:
-                            self._monitor_output_stream = sd.OutputStream(
-                                device=self.output_device,  # None is OK - uses system default
-                                channels=1,  # Mono output
-                                samplerate=try_sr,
-                                blocksize=blocksize,
-                                dtype=np.float32,
-                                callback=output_callback,
-                            )
-                            self._monitor_output_stream.start()
-                            logger.info(f"Loopback output started successfully on {device_name}")
-                        except Exception as e:
-                            logger.error(f"Failed to start loopback output: {e}", exc_info=True)
-                            # Continue without loopback
-                    break
-                except Exception as e:
-                    last_error = e
-                    logger.warning(
-                        f"Monitor open failed (device={self.input_device}, "
-                        f"channels={ch}, sr={try_sr}): {e}"
-                    )
-                    continue
-            if started:
-                break
-
-        if not started:
-            self._monitoring = False
-            self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
-            self.level_value.configure(text="デバイスエラー")
-            logger.error(
-                f"Input monitor could not open (device={self.input_device}, "
-                f"channels tried={channel_options}); last error: {last_error}"
-            )
-
-    def _stop_monitor(self) -> None:
-        """Stop input level monitoring."""
-        self._monitoring = False
-        if self._monitor_stream:
-            self._monitor_stream.stop()
-            self._monitor_stream.close()
-            self._monitor_stream = None
-        if self._monitor_output_stream:
-            try:
-                self._monitor_output_stream.stop()
-                self._monitor_output_stream.close()
-            except Exception as e:
-                logger.warning(f"Error stopping loopback output: {e}")
-            self._monitor_output_stream = None
-        self._monitor_queue = None
-        self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
-        self.level_bar.set(0)
-        self.level_value.configure(text="-∞ dB")
-
     def set_input_level_db(self, rms_db: float, peak_db: float = -60.0) -> None:
-        """Drive the input level meter from an external source (the running
-        voice changer). Used when a standalone monitor stream is unavailable
-        (ASIO exclusive devices) or is stopped while the voice changer runs.
+        """Drive the input level meter from the running voice changer.
+
+        This is the single source of truth for the input meter — it reflects
+        the live input the pipeline is processing, so it works uniformly across
+        ASIO/WASAPI/etc. without opening a separate monitor stream.
         """
-        if self._monitoring:
-            return  # the standalone monitor already owns the meter
         level = (max(rms_db, -60.0) + 60.0) / 60.0
         self._update_level(level, rms_db, peak_db)
 
@@ -1005,50 +693,11 @@ class AudioSettingsFrame(ctk.CTkFrame):
         """Get the currently selected output channel pair (canonical form)."""
         return normalize_output_channel_selection(self.output_channel_var.get())
 
-    def _update_monitor_controls_visibility(self) -> None:
-        """Show the standalone-monitor button/loopback only for devices that
-        support a separate InputStream. ASIO devices are exclusive and
-        full-duplex, so those controls are non-functional there — hide them and
-        show a hint that the input level appears while the voice changer runs.
-        """
-        if not hasattr(self, "monitor_btn"):
-            return
-        is_asio = is_device_on_asio(self.input_device, "input")
-        if is_asio:
-            self.monitor_btn.grid_remove()
-            self.loopback_check.grid_remove()
-            self.monitor_hint_label.grid()
-        else:
-            self.monitor_hint_label.grid_remove()
-            self.monitor_btn.grid()
-            self.loopback_check.grid()
-
     def reset_input_meter(self) -> None:
-        """Reset the input level meter to silence (e.g. when the voice changer
-        stops and no standalone monitor is running)."""
-        if self._monitoring:
-            return
+        """Reset the input level meter to idle (e.g. when the voice changer
+        stops — there is no live input to show)."""
         self.level_bar.set(0)
-        self.level_value.configure(text="-∞ dB")
-
-    def start_monitor(self) -> None:
-        """Public method to (re)start input level monitoring if idle.
-
-        Used for always-on monitoring: called on startup and after the voice
-        changer stops (which frees the input device). No-op while already
-        monitoring.
-        """
-        if self._monitoring:
-            return
-        try:
-            self._start_monitor()
-        except Exception as e:  # never let a device hiccup crash the caller
-            logger.warning(f"start_monitor failed: {e}")
-
-    def stop_monitor(self) -> None:
-        """Public method to stop monitoring (called when closing app)."""
-        if self._monitoring:
-            self._stop_monitor()
+        self.level_value.configure(text="—")
 
     def get_input_device_name(self) -> str:
         """Get the currently selected input device name (original, not formatted)."""

@@ -69,9 +69,6 @@ class RealtimeController:
                 "推奨: USBマイクなど、別のインターフェースを入力に使用してください。",
             )
 
-        # Stop audio monitor to avoid device conflict
-        self.app.audio_settings.stop_monitor()
-
         # Disable button and show loading state
         self.app.start_btn.configure(state="disabled", text="⏳ 起動中...")
         self.app._loading = True
@@ -210,10 +207,6 @@ class RealtimeController:
         self.app.status_bar.set_running(False)
         self.app.reset_output_meter()
         self.app.audio_settings.reset_input_meter()
-
-        # Resume always-on input monitoring (delayed so the voice changer's
-        # streams fully release the input device before we reopen it).
-        self.app.after(500, self.app.audio_settings.start_monitor)
 
         # Reset buffer warning flags so warnings show again on next start
         self._buffer_warning_shown = {"underrun": False, "overrun": False}
