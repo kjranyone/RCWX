@@ -35,6 +35,7 @@ class AudioConfig:
     chunk_sec: float = 0.3
     crossfade_sec: float = 0.05
     input_gain_db: float = 0.0  # Input gain in dB
+    output_gain_db: float = 0.0  # Output level adjustment in dB
     # Input channel selection for stereo devices: "left", "right", "average"
     input_channel_selection: str = "auto"
     # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.

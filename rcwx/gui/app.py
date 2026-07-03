@@ -516,6 +516,54 @@ class RCWXApp(ctk.CTk):
         )
         self.start_btn.pack(fill="x", padx=10, pady=5)
 
+        # --- Output level monitor (under the start button) ---
+        self.output_level_label = ctk.CTkLabel(
+            self.control_frame,
+            text="出力レベル",
+            font=ctk.CTkFont(size=11, weight="bold"),
+        )
+        self.output_level_label.pack(anchor="w", padx=10, pady=(4, 0))
+
+        self.output_level_frame = ctk.CTkFrame(self.control_frame, fg_color="transparent")
+        self.output_level_frame.pack(fill="x", padx=10, pady=(0, 4))
+        self.output_level_frame.grid_columnconfigure(0, weight=1)
+
+        self.output_level_bar = ctk.CTkProgressBar(self.output_level_frame, height=16)
+        self.output_level_bar.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.output_level_bar.set(0)
+
+        self.output_level_value = ctk.CTkLabel(
+            self.output_level_frame, text="-∞ dB", width=56
+        )
+        self.output_level_value.grid(row=0, column=1)
+
+        # --- Output level adjustment (gain) ---
+        self.output_gain_frame = ctk.CTkFrame(self.control_frame, fg_color="transparent")
+        self.output_gain_frame.pack(fill="x", padx=10, pady=(0, 8))
+        self.output_gain_frame.grid_columnconfigure(1, weight=1)
+
+        self.output_gain_label = ctk.CTkLabel(
+            self.output_gain_frame, text="レベル調整:", font=ctk.CTkFont(size=11)
+        )
+        self.output_gain_label.grid(row=0, column=0, padx=(0, 6))
+
+        self.output_gain_slider = ctk.CTkSlider(
+            self.output_gain_frame,
+            from_=-12,
+            to=12,
+            number_of_steps=24,
+            command=self._on_output_gain_changed,
+        )
+        self.output_gain_slider.grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        self.output_gain_slider.set(self.config.audio.output_gain_db)
+
+        self.output_gain_value = ctk.CTkLabel(
+            self.output_gain_frame,
+            text=f"{self.config.audio.output_gain_db:+.0f} dB",
+            width=50,
+        )
+        self.output_gain_value.grid(row=0, column=2)
+
     def _setup_audio_tab(self) -> None:
         """Setup the audio settings tab."""
         # Scrollable container
@@ -963,6 +1011,36 @@ class RCWXApp(ctk.CTk):
         # Update voice changer if running
         self.realtime_controller.set_energy_threshold(value)
 
+    def _on_output_gain_changed(self, value: float) -> None:
+        """Handle output level adjustment slider change."""
+        gain = round(value)
+        self.output_gain_value.configure(text=f"{gain:+.0f} dB")
+        self.config.audio.output_gain_db = float(gain)
+        self._save_config()
+        # Update voice changer if running (guard init: realtime_controller is
+        # created after _setup_ui).
+        if not self._initializing:
+            self.realtime_controller.set_output_gain_db(float(gain))
+
+    def update_output_meter(self, stats) -> None:
+        """Update the output level meter from realtime stats (main thread)."""
+        if not hasattr(self, "output_level_bar"):
+            return
+        rms_db = getattr(stats, "output_rms_db", -60.0)
+        level = max(0.0, min(1.0, (rms_db + 60.0) / 60.0))
+        self.output_level_bar.set(level)
+        if rms_db <= -60.0:
+            self.output_level_value.configure(text="-∞ dB")
+        else:
+            self.output_level_value.configure(text=f"{rms_db:.0f} dB")
+
+    def reset_output_meter(self) -> None:
+        """Reset the output level meter to silence (e.g. on stop)."""
+        if not hasattr(self, "output_level_bar"):
+            return
+        self.output_level_bar.set(0)
+        self.output_level_value.configure(text="-∞ dB")
+
     def _get_index_rate(self) -> float:
         """Get current index rate (0 if disabled)."""
         if self.use_index_var.get():
@@ -1075,6 +1153,8 @@ class RCWXApp(ctk.CTk):
                 self.config.inference.crossfade_sec = latency["crossfade_sec"]
                 self.config.inference.use_sola = latency["use_sola"]
             self.config.audio.input_gain_db = self.audio_settings.input_gain_db
+            if hasattr(self, "output_gain_slider"):
+                self.config.audio.output_gain_db = round(self.output_gain_slider.get())
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
             self.config.audio.output_channel_selection = self.audio_settings.get_output_channel_selection()
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()

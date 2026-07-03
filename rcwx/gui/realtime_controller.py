@@ -110,6 +110,7 @@ class RealtimeController:
                 hubert_context_sec=self.app.config.inference.hubert_context_sec,
                 # Audio settings
                 input_gain_db=self.app.audio_settings.input_gain_db,
+                output_gain_db=self.app.config.audio.output_gain_db,
                 index_rate=self.app._get_index_rate(),
                 denoise_enabled=self.app.use_denoise_var.get(),
                 denoise_method=self.app.denoise_method_var.get(),
@@ -207,6 +208,7 @@ class RealtimeController:
         self.app._is_running = False
         self.app.start_btn.configure(text="▶ 開始", fg_color=["#3B8ED0", "#1F6AA5"])
         self.app.status_bar.set_running(False)
+        self.app.reset_output_meter()
 
         # Reset buffer warning flags so warnings show again on next start
         self._buffer_warning_shown = {"underrun": False, "overrun": False}
@@ -282,6 +284,10 @@ class RealtimeController:
         if self.voice_changer:
             self.voice_changer.set_input_gain_db(gain_db)
 
+    def set_output_gain_db(self, gain_db: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_output_gain_db(gain_db)
+
     def apply_latency_settings(self, settings: dict) -> None:
         """Apply latency settings in the required order.
 
@@ -303,8 +309,12 @@ class RealtimeController:
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
-        # Update UI from main thread
-        self.app.after(0, lambda: self.app.status_bar.update_stats(stats))
+        # Update UI from main thread (status bar + output level meter)
+        def _apply_ui(s: RealtimeStats = stats) -> None:
+            self.app.status_bar.update_stats(s)
+            self.app.update_output_meter(s)
+
+        self.app.after(0, _apply_ui)
 
         # Show buffer warnings (first occurrence only, after threshold)
         # Threshold: 5 occurrences to avoid false positives during startup

@@ -51,6 +51,8 @@ class RealtimeStats:
     feedback_detected: bool = False
     feedback_correlation: float = 0.0
     gpu_memory_percent: float = 0.0
+    output_rms_db: float = -60.0
+    output_peak_db: float = -60.0
 
     def reset(self) -> None:
         self.latency_ms = 0.0
@@ -62,6 +64,8 @@ class RealtimeStats:
         self.feedback_detected = False
         self.feedback_correlation = 0.0
         self.gpu_memory_percent = 0.0
+        self.output_rms_db = -60.0
+        self.output_peak_db = -60.0
 
 
 @dataclass
@@ -99,6 +103,7 @@ class RealtimeConfig:
     # Processing
     max_queue_size: int = 8
     input_gain_db: float = 0.0
+    output_gain_db: float = 0.0  # Output level adjustment (post-processing)
     index_rate: float = 0.0
     index_k: int = 4
     use_parallel_extraction: bool = True
@@ -659,6 +664,9 @@ class RealtimeVoiceChangerUnified:
     def set_input_gain_db(self, gain_db: float) -> None:
         self.config.input_gain_db = float(gain_db)
 
+    def set_output_gain_db(self, gain_db: float) -> None:
+        self.config.output_gain_db = float(gain_db)
+
     def set_denoise(self, enabled: bool, method: str = "auto") -> None:
         self.config.denoise_enabled = enabled
         self.config.denoise_method = method
@@ -963,8 +971,19 @@ class RealtimeVoiceChangerUnified:
                 # --- Stage 7.6: Post-processing (treble boost + limiter) ---
                 output_48k = self._postprocessor.process(output_48k)
 
+                # --- Stage 7.7: User output level adjustment ---
+                if self.config.output_gain_db != 0.0:
+                    output_48k = output_48k * (10.0 ** (self.config.output_gain_db / 20.0))
+
                 # Hard clip final output (safety net after limiter)
                 output_48k = np.clip(output_48k, -1.0, 1.0)
+
+                # Measure final output level for the GUI output meter
+                if output_48k.size:
+                    out_rms = float(np.sqrt(np.mean(output_48k**2)))
+                    out_peak = float(np.max(np.abs(output_48k)))
+                    self.stats.output_rms_db = max(-60.0, 20.0 * np.log10(max(out_rms, 1e-6)))
+                    self.stats.output_peak_db = max(-60.0, 20.0 * np.log10(max(out_peak, 1e-6)))
 
                 # --- Stage 8: Feedback detection ---
                 if not self.config.wav_input_path:
