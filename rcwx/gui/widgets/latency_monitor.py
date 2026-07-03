@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import time
+from collections import deque
 from typing import Optional
 
 import customtkinter as ctk
 
 from rcwx.pipeline.realtime_unified import RealtimeStats
+
+# Counters are cumulative for the whole session; highlight them only while
+# they are actually increasing so a single early hiccup doesn't stay red.
+RECENT_ISSUE_SEC = 5.0
+
+# The status bar shows counts within this sliding window (not session
+# totals): once a problem stops, the number decays to zero and the
+# indicator disappears instead of accumulating forever.
+DISPLAY_WINDOW_SEC = 60.0
 
 
 class LatencyMonitor(ctk.CTkFrame):
@@ -26,6 +37,15 @@ class LatencyMonitor(ctk.CTkFrame):
         self._cpu_percent: float = 0.0
         self._index_loaded: bool = False
         self._index_rate: float = 0.0
+
+        # Recency tracking for buffer counters (cumulative in RealtimeStats)
+        self._prev_underruns: int = 0
+        self._prev_overruns: int = 0
+        self._prev_trims: int = 0
+        self._last_issue_time: float = 0.0  # underrun/overrun increased
+        self._last_trim_time: float = 0.0  # drift trim increased
+        # Snapshots (time, underruns, overruns, trims) for the sliding window
+        self._count_history: deque[tuple[float, int, int, int]] = deque()
 
         self._setup_ui()
 
@@ -136,19 +156,73 @@ class LatencyMonitor(ctk.CTkFrame):
             color = "#ff3333" if pct > 80 else "#ffaa00" if pct > 60 else "#88ff88"
             self.gpu_label.configure(text=f"GPU: {pct:.0f}%", text_color=color)
 
+        # --- Recency tracking ---
+        # Counters only ever grow within a session; a decrease means the
+        # pipeline restarted (stats.reset()), so resync silently.
+        now = time.monotonic()
+        if (
+            stats.buffer_underruns < self._prev_underruns
+            or stats.buffer_overruns < self._prev_overruns
+            or stats.buffer_trims < self._prev_trims
+        ):
+            self._count_history.clear()
+            self._last_issue_time = 0.0
+            self._last_trim_time = 0.0
+        if (
+            stats.buffer_underruns > self._prev_underruns
+            or stats.buffer_overruns > self._prev_overruns
+        ):
+            self._last_issue_time = now
+        if stats.buffer_trims > self._prev_trims:
+            self._last_trim_time = now
+        self._prev_underruns = stats.buffer_underruns
+        self._prev_overruns = stats.buffer_overruns
+        self._prev_trims = stats.buffer_trims
+
+        recent_issue = (
+            self._last_issue_time > 0
+            and now - self._last_issue_time < RECENT_ISSUE_SEC
+        )
+        recent_trim = (
+            self._last_trim_time > 0
+            and now - self._last_trim_time < RECENT_ISSUE_SEC
+        )
+
+        # --- Sliding-window counts for display ---
+        # Show events within the last DISPLAY_WINDOW_SEC instead of session
+        # totals: the numbers decay to zero (and disappear) once resolved.
+        self._count_history.append(
+            (now, stats.buffer_underruns, stats.buffer_overruns, stats.buffer_trims)
+        )
+        while (
+            len(self._count_history) > 1
+            and now - self._count_history[0][0] > DISPLAY_WINDOW_SEC
+        ):
+            self._count_history.popleft()
+        base = self._count_history[0]
+        win_underruns = stats.buffer_underruns - base[1]
+        win_overruns = stats.buffer_overruns - base[2]
+        win_trims = stats.buffer_trims - base[3]
+
         # Update buffer warning display
         warning_parts = []
-        if stats.buffer_underruns > 0:
-            warning_parts.append(f"UNDER:{stats.buffer_underruns}")
-        if stats.buffer_overruns > 0:
-            warning_parts.append(f"DROP:{stats.buffer_overruns}")
-        if stats.buffer_trims > 0:
-            warning_parts.append(f"DRIFT:{stats.buffer_trims}")
+        if win_underruns > 0:
+            warning_parts.append(f"UNDER:{win_underruns}")
+        if win_overruns > 0:
+            warning_parts.append(f"DROP:{win_overruns}")
+        if win_trims > 0:
+            warning_parts.append(f"DRIFT:{win_trims}")
 
         if warning_parts:
-            # Drift-only is informational (yellow), buffer issues are errors (red)
-            has_buffer_issue = stats.buffer_underruns > 0 or stats.buffer_overruns > 0
-            color = "#ff3333" if has_buffer_issue else "#ffaa00"
+            # Red only while underruns/drops are actively occurring; drift is
+            # informational (yellow while active).  Decaying counts are shown
+            # dimmed until they leave the window.
+            if recent_issue:
+                color = "#ff3333"
+            elif recent_trim:
+                color = "#ffaa00"
+            else:
+                color = "gray"
             self.buffer_warning_label.configure(
                 text=" ".join(warning_parts),
                 text_color=color,
@@ -158,9 +232,9 @@ class LatencyMonitor(ctk.CTkFrame):
             self.buffer_warning_label.configure(text="")
             self.sep6.grid()
 
-        # Update status color based on latency and buffer issues
-        if stats.buffer_underruns > 0 or stats.buffer_overruns > 0:
-            color = "#ff3333"  # Red - buffer issues
+        # Update status color based on latency and active buffer issues
+        if recent_issue:
+            color = "#ff3333"  # Red - buffer issues happening now
         elif stats.latency_ms < 150:
             color = "#00ff00"  # Green
         elif stats.latency_ms < 250:
@@ -172,6 +246,13 @@ class LatencyMonitor(ctk.CTkFrame):
 
     def set_running(self, running: bool) -> None:
         """Set the running status."""
+        # New session: clear recency state so stale warnings don't carry over
+        self._prev_underruns = 0
+        self._prev_overruns = 0
+        self._prev_trims = 0
+        self._last_issue_time = 0.0
+        self._last_trim_time = 0.0
+        self._count_history.clear()
         if running:
             self.status_indicator.configure(text="●", text_color="#00ff00")
         else:

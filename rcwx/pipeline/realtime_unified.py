@@ -883,8 +883,22 @@ class RealtimeVoiceChangerUnified:
                 )
         else:
             output = self.output_buffer.get(frames)
-            if self.output_buffer.available == 0:
-                self.stats.buffer_underruns += 1
+
+        # Count REAL underruns only: the ring's counter increments when a
+        # read could not be fully served (zero-padded output = audible gap).
+        # Previously "available == 0 after a full read" was also counted,
+        # over-reporting: an exactly-drained ring that refills before the
+        # next callback causes no gap at all.
+        ring_underruns = self.output_buffer.underrun_count
+        if ring_underruns > self.stats.buffer_underruns:
+            self.stats.buffer_underruns = ring_underruns
+            if ring_underruns <= 3 or ring_underruns % 20 == 0:
+                logger.warning(
+                    "[UNDERRUN] Output buffer starved (#%d, frames=%d, avail=%d)",
+                    ring_underruns,
+                    frames,
+                    self.output_buffer.available,
+                )
 
         return output
 

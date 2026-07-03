@@ -20,7 +20,11 @@ import numpy as np
 import sounddevice as sd
 
 from rcwx.audio.input import select_channel
-from rcwx.audio.stream_base import query_asio_native_sample_rate
+from rcwx.audio.stream_base import (
+    parse_output_channel_pair,
+    query_asio_channel_names,
+    query_asio_native_sample_rate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +76,33 @@ class AsioDuplexStream:
         self._channel_selection = channel_selection
 
         # Parse output channel selection into index pair
-        self._output_ch_indices: Optional[tuple[int, int]] = None
-        if output_channel_selection != "auto":
-            try:
-                parts = output_channel_selection.split(",")
-                if len(parts) == 2:
-                    self._output_ch_indices = (int(parts[0]), int(parts[1]))
-            except (ValueError, IndexError):
-                pass
+        self._output_ch_indices = parse_output_channel_pair(output_channel_selection)
+        if self._output_ch_indices is None and output_channel_selection != "auto":
+            logger.warning(
+                "Unparseable output_channel_selection %r — treating as auto "
+                "(output to Ch 1-2 only)",
+                output_channel_selection,
+            )
+
+        # ASIO LOOPBACK input channels carry the device's own playback (= the
+        # voice changer output).  Exclude them from auto/average input
+        # selection so the output can never be auto-picked back into the
+        # pipeline as input (digital-delay-like feedback loop).
+        self._input_exclude_channels: Optional[frozenset[int]] = None
+        try:
+            names = query_asio_channel_names(input_device, "input")
+            loopback = frozenset(
+                i for i, name in enumerate(names) if "loopback" in name.lower()
+            )
+            if loopback:
+                self._input_exclude_channels = loopback
+                logger.info(
+                    "Excluding ASIO loopback input channels from auto selection: %s",
+                    sorted(loopback),
+                )
+        except Exception as e:
+            logger.debug("Could not query ASIO input channel names: %s", e)
+
         self._stream: Optional[sd.Stream] = None
         self._actual_sample_rate: int = sample_rate
         self._stopped = False
@@ -178,7 +201,9 @@ class AsioDuplexStream:
 
         # --- Input side: channel selection → mono callback ---
         try:
-            audio = select_channel(indata, self._channel_selection)
+            audio = select_channel(
+                indata, self._channel_selection, self._input_exclude_channels
+            )
             self._input_callback(audio)
         except Exception as e:
             logger.error("ASIO duplex input callback error: %s", e)
@@ -202,7 +227,12 @@ class AsioDuplexStream:
                 if ch_b < outdata.shape[1]:
                     outdata[:, ch_b] = mono
             elif outdata.ndim > 1 and outdata.shape[1] > 1:
-                outdata[:] = mono[:, np.newaxis]
+                # Auto: first stereo pair only.  Broadcasting to ALL channels
+                # would also feed ASIO LOOPBACK outputs, whose signal returns
+                # on the loopback inputs (feedback loop).
+                outdata.fill(0)
+                outdata[:, 0] = mono
+                outdata[:, 1] = mono
             else:
                 outdata[:, 0] = mono
         except Exception as e:

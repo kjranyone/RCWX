@@ -14,7 +14,10 @@ from rcwx.audio.stream_base import AudioStreamBase, AudioStreamError, list_devic
 logger = logging.getLogger(__name__)
 
 
-def _auto_select_channel(indata: NDArray[np.float32]) -> NDArray[np.float32]:
+def _auto_select_channel(
+    indata: NDArray[np.float32],
+    exclude_channels: Optional[frozenset[int]] = None,
+) -> NDArray[np.float32]:
     """Auto-detect active channel for multi-channel input.
 
     For 2-channel (stereo) input:
@@ -23,15 +26,24 @@ def _auto_select_channel(indata: NDArray[np.float32]) -> NDArray[np.float32]:
         is near-silent (< 1% energy ratio). Otherwise averages both.
 
     For >2-channel input (e.g. ASIO with loopback):
-        Picks the single loudest channel to avoid mixing in loopback or
-        unrelated channels.
+        Picks the single loudest channel among the candidates.
+        ``exclude_channels`` removes channels from consideration — used to
+        keep ASIO LOOPBACK channels (which carry the device's own playback,
+        i.e. the voice changer output) from being auto-selected, which would
+        close a feedback loop.
     """
     n_channels = indata.shape[1]
+    candidates = [
+        i for i in range(n_channels)
+        if not exclude_channels or i not in exclude_channels
+    ]
+    if not candidates:
+        candidates = list(range(n_channels))
 
-    if n_channels == 2:
-        # Original stereo logic — average when both active
-        left = indata[:, 0]
-        right = indata[:, 1]
+    if len(candidates) == 2:
+        # Stereo logic — average when both active
+        left = indata[:, candidates[0]]
+        right = indata[:, candidates[1]]
         energy_l = np.dot(left, left)
         energy_r = np.dot(right, right)
         energy_max = max(energy_l, energy_r)
@@ -46,22 +58,30 @@ def _auto_select_channel(indata: NDArray[np.float32]) -> NDArray[np.float32]:
             else:
                 return right.astype(np.float32)
 
-        return np.mean(indata, axis=1).astype(np.float32)
+        return np.mean(indata[:, candidates], axis=1).astype(np.float32)
 
-    # >2 channels: pick the single loudest channel
-    energies = [float(np.dot(indata[:, i], indata[:, i])) for i in range(n_channels)]
+    if len(candidates) == 1:
+        return indata[:, candidates[0]].astype(np.float32)
+
+    # >2 candidates: pick the single loudest channel
+    energies = [float(np.dot(indata[:, i], indata[:, i])) for i in candidates]
     energy_max = max(energies)
 
     if energy_max < 1e-10:
-        return indata[:, 0].astype(np.float32)
+        return indata[:, candidates[0]].astype(np.float32)
 
-    loudest = int(np.argmax(energies))
+    loudest = candidates[int(np.argmax(energies))]
     return indata[:, loudest].astype(np.float32)
+
+
+# Selections already warned about (avoid per-audio-block log spam)
+_warned_channel_selections: set[str] = set()
 
 
 def select_channel(
     indata: NDArray[np.float32],
     channel_selection: str,
+    exclude_channels: Optional[frozenset[int]] = None,
 ) -> NDArray[np.float32]:
     """Extract mono audio from multi-channel input.
 
@@ -75,6 +95,9 @@ def select_channel(
         ``"right"`` — channel 1 (legacy alias for ``"1"``).
         ``"average"`` — average all channels.
         ``"0"``, ``"1"``, ``"2"``, … — specific channel index.
+    exclude_channels:
+        Channels excluded from ``"auto"`` / ``"average"`` (e.g. ASIO
+        LOOPBACK channels).  An explicit index selection always wins.
     """
     if indata.ndim == 1:
         return indata.astype(np.float32)
@@ -82,13 +105,19 @@ def select_channel(
         return indata[:, 0].astype(np.float32)
 
     if channel_selection == "auto":
-        return _auto_select_channel(indata)
+        return _auto_select_channel(indata, exclude_channels)
     elif channel_selection == "left":
         return indata[:, 0].astype(np.float32)
     elif channel_selection == "right":
         return indata[:, min(1, indata.shape[1] - 1)].astype(np.float32)
     elif channel_selection == "average":
-        return np.mean(indata, axis=1).astype(np.float32)
+        candidates = [
+            i for i in range(indata.shape[1])
+            if not exclude_channels or i not in exclude_channels
+        ]
+        if not candidates:
+            candidates = list(range(indata.shape[1]))
+        return np.mean(indata[:, candidates], axis=1).astype(np.float32)
     else:
         try:
             idx = int(channel_selection)
@@ -101,7 +130,19 @@ def select_channel(
                 )
                 return indata[:, 0].astype(np.float32)
         except ValueError:
-            return _auto_select_channel(indata)
+            # NEVER silently auto-select: an unparseable selection reaching
+            # this point means an upstream wiring bug (this previously turned
+            # an explicit mic-channel choice into loudest-channel auto pick,
+            # feeding ASIO LOOPBACK output back into the pipeline).
+            if channel_selection not in _warned_channel_selections:
+                _warned_channel_selections.add(channel_selection)
+                logger.warning(
+                    "Unrecognized channel_selection %r — falling back to auto "
+                    "channel detection. Fix the caller to pass a canonical "
+                    "value ('auto', 'average', 'left', 'right', or an index).",
+                    channel_selection,
+                )
+            return _auto_select_channel(indata, exclude_channels)
 
 
 class AudioInputError(AudioStreamError):

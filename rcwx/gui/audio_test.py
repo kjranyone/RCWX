@@ -11,6 +11,7 @@ import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
 
+from rcwx.audio.input import select_channel
 from rcwx.audio.resample import resample
 
 if TYPE_CHECKING:
@@ -100,16 +101,11 @@ class AudioTestManager:
                     )
                     sd.wait()
 
-                    # Convert to mono based on channel selection
+                    # Convert to mono based on channel selection (shared
+                    # logic — honors "auto"/"average"/explicit index)
                     if audio_raw.ndim > 1 and audio_raw.shape[1] > 1:
-                        # Stereo input - apply channel selection
                         channel_selection = self.app.audio_settings.get_channel_selection()
-                        if channel_selection == "left":
-                            audio_raw = audio_raw[:, 0]
-                        elif channel_selection == "right":
-                            audio_raw = audio_raw[:, 1]
-                        else:  # "average"
-                            audio_raw = np.mean(audio_raw, axis=1)
+                        audio_raw = select_channel(audio_raw, channel_selection)
                     else:
                         # Mono input
                         audio_raw = audio_raw.flatten()

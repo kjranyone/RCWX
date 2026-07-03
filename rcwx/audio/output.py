@@ -9,7 +9,13 @@ import numpy as np
 import sounddevice as sd
 from numpy.typing import NDArray
 
-from rcwx.audio.stream_base import AudioStreamBase, AudioStreamError, list_devices, get_default_device
+from rcwx.audio.stream_base import (
+    AudioStreamBase,
+    AudioStreamError,
+    get_default_device,
+    list_devices,
+    parse_output_channel_pair,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,14 +49,13 @@ class AudioOutput(AudioStreamBase):
         self._callback = callback
 
         # Parse output channel selection into index pair
-        self._output_ch_indices: Optional[tuple[int, int]] = None
-        if output_channel_selection != "auto":
-            try:
-                parts = output_channel_selection.split(",")
-                if len(parts) == 2:
-                    self._output_ch_indices = (int(parts[0]), int(parts[1]))
-            except (ValueError, IndexError):
-                pass
+        self._output_ch_indices = parse_output_channel_pair(output_channel_selection)
+        if self._output_ch_indices is None and output_channel_selection != "auto":
+            logger.warning(
+                "Unparseable output_channel_selection %r — treating as auto "
+                "(output to Ch 1-2 only)",
+                output_channel_selection,
+            )
 
     def _audio_callback(
         self,
@@ -80,6 +85,12 @@ class AudioOutput(AudioStreamBase):
                     outdata[:, ch_a] = mono
                 if ch_b < outdata.shape[1]:
                     outdata[:, ch_b] = mono
+            elif outdata.ndim > 1 and outdata.shape[1] > 2:
+                # Auto: first stereo pair only — never broadcast to loopback
+                # or other unrelated channels on multi-channel interfaces.
+                outdata.fill(0)
+                outdata[:, 0] = mono
+                outdata[:, 1] = mono
             elif outdata.ndim > 1 and outdata.shape[1] > 1:
                 outdata[:] = mono[:, np.newaxis]
             else:

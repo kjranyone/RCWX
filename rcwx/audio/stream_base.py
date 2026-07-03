@@ -273,6 +273,27 @@ class AudioStreamError(Exception):
     pass
 
 
+def parse_output_channel_pair(selection: str) -> Optional[tuple[int, int]]:
+    """Parse a canonical output channel selection ("a,b") into an index pair.
+
+    Returns None for "auto" or any unparseable value.  Callers that receive
+    None for a non-"auto" value should treat it as auto AND emit a warning —
+    silently opening/broadcasting to all channels is what previously routed
+    voice-changer output into ASIO LOOPBACK channels (feedback loop).
+    """
+    if selection == "auto":
+        return None
+    try:
+        parts = str(selection).split(",")
+        if len(parts) == 2:
+            a, b = int(parts[0]), int(parts[1])
+            if a >= 0 and b >= 0:
+                return (a, b)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
 def list_devices(stream_type: str, wasapi_only: bool = False) -> list[dict]:
     """
     List available audio devices.

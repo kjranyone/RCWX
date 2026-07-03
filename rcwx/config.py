@@ -3,13 +3,84 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 
 def _default_models_dir() -> Path:
     return Path.home() / ".cache" / "rcwx" / "models"
+
+
+# ---------------------------------------------------------------------------
+# Channel selection normalization
+#
+# Canonical internal values:
+#   input:  "auto" | "average" | "left" | "right" | "0" | "1" | ...
+#   output: "auto" | "0,1" | "2,3" | ...
+#
+# GUI dropdowns historically leaked display strings ("Ch 1: MIC/LINE/INST 1",
+# "自動 (Ch 1-2)", "平均", ...) into saved configs, where downstream parsers
+# silently fell back to auto channel selection — on multi-channel ASIO
+# interfaces with LOOPBACK channels this closed a feedback loop.  These
+# normalizers accept both canonical and display forms and are applied on
+# config load and by the GUI when converting dropdown selections.
+# ---------------------------------------------------------------------------
+
+_INPUT_CHANNEL_KEYWORDS = {"auto", "average", "left", "right"}
+_INPUT_DISPLAY_MAP = {"自動": "auto", "平均": "average"}
+
+
+def normalize_input_channel_selection(value: str) -> str:
+    """Normalize an input channel selection to its canonical internal form.
+
+    Accepts canonical values ("auto", "average", "left", "right", "0", ...)
+    and GUI display strings ("自動", "平均", "Ch 3", "Ch 1: MIC/LINE/INST 1").
+    Unrecognized values fall back to "auto" with a warning.
+    """
+    value = str(value).strip()
+    if value in _INPUT_CHANNEL_KEYWORDS:
+        return value
+    if value in _INPUT_DISPLAY_MAP:
+        return _INPUT_DISPLAY_MAP[value]
+    if value.isdigit():
+        return value
+    # "Ch N" or "Ch N: <ASIO channel name>" (1-based display index)
+    m = re.fullmatch(r"Ch\s*(\d+)(?::.*)?", value)
+    if m:
+        return str(int(m.group(1)) - 1)
+    logger.warning(
+        "Unrecognized input_channel_selection %r — falling back to 'auto'", value
+    )
+    return "auto"
+
+
+def normalize_output_channel_selection(value: str) -> str:
+    """Normalize an output channel selection to its canonical internal form.
+
+    Accepts canonical values ("auto", "0,1", "2,3", ...) and GUI display
+    strings ("自動 (Ch 1-2)", "Ch 3-4", "Ch 1-2: Main L / Main R").
+    Unrecognized values fall back to "auto" with a warning.
+    """
+    value = str(value).strip()
+    if value == "auto" or value.startswith("自動"):
+        return "auto"
+    # Canonical "a,b" pair (0-based)
+    m = re.fullmatch(r"(\d+)\s*,\s*(\d+)", value)
+    if m:
+        return f"{int(m.group(1))},{int(m.group(2))}"
+    # "Ch A-B" or "Ch A-B: <names>" (1-based display pair)
+    m = re.fullmatch(r"Ch\s*(\d+)\s*-\s*(\d+)(?::.*)?", value)
+    if m:
+        return f"{int(m.group(1)) - 1},{int(m.group(2)) - 1}"
+    logger.warning(
+        "Unrecognized output_channel_selection %r — falling back to 'auto'", value
+    )
+    return "auto"
 
 
 def _filter_known(dc_cls: type, data: dict) -> dict:
@@ -43,6 +114,15 @@ class AudioConfig:
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
+
+    def __post_init__(self) -> None:
+        # Repair configs saved by older GUI builds that leaked display strings.
+        self.input_channel_selection = normalize_input_channel_selection(
+            self.input_channel_selection
+        )
+        self.output_channel_selection = normalize_output_channel_selection(
+            self.output_channel_selection
+        )
 
 
 @dataclass
