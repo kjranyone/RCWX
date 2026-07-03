@@ -18,6 +18,7 @@ from queue import Empty, Queue
 from typing import Callable, Optional
 
 import numpy as np
+from scipy.signal import resample_poly
 
 from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.audio.denoise import denoise as denoise_audio
@@ -27,10 +28,54 @@ from rcwx.audio.output import AudioOutput
 from rcwx.audio.postprocess import Postprocessor, PostprocessConfig
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
-from rcwx.audio.stream_base import is_device_on_asio
+from rcwx.audio.stream_base import is_device_on_asio, parse_output_channel_pair
 from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 
 logger = logging.getLogger(__name__)
+
+
+def _max_normalized_lag_correlation(
+    needle: np.ndarray, haystack: np.ndarray
+) -> float:
+    """Max normalized cross-correlation of ``needle`` over all lags of
+    ``haystack`` (both 1D).  Returns a value in [0, 1].
+
+    Used for feedback detection: when the played output re-enters the input,
+    the input chunk is a (delayed, near-identical) copy of some window of the
+    output history, giving a correlation near 1 at the corresponding lag.
+    Per-window normalization uses cumulative sums (O(N), same technique as
+    SOLA's offset search).
+    """
+    n = len(needle)
+    if n < 8 or len(haystack) <= n:
+        return 0.0
+
+    needle = needle - float(np.mean(needle))
+    needle_norm = float(np.sqrt(np.sum(needle**2)))
+    if needle_norm < 1e-8:
+        return 0.0
+
+    # Since sum(needle)==0, dot(needle, w - mean(w)) == dot(needle, w)
+    dots = np.correlate(haystack, needle, mode="valid")  # len(hay) - n + 1
+
+    x = haystack.astype(np.float64)
+    cumsum = np.empty(len(x) + 1, dtype=np.float64)
+    cumsum[0] = 0.0
+    np.cumsum(x, out=cumsum[1:])
+    cumsum_sq = np.empty(len(x) + 1, dtype=np.float64)
+    cumsum_sq[0] = 0.0
+    np.cumsum(x * x, out=cumsum_sq[1:])
+
+    window_sums = cumsum[n:] - cumsum[:-n]
+    window_sq_sums = cumsum_sq[n:] - cumsum_sq[:-n]
+    norms_sq = np.maximum(window_sq_sums - window_sums * window_sums / n, 0.0)
+    norms = np.sqrt(norms_sq)
+
+    valid = norms > 1e-8
+    if not np.any(valid):
+        return 0.0
+    corrs = np.abs(dots[valid]) / (needle_norm * norms[valid])
+    return float(np.max(corrs))
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +96,8 @@ class RealtimeStats:
     feedback_detected: bool = False
     feedback_correlation: float = 0.0
     gpu_memory_percent: float = 0.0
+    input_rms_db: float = -60.0
+    input_peak_db: float = -60.0
     output_rms_db: float = -60.0
     output_peak_db: float = -60.0
 
@@ -64,6 +111,8 @@ class RealtimeStats:
         self.feedback_detected = False
         self.feedback_correlation = 0.0
         self.gpu_memory_percent = 0.0
+        self.input_rms_db = -60.0
+        self.input_peak_db = -60.0
         self.output_rms_db = -60.0
         self.output_peak_db = -60.0
 
@@ -492,8 +541,13 @@ class RealtimeVoiceChangerUnified:
                 use_asio_duplex = False
 
         # Voice changer output is mono — only a stereo pair is needed.
-        # When ASIO with specific channel pair selection, open all channels.
-        if use_asio_duplex and self.config.output_channel_selection != "auto":
+        # Open all channels ONLY when an explicit, parseable channel pair is
+        # selected.  An unparseable selection must NOT open all channels: the
+        # duplex callback would then fall back to auto routing across a fully
+        # opened multi-channel device (previously this fed ASIO LOOPBACK
+        # outputs and closed a feedback loop).
+        output_pair = parse_output_channel_pair(self.config.output_channel_selection)
+        if use_asio_duplex and output_pair is not None:
             output_channels = self.config.output_channels
         else:
             output_channels = min(2, self.config.output_channels)
@@ -882,6 +936,15 @@ class RealtimeVoiceChangerUnified:
 
                 chunk_at_mic_rate = hop_mic.copy()
 
+                # Measure input level (post-gain) for the GUI input meter. This
+                # is the only way to monitor input on exclusive ASIO devices,
+                # which cannot be opened by a separate standalone InputStream.
+                if chunk_at_mic_rate.size:
+                    in_rms = float(np.sqrt(np.mean(chunk_at_mic_rate**2)))
+                    in_peak = float(np.max(np.abs(chunk_at_mic_rate)))
+                    self.stats.input_rms_db = max(-60.0, 20.0 * np.log10(max(in_rms, 1e-6)))
+                    self.stats.input_peak_db = max(-60.0, 20.0 * np.log10(max(in_peak, 1e-6)))
+
                 # --- Stage 2: Resample mic_sr -> 16k ---
                 hop_16k = self.input_resampler.resample_chunk(hop_mic)
 
@@ -1103,6 +1166,15 @@ class RealtimeVoiceChangerUnified:
         self._output_history_pos = end_pos % self._output_history_size
 
     def _check_feedback(self, input_audio: np.ndarray) -> float:
+        """Return the max normalized cross-correlation between the current
+        input chunk and the last ~1s of played output, scanned over all lags.
+
+        Feedback returns to the input delayed by one full E2E latency, so the
+        correlation must be searched across lags — a zero-lag comparison
+        never fires on real feedback.  The output history ring is unrolled
+        chronologically before the scan.  Both signals are decimated to keep
+        the lag scan cheap (runs every ``_feedback_check_interval`` chunks).
+        """
         if len(input_audio) < 1000:
             return 0.0
         input_rms = np.sqrt(np.mean(input_audio**2))
@@ -1111,17 +1183,23 @@ class RealtimeVoiceChangerUnified:
         output_rms = np.sqrt(np.mean(self._output_history**2))
         if output_rms < 0.01:
             return 0.0
-        input_norm = input_audio - np.mean(input_audio)
-        output_norm = self._output_history - np.mean(self._output_history)
-        input_std = np.std(input_norm)
-        output_std = np.std(output_norm)
-        if input_std < 1e-6 or output_std < 1e-6:
-            return 0.0
-        input_norm = input_norm / input_std
-        output_norm = output_norm / output_std
-        check_len = min(len(input_audio), self._runtime_mic_sample_rate // 2)
-        corr = np.correlate(input_norm[:check_len], output_norm[:check_len], mode="valid")
-        return float(np.max(np.abs(corr)) / check_len)
+
+        # Unroll ring buffer chronologically (oldest -> newest)
+        pos = self._output_history_pos
+        history = np.concatenate(
+            [self._output_history[pos:], self._output_history[:pos]]
+        )
+
+        # Decimate to ~11-12kHz (anti-aliased) for a cheap lag scan
+        decim = max(1, self._runtime_mic_sample_rate // 11025)
+        if decim > 1:
+            needle = resample_poly(input_audio, 1, decim).astype(np.float32)
+            haystack = resample_poly(history, 1, decim).astype(np.float32)
+        else:
+            needle = input_audio
+            haystack = history
+
+        return _max_normalized_lag_correlation(needle, haystack)
 
     def _maybe_check_feedback(self, chunk_at_mic_rate: np.ndarray) -> None:
         if (

@@ -619,6 +619,22 @@ class AudioSettingsFrame(ctk.CTkFrame):
         import sounddevice as sd
         import queue
 
+        # ASIO devices are exclusive and full-duplex: a standalone InputStream
+        # cannot open them (PaErrorCode -9985 "Device unavailable"). For these,
+        # the input meter is fed from the running voice changer's stats instead
+        # (see set_input_level_db), so skip the doomed open attempt entirely.
+        if is_device_on_asio(self.input_device, "input"):
+            self._monitoring = False
+            self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
+            self.level_bar.set(0)
+            self.level_value.configure(text="ASIO")
+            self.recommended_label.configure(text="ASIO: 変換の実行中に入力レベルを表示します")
+            logger.info(
+                f"Standalone input monitor skipped for ASIO device={self.input_device}; "
+                "meter is driven by voice-changer stats."
+            )
+            return
+
         self._monitoring = True
         self.monitor_btn.configure(text="モニター停止", fg_color="#cc3333")
 
@@ -781,6 +797,16 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
         self.level_bar.set(0)
         self.level_value.configure(text="-∞ dB")
+
+    def set_input_level_db(self, rms_db: float, peak_db: float = -60.0) -> None:
+        """Drive the input level meter from an external source (the running
+        voice changer). Used when a standalone monitor stream is unavailable
+        (ASIO exclusive devices) or is stopped while the voice changer runs.
+        """
+        if self._monitoring:
+            return  # the standalone monitor already owns the meter
+        level = (max(rms_db, -60.0) + 60.0) / 60.0
+        self._update_level(level, rms_db, peak_db)
 
     def _update_level(self, level: float, rms_db: float, peak_db: float) -> None:
         """Update level meter display and recommended gain."""

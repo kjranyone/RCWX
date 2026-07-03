@@ -313,10 +313,13 @@ class RealtimeController:
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
-        # Update UI from main thread (status bar + output level meter)
+        # Update UI from main thread (status bar + input/output level meters).
+        # The input meter is driven from pipeline stats so it works even on
+        # exclusive ASIO devices, where a standalone monitor stream cannot open.
         def _apply_ui(s: RealtimeStats = stats) -> None:
             self.app.status_bar.update_stats(s)
             self.app.update_output_meter(s)
+            self.app.audio_settings.set_input_level_db(s.input_rms_db, s.input_peak_db)
 
         self.app.after(0, _apply_ui)
 
