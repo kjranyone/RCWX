@@ -12,6 +12,10 @@ import numpy as np
 from rcwx.audio.input import list_input_devices, select_channel
 from rcwx.audio.output import list_output_devices
 from rcwx.audio.stream_base import is_device_on_asio, query_asio_channel_names
+from rcwx.config import (
+    normalize_input_channel_selection,
+    normalize_output_channel_selection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -206,10 +210,13 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.output_channel_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.output_channel_frame.grid(row=7, column=0, padx=10, pady=2, sticky="ew")
 
+        # Internal value only ("auto", "0,1", "2,3", ...).  NOT bound to the
+        # dropdown: binding via variable= makes dropdown.set() overwrite the
+        # internal value with display text, which then leaks into the config
+        # and RealtimeConfig (feedback-loop bug on multi-channel ASIO).
         self.output_channel_var = ctk.StringVar(value="auto")
         self.output_channel_dropdown = ctk.CTkOptionMenu(
             self.output_channel_frame,
-            variable=self.output_channel_var,
             values=["自動 (Ch 1-2)"],
             width=300,
             command=self._on_output_channel_dropdown_change,
@@ -275,11 +282,11 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self.channel_frame.grid(row=12, column=0, padx=10, pady=2, sticky="ew")
 
         # Internal value: "auto", "average", "0", "1", "2", ...
+        # NOT bound to the dropdown (see output_channel_var above).
         self.channel_var = ctk.StringVar(value="auto")
 
         self.channel_dropdown = ctk.CTkOptionMenu(
             self.channel_frame,
-            variable=self.channel_var,
             values=["自動"],
             width=200,
             command=self._on_channel_dropdown_change,
@@ -482,6 +489,11 @@ class AudioSettingsFrame(ctk.CTkFrame):
         # Update channel selection UI state
         self._update_channel_selection_state()
 
+        # Keep the always-on input monitor pointed at the newly selected device
+        if self._monitoring:
+            self._stop_monitor()
+            self.start_monitor()
+
         if self.on_settings_changed:
             self.on_settings_changed()
 
@@ -683,54 +695,73 @@ class AudioSettingsFrame(ctk.CTkFrame):
                     logger.info(f"  Queue empty, outputting silence")
                 outdata.fill(0)  # Output silence if no data
 
-        # Try to start monitoring with device's native rate and channels, fallback if needed
-        common_rates = [self.input_sample_rate, 48000, 44100, 16000]
+        # Try the configured device across common rates. If the device's native
+        # channel count fails, retry mono. Every failure is logged so the real
+        # reason behind a "デバイスエラー" is visible in the logs.
+        rates: list[int] = []
+        for r in (self.input_sample_rate, 48000, 44100, 16000):
+            if r not in rates:
+                rates.append(r)
+
+        channel_options = [self.input_channels]
+        if self.input_channels != 1:
+            channel_options.append(1)  # mono fallback
+
         started = False
-
-        for try_sr in common_rates:
-            try:
-                blocksize = int(try_sr * 0.1)  # 100ms blocks
-                # Use actual device channel count (mono or stereo)
-                self._monitor_stream = sd.InputStream(
-                    device=self.input_device,
-                    channels=self.input_channels,
-                    samplerate=try_sr,
-                    blocksize=blocksize,
-                    callback=audio_callback,
-                )
-                self._monitor_stream.start()
-                started = True
-
-                # Start loopback output stream if enabled
-                if enable_loopback:
-                    device_name = "default" if self.output_device is None else str(self.output_device)
-                    logger.info(f"Starting loopback output: device={device_name}, sr={try_sr}Hz, blocksize={blocksize}")
-                    try:
-                        self._monitor_output_stream = sd.OutputStream(
-                            device=self.output_device,  # None is OK - uses system default
-                            channels=1,  # Mono output
-                            samplerate=try_sr,
-                            blocksize=blocksize,
-                            dtype=np.float32,
-                            callback=output_callback,
-                        )
-                        self._monitor_output_stream.start()
-                        logger.info(f"Loopback output started successfully on {device_name}")
-                    except Exception as e:
-                        logger.error(f"Failed to start loopback output: {e}", exc_info=True)
-                        # Continue without loopback
-
-                if try_sr != self.input_sample_rate:
-                    # Update the detected sample rate for future use
+        last_error: Optional[Exception] = None
+        for ch in channel_options:
+            for try_sr in rates:
+                try:
+                    blocksize = int(try_sr * 0.1)  # 100ms blocks
+                    self._monitor_stream = sd.InputStream(
+                        device=self.input_device,
+                        channels=ch,
+                        samplerate=try_sr,
+                        blocksize=blocksize,
+                        callback=audio_callback,
+                    )
+                    self._monitor_stream.start()
+                    started = True
+                    self.input_channels = ch
                     self.input_sample_rate = try_sr
-                    self.level_value.configure(text=f"{try_sr}Hz")
+
+                    # Start loopback output stream if enabled
+                    if enable_loopback:
+                        device_name = "default" if self.output_device is None else str(self.output_device)
+                        logger.info(f"Starting loopback output: device={device_name}, sr={try_sr}Hz, blocksize={blocksize}")
+                        try:
+                            self._monitor_output_stream = sd.OutputStream(
+                                device=self.output_device,  # None is OK - uses system default
+                                channels=1,  # Mono output
+                                samplerate=try_sr,
+                                blocksize=blocksize,
+                                dtype=np.float32,
+                                callback=output_callback,
+                            )
+                            self._monitor_output_stream.start()
+                            logger.info(f"Loopback output started successfully on {device_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to start loopback output: {e}", exc_info=True)
+                            # Continue without loopback
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        f"Monitor open failed (device={self.input_device}, "
+                        f"channels={ch}, sr={try_sr}): {e}"
+                    )
+                    continue
+            if started:
                 break
-            except Exception as e:
-                if try_sr == common_rates[-1]:  # Last attempt
-                    self._monitoring = False
-                    self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
-                    self.level_value.configure(text="デバイスエラー")
-                continue
+
+        if not started:
+            self._monitoring = False
+            self.monitor_btn.configure(text="モニター開始", fg_color=["#3B8ED0", "#1F6AA5"])
+            self.level_value.configure(text="デバイスエラー")
+            logger.error(
+                f"Input monitor could not open (device={self.input_device}, "
+                f"channels tried={channel_options}); last error: {last_error}"
+            )
 
     def _stop_monitor(self) -> None:
         """Stop input level monitoring."""
@@ -792,19 +823,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
     def _channel_display_to_value(self, display: str) -> str:
         """Convert dropdown display text to internal value."""
-        if display == self._CHANNEL_DISPLAY_AUTO:
-            return "auto"
-        if display == self._CHANNEL_DISPLAY_AVERAGE:
-            return "average"
-        # "Ch 1" or "Ch 1: ASIO Name" → "0"
-        if display.startswith("Ch "):
-            try:
-                # Extract number before optional ": name" suffix
-                num_part = display[3:].split(":")[0].strip()
-                return str(int(num_part) - 1)
-            except ValueError:
-                pass
-        return "auto"
+        return normalize_input_channel_selection(display)
 
     def _channel_value_to_display(self, value: str) -> str:
         """Convert internal value to dropdown display text."""
@@ -825,10 +844,7 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
     def _on_channel_dropdown_change(self, display_value: str) -> None:
         """Handle channel dropdown selection."""
-        internal = self._channel_display_to_value(display_value)
-        self.channel_var.set(internal)
-        # Restore display text (variable trace may overwrite with internal value)
-        self.channel_dropdown.set(display_value)
+        self.channel_var.set(self._channel_display_to_value(display_value))
         if self.on_settings_changed:
             self.on_settings_changed()
 
@@ -868,8 +884,8 @@ class AudioSettingsFrame(ctk.CTkFrame):
                 self.channel_var.set("auto")
 
     def get_channel_selection(self) -> str:
-        """Get the currently selected input channel mode."""
-        return self.channel_var.get()
+        """Get the currently selected input channel mode (canonical form)."""
+        return normalize_input_channel_selection(self.channel_var.get())
 
     # --- Output channel selection ---
 
@@ -877,30 +893,13 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
     def _on_output_channel_dropdown_change(self, display_value: str) -> None:
         """Handle output channel dropdown selection."""
-        internal = self._output_channel_display_to_value(display_value)
-        self.output_channel_var.set(internal)
-        # Restore display text (variable trace may overwrite with internal value)
-        self.output_channel_dropdown.set(display_value)
+        self.output_channel_var.set(self._output_channel_display_to_value(display_value))
         if self.on_settings_changed:
             self.on_settings_changed()
 
     def _output_channel_display_to_value(self, display: str) -> str:
         """Convert output channel dropdown text to internal value."""
-        if display.startswith("自動"):
-            return "auto"
-        # "Ch 1-2" or "Ch 1-2: Name A / Name B" → "0,1"
-        if display.startswith("Ch "):
-            try:
-                # Extract "N-M" before optional ": ..."
-                pair_part = display[3:].split(":")[0].strip()
-                parts = pair_part.split("-")
-                if len(parts) == 2:
-                    a = int(parts[0]) - 1
-                    b = int(parts[1]) - 1
-                    return f"{a},{b}"
-            except (ValueError, IndexError):
-                pass
-        return "auto"
+        return normalize_output_channel_selection(display)
 
     def _output_channel_value_to_display(self, value: str) -> str:
         """Convert internal output channel value to display text."""
@@ -962,8 +961,22 @@ class AudioSettingsFrame(ctk.CTkFrame):
             self.output_channel_var.set("auto")
 
     def get_output_channel_selection(self) -> str:
-        """Get the currently selected output channel pair."""
-        return self.output_channel_var.get()
+        """Get the currently selected output channel pair (canonical form)."""
+        return normalize_output_channel_selection(self.output_channel_var.get())
+
+    def start_monitor(self) -> None:
+        """Public method to (re)start input level monitoring if idle.
+
+        Used for always-on monitoring: called on startup and after the voice
+        changer stops (which frees the input device). No-op while already
+        monitoring.
+        """
+        if self._monitoring:
+            return
+        try:
+            self._start_monitor()
+        except Exception as e:  # never let a device hiccup crash the caller
+            logger.warning(f"start_monitor failed: {e}")
 
     def stop_monitor(self) -> None:
         """Public method to stop monitoring (called when closing app)."""

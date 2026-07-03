@@ -90,6 +90,17 @@ class RCWXApp(ctk.CTk):
         # Initialization complete - allow config saves
         self._initializing = False
 
+        # Always-on input level monitoring: start once the window is up (the
+        # voice changer, when started, temporarily takes over the input device
+        # via stop_monitor()/start_monitor()).
+        self.after(800, self._autostart_input_monitor)
+
+    def _autostart_input_monitor(self) -> None:
+        """Start input level monitoring if the voice changer is not running."""
+        if getattr(self, "_is_running", False):
+            return
+        self.audio_settings.start_monitor()
+
     def _set_window_icon(self) -> None:
         """Set the desktop/window icon when packaged assets are available."""
         assets_dir = Path(__file__).with_name("assets")
