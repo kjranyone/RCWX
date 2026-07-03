@@ -137,6 +137,7 @@ rcwx/
 | `use_sola`                    |   `true` | SOLA有効化                      |
 | `sola_search_ms`              |   `10.0` | SOLA探索窓                      |
 | `hubert_context_sec`          |    `1.0` | HuBERTコンテキスト窓 (秒)       |
+| `f0_context_sec`              |   `0.32` | F0抽出窓の先行コンテキスト (秒、<=0で全コンテキスト抽出) |
 | `pre_hubert_pitch_ratio`      |   `0.08` | プレHuBERTシフト比率 (0.0-1.0)  |
 | `moe_boost`                   |   `0.45` | Moeボイススタイル強度 (0.0-1.0) |
 | `noise_scale`                 |   `0.45` | 合成ノイズスケール (0.0-1.0)    |
@@ -166,6 +167,7 @@ rcwx/
 - `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
 - `hubert_context_sec` (既定 1.0)
+- `f0_context_sec` (既定 0.32、F0抽出を [コンテキスト+新規ホップ] 窓に限定。過去フレームはF0履歴キャッシュで補完。<=0で旧来の全コンテキスト抽出)
 - `prebuffer_chunks` (既定 1)
 - `buffer_margin` (既定 0.5)
 - `f0_method` (既定 `rmvpe`)
@@ -220,7 +222,8 @@ uv run rcwx logs --open      # 最新ログを開く
 
 - `[INPUT] Queue full, dropping chunk`
 - `[INFER] Chunk #...`
-- `[PERF] Inference slow ...`
+- `[PERF] Inference slow ...`（pre/hubert/f0/faiss/synth のステージ内訳付き）
+- `[PERF] Stage breakdown: ...`（100チャンクごとの定期内訳。GPUステージはデバイスイベントで計測しホスト同期なし。イベント非対応環境のみ10チャンクに1回のsync付きサンプリングにフォールバック。並列抽出時は hubert/f0 の時間が相互に重なるため、正確な帰属には `use_parallel_extraction=false`）
 - `[FEEDBACK] Detected feedback (corr=...)`
 - `[WARMUP] ...`
 

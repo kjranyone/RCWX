@@ -33,6 +33,23 @@ from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 
 logger = logging.getLogger(__name__)
 
+# GPU/driver-level failure signatures (Intel level_zero / CUDA).  Once the
+# device context is lost, every following chunk fails the same way — these
+# are unrecoverable without restarting the process.
+_DEVICE_ERROR_TOKENS = (
+    "UR_RESULT_ERROR_DEVICE_LOST",
+    "UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY",
+    "UR_RESULT_ERROR_OUT_OF_RESOURCES",
+    "level_zero backend failed",
+    "CUDA error",
+)
+_DEVICE_ERROR_STREAK_LIMIT = 3
+
+
+def _is_device_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(token in msg for token in _DEVICE_ERROR_TOKENS)
+
 
 def _max_normalized_lag_correlation(
     needle: np.ndarray, haystack: np.ndarray
@@ -89,6 +106,11 @@ class RealtimeStats:
 
     latency_ms: float = 0.0
     inference_ms: float = 0.0
+    # Per-stage breakdown of inference_ms (from RVCPipeline.stage_times)
+    hubert_ms: float = 0.0
+    f0_ms: float = 0.0
+    faiss_ms: float = 0.0
+    synth_ms: float = 0.0
     buffer_underruns: int = 0
     buffer_overruns: int = 0
     buffer_trims: int = 0
@@ -104,6 +126,10 @@ class RealtimeStats:
     def reset(self) -> None:
         self.latency_ms = 0.0
         self.inference_ms = 0.0
+        self.hubert_ms = 0.0
+        self.f0_ms = 0.0
+        self.faiss_ms = 0.0
+        self.synth_ms = 0.0
         self.buffer_underruns = 0
         self.buffer_overruns = 0
         self.buffer_trims = 0
@@ -170,6 +196,10 @@ class RealtimeConfig:
 
     # HuBERT context window in seconds (longer = more stable timbre across chunks)
     hubert_context_sec: float = 1.0
+
+    # F0 extraction window: leading context (sec) before the new hop.
+    # <= 0 extracts F0 on the full HuBERT context (legacy behavior).
+    f0_context_sec: float = 0.32
 
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift before HuBERT)
     pre_hubert_pitch_ratio: float = 0.0
@@ -368,6 +398,10 @@ class RealtimeVoiceChangerUnified:
         # Threading
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        # Consecutive GPU/driver-level failures (device lost, VRAM exhausted).
+        # After a device loss every subsequent chunk fails the same way, so
+        # the inference thread stops itself instead of error-spamming.
+        self._device_error_streak = 0
         self._input_queue: Queue = Queue(maxsize=self.config.max_queue_size)
         self._output_queue: Queue = Queue(maxsize=self.config.max_queue_size)
 
@@ -1102,6 +1136,11 @@ class RealtimeVoiceChangerUnified:
                 # --- Stage 9: Queue output ---
                 inference_ms = (time.perf_counter() - start_time) * 1000
                 self.stats.inference_ms = inference_ms
+                stage = getattr(self.pipeline, "stage_times", None) or {}
+                self.stats.hubert_ms = float(stage.get("hubert_ms", 0.0))
+                self.stats.f0_ms = float(stage.get("f0_ms", 0.0))
+                self.stats.faiss_ms = float(stage.get("faiss_ms", 0.0))
+                self.stats.synth_ms = float(stage.get("synth_ms", 0.0))
                 self.stats.frames_processed += 1
 
                 # --- GPU memory usage ---
@@ -1157,10 +1196,21 @@ class RealtimeVoiceChangerUnified:
 
                 # Performance monitoring
                 chunk_ms = self.config.chunk_sec * 1000
+                stage_detail = (
+                    f"pre={preprocess_ms:.0f} hubert={self.stats.hubert_ms:.0f} "
+                    f"f0={self.stats.f0_ms:.0f} faiss={self.stats.faiss_ms:.0f} "
+                    f"synth={self.stats.synth_ms:.0f}ms"
+                )
                 if inference_ms > chunk_ms * 0.8 and self.stats.frames_processed % 50 == 0:
                     logger.warning(
                         f"[PERF] Inference slow: {inference_ms:.0f}ms "
-                        f"(pre={preprocess_ms:.0f}ms) > {chunk_ms:.0f}ms chunk"
+                        f"({stage_detail}) > {chunk_ms:.0f}ms chunk"
+                    )
+
+                if self.stats.frames_processed % 100 == 0:
+                    logger.info(
+                        f"[PERF] Stage breakdown: infer={inference_ms:.0f}ms "
+                        f"({stage_detail}) / chunk={chunk_ms:.0f}ms"
                     )
 
                 if self.stats.frames_processed <= 5:
@@ -1168,12 +1218,32 @@ class RealtimeVoiceChangerUnified:
                         f"[INFER] Chunk #{self.stats.frames_processed}: "
                         f"hop_16k={len(hop_16k)}, overlap={overlap_samples}, "
                         f"out_model={len(output_model)}, out_48k={len(output_48k)}, "
-                        f"pre={preprocess_ms:.0f}ms, infer={inference_ms:.0f}ms"
+                        f"infer={inference_ms:.0f}ms ({stage_detail})"
                     )
+
+                self._device_error_streak = 0
 
             except Exception as e:
                 logger.error(f"Inference error: {e}", exc_info=True)
                 self._reset_boundary_continuity_state()
+                if _is_device_error(e):
+                    self._device_error_streak += 1
+                    if self._device_error_streak >= _DEVICE_ERROR_STREAK_LIMIT:
+                        logger.error(
+                            "[FATAL] %d consecutive GPU device errors — "
+                            "stopping stream (device context is likely lost; "
+                            "restart the app to recover)",
+                            self._device_error_streak,
+                        )
+                        if self.on_error:
+                            self.on_error(
+                                "GPUデバイスエラーが継続したため停止しました。"
+                                "アプリの再起動が必要です"
+                            )
+                        self._running = False
+                        break
+                else:
+                    self._device_error_streak = 0
                 if self.on_error:
                     self.on_error(f"推論エラー: {e}")
 
@@ -1401,6 +1471,7 @@ class RealtimeVoiceChangerUnified:
             f0_slew_max_step_st=cfg.f0_slew_max_step_st,
             hubert_context_sec=cfg.hubert_context_sec,
             fixed_harmonics=cfg.fixed_harmonics,
+            f0_context_sec=cfg.f0_context_sec,
         )
 
     def _reset_boundary_continuity_state(self) -> None:

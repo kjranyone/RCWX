@@ -206,6 +206,11 @@ class InferenceConfig:
     # HuBERT context window in seconds (longer = more stable timbre across chunks)
     hubert_context_sec: float = 1.0
 
+    # F0 extraction window: leading context (sec) before the new hop.
+    # Pitch is local, so F0 doesn't need the full HuBERT context.
+    # <= 0 extracts F0 on the full context (legacy behavior).
+    f0_context_sec: float = 0.32
+
     # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
     pre_hubert_pitch_ratio: float = 0.08
 

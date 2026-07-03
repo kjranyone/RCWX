@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from fractions import Fraction
@@ -42,9 +43,91 @@ MIN_SYNTH_FEATURE_FRAMES = 64
 MAX_PRE_HUBERT_SHIFT_ST = 24.0
 MAX_MOE_BOOST = 1.0
 F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
+# Windowed-F0 extraction floor (16kHz samples, 0.56s).  RMVPE's U-Net needs a
+# minimum number of mel frames (short inputs crash in avg_pool), and a fixed
+# slice size avoids per-chunk kernel recompilation on Intel XPU.
+F0_MIN_WINDOW_16K = 8960
+# Fallback stage-profiling cadence when device timing events are unavailable:
+# wall-clock + device-wide sync is only paid on every Nth infer_streaming call
+# (plus the first 5).  With event support, profiling is sync-free and runs on
+# every chunk.
+STAGE_PROFILE_INTERVAL = 10
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
 SWIFTF0_VOICING_THRESHOLD = 0.35
+
+
+class _StageProfiler:
+    """Per-stage timing without hot-path device syncs.
+
+    GPU stages are bracketed with device timing events and resolved in
+    :meth:`finalize` after the chunk's natural end-of-pipeline sync
+    (``output.cpu()``), so no ``synchronize()`` lands on the hot path.
+    If timing events are unavailable, :meth:`stop` falls back to wall-clock
+    plus an explicit device sync — callers then only profile sampled chunks
+    (see ``STAGE_PROFILE_INTERVAL``).  CPU-synchronous stages use
+    :meth:`stop_wall` (exact without any sync).  ``list.append`` from the
+    parallel HuBERT/F0 threads is GIL-safe.
+    """
+
+    def __init__(self, pipeline: "RVCPipeline", use_events: bool):
+        self._pipeline = pipeline
+        self._use_events = use_events
+        self._pending: list = []  # (key, start_event, end_event)
+        self.times: dict = {}
+
+    def _new_event(self):
+        try:
+            dev = str(self._pipeline.device)
+            if "xpu" in dev:
+                return torch.xpu.Event(enable_timing=True)
+            if "cuda" in dev:
+                return torch.cuda.Event(enable_timing=True)
+        except Exception:
+            pass
+        return None
+
+    def start(self):
+        """Begin a GPU stage: a timing event if available, else wall clock."""
+        if self._use_events:
+            ev = self._new_event()
+            if ev is not None:
+                ev.record()
+                return ev
+            self._use_events = False
+            self._pipeline._profile_events_ok = False
+        return time.perf_counter()
+
+    def stop(self, key: str, token) -> None:
+        """End a GPU stage started with :meth:`start`."""
+        if isinstance(token, float):
+            # Wall-clock fallback needs a device sync for real numbers.
+            self._pipeline._sync_device_for_profile()
+            self.times[key] = (
+                self.times.get(key, 0.0) + (time.perf_counter() - token) * 1000.0
+            )
+            return
+        end = self._new_event()
+        if end is None:
+            return
+        end.record()
+        self._pending.append((key, token, end))
+
+    def stop_wall(self, key: str, t0: float) -> None:
+        """End a CPU-synchronous stage (no device sync needed)."""
+        self.times[key] = self.times.get(key, 0.0) + (time.perf_counter() - t0) * 1000.0
+
+    def finalize(self) -> None:
+        """Resolve event-based stages; call after the end-of-chunk sync."""
+        for key, start, end in self._pending:
+            try:
+                self.times[key] = self.times.get(key, 0.0) + float(
+                    start.elapsed_time(end)
+                )
+                self._pipeline._profile_events_ok = True
+            except Exception:
+                self._pipeline._profile_events_ok = False
+        self._pending.clear()
 
 
 @dataclass
@@ -76,6 +159,11 @@ class StreamingParams:
     f0_slew_max_step_st: float = 2.8
     hubert_context_sec: float = 1.0
     fixed_harmonics: bool = False
+    # F0 extraction window: leading context (sec) before the new hop.
+    # Pitch is local, so the F0 model only needs [context | new_hop] instead
+    # of the full HuBERT history; older frames are served from the streaming
+    # F0 cache.  <= 0 disables windowing (extract on the full context).
+    f0_context_sec: float = 0.32
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -886,6 +974,15 @@ class RVCPipeline:
         self._streaming_feat_cache = None
         self._streaming_audio_history: Optional[np.ndarray] = None
         self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
+        # Windowed-F0 history: post-shift/moe, pre-filter F0 (Hz) @100fps,
+        # kept in lockstep with the tail of _streaming_audio_history.
+        self._streaming_f0_hz_history: Optional[torch.Tensor] = None
+
+        # Per-stage times (ms) of the last profiled infer_streaming() call.
+        self.stage_times: dict = {}
+        self._stage_profile_counter: int = 0
+        # Device timing-event support: None=unknown, resolved on first use.
+        self._profile_events_ok: Optional[bool] = None
 
     def load(self) -> None:
         """Load all models."""
@@ -1105,6 +1202,84 @@ class RVCPipeline:
         self._streaming_audio_history = None
         # F0 pre-filter tail for cross-chunk filter continuity
         self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
+        # Windowed-F0 history (Hz @100fps, aligned with _streaming_audio_history)
+        self._streaming_f0_hz_history = None
+
+    def _sync_device_for_profile(self) -> None:
+        """Synchronize the device so stage wall-times reflect real GPU work.
+
+        Device-wide sync: with parallel HuBERT+F0 extraction the two stage
+        times overlap and each may include the other's queued kernels; set
+        use_parallel_extraction=False for exact per-stage attribution.
+        """
+        try:
+            if "xpu" in str(self.device):
+                torch.xpu.synchronize()
+            elif "cuda" in str(self.device):
+                torch.cuda.synchronize()
+        except Exception:
+            pass
+
+    def _assemble_windowed_f0(
+        self,
+        f0_win: torch.Tensor,
+        target_frames: int,
+        window_samples: int,
+        slice_samples: int,
+        new_samples: int,
+        input_length: int,
+        t_pad: int,
+    ) -> torch.Tensor:
+        """Build a full-context F0 track from a windowed extraction.
+
+        The F0 model only saw [t_pad ctx | window | t_pad ctx]; frames older
+        than the window are served from ``_streaming_f0_hz_history`` (values
+        cached post-shift/moe, pre-filter, so re-filtering the assembled
+        track each chunk matches the legacy full-recompute path).  The
+        returned track matches the feature timeline layout
+        [left pad | real audio | right pad]; pad regions are edge-replicated
+        (context-only, trimmed from the synthesized output).
+        """
+        samples_per_frame = 160  # 100fps @ 16kHz
+        pad_frames = t_pad // samples_per_frame
+
+        # Interpolate model output onto the padded-slice frame grid, then keep
+        # only the frames that map 1:1 onto the window's real audio (the slice
+        # may extend past it into reflect padding to keep its size fixed).
+        win_grid = (slice_samples + 2 * t_pad) // samples_per_frame
+        if f0_win.shape[1] != win_grid:
+            f0_win = torch.nn.functional.interpolate(
+                f0_win.unsqueeze(1).float(),
+                size=win_grid,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)
+        f0_win = f0_win[
+            :, pad_frames : pad_frames + window_samples // samples_per_frame
+        ]
+
+        # Append the new-hop frames to the history.  The context portion of
+        # the window is re-extracted only as model warmup; cached values win
+        # so a frame's F0 never changes after it is first published.
+        new_frames = min(new_samples // samples_per_frame, f0_win.shape[1])
+        hist_cap = input_length // samples_per_frame
+        hist = self._streaming_f0_hz_history
+        if hist is not None and hist.shape[0] == f0_win.shape[0]:
+            new_tail = f0_win[:, f0_win.shape[1] - new_frames :]
+            hist = torch.cat([hist.to(f0_win.dtype), new_tail], dim=1)
+        else:
+            hist = f0_win
+        hist = hist[:, -hist_cap:]
+        self._streaming_f0_hz_history = hist
+
+        # Assemble [left pad | (front fill +) history | right fill].
+        h = hist.shape[1]
+        front_fill = pad_frames + max(0, hist_cap - h)
+        right_fill = max(0, target_frames - front_fill - h)
+        parts = [hist[:, :1].expand(-1, front_fill), hist]
+        if right_fill > 0:
+            parts.append(hist[:, -1:].expand(-1, right_fill))
+        return torch.cat(parts, dim=1)[:, :target_frames]
 
     def _set_fixed_harmonics(self, enabled: bool) -> None:
         """Set SineGen harmonic initial phase mode (fixed=zero or random)."""
@@ -1957,6 +2132,24 @@ class RVCPipeline:
         f0_slew_max_step_st = params.f0_slew_max_step_st
         hubert_context_sec = params.hubert_context_sec
         fixed_harmonics = params.fixed_harmonics
+        f0_context_sec = params.f0_context_sec
+
+        # Per-stage times (ms); published on self for the realtime
+        # controller's [PERF] logging.  With device timing events (preferred)
+        # GPU stages are measured on the GPU timeline and resolved after the
+        # chunk's natural end-of-pipeline sync — nothing lands on the hot
+        # path.  Without event support, fall back to wall-clock + device sync
+        # on sampled chunks only.
+        self._stage_profile_counter += 1
+        use_timing_events = self._profile_events_ok is not False
+        if use_timing_events or (
+            self._stage_profile_counter <= 5
+            or (self._stage_profile_counter - 1) % STAGE_PROFILE_INTERVAL == 0
+        ):
+            prof: Optional[_StageProfiler] = _StageProfiler(self, use_timing_events)
+            self.stage_times = prof.times
+        else:
+            prof = None
 
         hubert_hop = 320
 
@@ -2110,6 +2303,32 @@ class RVCPipeline:
             output_dim = 768
             output_layer = 12
 
+        # --- F0 extraction window (pitch is local) ---
+        # Instead of running the F0 model over the full HuBERT context every
+        # chunk, slice [f0_context | new_hop] plus t_pad of edge context on
+        # both sides from the already-padded tensor (the left edge context is
+        # real audio, the right edge is the existing reflect padding).  Frames
+        # older than the window come from _streaming_f0_hz_history.
+        f0_window_samples = 0
+        f0_slice_samples = 0
+        f0_input = f0_source_audio
+        if f0_context_sec > 0:
+            f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
+            # Fixed slice size: clamp to [F0_MIN_WINDOW_16K, hubert context].
+            # Constant shape = single XPU kernel compilation, and never below
+            # the F0 model's minimum input.
+            f0_slice_samples = min(
+                max(new_samples + max(0, f0_ctx), F0_MIN_WINDOW_16K),
+                max_hubert_context_16k,
+            )
+            # Real-audio coverage; the shortfall (early chunks with a short
+            # history) is taken from the existing right reflect padding.
+            f0_window_samples = min(input_length, f0_slice_samples)
+            pad_extend = f0_slice_samples - f0_window_samples
+            win_start = input_length - f0_window_samples
+            win_end = t_pad + input_length + t_pad + pad_extend
+            f0_input = f0_source_audio[:, win_start:win_end]
+
         # Parallel HuBERT + F0 extraction
         # HuBERT/F0 use the same source audio to preserve alignment.
         features = None
@@ -2118,33 +2337,49 @@ class RVCPipeline:
 
         if use_parallel_extraction and use_f0:
             def extract_hubert():
+                tok = prof.start() if prof is not None else None
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
-                    return self.hubert.extract(
+                    feats = self.hubert.extract(
                         audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
                     )
+                if prof is not None:
+                    prof.stop("hubert_ms", tok)
+                return feats
 
             def extract_f0():
+                # SwiftF0 runs synchronously on CPU — wall time is exact
+                # there; the GPU methods use device timing events.
+                on_device = f0_method != "swiftf0"
+                tok = prof.start() if (prof is not None and on_device) else None
+                wall0 = time.perf_counter()
+                result = None
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.fcpe.infer(
-                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                        result = self.fcpe.infer(
+                            f0_input, threshold=FCPE_VOICING_THRESHOLD
                         )
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
-                    return self.swiftf0.infer(
-                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                    result = self.swiftf0.infer(
+                        f0_input, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
-                        return self.rmvpe.infer(
-                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                        result = self.rmvpe.infer(
+                            f0_input, threshold=RMVPE_VOICING_THRESHOLD
                         )
-                logger.warning(
-                    "[INFER] F0 parallel extraction returned None "
-                    f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
-                    f"swiftf0={'loaded' if self.swiftf0 else 'None'}, "
-                    f"rmvpe={'loaded' if self.rmvpe else 'None'})"
-                )
-                return None
+                else:
+                    logger.warning(
+                        "[INFER] F0 parallel extraction returned None "
+                        f"(method={f0_method}, fcpe={'loaded' if self.fcpe else 'None'}, "
+                        f"swiftf0={'loaded' if self.swiftf0 else 'None'}, "
+                        f"rmvpe={'loaded' if self.rmvpe else 'None'})"
+                    )
+                if prof is not None:
+                    if on_device:
+                        prof.stop("f0_ms", tok)
+                    else:
+                        prof.stop_wall("f0_ms", wall0)
+                return result
 
             with ThreadPoolExecutor(max_workers=2) as executor:
                 hubert_future = executor.submit(extract_hubert)
@@ -2152,14 +2387,20 @@ class RVCPipeline:
                 features = hubert_future.result()
                 f0_raw = f0_future.result()
         else:
+            tok = prof.start() if prof is not None else None
             with torch.autocast(device_type=self.device, dtype=self.dtype):
                 features = self.hubert.extract(
                     audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
                 )
+            if prof is not None:
+                prof.stop("hubert_ms", tok)
 
-        # FAISS index retrieval
+        # FAISS index retrieval (internally synced by the .cpu() transfer)
         if index_rate > 0 and self.faiss_index is not None:
+            t0 = time.perf_counter()
             features = self._search_index(features, index_rate, k=index_k)
+            if prof is not None:
+                prof.stop_wall("faiss_ms", t0)
 
         # Interpolate features 2x (50fps -> 100fps for synthesizer)
         features = torch.nn.functional.interpolate(
@@ -2185,20 +2426,28 @@ class RVCPipeline:
                     "[INFER] F0 parallel result was None, trying sequential fallback "
                     f"(method={f0_method})"
                 )
+                on_device = f0_method != "swiftf0"
+                tok = prof.start() if (prof is not None and on_device) else None
+                wall0 = time.perf_counter()
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.fcpe.infer(
-                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                            f0_input, threshold=FCPE_VOICING_THRESHOLD
                         )
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     f0 = self.swiftf0.infer(
-                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        f0_input, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.rmvpe.infer(
-                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                            f0_input, threshold=RMVPE_VOICING_THRESHOLD
                         )
+                if prof is not None:
+                    if on_device:
+                        prof.stop("f0_ms", tok)
+                    else:
+                        prof.stop_wall("f0_ms", wall0)
 
             if f0 is not None and f0.numel() > 0:
                 # FCPE smoothing
@@ -2213,8 +2462,21 @@ class RVCPipeline:
                 if moe_strength > 0.0:
                     f0 = apply_moe_f0_style(f0, moe_strength)
 
+                if f0_window_samples > 0:
+                    # Windowed extraction: place the fresh window frames at
+                    # the timeline tail and serve older frames from the
+                    # streaming F0 history cache.
+                    f0 = self._assemble_windowed_f0(
+                        f0,
+                        target_frames=features.shape[1],
+                        window_samples=f0_window_samples,
+                        slice_samples=f0_slice_samples,
+                        new_samples=new_samples,
+                        input_length=input_length,
+                        t_pad=t_pad,
+                    )
                 # Align F0 to feature length (F0 from same audio_t, minor hop mismatch)
-                if f0.shape[1] != features.shape[1]:
+                elif f0.shape[1] != features.shape[1]:
                     f0 = torch.nn.functional.interpolate(
                         f0.unsqueeze(1),
                         size=features.shape[1],
@@ -2272,6 +2534,8 @@ class RVCPipeline:
                     f"(method={f0_method}, f0_raw={'OK' if f0_raw is not None else 'None'}, "
                     f"audio_samples={audio_t.shape[-1]})"
                 )
+                # A missed chunk breaks the windowed-F0 history alignment.
+                self._streaming_f0_hz_history = None
                 pitch = torch.ones(
                     features.shape[0], features.shape[1],
                     dtype=torch.long, device=self.device,
@@ -2287,6 +2551,7 @@ class RVCPipeline:
                 "[INFER] F0 skipped — flat pitch fallback "
                 f"(f0_method={f0_method}, use_f0={use_f0})"
             )
+            self._streaming_f0_hz_history = None
             pitch = torch.ones(
                 features.shape[0], features.shape[1],
                 dtype=torch.long, device=self.device,
@@ -2404,6 +2669,7 @@ class RVCPipeline:
         self._set_fixed_harmonics(fixed_harmonics)
 
         # Run synthesizer with skip_head/return_length
+        t_synth = time.perf_counter()
         with torch.autocast(device_type=self.device, dtype=self.dtype):
             output = self.synthesizer.infer(
                 features, feature_lengths, pitch=pitch, pitchf=pitchf,
@@ -2427,8 +2693,13 @@ class RVCPipeline:
                 sample_rate=self.sample_rate,
             )
 
-        # Convert to numpy
+        # Convert to numpy (the .cpu() transfer is the device sync point, so
+        # synth_ms includes the real synthesis + gate execution time, and all
+        # pending stage timing events are complete for finalize())
         output = output.cpu().float().numpy()
+        if prof is not None:
+            prof.stop_wall("synth_ms", t_synth)
+            prof.finalize()
         if output.ndim == 2:
             output = output[0]
 
