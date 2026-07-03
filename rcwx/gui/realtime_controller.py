@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+import threading
+import time
+from collections import deque
+from typing import TYPE_CHECKING, Callable, Optional
 
 import customtkinter as ctk
 import sounddevice as sd
@@ -18,6 +21,15 @@ if TYPE_CHECKING:
     from rcwx.gui.app import RCWXApp
 
 logger = logging.getLogger(__name__)
+
+# Buffer warning dialog policy: startup always produces a few underruns while
+# the stream stabilizes, so session-cumulative thresholds fire every single
+# session.  Instead, ignore a grace period after (re)start and require the
+# threshold to be crossed within a sliding window — i.e. only warn about
+# SUSTAINED problems that the user should actually act on.
+BUFFER_WARNING_GRACE_SEC = 10.0
+BUFFER_WARNING_WINDOW_SEC = 30.0
+BUFFER_WARNING_THRESHOLD = 5
 
 
 class RealtimeController:
@@ -42,6 +54,13 @@ class RealtimeController:
         self.app = app
         self.voice_changer: Optional[RealtimeVoiceChangerUnified] = None
         self._buffer_warning_shown = {"underrun": False, "overrun": False}
+        # Sliding-window state for buffer warning dialogs:
+        # snapshots of (time, underruns, overruns)
+        self._warn_history: deque[tuple[float, int, int]] = deque()
+        self._session_start: float = 0.0
+        # Latency settings that arrived while an async (re)start was in
+        # flight; applied once the pipeline is running again.
+        self._pending_latency_settings: Optional[dict] = None
 
     def toggle(self) -> None:
         """Toggle voice changer on/off."""
@@ -70,13 +89,8 @@ class RealtimeController:
             )
 
         # Disable button and show loading state
-        self.app.start_btn.configure(state="disabled", text="⏳ 起動中...")
-        self.app._loading = True
-        self.app.status_bar.set_loading()
+        self._begin_loading("起動中...")
 
-        # NOTE: sounddevice/PortAudio requires audio streams to be created
-        # from the main thread on Windows. Running in a separate thread
-        # causes "Invalid sample rate" or other errors.
         try:
             # Get latency settings
             latency = self.app.latency_settings.get_settings()
@@ -131,32 +145,74 @@ class RealtimeController:
                 ),
             )
 
-            # Create unified voice changer
-            self.voice_changer = RealtimeVoiceChangerUnified(
-                self.app.pipeline,
-                config=rt_config,
-                on_warmup_progress=self._on_warmup_progress,
-            )
-            self.voice_changer.on_stats_update = self._on_stats_update
-            self.voice_changer.on_error = self._on_inference_error
+            # Heavy construction (model load check + warmup) runs on a
+            # worker thread so the GUI stays responsive; all Tk state was
+            # already read into rt_config above on the main thread.
+            def _factory() -> RealtimeVoiceChangerUnified:
+                vc = RealtimeVoiceChangerUnified(
+                    self.app.pipeline,
+                    config=rt_config,
+                    on_warmup_progress=self._on_warmup_progress,
+                )
+                vc.on_stats_update = self._on_stats_update
+                vc.on_error = self._on_inference_error
+                return vc
 
-            # Update UI before starting (may take a moment for warmup)
-            self.app.update_idletasks()
-
-            # Start (this calls pipeline.load() internally)
-            # Must be called from main thread due to sounddevice limitations
-            self.voice_changer.start()
-
-            # Success
-            self._on_started()
+            self._prepare_and_start_async(_factory)
         except Exception as e:
             logger.error(f"Failed to start voice changer: {e}")
             self._on_start_error(str(e))
 
+    def _begin_loading(self, message: str) -> None:
+        """Put the UI into loading state (main thread)."""
+        self.app.start_btn.configure(state="disabled", text=f"⏳ {message}")
+        self.app._loading = True
+        self.app.status_bar.set_loading()
+
+    def _ui(self, fn: Callable[[], None]) -> None:
+        """Schedule a callable on the Tk main thread (safe from workers)."""
+        try:
+            self.app.after(0, fn)
+        except Exception:
+            logger.debug("UI update skipped (app closing)")
+
+    def _prepare_and_start_async(
+        self, vc_factory: Callable[[], RealtimeVoiceChangerUnified]
+    ) -> None:
+        """Warm up on a background thread, then open streams on the main one.
+
+        Only audio stream creation must run on the main thread on Windows
+        (PortAudio fails with "Invalid sample rate" etc. otherwise); the
+        expensive part — model load and XPU kernel warmup — has no such
+        constraint and previously froze the GUI for ~10s.
+        """
+
+        def _worker() -> None:
+            try:
+                vc = vc_factory()
+                vc.prepare()
+            except Exception as e:
+                logger.error(f"Voice changer warmup failed: {e}", exc_info=True)
+                self._ui(lambda err=str(e): self._on_start_error(err))
+                return
+
+            def _open_streams(vc: RealtimeVoiceChangerUnified = vc) -> None:
+                try:
+                    # Fast: warmups already done, only opens audio streams.
+                    vc.start()
+                    self.voice_changer = vc
+                    self._on_started()
+                except Exception as e:
+                    logger.error(f"Failed to start voice changer: {e}")
+                    self._on_start_error(str(e))
+
+            self._ui(_open_streams)
+
+        threading.Thread(target=_worker, daemon=True, name="RCWX-Warmup").start()
+
     def _on_warmup_progress(self, current: int, total: int, message: str) -> None:
-        """Called during warmup to show progress."""
-        self.app.start_btn.configure(text=f"⏳ {message}")
-        self.app.update_idletasks()  # Force UI update
+        """Show warmup progress (called from the warmup worker thread)."""
+        self._ui(lambda m=message: self.app.start_btn.configure(text=f"⏳ {m}"))
 
     def _on_started(self) -> None:
         """Called when voice changer starts successfully."""
@@ -164,10 +220,20 @@ class RealtimeController:
         self.app._is_running = True
         self.app.start_btn.configure(text="■ 停止", fg_color="#cc3333", state="normal")
         self.app.status_bar.set_running(True)
+        self._session_start = time.monotonic()
+        self._warn_history.clear()
+
+        # Latency settings changed while (re)starting — apply them now.
+        pending = self._pending_latency_settings
+        self._pending_latency_settings = None
+        if pending is not None:
+            self.apply_latency_settings(pending)
 
     def _on_start_error(self, error_msg: str) -> None:
-        """Called when voice changer fails to start."""
+        """Called when voice changer fails to start (or restart)."""
         self.app._loading = False
+        self.app._is_running = False
+        self._pending_latency_settings = None
         self.app.start_btn.configure(text="▶ 開始", fg_color=["#3B8ED0", "#1F6AA5"], state="normal")
         self.app.status_bar.set_running(False)
 
@@ -210,6 +276,8 @@ class RealtimeController:
 
         # Reset buffer warning flags so warnings show again on next start
         self._buffer_warning_shown = {"underrun": False, "overrun": False}
+        self._warn_history.clear()
+        self._session_start = 0.0
 
     # ======== Runtime parameter passthrough ========
     # Forward live parameter changes to the running voice changer, guarding on
@@ -287,19 +355,38 @@ class RealtimeController:
             self.voice_changer.set_output_gain_db(gain_db)
 
     def apply_latency_settings(self, settings: dict) -> None:
-        """Apply latency settings in the required order.
+        """Apply latency settings; chunk changes restart asynchronously.
 
-        ``set_chunk_sec()`` restarts the pipeline, so overlap/crossfade/
-        prebuffer/margin must be set first to take effect.
+        Non-restarting parameters (overlap/crossfade/prebuffer/margin) are
+        applied directly.  A chunk_sec change requires a pipeline restart
+        with fresh warmup, which runs through the same async path as
+        start() so the GUI does not freeze.  Settings arriving mid-restart
+        are stashed and applied once running again.
         """
         if not self.voice_changer:
             return
+        if self.app._loading:
+            self._pending_latency_settings = settings
+            return
+
         vc = self.voice_changer
         vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
         vc.set_buffer_margin(settings["buffer_margin"])
         vc.set_overlap(settings["overlap_sec"])
         vc.set_crossfade(settings["crossfade_sec"])
-        vc.set_chunk_sec(settings["chunk_sec"])
+
+        if not vc.is_running:
+            vc.set_chunk_sec(settings["chunk_sec"])
+            return
+        if abs(settings["chunk_sec"] - vc.config.chunk_sec) < 1e-9:
+            return  # no chunk change → no restart needed
+
+        # Restart with new chunk size: stop synchronously (fast, streams
+        # must close on the main thread), then re-warm asynchronously.
+        self._begin_loading("再起動中...")
+        vc.stop()
+        vc.set_chunk_sec(settings["chunk_sec"])  # not running → just stores
+        self._prepare_and_start_async(lambda vc=vc: vc)
 
     def apply_postprocess_config(self, cfg) -> None:
         if self.voice_changer and hasattr(self.voice_changer, "set_postprocess_config"):
@@ -317,13 +404,41 @@ class RealtimeController:
 
         self.app.after(0, _apply_ui)
 
-        # Show buffer warnings (first occurrence only, after threshold)
-        # Threshold: 5 occurrences to avoid false positives during startup
-        BUFFER_WARNING_THRESHOLD = 5
+        # Show buffer warning dialogs only for SUSTAINED problems (see the
+        # module-level policy constants).  Session-cumulative counts fired a
+        # modal dialog every session due to the unavoidable startup transient.
+        now = time.monotonic()
+        if self._session_start == 0.0:
+            self._session_start = now
+
+        # Counters shrinking means the pipeline restarted internally
+        # (e.g. chunk size change): resync and re-arm the grace period,
+        # since a restart has its own startup transient.
+        if self._warn_history and (
+            stats.buffer_underruns < self._warn_history[-1][1]
+            or stats.buffer_overruns < self._warn_history[-1][2]
+        ):
+            self._warn_history.clear()
+            self._session_start = now
+
+        if now - self._session_start < BUFFER_WARNING_GRACE_SEC:
+            return
+
+        self._warn_history.append(
+            (now, stats.buffer_underruns, stats.buffer_overruns)
+        )
+        while (
+            len(self._warn_history) > 1
+            and now - self._warn_history[0][0] > BUFFER_WARNING_WINDOW_SEC
+        ):
+            self._warn_history.popleft()
+        base = self._warn_history[0]
+        window_underruns = stats.buffer_underruns - base[1]
+        window_overruns = stats.buffer_overruns - base[2]
 
         # Buffer underrun warning
         if (
-            stats.buffer_underruns >= BUFFER_WARNING_THRESHOLD
+            window_underruns >= BUFFER_WARNING_THRESHOLD
             and not self._buffer_warning_shown["underrun"]
         ):
             self._buffer_warning_shown["underrun"] = True
@@ -331,7 +446,7 @@ class RealtimeController:
 
         # Buffer overrun warning
         if (
-            stats.buffer_overruns >= BUFFER_WARNING_THRESHOLD
+            window_overruns >= BUFFER_WARNING_THRESHOLD
             and not self._buffer_warning_shown["overrun"]
         ):
             self._buffer_warning_shown["overrun"] = True

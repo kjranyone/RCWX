@@ -402,6 +402,10 @@ class RealtimeVoiceChangerUnified:
         self._overload_until: float = 0.0
         self._overload_active = False
 
+        # True when prepare() already ran the warmups for the current
+        # config; start() consumes this to skip its synchronous warmup.
+        self._prepared = False
+
     @staticmethod
     def _align_to_hop(samples: int, hop: int) -> int:
         """Round sample count up to nearest multiple of hop."""
@@ -480,6 +484,30 @@ class RealtimeVoiceChangerUnified:
 
     # ======== Lifecycle ========
 
+    def prepare(self) -> None:
+        """Run all warmups ahead of start().
+
+        Contains no PortAudio or UI calls, so it can run on a background
+        thread — unlike stream creation in start(), which must stay on the
+        main thread on Windows.  After prepare(), start() skips the
+        warmups and only opens the audio streams (milliseconds instead of
+        seconds), keeping the GUI responsive during the expensive XPU
+        kernel compilation.
+        """
+        self._apply_runtime_sample_rates(
+            self.config.mic_sample_rate,
+            self.config.output_sample_rate,
+        )
+        if self._on_warmup_progress:
+            self._on_warmup_progress(0, 2, "デノイザ準備中...")
+        self._run_denoise_warmup()
+        if self._on_warmup_progress:
+            self._on_warmup_progress(1, 2, "ストリーミング準備中...")
+        self._run_runtime_warmup()
+        if self._on_warmup_progress:
+            self._on_warmup_progress(2, 2, "準備完了")
+        self._prepared = True
+
     def start(self) -> None:
         if self._running:
             return
@@ -505,8 +533,12 @@ class RealtimeVoiceChangerUnified:
         self._output_history_pos = 0
         self._feedback_warning_shown = False
         self._clear_queues()
-        self._run_denoise_warmup()
-        self._run_runtime_warmup()
+        if not self._prepared:
+            self._run_denoise_warmup()
+            self._run_runtime_warmup()
+        # Consumed: restarts (e.g. after a chunk-size change) must re-warm
+        # because shape-dependent kernels change with the config.
+        self._prepared = False
 
         # Audio stream block size: chunk/4 for responsive I/O
         output_chunk_sec = self.config.chunk_sec / 4
