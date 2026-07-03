@@ -463,7 +463,18 @@ def denoise(
     use_ml = False
 
     if method == "ml":
-        use_ml = True
+        # Explicit ML request still degrades gracefully when the optional
+        # 'denoiser' package is missing, so a stale config (or direct call)
+        # never crashes the real-time inference thread with ImportError.
+        if is_ml_denoiser_available():
+            use_ml = True
+        else:
+            logger.warning(
+                "ML denoiser requested but 'denoiser' is not installed; "
+                "falling back to spectral gate. Install with: "
+                "uv sync --extra ml-denoise"
+            )
+            use_ml = False
     elif method == "auto":
         # Try ML denoiser first
         if is_ml_denoiser_available():

@@ -48,6 +48,7 @@ class RCWXApp(ctk.CTk):
         self.title("RCWX - RVC Voice Changer")
         self.geometry("800x550")
         self.minsize(800, 500)
+        self._set_window_icon()
 
         # Set appearance
         ctk.set_appearance_mode("dark")
@@ -88,6 +89,24 @@ class RCWXApp(ctk.CTk):
 
         # Initialization complete - allow config saves
         self._initializing = False
+
+    def _set_window_icon(self) -> None:
+        """Set the desktop/window icon when packaged assets are available."""
+        assets_dir = Path(__file__).with_name("assets")
+        png_path = assets_dir / "rcwx_icon.png"
+        ico_path = assets_dir / "rcwx_icon.ico"
+
+        try:
+            if png_path.exists():
+                import tkinter as tk
+
+                self._app_icon_image = tk.PhotoImage(file=str(png_path))
+                self.iconphoto(True, self._app_icon_image)
+
+            if sys.platform == "win32" and ico_path.exists():
+                self.iconbitmap(str(ico_path))
+        except Exception as e:
+            logger.debug("Failed to set application icon: %s", e)
 
     def _setup_ui(self) -> None:
         """Setup the main UI layout."""
@@ -284,23 +303,36 @@ class RCWXApp(ctk.CTk):
         )
         self.denoise_method_label.grid(row=0, column=0, padx=(0, 5))
 
-        self.denoise_method_var = ctk.StringVar(value=self.config.inference.denoise.method)
+        # Only offer denoise methods that will actually work here. "ml" needs
+        # the optional 'denoiser' package (extra "ml-denoise"); hide it when it
+        # is not installed and fall back a saved "ml" selection to "spectral",
+        # so the user can't pick a method that would silently degrade / fail.
+        ml_available = is_ml_denoiser_available()
+        method_values = ["auto", "ml", "spectral"] if ml_available else ["auto", "spectral"]
+        saved_method = self.config.inference.denoise.method
+        if not ml_available and saved_method == "ml":
+            saved_method = "spectral"
+
+        self.denoise_method_var = ctk.StringVar(value=saved_method)
         self.denoise_method_menu = ctk.CTkOptionMenu(
             self.denoise_method_frame,
             variable=self.denoise_method_var,
-            values=["auto", "ml", "spectral"],
+            values=method_values,
             width=120,
             command=lambda _: self._on_denoise_changed(),
         )
         self.denoise_method_menu.grid(row=0, column=1, padx=5)
 
         # Status label
-        ml_status = "✓ 利用可能" if is_ml_denoiser_available() else "✗ 未インストール"
+        if ml_available:
+            ml_status = "✓ 利用可能"
+        else:
+            ml_status = "✗ 未インストール (方式 ml は無効 / uv sync --extra ml-denoise で有効化)"
         self.denoise_status = ctk.CTkLabel(
             self.denoise_frame,
             text=f"ML Denoiser: {ml_status}",
             font=ctk.CTkFont(size=10),
-            text_color="green" if is_ml_denoiser_available() else "gray",
+            text_color="green" if ml_available else "gray",
         )
         self.denoise_status.pack(anchor="w", padx=10, pady=(0, 5))
 
