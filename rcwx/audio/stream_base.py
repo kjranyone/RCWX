@@ -32,11 +32,18 @@ class AudioStreamBase(ABC):
         sample_rate: int = 48000,
         channels: int = 1,
         blocksize: int = 1024,
+        asio_buffer_size: int = 0,
     ):
         self.device = device
         self.sample_rate = sample_rate
         self.channels = channels
         self.blocksize = blocksize
+        # Requested ASIO buffer size in frames (0 = driver control-panel
+        # preferred).  Only consulted when *device* is on the ASIO host API;
+        # honored via _try_open_asio() so a simplex ASIO stream (e.g. ASIO
+        # output paired with a WASAPI mic) still gets a controlled buffer
+        # instead of the driver default.
+        self.asio_buffer_size = asio_buffer_size
         self._stream: Optional[sd.InputStream | sd.OutputStream] = None
         self._actual_sample_rate: Optional[int] = None
 
@@ -194,9 +201,78 @@ class AudioStreamBase(ABC):
             f"4. PCを再起動してください"
         )
 
+    def _try_open_asio(self) -> bool:
+        """Open *self.device* as a dedicated ASIO stream with a controlled buffer.
+
+        The generic fallback in start() intentionally excludes ASIO from its
+        API list, but its final ``"default"`` entry still opens an ASIO device
+        index with a fixed blocksize — leaving the ASIO hardware buffer at the
+        driver's control-panel value (often 2048).  This path instead opens
+        with ``blocksize=0`` + ``latency = size / samplerate`` so PortAudio
+        builds the ASIO buffers at the requested (or preferred) size, mirroring
+        AsioDuplexStream.  Only valid when the device is a *different* device
+        from the other direction's stream (else use AsioDuplexStream) — that is
+        the case for a mixed config (e.g. ASIO output + WASAPI mic).
+
+        Returns True on success; False (with no stream opened) otherwise, so
+        the caller falls through to the generic fallback unchanged.
+        """
+        if self.device is None or not is_device_on_asio(self.device, self.STREAM_TYPE):
+            return False
+
+        target_size = resolve_asio_buffer_size(
+            self.device, self.asio_buffer_size, self.STREAM_TYPE
+        )
+
+        # Native (control-panel) rate first; ASIO drivers run at a fixed rate.
+        rates: list[int] = []
+        native = query_asio_native_sample_rate(self.device, self.STREAM_TYPE)
+        if native is not None:
+            rates.append(native)
+        for r in [self.sample_rate, 48000, 44100, 96000]:
+            if r not in rates:
+                rates.append(r)
+
+        device_name = self._get_device_name(self.device)
+        for sr in rates:
+            # target_size==0 (query failed): fall back to a ~10ms hint rather
+            # than 'high' (=driver max) which sd would otherwise pick.
+            latency = (target_size / float(sr)) if target_size > 0 else 0.010
+            try:
+                self._stream = self.STREAM_CLASS(
+                    device=self.device,
+                    samplerate=sr,
+                    channels=self.channels,
+                    blocksize=0,
+                    dtype=np.float32,
+                    latency=latency,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+                self._actual_sample_rate = int(self._stream.samplerate)
+                logger.info(
+                    "%s stream started (ASIO): %s, sr=%dHz, asio_buffer=%s, "
+                    "latency=%s",
+                    self.STREAM_TYPE.capitalize(), device_name,
+                    self._actual_sample_rate,
+                    target_size if target_size > 0 else "auto",
+                    self._stream.latency,
+                )
+                return True
+            except Exception as e:
+                logger.debug("ASIO %s open failed (sr=%d): %s", self.STREAM_TYPE, sr, e)
+                self._stream = None
+        return False
+
     def start(self) -> None:
         """Start stream with robust fallback."""
         if self._stream is not None:
+            return
+
+        # ASIO devices: open with a controlled buffer first (blocksize=0 +
+        # explicit latency).  If it fails, fall through to the generic
+        # WASAPI/DirectSound/MME/default chain below (behavior unchanged).
+        if self._try_open_asio():
             return
 
         api_preferences = self._get_api_preferences()
@@ -541,6 +617,55 @@ def snap_asio_buffer_size(
         size = min_size + int(steps) * granularity
         size = max(min_size, min(max_size, size))
     return size
+
+
+def resolve_asio_buffer_size(
+    device_index: Optional[int],
+    requested_buffer_size: int,
+    stream_type: str = "output",
+) -> int:
+    """Resolve the ASIO host buffer size (frames) to request for a device.
+
+    Intended for use with ``blocksize=0`` + ``latency = size / samplerate`` so
+    PortAudio builds the ASIO buffers at exactly this size.  PortAudio's
+    'low'/'high' latency classes map to the driver min/max instead, so an
+    explicit size is required to honor either the user's choice or the
+    control-panel preferred value.
+
+    - ``requested_buffer_size > 0``: snapped to the driver's
+      min/max/granularity constraints.
+    - ``requested_buffer_size == 0``: the driver's preferred (control-panel)
+      size.
+    - Returns ``0`` when the size can't be determined (caller should fall back
+      to a plain latency hint, e.g. ~10ms).
+
+    Shared by AsioDuplexStream and AudioStreamBase._try_open_asio so both the
+    duplex and simplex ASIO paths honor the same setting identically.
+    """
+    sizes = query_asio_buffer_sizes(device_index, stream_type)
+    if sizes is not None:
+        logger.info(
+            "ASIO buffer sizes (%s): min=%d max=%d preferred=%d granularity=%d",
+            stream_type, *sizes,
+        )
+    if requested_buffer_size and requested_buffer_size > 0:
+        target = int(requested_buffer_size)
+        if sizes is not None:
+            snapped = snap_asio_buffer_size(target, sizes)
+            if snapped != target:
+                logger.info(
+                    "ASIO buffer size %d snapped to %d (driver constraints)",
+                    target, snapped,
+                )
+            target = snapped
+        logger.info("ASIO buffer size: %d (user-selected)", target)
+        return target
+    if sizes is not None and sizes[2] > 0:
+        logger.info(
+            "ASIO buffer size: %d (driver preferred / control panel)", sizes[2]
+        )
+        return sizes[2]
+    return 0
 
 
 def enumerate_asio_buffer_sizes(

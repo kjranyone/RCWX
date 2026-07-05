@@ -675,6 +675,7 @@ class RealtimeVoiceChangerUnified:
                 blocksize=output_blocksize,
                 callback=self._on_audio_output,
                 output_channel_selection=self.config.output_channel_selection,
+                asio_buffer_size=self.config.asio_buffer_size,
             )
             self._output_stream.start()
 
@@ -695,6 +696,7 @@ class RealtimeVoiceChangerUnified:
                     blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
                     callback=self._on_audio_input,
                     channel_selection=self.config.input_channel_selection,
+                    asio_buffer_size=self.config.asio_buffer_size,
                 )
             self._input_stream.start()
 

@@ -44,8 +44,9 @@ class AudioOutput(AudioStreamBase):
         blocksize: int = 1024,
         callback: Optional[Callable[[int], NDArray[np.float32]]] = None,
         output_channel_selection: str = "auto",
+        asio_buffer_size: int = 0,
     ):
-        super().__init__(device, sample_rate, channels, blocksize)
+        super().__init__(device, sample_rate, channels, blocksize, asio_buffer_size)
         self._callback = callback
 
         # Parse output channel selection into index pair

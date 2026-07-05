@@ -27,10 +27,9 @@ import sounddevice as sd
 from rcwx.audio.input import select_channel
 from rcwx.audio.stream_base import (
     parse_output_channel_pair,
-    query_asio_buffer_sizes,
     query_asio_channel_names,
     query_asio_native_sample_rate,
-    snap_asio_buffer_size as _snap_buffer_size,
+    resolve_asio_buffer_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,29 +140,10 @@ class AsioDuplexStream:
         # to the driver's min/max buffer instead and would override the
         # control panel in either direction.  The size is the user's
         # explicit choice when set, else the panel value (preferredSize).
-        buffer_sizes = query_asio_buffer_sizes(output_device, "output")
-        if buffer_sizes is not None:
-            logger.info(
-                "ASIO buffer sizes: min=%d max=%d preferred=%d granularity=%d",
-                *buffer_sizes,
-            )
-        target_size = 0
-        if requested_buffer_size and requested_buffer_size > 0:
-            target_size = int(requested_buffer_size)
-            if buffer_sizes is not None:
-                target_size = _snap_buffer_size(target_size, buffer_sizes)
-                if target_size != requested_buffer_size:
-                    logger.info(
-                        "ASIO buffer size %d snapped to %d (driver constraints)",
-                        requested_buffer_size, target_size,
-                    )
-            logger.info("ASIO buffer size: %d (user-selected)", target_size)
-        elif buffer_sizes is not None and buffer_sizes[2] > 0:
-            target_size = buffer_sizes[2]
-            logger.info(
-                "ASIO buffer size: %d (driver preferred / control panel)",
-                target_size,
-            )
+        # Shared with the simplex ASIO path (AudioStreamBase._try_open_asio).
+        target_size = resolve_asio_buffer_size(
+            output_device, requested_buffer_size, "output"
+        )
         last_error: Optional[Exception] = None
         for sr in rates:
             if target_size > 0:
