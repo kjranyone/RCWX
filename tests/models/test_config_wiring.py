@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from rcwx.config import InferenceConfig, RCWXConfig
+from rcwx.config import AudioConfig, InferenceConfig, RCWXConfig
 from rcwx.pipeline.realtime_unified import RealtimeConfig
 
 
@@ -58,6 +58,25 @@ def test_inference_config_has_f0_lowpass_cutoff():
     cfg = InferenceConfig()
     assert hasattr(cfg, "f0_lowpass_cutoff_hz"), "InferenceConfig missing f0_lowpass_cutoff_hz"
     assert cfg.f0_lowpass_cutoff_hz == 16.0, f"Expected 16.0, got {cfg.f0_lowpass_cutoff_hz}"
+
+
+def test_asio_buffer_size_field():
+    """asio_buffer_size should default to 0 (follow driver panel) on both configs."""
+    assert AudioConfig().asio_buffer_size == 0, "AudioConfig.asio_buffer_size default"
+    assert RealtimeConfig().asio_buffer_size == 0, "RealtimeConfig.asio_buffer_size default"
+
+
+def test_hole_fill_and_uv_ramp_fields():
+    """f0_hole_fill_ms / uv_ramp_ms should exist on both configs with matching defaults."""
+    inf = InferenceConfig()
+    rt = RealtimeConfig()
+    for cfg, name in ((inf, "InferenceConfig"), (rt, "RealtimeConfig")):
+        assert getattr(cfg, "f0_hole_fill_ms", None) == 30.0, (
+            f"{name}.f0_hole_fill_ms expected 30.0, got {getattr(cfg, 'f0_hole_fill_ms', None)}"
+        )
+        assert getattr(cfg, "uv_ramp_ms", None) == 5.0, (
+            f"{name}.uv_ramp_ms expected 5.0, got {getattr(cfg, 'uv_ramp_ms', None)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +144,8 @@ if __name__ == "__main__":
         test_realtime_config_custom_values,
         test_inference_config_has_noise_scale,
         test_inference_config_has_f0_lowpass_cutoff,
+        test_asio_buffer_size_field,
+        test_hole_fill_and_uv_ramp_fields,
         test_config_roundtrip_new_fields,
         test_config_backward_compat,
     ]

@@ -7,8 +7,13 @@ because the first stream exclusively claims the driver.  This module wraps
 
 ASIO devices typically have a fixed sample rate and buffer size configured
 in the driver's control panel.  This class queries the device's native
-sample rate and passes ``blocksize=0`` so PortAudio uses the ASIO-preferred
-buffer size.
+sample rate AND its preferred (= control panel) buffer size, then passes
+``blocksize=0`` with ``latency = preferred / samplerate`` so PortAudio
+creates the ASIO buffers at exactly the panel value.  ``latency`` must be
+explicit and exact: PortAudio reports the driver's min/max buffer sizes as
+its 'low'/'high' latency defaults, so both sounddevice's default
+(``'high'`` → max, e.g. 2048) and a naive ``'low'`` (→ min, e.g. 64)
+silently rebuild the ASIO buffers away from the panel setting.
 """
 
 from __future__ import annotations
@@ -22,8 +27,10 @@ import sounddevice as sd
 from rcwx.audio.input import select_channel
 from rcwx.audio.stream_base import (
     parse_output_channel_pair,
+    query_asio_buffer_sizes,
     query_asio_channel_names,
     query_asio_native_sample_rate,
+    snap_asio_buffer_size as _snap_buffer_size,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,10 @@ class AsioDuplexStream:
     output_channel_selection:
         Which output channel pair to route audio to: ``"auto"`` (broadcast
         to all) / ``"0,1"`` / ``"2,3"`` etc.
+    requested_buffer_size:
+        Explicit ASIO buffer size in frames.  0 (default) follows the
+        driver's control panel (preferredSize).  Non-zero values are
+        snapped to the driver's min/max/granularity constraints.
     """
 
     def __init__(
@@ -70,6 +81,7 @@ class AsioDuplexStream:
         output_callback: Callable[[int], np.ndarray],
         channel_selection: str = "auto",
         output_channel_selection: str = "auto",
+        requested_buffer_size: int = 0,
     ) -> None:
         self._input_callback = input_callback
         self._output_callback = output_callback
@@ -124,9 +136,42 @@ class AsioDuplexStream:
             input_device, output_device, rates,
         )
 
-        # blocksize=0 lets PortAudio use the ASIO driver's preferred buffer.
+        # blocksize=0 + latency=size/sr → PortAudio creates the ASIO
+        # buffers at exactly that size.  'low'/'high' latency classes map
+        # to the driver's min/max buffer instead and would override the
+        # control panel in either direction.  The size is the user's
+        # explicit choice when set, else the panel value (preferredSize).
+        buffer_sizes = query_asio_buffer_sizes(output_device, "output")
+        if buffer_sizes is not None:
+            logger.info(
+                "ASIO buffer sizes: min=%d max=%d preferred=%d granularity=%d",
+                *buffer_sizes,
+            )
+        target_size = 0
+        if requested_buffer_size and requested_buffer_size > 0:
+            target_size = int(requested_buffer_size)
+            if buffer_sizes is not None:
+                target_size = _snap_buffer_size(target_size, buffer_sizes)
+                if target_size != requested_buffer_size:
+                    logger.info(
+                        "ASIO buffer size %d snapped to %d (driver constraints)",
+                        requested_buffer_size, target_size,
+                    )
+            logger.info("ASIO buffer size: %d (user-selected)", target_size)
+        elif buffer_sizes is not None and buffer_sizes[2] > 0:
+            target_size = buffer_sizes[2]
+            logger.info(
+                "ASIO buffer size: %d (driver preferred / control panel)",
+                target_size,
+            )
         last_error: Optional[Exception] = None
         for sr in rates:
+            if target_size > 0:
+                latency = target_size / float(sr)
+            else:
+                # Size unknown: target ~10ms, a sane middle ground
+                # between the min (fragile) and max (laggy).
+                latency = 0.010
             try:
                 self._stream = sd.Stream(
                     device=(input_device, output_device),
@@ -134,13 +179,16 @@ class AsioDuplexStream:
                     channels=(input_channels, output_channels),
                     blocksize=0,
                     dtype=np.float32,
+                    latency=latency,
                     callback=self._duplex_callback,
                 )
                 self._actual_sample_rate = int(self._stream.samplerate)
                 logger.info(
-                    "ASIO duplex stream created: in=%s out=%s sr=%d bs=%s",
+                    "ASIO duplex stream created: in=%s out=%s sr=%d bs=%s "
+                    "latency=%s",
                     input_device, output_device,
                     self._actual_sample_rate, self._stream.blocksize,
+                    self._stream.latency,
                 )
                 return
             except Exception as e:

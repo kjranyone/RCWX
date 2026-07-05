@@ -442,6 +442,119 @@ def is_device_on_asio(device_index: Optional[int], stream_type: str = "output") 
         return False
 
 
+def query_asio_buffer_sizes(
+    device_index: Optional[int],
+    stream_type: str = "output",
+) -> Optional[tuple[int, int, int, int]]:
+    """Return (min, max, preferred, granularity) ASIO buffer sizes in frames.
+
+    Uses ``PaAsio_GetAvailableBufferSizes`` from the PortAudio DLL via
+    ctypes.  ``preferred`` is the buffer size configured in the driver's
+    control panel — PortAudio's 'low'/'high' latency defaults map to
+    min/max buffer size instead, so honoring the panel value requires
+    this query.  Returns None if unavailable or the device is not ASIO.
+    """
+    import ctypes
+    import re
+
+    if device_index is None or not is_device_on_asio(device_index, stream_type):
+        return None
+
+    try:
+        m = re.search(r"'([^']+)'", repr(sd._lib))
+        if not m:
+            return None
+        pa = ctypes.CDLL(m.group(1))
+
+        func = pa.PaAsio_GetAvailableBufferSizes
+        func.restype = ctypes.c_int
+        func.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_long),
+            ctypes.POINTER(ctypes.c_long),
+            ctypes.POINTER(ctypes.c_long),
+            ctypes.POINTER(ctypes.c_long),
+        ]
+
+        min_size = ctypes.c_long()
+        max_size = ctypes.c_long()
+        preferred = ctypes.c_long()
+        granularity = ctypes.c_long()
+        err = func(
+            device_index,
+            ctypes.byref(min_size),
+            ctypes.byref(max_size),
+            ctypes.byref(preferred),
+            ctypes.byref(granularity),
+        )
+        if err != 0:
+            return None
+        return (
+            int(min_size.value),
+            int(max_size.value),
+            int(preferred.value),
+            int(granularity.value),
+        )
+    except Exception as e:
+        logger.debug("Failed to query ASIO buffer sizes: %s", e)
+        return None
+
+
+def snap_asio_buffer_size(
+    requested: int, sizes: tuple[int, int, int, int]
+) -> int:
+    """Clamp a requested ASIO buffer size to the driver's constraints.
+
+    ``sizes`` is (min, max, preferred, granularity) from
+    ``query_asio_buffer_sizes``.  Granularity -1 means power-of-two steps
+    (per the ASIO SDK); a positive value means arithmetic steps from min.
+    """
+    min_size, max_size, _preferred, granularity = sizes
+    size = max(min_size, min(max_size, int(requested)))
+    if granularity == -1:
+        p = min_size if min_size > 0 else 1
+        while p * 2 <= size:
+            p *= 2
+        if (size - p) > (p * 2 - size) and p * 2 <= max_size:
+            p *= 2
+        size = p
+    elif granularity > 0:
+        steps = round((size - min_size) / granularity)
+        size = min_size + int(steps) * granularity
+        size = max(min_size, min(max_size, size))
+    return size
+
+
+def enumerate_asio_buffer_sizes(
+    sizes: tuple[int, int, int, int]
+) -> list[int]:
+    """Enumerate a concise sorted list of buffer sizes the driver supports.
+
+    Power-of-two granularity (-1) is enumerated exactly.  Arithmetic
+    granularity snaps a ladder of common sizes to the driver's step so
+    every listed value is valid (drivers with fine granularity support
+    hundreds of sizes — listing them all is useless in a dropdown).
+    min, max and preferred are always included.
+    """
+    min_size, max_size, preferred, granularity = sizes
+    result: set[int] = set()
+    if granularity == -1:
+        v = 1
+        while v < min_size:
+            v *= 2
+        while v <= max_size:
+            result.add(v)
+            v *= 2
+    elif granularity > 0:
+        ladder = [16, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]
+        for t in ladder:
+            result.add(snap_asio_buffer_size(t, sizes))
+    for v in (min_size, max_size, preferred):
+        if v > 0:
+            result.add(v)
+    return sorted(x for x in result if min_size <= x <= max_size)
+
+
 def query_asio_native_sample_rate(
     device_index: Optional[int],
     stream_type: str = "output",
@@ -451,9 +564,6 @@ def query_asio_native_sample_rate(
     ASIO drivers typically operate at a fixed sample rate configured in the
     driver's control panel.  ``sd.query_devices()["default_samplerate"]``
     reflects this value.
-
-    Buffer size is *not* exposed by the sounddevice Python API, so callers
-    should pass ``blocksize=0`` to let PortAudio use the ASIO-preferred value.
     """
     if not is_device_on_asio(device_index, stream_type):
         return None

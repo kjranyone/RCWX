@@ -39,6 +39,11 @@ class SolaState:
         default=None, repr=False
     )
 
+    # Diagnostics from the last crossfade (for boundary-continuity logging).
+    last_offset: int = 0
+    last_in_len: int = 0
+    last_out_len: int = 0
+
     def _ensure_window(self) -> None:
         """Create Hann crossfade windows if not yet created."""
         if self._hann_fade_in is None and self.crossfade_samples > 0:
@@ -77,27 +82,36 @@ def sola_crossfade(
 
     # No crossfade configured — passthrough
     if cf <= 0:
+        state.last_in_len = len(audio)
+        state.last_out_len = len(audio)
         return audio
 
     state._ensure_window()
+    state.last_in_len = len(audio)
 
     # First chunk: output + hold-back, no crossfade
     if state.buffer is None:
+        state.last_offset = 0
         if target_len > 0 and len(audio) >= target_len + cf:
             state.buffer = audio[target_len:target_len + cf].copy()
-            return audio[:target_len]
-        if len(audio) > cf:
+            out = audio[:target_len]
+        elif len(audio) > cf:
             state.buffer = audio[-cf:].copy()
-            return audio[:-cf]
-        # Chunk too short to hold back — output nothing, hold everything
-        state.buffer = audio.copy()
-        return np.array([], dtype=np.float32)
+            out = audio[:-cf]
+        else:
+            # Chunk too short to hold back — output nothing, hold everything
+            state.buffer = audio.copy()
+            out = np.array([], dtype=np.float32)
+        state.last_out_len = len(out)
+        return out
 
     # Subsequent chunks — need at least cf samples in audio
     if len(audio) < cf:
         # Chunk shorter than crossfade — prepend buffer, no hold-back
         result = np.concatenate([state.buffer, audio])
         state.buffer = None
+        state.last_offset = 0
+        state.last_out_len = len(result)
         return result
 
     prev_tail = state.buffer  # [cf] samples held from previous chunk
@@ -108,6 +122,7 @@ def sola_crossfade(
 
     # Find optimal splice offset using cross-correlation
     offset = _find_best_offset(prev_tail, search_region, cf, search)
+    state.last_offset = offset
 
     # Extract the crossfade region from current chunk at found offset
     curr_cf = audio[offset:offset + cf]
@@ -125,6 +140,7 @@ def sola_crossfade(
             # Hold-back contiguous with output — no content gap
             state.buffer = remaining[take:take + cf].copy()
             result = np.concatenate([crossfaded, remaining[:take]])
+            state.last_out_len = len(result)
             return result
         # Fall through to default if audio too short for target
 
@@ -135,6 +151,7 @@ def sola_crossfade(
         state.buffer = audio[-cf:].copy()
         result = np.concatenate([crossfaded, remaining])
 
+    state.last_out_len = len(result)
     return result
 
 
@@ -216,5 +233,22 @@ def _find_best_offset(
     valid = norms > 1e-8
     corrs[valid] = dots[valid] / (pt_norm * norms[valid])
 
-    # argmax returns first index on tie — same as the sequential scan
-    return int(np.argmax(corrs))
+    # Minimum-shift selection within a tolerance of the peak.
+    #
+    # On a sustained periodic tone the normalized cross-correlation has
+    # several near-equal peaks (one per pitch period), so a plain argmax
+    # picks among them inconsistently from chunk to chunk — the splice
+    # offset then jitters by hundreds of samples, audible as periodic
+    # stutter / phoneme truncation at every chunk boundary.
+    #
+    # The held-back tail is time-contiguous with the new chunk by
+    # construction (it is the immediate continuation), so the TRUE
+    # alignment is the smallest offset.  We therefore pick the smallest
+    # offset whose correlation is within `tol` of the peak, allowing a
+    # larger shift only when it is genuinely (above tol) better matched.
+    best = corrs.max()
+    if best == -np.inf:
+        return 0
+    tol = 0.02
+    candidates = np.flatnonzero(corrs >= best - tol)
+    return int(candidates[0]) if candidates.size else int(np.argmax(corrs))

@@ -185,11 +185,39 @@ class SineGen(nn.Module):
         # When True, harmonic initial phases are fixed to zero for streaming
         # continuity (eliminates per-chunk tonal colour shift).
         self.fixed_harmonics = False
+        # Voiced/unvoiced excitation crossfade length in ms.  The original
+        # RVC uv mask is binary at sample resolution, so the sine->noise
+        # switch happens in one sample and is audible as a rasp at voicing
+        # boundaries.  > 0 ramps the mask over this duration.  0 = original.
+        self.uv_ramp_ms = 0.0
 
     def _f02uv(self, f0: torch.Tensor) -> torch.Tensor:
         uv = torch.ones_like(f0)
         uv = uv * (f0 > self.voiced_threshold)
         return uv
+
+    def _ramp_uv(self, uv: torch.Tensor) -> torch.Tensor:
+        """Ramp the binary uv mask over ~uv_ramp_ms (box filter).
+
+        Crossfades sine/noise excitation at voicing boundaries instead of
+        switching within one sample.  Replicate padding keeps the mask flat
+        at window edges (no artificial dip at streaming chunk boundaries).
+
+        Args:
+            uv: [B, T, 1] binary mask at waveform rate
+
+        Returns:
+            [B, T, 1] mask ramped into [0, 1]
+        """
+        k = int(self.sampling_rate * self.uv_ramp_ms / 1000.0)
+        if k < 3:
+            return uv
+        if k % 2 == 0:
+            k += 1
+        x = uv.transpose(2, 1)  # [B, 1, T]
+        x = F.pad(x, (k // 2, k // 2), mode="replicate")
+        x = F.avg_pool1d(x, kernel_size=k, stride=1)
+        return x.transpose(2, 1)
 
     def _f02sine(
         self, f0: torch.Tensor, upp: int
@@ -298,6 +326,8 @@ class SineGen(nn.Module):
             uv = F.interpolate(
                 uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
             ).transpose(2, 1)
+            if self.uv_ramp_ms > 0:
+                uv = self._ramp_uv(uv)
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
             noise = noise_amp * torch.randn_like(sine_waves)
 

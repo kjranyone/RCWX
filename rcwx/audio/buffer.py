@@ -127,6 +127,23 @@ class RingOutputBuffer:
         self._count -= n
         return result
 
+    def skip(self, samples: int) -> int:
+        """Discard up to ``samples`` of the oldest buffered audio.
+
+        Used by drift control to drop accumulated latency in one step.
+        Flags the next read for fade-in so the splice doesn't click.
+
+        Returns:
+            Number of samples actually discarded.
+        """
+        n = min(int(samples), self._count)
+        if n <= 0:
+            return 0
+        self._read_pos = (self._read_pos + n) % self.capacity
+        self._count -= n
+        self._last_was_underrun = True  # fade-in on next get()
+        return n
+
     def clear(self) -> None:
         """Reset buffer to empty state (no reallocation)."""
         self._read_pos = 0

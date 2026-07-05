@@ -124,6 +124,9 @@ class AudioConfig:
     # Latency settings
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
+    # ASIO buffer size in frames (0 = follow the driver control panel /
+    # preferredSize; snapped to the driver's min/max/granularity when set)
+    asio_buffer_size: int = 0
 
     def __post_init__(self) -> None:
         # Repair configs saved by older GUI builds that leaked display strings.
@@ -224,6 +227,11 @@ class InferenceConfig:
     fixed_harmonics: bool = True
     # F0 lowpass cutoff frequency in Hz (higher = more pitch detail preserved)
     f0_lowpass_cutoff_hz: float = 16.0
+    # Longest unvoiced hole (ms) inside a voiced run to fill by interpolation
+    # (prevents noise-excitation raspiness; <= 0 disables)
+    f0_hole_fill_ms: float = 30.0
+    # Voiced/unvoiced excitation crossfade ramp in ms (0 = original RVC hard switch)
+    uv_ramp_ms: float = 5.0
     # Stabilize 1-octave frame flips in F0 contour
     enable_octave_flip_suppress: bool = True
     # Limit frame-to-frame F0 slew in semitones

@@ -174,6 +174,13 @@ class StreamingParams:
     # of the full HuBERT history; older frames are served from the streaming
     # F0 cache.  <= 0 disables windowing (extract on the full context).
     f0_context_sec: float = 0.32
+    # Longest unvoiced hole (ms) inside a voiced run to fill by interpolation
+    # before synthesis (prevents noise-excitation bursts / raspiness).
+    # <= 0 disables hole filling.
+    f0_hole_fill_ms: float = 30.0
+    # Voiced/unvoiced crossfade ramp (ms) for the NSF sine/noise excitation
+    # switch.  0 keeps the original RVC hard switch.
+    uv_ramp_ms: float = 5.0
 
 
 def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
@@ -873,6 +880,60 @@ def stabilize_f0_boundaries(
     return corrected
 
 
+def fill_short_unvoiced_gaps(f0: torch.Tensor, max_gap_frames: int = 3) -> torch.Tensor:
+    """Fill short unvoiced holes inside voiced runs by log2 interpolation.
+
+    F0 extractors occasionally drop single frames to 0 mid-vowel (FCPE NaN
+    frames, RMVPE threshold flicker).  The NSF decoder switches those frames
+    to pure noise excitation (sine_amp/3 vs noise_std when voiced), which is
+    audible as raspiness.  Only holes bounded by voiced frames on BOTH sides
+    and no longer than ``max_gap_frames`` are filled — longer gaps are true
+    unvoiced consonants / silence and must stay unvoiced.
+
+    Args:
+        f0: F0 tensor [B, T] in Hz, 0 = unvoiced
+        max_gap_frames: Longest hole to fill (frames @100fps; 3 = 30ms)
+
+    Returns:
+        F0 tensor with short holes filled
+    """
+    if max_gap_frames <= 0 or f0.shape[1] < 3:
+        return f0
+
+    # Cheap on-device gate: a fillable hole needs >= 2 voiced frames with at
+    # least one unvoiced frame between them.  The common steady-voiced and
+    # silent cases (all-voiced / <2 voiced) short-circuit here and skip the
+    # host transfer + Python loop below — the only forced sync in the F0
+    # chain.  One scalar reduction is far cheaper than moving the full tensor.
+    voiced = f0 > 0
+    n_voiced = int(voiced.sum())
+    if n_voiced < 2 or n_voiced == f0.numel():
+        return f0
+
+    f0_np = f0.detach().cpu().to(torch.float32).numpy().copy()
+    changed = False
+    for b in range(f0_np.shape[0]):
+        row = f0_np[b]
+        vidx = np.flatnonzero(row > 0)
+        if vidx.size < 2:
+            continue
+        # Unvoiced frame count between consecutive voiced frames
+        gaps = np.diff(vidx) - 1
+        for gi in np.flatnonzero((gaps > 0) & (gaps <= max_gap_frames)):
+            left = int(vidx[gi])
+            right = int(vidx[gi + 1])
+            n = right - left
+            t = np.arange(1, n, dtype=np.float32) / n
+            lv = np.log2(row[left])
+            rv = np.log2(row[right])
+            row[left + 1:right] = np.exp2(lv * (1.0 - t) + rv * t)
+            changed = True
+
+    if not changed:
+        return f0
+    return torch.from_numpy(f0_np).to(device=f0.device, dtype=f0.dtype)
+
+
 def apply_f0_filter_chain(
     f0: torch.Tensor,
     *,
@@ -880,13 +941,16 @@ def apply_f0_filter_chain(
     enable_octave_flip_suppress: bool,
     enable_f0_slew_limit: bool,
     f0_slew_max_step_st: float,
+    f0_hole_fill_ms: float = 30.0,
 ) -> torch.Tensor:
     """Apply the shared F0 post-processing chain.
 
-    median spike removal -> lowpass -> (optional) octave-flip suppression ->
-    (optional) slew limiting. Used identically by ``infer`` (on the final F0)
-    and ``infer_streaming`` (on the history-extended F0).
+    short-hole fill -> median spike removal -> lowpass -> (optional)
+    octave-flip suppression -> (optional) slew limiting. Used identically by
+    ``infer`` (on the final F0) and ``infer_streaming`` (on the
+    history-extended F0).
     """
+    f0 = fill_short_unvoiced_gaps(f0, max_gap_frames=int(round(f0_hole_fill_ms / 10.0)))
     f0 = smooth_f0_spikes(f0, window=3)
     f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
     if enable_octave_flip_suppress:
@@ -1440,6 +1504,21 @@ class RVCPipeline:
         if sin_gen is not None:
             sin_gen.fixed_harmonics = enabled
 
+    def _set_uv_ramp(self, ramp_ms: float) -> None:
+        """Set SineGen voiced/unvoiced excitation crossfade length (ms)."""
+        model = getattr(self.synthesizer, "model", None)
+        if model is None:
+            return
+        dec = getattr(model, "dec", None)
+        if dec is None:
+            return
+        m_source = getattr(dec, "m_source", None)
+        if m_source is None:
+            return  # non-F0 model — no SineGen
+        sin_gen = getattr(m_source, "l_sin_gen", None)
+        if sin_gen is not None:
+            sin_gen.uv_ramp_ms = float(ramp_ms)
+
     @torch.no_grad()
     def infer(
         self,
@@ -1466,6 +1545,7 @@ class RVCPipeline:
         enable_octave_flip_suppress: bool = True,
         enable_f0_slew_limit: bool = True,
         f0_slew_max_step_st: float = 2.8,
+        f0_hole_fill_ms: float = 30.0,
     ) -> np.ndarray:
         """
         Convert voice using the RVC pipeline.
@@ -1974,6 +2054,7 @@ class RVCPipeline:
                     enable_octave_flip_suppress=enable_octave_flip_suppress,
                     enable_f0_slew_limit=enable_f0_slew_limit,
                     f0_slew_max_step_st=f0_slew_max_step_st,
+                    f0_hole_fill_ms=f0_hole_fill_ms,
                 )
 
                 # Batch boundary stabilization to suppress start/end F0 flutter.
@@ -2276,6 +2357,8 @@ class RVCPipeline:
         hubert_context_sec = params.hubert_context_sec
         fixed_harmonics = params.fixed_harmonics
         f0_context_sec = params.f0_context_sec
+        f0_hole_fill_ms = params.f0_hole_fill_ms
+        uv_ramp_ms = params.uv_ramp_ms
 
         # Per-stage times (ms); published on self for the realtime
         # controller's [PERF] logging.  With device timing events (preferred)
@@ -2676,6 +2759,7 @@ class RVCPipeline:
                     enable_octave_flip_suppress=enable_octave_flip_suppress,
                     enable_f0_slew_limit=enable_f0_slew_limit,
                     f0_slew_max_step_st=f0_slew_max_step_st,
+                    f0_hole_fill_ms=f0_hole_fill_ms,
                 )
 
                 # Strip history prefix to restore original size
@@ -2826,8 +2910,9 @@ class RVCPipeline:
         # Residual samples not covered by feature-level skip (sub-frame trim)
         residual_left = total_left_samples - skip_head_feat * samples_per_frame
 
-        # Set SineGen harmonic phase mode before synthesis
+        # Set SineGen harmonic phase mode / uv crossfade before synthesis
         self._set_fixed_harmonics(fixed_harmonics)
+        self._set_uv_ramp(uv_ramp_ms)
 
         # Run synthesizer with skip_head/return_length
         t_synth = time.perf_counter()

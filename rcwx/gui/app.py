@@ -650,6 +650,9 @@ class RCWXApp(ctk.CTk):
             self.audio_settings.output_channel_var.set(saved_out_ch)
             self.audio_settings._update_output_channel_selection_state()
 
+        # Restore ASIO buffer size selection
+        self.audio_settings.set_asio_buffer_size(self.config.audio.asio_buffer_size)
+
     def _setup_settings_tab(self) -> None:
         """Setup the advanced settings tab."""
         # Scrollable container
@@ -1167,6 +1170,7 @@ class RCWXApp(ctk.CTk):
             self.config.audio.output_hostapi_filter = self.audio_settings.output_api_var.get()
             self.config.audio.input_device_name = self.audio_settings.get_input_device_name()
             self.config.audio.output_device_name = self.audio_settings.get_output_device_name()
+            self.config.audio.asio_buffer_size = self.audio_settings.asio_buffer_size
             self.config.save()
         except Exception as e:
             logger.error(f"Failed to save config: {e}")

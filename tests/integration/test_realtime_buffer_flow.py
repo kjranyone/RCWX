@@ -33,8 +33,9 @@ def _make_vc(
     vc._output_queue = Queue(maxsize=output_queue_size)
     vc.output_buffer = RingOutputBuffer(capacity_samples=hop_out * 4, fade_samples=0)
 
-    vc._interp_cache_frames = 0
-    vc._interp_cache_x_base = None
+    # Drift-control state (floor-based, skip-only).
+    vc._level_window = None
+    vc._level_window_frames = 0
 
     vc._runtime_output_sample_rate = out_sr
     vc._hop_samples_out = hop_out

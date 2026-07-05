@@ -221,6 +221,13 @@ class RealtimeConfig:
     enable_octave_flip_suppress: bool = True
     enable_f0_slew_limit: bool = True
     f0_slew_max_step_st: float = 2.8
+    # Longest unvoiced hole (ms) inside a voiced run to fill (<= 0 disables)
+    f0_hole_fill_ms: float = 30.0
+    # Voiced/unvoiced excitation crossfade ramp in ms (0 = hard switch)
+    uv_ramp_ms: float = 5.0
+
+    # ASIO buffer size in frames (0 = follow the driver control panel)
+    asio_buffer_size: int = 0
 
     # Decoder overlap for cross-chunk continuity (feature frames, 1 frame = 10ms)
     decoder_overlap_frames: int = 5
@@ -378,18 +385,22 @@ class RealtimeVoiceChangerUnified:
             fade_samples=256,
         )
 
-        # Adaptive drift control target.
+        # Adaptive drift control state (floor-based, skip-only).
         #
-        # The output callback runs 4x per chunk (blocksize = hop/4).
-        # After an inference burst fills the ring, successive callbacks
-        # drain it:  3/4 hop → 2/4 → 1/4 → 0 → (next burst) → 3/4 …
-        # Natural steady-state peak = hop * 3/4.
-        #
-        # When the ring exceeds this target, we read *extra* samples and
-        # resample (np.interp) to the requested frame count.  This speeds
-        # up playback by an imperceptible amount (≤1.5%) instead of
-        # skipping audio, which would cause clicks.
-        self._drain_target = self._compute_drain_target()
+        # The ring conserves ~prebuffer_chunks hops of standing latency
+        # (output tracks the mic rate, so the prebuffer fill is never
+        # consumed), so the windowed MINIMUM post-read level (the floor)
+        # sits at ~prebuffer_chunks*hop in steady state and must NOT be
+        # shed.  Every callback records its post-read level into a sliding
+        # window (~2 chunk periods); only when genuine accumulation
+        # (inference stall, startup transient, clock drift on split
+        # devices) lifts the floor a full chunk above the standing level do
+        # we hard-skip the excess.  No per-callback time-compression: with
+        # small device blocks (e.g. 64-frame ASIO) an np.interp every
+        # callback restarts the resampling phase each block and buzzes.
+        # See _on_audio_output / _compute_shed_threshold.
+        self._level_window: Optional[deque] = None
+        self._level_window_frames = 0
 
         # Input accumulator (ring buffer at mic rate)
         self._input_buf = np.array([], dtype=np.float32)
@@ -423,10 +434,6 @@ class RealtimeVoiceChangerUnified:
         self._feedback_check_interval = 10
         self._feedback_warning_shown = False
 
-        # Cached arrays for adaptive drift np.interp (avoid per-callback alloc)
-        self._interp_cache_frames: int = 0
-        self._interp_cache_x_base: Optional[np.ndarray] = None
-
         # Boundary gain continuity across emitted chunks (post-SOLA).
         self._prev_tail_rms: float = 0.0
 
@@ -447,20 +454,36 @@ class RealtimeVoiceChangerUnified:
         """Round sample count up to nearest multiple of hop."""
         return ((samples + hop - 1) // hop) * hop
 
-    def _compute_drain_target_for_frames(self, frames: int) -> int:
-        """Compute drift-control target for the current callback frame size."""
-        frame_count = max(1, int(frames))
-        # Natural post-callback level after one hop-sized enqueue.
-        base_target = max(0, self._hop_samples_out - frame_count)
-        margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
-        # 0.5 = neutral (natural target), <0.5 tighter, >0.5 more relaxed.
-        margin_offset = int((margin - 0.5) * self._hop_samples_out)
-        return max(0, base_target + margin_offset)
+    def _compute_shed_threshold(self) -> tuple[int, int]:
+        """Return (shed_threshold, shed_target) for the post-read floor.
 
-    def _compute_drain_target(self) -> int:
-        """Compute nominal drift-control target (for non-callback contexts)."""
-        nominal_frames = max(1, self._hop_samples_out // 4)
-        return self._compute_drain_target_for_frames(nominal_frames)
+        The ring conserves roughly ``prebuffer_chunks`` hops of *standing*
+        latency: output never runs ahead of input (it tracks the mic rate),
+        so the initial prebuffer fill is never consumed — the windowed floor
+        sits at ~``prebuffer_chunks * hop`` and wobbles with the
+        burst/callback phase beat.  This standing level is NOT drift; it is
+        the latency the prebuffer setting deliberately holds, so shedding it
+        would just defeat the prebuffer (and, with small device blocks,
+        click or buzz on every callback).
+
+        We only shed once the floor exceeds the natural standing level by a
+        full chunk plus a margin-scaled tolerance — anything below that is
+        harmless wobble / deliberate prebuffer.
+
+        Returns:
+            (shed_threshold, shed_target): skip down to ``shed_target``
+            (≈ standing + half a hop) whenever ``floor > shed_threshold``.
+        """
+        margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
+        standing = self._prebuffer_chunks * self._hop_samples_out
+        # Tolerance: a full chunk of wobble headroom plus margin scaling
+        # (margin 0.5 → ~1.5 chunks above standing; tighter/looser below/above).
+        tol = int((1.0 + margin) * self._hop_samples_out)
+        shed_threshold = standing + tol
+        # Land back near the natural floor + a small cushion so post-skip
+        # wobble doesn't immediately re-trigger a skip.
+        shed_target = standing + self._hop_samples_out // 2
+        return shed_threshold, shed_target
 
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
@@ -494,8 +517,8 @@ class RealtimeVoiceChangerUnified:
             // zc_model * zc_model
         )
 
-        # Adaptive drift control target
-        self._drain_target = self._compute_drain_target()
+        # Hop change invalidates the drift-control level window
+        self._level_window = None
 
     def _apply_runtime_sample_rates(self, mic_rate: int, output_rate: int) -> None:
         """Apply actual stream sample rates and rebuild dependent state."""
@@ -632,6 +655,7 @@ class RealtimeVoiceChangerUnified:
                 output_callback=self._on_audio_output,
                 channel_selection=self.config.input_channel_selection,
                 output_channel_selection=self.config.output_channel_selection,
+                requested_buffer_size=self.config.asio_buffer_size,
             )
             duplex.start()
             # Both references point to the same object so stop() only closes once.
@@ -828,7 +852,6 @@ class RealtimeVoiceChangerUnified:
 
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
-        self._drain_target = self._compute_drain_target()
 
     def set_overlap(self, overlap_sec: float) -> None:
         self.config.overlap_sec = max(0.0, float(overlap_sec))
@@ -912,45 +935,59 @@ class RealtimeVoiceChangerUnified:
             else:
                 return np.zeros(frames, dtype=np.float32)
 
-        # --- Adaptive drift control ---
-        # Instead of skipping samples (which causes clicks), read extra
-        # samples from the ring and linearly interpolate back to `frames`.
-        # This speeds up playback by ≤1.5% — inaudible — while smoothly
-        # converging the buffer level toward the natural steady-state peak.
-        drain_target = self._compute_drain_target_for_frames(frames)
-        threshold = drain_target + frames
-        avail = self.output_buffer.available
-        extra = 0
-        if avail > threshold:
-            excess = avail - threshold
-            # Cap extra at ~1.5% of frames to keep pitch shift inaudible
-            max_extra = max(1, frames // 64)
-            extra = min(max_extra, excess)
+        # --- Adaptive drift control (floor-based, skip-only) ---
+        # Latency state is judged on the MINIMUM post-read ring level over
+        # the last ~2 chunk periods (the floor), never on the instantaneous
+        # level — the burst/drain oscillation and device blocksize phase
+        # beats don't lift the floor, so they can't trigger false skips.
+        #
+        # The ring conserves ~prebuffer_chunks hops of standing latency
+        # (output tracks the mic rate, so the prebuffer fill is never
+        # consumed), so the natural floor sits at ~prebuffer_chunks*hop and
+        # must NOT be shed.  We only skip once genuine accumulation pushes
+        # the floor a full chunk-plus-margin above the standing level.
+        #
+        # Shedding is done exclusively via hard-skip (one splice + fade-in),
+        # NEVER per-callback time-compression: with small device blocks
+        # (e.g. 64-frame ASIO) an np.interp every callback restarts the
+        # resampling phase each block, producing a audible tone at
+        # sample_rate/blocksize.  A periodic clean skip is inaudible by
+        # comparison.
+        if self._level_window is None or self._level_window_frames != frames:
+            self._level_window_frames = frames
+            window_len = max(4, -(-2 * self._hop_samples_out // max(1, frames)))
+            self._level_window = deque(maxlen=window_len)
 
-        if extra > 0 and avail >= frames + extra:
-            total = frames + extra
-            raw = self.output_buffer.get(total)
-            # Linear interpolation: compress (frames+extra) → frames.
-            # Cache the base x_new array for `frames` (constant across calls)
-            # and build x_src from it.  Only np.interp itself runs per-call.
-            if self._interp_cache_frames != frames:
-                self._interp_cache_frames = frames
-                self._interp_cache_x_base = np.arange(frames, dtype=np.float32)
-            x_src = self._interp_cache_x_base * (total - 1) / (frames - 1)
-            x_raw = np.arange(total, dtype=np.float32)
-            output = np.interp(x_src, x_raw, raw).astype(np.float32)
-            self.stats.buffer_trims += 1
-            if self.stats.buffer_trims <= 3 or self.stats.buffer_trims % 20 == 0:
+        if len(self._level_window) == self._level_window.maxlen:
+            floor = min(self._level_window)
+            shed_threshold, shed_target = self._compute_shed_threshold()
+            if floor > shed_threshold:
+                # Drop the accumulated excess in one splice.  Land below the
+                # threshold (at shed_target) so post-skip wobble doesn't
+                # immediately re-trigger.  skip() flags the next read for
+                # fade-in, so the splice doesn't click.
+                skip_amount = max(0, floor - shed_target)
+                skipped = self.output_buffer.skip(skip_amount)
+                self._level_window.clear()  # re-measure from the new level
+                self.stats.buffer_trims += 1
                 logger.info(
-                    "[DRIFT] Time-compressed %d samples (%.1fms), avail=%d target=%d (trim #%d)",
-                    extra,
-                    extra * 1000.0 / self._runtime_output_sample_rate,
-                    avail,
-                    drain_target,
+                    "[DRIFT] Skipped %d samples (%.0fms) of accumulated latency, "
+                    "floor=%d threshold=%d target=%d (trim #%d)",
+                    skipped,
+                    skipped * 1000.0 / self._runtime_output_sample_rate,
+                    floor,
+                    shed_threshold,
+                    shed_target,
                     self.stats.buffer_trims,
                 )
-        else:
-            output = self.output_buffer.get(frames)
+
+        output = self.output_buffer.get(frames)
+
+        # Record the post-read level: the true sawtooth trough occurs right
+        # before a burst lands, and only the post-read sample at the
+        # preceding callback captures it (pre-read sampling sits one
+        # callback higher and hides the real floor).
+        self._level_window.append(self.output_buffer.available)
 
         # Count REAL underruns only: the ring's counter increments when a
         # read could not be fully served (zero-padded output = audible gap).
@@ -1102,11 +1139,41 @@ class RealtimeVoiceChangerUnified:
                 # target_len = hop_out: forces output to exactly output-hop
                 # samples and places the hold-back contiguously after
                 # the output boundary, preventing latency drift.
+                sola_in_len = len(output_48k)
                 if self.config.use_sola:
                     output_48k = sola_crossfade(
                         output_48k,
                         self._sola_state,
                         target_len=self._hop_samples_out,
+                    )
+
+                # --- Boundary-continuity diagnostics ---
+                # Tracks the per-chunk content advance vs the expected
+                # hop.  A non-zero SOLA offset skips that many samples of
+                # the new chunk (replaced by the held-back prev tail), and a
+                # SOLA output shorter than hop_out is a content deficit —
+                # both manifest as "phonemes cut at the boundary" / periodic
+                # stutter on sustained tones.  Logged throttled.
+                if not hasattr(self, "_bdiag_n"):
+                    self._bdiag_n = 0
+                    self._bdiag_balance = 0  # emitted - expected (samples)
+                self._bdiag_n += 1
+                sola_out_len = len(output_48k)
+                self._bdiag_balance += sola_out_len - self._hop_samples_out
+                if (
+                    self._bdiag_n <= 5
+                    or self._bdiag_n % 50 == 0
+                    or (self.config.use_sola and self._sola_state.last_offset != 0
+                        and self._bdiag_n <= 200)
+                ):
+                    off = self._sola_state.last_offset if self.config.use_sola else 0
+                    logger.info(
+                        "[BOUNDARY] chunk#%d sola_in=%d out=%d hop=%d offset=%d "
+                        "balance=%d (%.1fms)",
+                        self._bdiag_n, sola_in_len, sola_out_len,
+                        self._hop_samples_out, off,
+                        self._bdiag_balance,
+                        self._bdiag_balance * 1000.0 / self._runtime_output_sample_rate,
                     )
 
                 # --- Stage 7.5: Boundary gain continuity ---
@@ -1474,6 +1541,8 @@ class RealtimeVoiceChangerUnified:
             hubert_context_sec=cfg.hubert_context_sec,
             fixed_harmonics=cfg.fixed_harmonics,
             f0_context_sec=cfg.f0_context_sec,
+            f0_hole_fill_ms=cfg.f0_hole_fill_ms,
+            uv_ramp_ms=cfg.uv_ramp_ms,
         )
 
     def _reset_boundary_continuity_state(self) -> None:
@@ -1484,35 +1553,16 @@ class RealtimeVoiceChangerUnified:
     def _apply_output_boundary_gain(self, output: np.ndarray) -> np.ndarray:
         """Apply a mild post-SOLA gain ramp to smooth boundary loudness.
 
-        The adjustment is intentionally conservative:
-        - short analysis window (5ms),
-        - tight gain clamp (0.9x..1.1x),
-        - short ramp (10ms),
-        - disabled for quiet heads (e.g., breaths).
+        DISABLED: this runs *after* SOLA and applies a gain step at the chunk
+        boundary (prev tail ends at gain 1.0, next head starts at ``ratio``
+        0.9..1.1, ramping back over 10ms).  On sustained tones any >2% RMS
+        difference between the SOLA splice region and the previous tail fires
+        this every chunk, amplitude-modulating the seam at the chunk rate
+        (~4Hz) — audible as periodic stutter.  SOLA + the stateful
+        limiter/treble already keep boundary loudness smooth, so the
+        post-SOLA gain step does more harm than good.  Kept as a no-op for
+        easy re-enable / experimentation.
         """
-        if len(output) == 0:
-            return output
-
-        boundary = min(
-            len(output),
-            max(1, int(self._runtime_output_sample_rate * 0.005)),
-        )
-        head_rms = float(np.sqrt(np.mean(output[:boundary] ** 2) + 1e-10))
-        min_rms = 2e-3
-
-        if self._prev_tail_rms >= min_rms and head_rms >= min_rms:
-            ratio = float(np.clip(self._prev_tail_rms / head_rms, 0.9, 1.1))
-            if abs(ratio - 1.0) >= 0.02:
-                ramp_len = min(
-                    len(output),
-                    max(boundary, int(self._runtime_output_sample_rate * 0.010)),
-                )
-                ramp = np.linspace(ratio, 1.0, ramp_len, dtype=np.float32)
-                adjusted = output.copy()
-                adjusted[:ramp_len] *= ramp
-                output = adjusted
-
-        self._prev_tail_rms = float(np.sqrt(np.mean(output[-boundary:] ** 2) + 1e-10))
         return output
 
     def _clear_queues(self) -> None:

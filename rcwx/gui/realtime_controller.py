@@ -105,6 +105,7 @@ class RealtimeController:
                 output_channels=self.app.audio_settings.output_channels,
                 input_channel_selection=self.app.audio_settings.get_channel_selection(),
                 output_channel_selection=self.app.audio_settings.get_output_channel_selection(),
+                asio_buffer_size=self.app.audio_settings.asio_buffer_size,
                 # Latency settings
                 chunk_sec=latency["chunk_sec"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
@@ -133,6 +134,8 @@ class RealtimeController:
                 enable_octave_flip_suppress=self.app.pitch_control.enable_octave_flip_suppress,
                 enable_f0_slew_limit=self.app.pitch_control.enable_f0_slew_limit,
                 f0_slew_max_step_st=self.app.pitch_control.f0_slew_max_step_st,
+                f0_hole_fill_ms=self.app.config.inference.f0_hole_fill_ms,
+                uv_ramp_ms=self.app.config.inference.uv_ramp_ms,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
                 # Post-processing

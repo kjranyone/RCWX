@@ -117,6 +117,7 @@ rcwx/
 | `input_channel_selection` |   `auto` | left/right/average/auto |
 | `input_hostapi_filter`    | `WASAPI` | Windows向け             |
 | `output_hostapi_filter`   | `WASAPI` | Windows向け             |
+| `asio_buffer_size`        |      `0` | ASIOバッファ (frames、0=ドライバパネル準拠。min/max/granularityに自動スナップ) |
 
 ### `InferenceConfig` (`rcwx/config.py`)
 
@@ -145,6 +146,8 @@ rcwx/
 | `enable_octave_flip_suppress` |   `true` | 1オクターブF0飛び補正           |
 | `enable_f0_slew_limit`        |   `true` | フレーム間F0変化量制限          |
 | `f0_slew_max_step_st`         |    `3.6` | 最大F0ステップ (semitones)      |
+| `f0_hole_fill_ms`             |   `30.0` | 有声区間内の短い無声穴を補間で埋める上限 (ms、<=0で無効。ノイズ励振バースト=かすれ対策) |
+| `uv_ramp_ms`                  |    `5.0` | NSF有声/無声励振のクロスフェード長 (ms、0で従来のハード切替) |
 | `denoise.enabled`             |   `true` | ノイズ除去                      |
 | `denoise.method`              |     `ml` | `auto` / `ml` / `spectral`      |
 
@@ -174,6 +177,8 @@ rcwx/
 - `pre_hubert_pitch_ratio` (既定 0.08)
 - `noise_scale` (既定 0.45)
 - `f0_lowpass_cutoff_hz` (既定 16.0)
+- `f0_hole_fill_ms` (既定 30.0、有声区間内の短い無声穴を log2 補間で埋める。長い穴=真の無声子音は保持)
+- `uv_ramp_ms` (既定 5.0、NSFのサイン/ノイズ励振切替を~5msでクロスフェード)
 - `fixed_harmonics` (既定 true)
 - `decoder_overlap_frames` (既定 5、1フレーム=10ms、チャンク境界のデコーダ連続性用)
 - `postprocess_enabled` (既定 true) / `treble_boost_db` (既定 4.0) / `treble_cutoff_hz` (既定 2800.0) / `limiter_threshold_db` (既定 -1.0) / `limiter_release_ms` (既定 80.0)

@@ -9,7 +9,12 @@ import customtkinter as ctk
 
 from rcwx.audio.input import list_input_devices
 from rcwx.audio.output import list_output_devices
-from rcwx.audio.stream_base import is_device_on_asio, query_asio_channel_names
+from rcwx.audio.stream_base import (
+    enumerate_asio_buffer_sizes,
+    is_device_on_asio,
+    query_asio_buffer_sizes,
+    query_asio_channel_names,
+)
 from rcwx.config import (
     normalize_input_channel_selection,
     normalize_output_channel_selection,
@@ -328,6 +333,35 @@ class AudioSettingsFrame(ctk.CTkFrame):
         )
         self.apply_recommended_btn.grid(row=0, column=1, padx=(10, 0))
 
+        # ASIO buffer size selection (effective only for ASIO devices)
+        self.asio_buffer_label = ctk.CTkLabel(
+            self,
+            text="ASIOバッファサイズ",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.asio_buffer_label.grid(row=16, column=0, sticky="w", padx=10, pady=(8, 2))
+
+        # Internal value in frames; 0 = follow the driver control panel.
+        self._asio_buffer_size: int = 0
+        self.asio_buffer_dropdown = ctk.CTkOptionMenu(
+            self,
+            values=["自動 (パネル設定)", "64", "128", "256", "512", "1024", "2048"],
+            width=200,
+            command=self._on_asio_buffer_change,
+        )
+        self.asio_buffer_dropdown.grid(row=17, column=0, sticky="w", padx=10, pady=2)
+
+        self.asio_buffer_caption = ctk.CTkLabel(
+            self,
+            text="選択デバイスがサポートするサイズのみ表示。次回の変換開始時に適用",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+        )
+        self.asio_buffer_caption.grid(row=18, column=0, sticky="w", padx=10, pady=(0, 5))
+
+        # Populate from the current device (hidden for non-ASIO devices)
+        self._update_asio_buffer_options()
+
         # Configure grid
         self.grid_columnconfigure(0, weight=1)
 
@@ -340,6 +374,63 @@ class AudioSettingsFrame(ctk.CTkFrame):
         self._cached_input_names: list[str] | None = None
         self._cached_output_names: list[str] | None = None
 
+
+    def _on_asio_buffer_change(self, selected: str) -> None:
+        """Handle ASIO buffer size dropdown change."""
+        self._asio_buffer_size = int(selected) if selected.isdigit() else 0
+
+    def _update_asio_buffer_options(self) -> None:
+        """Rebuild the ASIO buffer dropdown from the selected device.
+
+        Only sizes the driver actually supports (via
+        ``PaAsio_GetAvailableBufferSizes``) are listed; the whole control
+        is hidden for non-ASIO output devices.
+        """
+        device = self.output_device
+        is_asio = device is not None and is_device_on_asio(device, "output")
+        if not is_asio:
+            self.asio_buffer_label.grid_remove()
+            self.asio_buffer_dropdown.grid_remove()
+            self.asio_buffer_caption.grid_remove()
+            return
+
+        self.asio_buffer_label.grid()
+        self.asio_buffer_dropdown.grid()
+        self.asio_buffer_caption.grid()
+
+        sizes = query_asio_buffer_sizes(device, "output")
+        if sizes is not None:
+            supported = enumerate_asio_buffer_sizes(sizes)
+            values = ["自動 (パネル設定)"] + [str(s) for s in supported]
+        else:
+            # Query unavailable (e.g. driver busy): generic list; the
+            # stream open snaps to driver constraints anyway.
+            supported = []
+            values = ["自動 (パネル設定)", "64", "128", "256", "512", "1024", "2048"]
+        self.asio_buffer_dropdown.configure(values=values)
+
+        # Keep the current selection if the new device supports it;
+        # otherwise fall back to auto.
+        if self._asio_buffer_size > 0 and str(self._asio_buffer_size) in values:
+            self.asio_buffer_dropdown.set(str(self._asio_buffer_size))
+        elif self._asio_buffer_size > 0:
+            self._asio_buffer_size = 0
+            self.asio_buffer_dropdown.set("自動 (パネル設定)")
+        else:
+            self.asio_buffer_dropdown.set("自動 (パネル設定)")
+
+    def set_asio_buffer_size(self, size: int) -> None:
+        """Restore the ASIO buffer size selection (0 = follow panel)."""
+        self._asio_buffer_size = max(0, int(size))
+        if self._asio_buffer_size > 0:
+            self.asio_buffer_dropdown.set(str(self._asio_buffer_size))
+        else:
+            self.asio_buffer_dropdown.set("自動 (パネル設定)")
+
+    @property
+    def asio_buffer_size(self) -> int:
+        """Selected ASIO buffer size in frames (0 = follow panel)."""
+        return self._asio_buffer_size
 
     def _on_input_api_change(self, selected_api: str) -> None:
         """Handle input API filter change."""
@@ -645,6 +736,11 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
     def _update_output_channel_selection_state(self) -> None:
         """Rebuild output channel dropdown based on output device."""
+        # The ASIO buffer options track the same device change (guarded:
+        # this method first runs during __init__ before those widgets exist).
+        if hasattr(self, "asio_buffer_dropdown"):
+            self._update_asio_buffer_options()
+
         n = self.output_channels
         is_asio = (
             self.output_device is not None
