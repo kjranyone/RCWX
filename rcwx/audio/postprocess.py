@@ -32,12 +32,19 @@ class TrebleBoost:
     def __init__(self, sample_rate: int, config: PostprocessConfig):
         self.sample_rate = sample_rate
         self.config = config
+        # True until the first process() call after (re)design/reset; consumed
+        # to warm-start the filter against the incoming chunk's DC level.
+        # Subsequent chunks reuse the accumulated state directly — scaling by
+        # audio[0] on every chunk would throw away the resonator's phase memory
+        # and inject a click at every chunk boundary on sustained tones.
+        self._warm_start = True
         self._design_filter()
 
     def _design_filter(self) -> None:
         if self.config.treble_boost_db <= 0:
             self.b, self.a = np.array([1.0]), np.array([1.0])
             self.zi = np.array([0.0])
+            self._warm_start = True
             return
 
         nyquist = self.sample_rate / 2
@@ -59,15 +66,22 @@ class TrebleBoost:
         self.b = np.array([b0, b1, b2], dtype=np.float32) / a0
         self.a = np.array([1.0, a1 / a0, a2 / a0], dtype=np.float32)
         self.zi = signal.lfilter_zi(self.b, self.a).astype(np.float32)
+        self._warm_start = True
 
     def reset(self) -> None:
         self.zi = signal.lfilter_zi(self.b, self.a).astype(np.float32)
+        self._warm_start = True
 
     def process(self, audio: np.ndarray) -> np.ndarray:
         if self.config.treble_boost_db <= 0 or len(audio) == 0:
             return audio
 
-        filtered, self.zi = signal.lfilter(self.b, self.a, audio, zi=self.zi * audio[0])
+        if self._warm_start:
+            zi_use = self.zi * audio[0]
+            self._warm_start = False
+        else:
+            zi_use = self.zi
+        filtered, self.zi = signal.lfilter(self.b, self.a, audio, zi=zi_use)
         return filtered.astype(np.float32)
 
 
