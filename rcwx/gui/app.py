@@ -1182,6 +1182,12 @@ class RCWXApp(ctk.CTk):
 
         tab_name = self.tabview.get()
         if tab_name == "オーディオ":
+            # Rebuild PortAudio's device cache so devices plugged in after
+            # startup become visible. Only safe while no stream is running.
+            if not self._is_running:
+                from rcwx.audio.stream_base import reinit_portaudio
+                if reinit_portaudio():
+                    self.audio_settings._refresh_devices()
             # Start auto-refresh when audio tab is selected
             self.audio_settings.start_auto_refresh(interval_ms=1000)
         else:

@@ -294,6 +294,24 @@ def parse_output_channel_pair(selection: str) -> Optional[tuple[int, int]]:
     return None
 
 
+def reinit_portaudio() -> bool:
+    """Rebuild PortAudio's internal device cache.
+
+    PortAudio enumerates devices only at ``Pa_Initialize`` time, so devices
+    plugged in after process start are invisible to ``sd.query_devices()``
+    until we terminate and re-initialize. Must NOT be called while any
+    sounddevice stream is active — doing so crashes PortAudio.
+    Returns True on success.
+    """
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as e:
+        logger.warning("PortAudio reinit failed: %s", e)
+        return False
+
+
 def list_devices(stream_type: str, wasapi_only: bool = False) -> list[dict]:
     """
     List available audio devices.
