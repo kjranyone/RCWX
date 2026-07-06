@@ -8,13 +8,12 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from fractions import Fraction
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import torch
-from scipy.signal import butter, filtfilt, medfilt, resample_poly
+from scipy.signal import butter, filtfilt, medfilt
 
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
@@ -33,14 +32,7 @@ logger = logging.getLogger(__name__)
 # 64 frames @ 100fps = 640ms worth of features
 MIN_SYNTH_FEATURE_FRAMES = 64
 
-# Maximum audio context for HuBERT in streaming mode (16kHz samples).
-# Longer context = better feature quality (HuBERT is a transformer that
-# benefits from seeing more audio).  F0 is extracted on the current chunk
-# only (pitch detection is local), so this doesn't affect F0 processing time.
-# 2.0s (32000 samples) gives cosine similarity ~0.60 vs batch features.
-# Keep within practical CLI/GUI pitch range.
-# GUI pitch slider is -24..+24 semitones.
-MAX_PRE_HUBERT_SHIFT_ST = 24.0
+# Upper bound for moe_boost strength (F0-only stylization intensity).
 MAX_MOE_BOOST = 1.0
 F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 # Windowed-F0 extraction floor (16kHz samples, 0.56s).  RMVPE's U-Net needs a
@@ -60,12 +52,6 @@ SWIFTF0_VOICING_THRESHOLD = 0.35
 # values are restored), so single-frame glitch suppression never latches
 # onto real octave jumps or fast slides.
 F0_CORRECTION_SUSTAIN_FRAMES = 3
-# Adaptive pre-HuBERT shift stabilization: a per-hop median-F0 estimate is
-# noisy, and a time-varying resample ratio warps the shared audio history
-# differently every chunk (feature flutter at chunk boundaries).
-ADAPTIVE_SHIFT_DEADBAND_ST = 0.25
-ADAPTIVE_SHIFT_SLEW_ST_PER_SEC = 2.0
-
 
 class _StageProfiler:
     """Per-stage timing without hot-path device syncs.
@@ -161,7 +147,6 @@ class StreamingParams:
     use_parallel_extraction: bool = True
     noise_scale: float = 0.66666
     sola_extra_samples: int = 0
-    pre_hubert_pitch_ratio: float = 0.0
     moe_boost: float = 0.0
     f0_lowpass_cutoff_hz: float = 16.0
     enable_octave_flip_suppress: bool = True
@@ -181,219 +166,6 @@ class StreamingParams:
     # Voiced/unvoiced crossfade ramp (ms) for the NSF sine/noise excitation
     # switch.  0 keeps the original RVC hard switch.
     uv_ramp_ms: float = 5.0
-
-
-def compute_pre_hubert_shift(pitch_shift: int, ratio: float) -> float:
-    """Compute bounded pre-HuBERT shift in semitones."""
-    ratio = max(0.0, min(1.0, float(ratio)))
-    shift = float(pitch_shift) * ratio
-    if shift > MAX_PRE_HUBERT_SHIFT_ST:
-        return MAX_PRE_HUBERT_SHIFT_ST
-    if shift < -MAX_PRE_HUBERT_SHIFT_ST:
-        return -MAX_PRE_HUBERT_SHIFT_ST
-    return shift
-
-
-def compute_post_f0_shift(pitch_shift: int, pre_hubert_shift: float) -> float:
-    """Compute residual F0 shift after pre-HuBERT audio shift."""
-    return float(pitch_shift) - float(pre_hubert_shift)
-
-
-def estimate_median_f0_autocorr(
-    audio_16k: np.ndarray,
-    sample_rate: int = 16000,
-    f0_min_hz: float = 70.0,
-    f0_max_hz: float = 420.0,
-    max_analysis_sec: float = 0.45,
-) -> tuple[Optional[float], float, float]:
-    """Estimate median F0 (Hz) from audio using lightweight autocorrelation.
-
-    Returns:
-        (median_f0_hz or None, voiced_ratio, periodicity_score)
-    """
-    audio = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
-    if audio.size < int(sample_rate * 0.08):
-        return None, 0.0, 0.0
-
-    max_samples = int(max(0.05, max_analysis_sec) * sample_rate)
-    if audio.size > max_samples:
-        audio = audio[-max_samples:]
-
-    frame_len = int(0.032 * sample_rate)  # 32ms
-    hop = int(0.010 * sample_rate)  # 10ms
-    if frame_len <= 0 or hop <= 0 or audio.size < frame_len:
-        return None, 0.0, 0.0
-
-    min_lag = int(sample_rate / max(f0_max_hz, 1e-6))
-    max_lag = int(sample_rate / max(f0_min_hz, 1e-6))
-    if min_lag < 1 or max_lag <= min_lag or frame_len <= max_lag + 1:
-        return None, 0.0, 0.0
-
-    num_frames = 1 + (audio.size - frame_len) // hop
-    energies = np.zeros(num_frames, dtype=np.float32)
-    for i in range(num_frames):
-        start = i * hop
-        frame = audio[start : start + frame_len]
-        energies[i] = float(np.mean(frame * frame))
-
-    energy_gate = max(1e-7, float(np.quantile(energies, 0.35)) * 0.30)
-    window = np.hanning(frame_len).astype(np.float32)
-
-    f0_values: list[float] = []
-    periodicity_scores: list[float] = []
-    voiced_frames = 0
-
-    for i in range(num_frames):
-        if energies[i] < energy_gate:
-            continue
-
-        start = i * hop
-        frame = audio[start : start + frame_len]
-        frame = (frame - float(np.mean(frame))) * window
-
-        acf = np.correlate(frame, frame, mode="full")[frame_len - 1 :]
-        acf0 = float(acf[0])
-        if acf0 <= 1e-8:
-            continue
-
-        segment = acf[min_lag : max_lag + 1]
-        if segment.size == 0:
-            continue
-        lag_offset = int(np.argmax(segment))
-        lag = min_lag + lag_offset
-        periodicity = float(segment[lag_offset] / acf0)
-        if periodicity < 0.32:
-            continue
-
-        f0_hz = float(sample_rate / lag)
-        if f0_hz < f0_min_hz or f0_hz > f0_max_hz:
-            continue
-        voiced_frames += 1
-        f0_values.append(f0_hz)
-        periodicity_scores.append(periodicity)
-
-    if voiced_frames < 3:
-        return None, 0.0, 0.0
-
-    median_hz = float(np.median(np.asarray(f0_values, dtype=np.float32)))
-    voiced_ratio = float(voiced_frames / max(1, num_frames))
-    periodicity_score = float(np.mean(np.asarray(periodicity_scores, dtype=np.float32)))
-    return median_hz, voiced_ratio, periodicity_score
-
-
-def compute_adaptive_pre_hubert_shift(
-    pitch_shift: int,
-    ratio: float,
-    source_median_f0_hz: Optional[float],
-    moe_boost: float = 0.0,
-    voiced_ratio: float = 0.0,
-    periodicity: float = 0.0,
-) -> float:
-    """Compute pre-HuBERT shift with adaptive upward assist for low register.
-
-    The adaptive assist is only active when:
-    - source median F0 is available,
-    - pitch_shift is upward (>0),
-    - moe_boost > 0.
-    """
-    base_shift = compute_pre_hubert_shift(pitch_shift, ratio)
-    if source_median_f0_hz is None:
-        return base_shift
-
-    strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
-    if pitch_shift <= 0 or strength <= 0.0:
-        return base_shift
-
-    upper_limit = min(float(pitch_shift), MAX_PRE_HUBERT_SHIFT_ST)
-    if upper_limit <= base_shift + 1e-6:
-        return base_shift
-
-    # Match moe stylization target range (higher target for stronger moe_boost).
-    target_median_hz = 165.0 + 75.0 * strength
-    required_shift = 12.0 * math.log2(
-        target_median_hz / max(float(source_median_f0_hz), 1e-5)
-    )
-    required_shift = min(upper_limit, max(base_shift, required_shift))
-
-    voiced_conf = max(0.0, min(1.0, (float(voiced_ratio) - 0.15) / 0.60))
-    periodicity_conf = max(0.0, min(1.0, (float(periodicity) - 0.30) / 0.50))
-    confidence = voiced_conf * periodicity_conf
-    adapt_mix = (0.25 + 0.55 * strength) * confidence
-
-    shift = base_shift + adapt_mix * (required_shift - base_shift)
-    return max(-MAX_PRE_HUBERT_SHIFT_ST, min(MAX_PRE_HUBERT_SHIFT_ST, shift))
-
-
-def _fit_length_center(x: np.ndarray, target_len: int) -> np.ndarray:
-    """Center-crop or symmetric-pad 1D array to target length."""
-    cur_len = len(x)
-    if cur_len == target_len:
-        return x
-    if cur_len > target_len:
-        start = (cur_len - target_len) // 2
-        return x[start : start + target_len]
-
-    pad_total = target_len - cur_len
-    pad_left = pad_total // 2
-    pad_right = pad_total - pad_left
-    pad_mode = "reflect" if cur_len > 1 else "edge"
-    return np.pad(x, (pad_left, pad_right), mode=pad_mode)
-
-
-def pitch_shift_resample(
-    audio_t: torch.Tensor, sample_rate: int, semitones: float
-) -> torch.Tensor:
-    """Pitch-shift audio by resampling with boundary context and fixed length."""
-    if abs(semitones) < 0.01:
-        return audio_t
-
-    ratio = 2.0 ** (semitones / 12.0)
-
-    device = audio_t.device
-    dtype = audio_t.dtype
-    shape = audio_t.shape  # e.g. (1, N) or (N,)
-    audio_np = audio_t.detach().cpu().numpy().squeeze()
-    orig_len = len(audio_np)
-    if orig_len < 8:
-        return audio_t
-
-    # Symmetric context reduces edge artifacts when chunks are shifted independently.
-    max_reflect = max(0, orig_len - 1)
-    context = min(int(sample_rate * 0.04), max_reflect, max(16, orig_len // 4))
-    if context > 0:
-        audio_ctx = np.pad(audio_np, (context, context), mode="reflect")
-    else:
-        audio_ctx = audio_np
-
-    # resample_poly(x, up, down) => len(x) * up / down.
-    # We need output_len ~= len / ratio, so up/down ~= 1/ratio.
-    frac = Fraction(1.0 / ratio).limit_denominator(256)
-    up = frac.numerator
-    down = frac.denominator
-
-    shifted_ctx = resample_poly(
-        audio_ctx, up, down, window=("kaiser", 8.0)
-    ).astype(np.float32)
-    shifted_ctx = _fit_length_center(shifted_ctx, len(audio_ctx))
-
-    if context > 0:
-        shifted = shifted_ctx[context : context + orig_len]
-    else:
-        shifted = _fit_length_center(shifted_ctx, orig_len)
-    shifted = _fit_length_center(shifted, orig_len).astype(np.float32, copy=False)
-
-    # Anchor chunk edges to original audio to avoid boundary discontinuities
-    # when processing chunk-by-chunk in realtime.
-    edge = min(int(sample_rate * 0.01), orig_len // 8)
-    if edge >= 4:
-        ramp = np.linspace(0.0, 1.0, edge, dtype=np.float32)
-        shifted[:edge] = audio_np[:edge] * (1.0 - ramp) + shifted[:edge] * ramp
-        shifted[-edge:] = shifted[-edge:] * (1.0 - ramp) + audio_np[-edge:] * ramp
-
-    result = torch.from_numpy(shifted)
-    if len(shape) > 1:
-        result = result.unsqueeze(0)
-    return result.to(device=device, dtype=dtype)
 
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
@@ -590,12 +362,21 @@ def _align_f0_frames(f0: torch.Tensor, target_frames: int) -> torch.Tensor:
 
 
 def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
-    """Apply moe F0 stylization for brighter, feminine-leaning prosody.
+    """Apply F0-only moe stylization for brighter, feminine-leaning prosody.
 
     Design goals:
-    - lift low register toward a higher target median F0,
+    - lift only low-register contours toward a safer target median F0,
     - preserve and enhance upward accents while softening downward dips,
-    - fill short unvoiced gaps to reduce raspy flicker.
+    - fill short unvoiced gaps to reduce raspy flicker,
+    - avoid touching HuBERT input audio, which is fragile under pitch warps.
+
+    ``strength`` sets the coefficient magnitudes (how aggressive the target is);
+    a separate per-window voiced-ratio ``confidence`` blends the styled contour
+    toward the raw one.  Keeping these two axes distinct (instead of folding
+    ``strength * confidence`` into every coefficient) makes the mapping
+    continuous as confidence -> 0, so a marginally-voiced streaming chunk cannot
+    snap its frames to the register floor and produce an audible pitch step at
+    chunk boundaries.
     """
     strength = max(0.0, min(MAX_MOE_BOOST, float(strength)))
     if strength <= 0.0 or f0.numel() == 0:
@@ -634,31 +415,49 @@ def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
                 filled[start:end] = left * (1.0 - w) + right * w
         return filled
 
-    max_gap_frames = int(2 + 6 * strength)  # 20-80ms @ 100fps
-
-    # Register and contour shaping coefficients.
-    target_median_hz = 165.0 + 75.0 * strength  # 165-240Hz
-    max_up_shift_st = 3.0 + 9.0 * strength      # +3..+12 semitones
-    up_gain = 1.0 + 0.80 * strength
-    down_gain = 1.0 - 0.30 * strength
-    phrase_bias_st = 0.20 + 0.90 * strength
+    # Conservative F0-only mapping: keep register lift bounded and make
+    # expressiveness mostly contour shaping rather than a large constant
+    # pitch jump.  All coefficients depend only on ``strength`` (constant over
+    # the batch), so they are computed once; ``confidence`` enters later purely
+    # as a blend weight.
+    max_gap_frames = int(round(2 + 4 * strength))  # 20-60ms @ 100fps
+    target_median_hz = 165.0 + 55.0 * strength  # 165-220Hz
+    max_up_shift_st = 1.5 + 4.5 * strength      # +1.5..+6 semitones
+    up_gain = 1.0 + 0.45 * strength
+    down_gain = 1.0 - 0.25 * strength
+    phrase_bias_st = 0.10 + 0.45 * strength
+    sat_coef = 0.08 + 0.16 * strength
+    window = max(7, int(7 + 14 * strength))
+    if window % 2 == 0:
+        window += 1
+    floor_rel = target_median_hz * (0.55 + 0.08 * strength)
+    floor_abs = 85.0 + 45.0 * strength
+    floor_hz = float(np.clip(max(floor_rel, floor_abs), 85.0, 220.0))
     max_dev_st = 22.0
 
     styled = f0.clone()
     for b in range(styled.shape[0]):
         row = _fill_short_unvoiced_gaps(styled[b], max_gap_frames=max_gap_frames)
         voiced = row > 0
-        if voiced.sum().item() < 6:
+        n_voiced = int(voiced.sum().item())
+        if n_voiced < 6:
             styled[b] = row
             continue
 
-        voiced_f0 = torch.clamp(row[voiced], min=1e-5, max=1400.0)
+        # Confidence is a blend weight only: styling fades smoothly to identity
+        # on low-voiced windows instead of switching off abruptly, so adjacent
+        # streaming chunks with slightly different voiced ratios stay continuous.
+        voiced_ratio = n_voiced / float(max(1, row.numel()))
+        confidence = max(0.0, min(1.0, (voiced_ratio - 0.12) / 0.50))
+        if confidence <= 1e-4:
+            styled[b] = row
+            continue
+
+        raw_voiced = row[voiced]
+        voiced_f0 = torch.clamp(raw_voiced, min=1e-5, max=1400.0)
         log2_f0 = torch.log2(voiced_f0)
 
         # Local trend (phrase-level baseline at F0 frame rate ~100Hz).
-        window = max(7, int(7 + 14 * strength))
-        if window % 2 == 0:
-            window += 1
         trend_input = torch.nn.functional.pad(
             log2_f0.view(1, 1, -1), (window // 2, window // 2), mode="replicate"
         )
@@ -677,20 +476,20 @@ def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
         dev_st = torch.where(dev_st >= 0, dev_st * up_gain, dev_st * down_gain)
 
         # Soft saturation prevents extreme overshoot at high boost.
-        sat = 1.0 + (0.10 + 0.20 * strength) * torch.abs(dev_st)
+        sat = 1.0 + sat_coef * torch.abs(dev_st)
         dev_st = torch.clamp(dev_st / sat, -max_dev_st, max_dev_st)
 
         shaped_log2 = trend + (dev_st + reg_shift_st + phrase_bias_st) / 12.0
         shaped = torch.exp2(shaped_log2)
 
         # Keep low floor above chesty dips; this is critical for male->female tilt.
-        floor_rel = target_median_hz * (0.58 + 0.10 * strength)
-        floor_abs = 85.0 + 70.0 * strength
-        floor_hz = float(np.clip(max(floor_rel, floor_abs), 85.0, 260.0))
-        shaped = torch.maximum(shaped, torch.tensor(floor_hz, device=row.device, dtype=row.dtype))
+        shaped = torch.maximum(
+            shaped, torch.tensor(floor_hz, device=row.device, dtype=row.dtype)
+        )
         shaped = torch.clamp(shaped, min=0.0, max=940.0)
 
-        row[voiced] = shaped
+        # Blend styled -> raw by confidence (continuous as confidence -> 0).
+        row[voiced] = raw_voiced * (1.0 - confidence) + shaped * confidence
         styled[b] = row
 
     return styled
@@ -1182,10 +981,6 @@ class RVCPipeline:
         # Windowed-F0 history: post-shift/moe, pre-filter F0 (Hz) @100fps,
         # kept in lockstep with the tail of _streaming_audio_history.
         self._streaming_f0_hz_history: Optional[torch.Tensor] = None
-        # Stabilized adaptive pre-HuBERT shift (streaming): value + the
-        # (pitch_shift, ratio, moe) key it was computed under.
-        self._adaptive_shift_state: Optional[float] = None
-        self._adaptive_shift_key: Optional[tuple] = None
 
         # Per-stage times (ms) of the last profiled infer_streaming() call.
         self.stage_times: dict = {}
@@ -1413,9 +1208,6 @@ class RVCPipeline:
         self._streaming_f0_pre_filter_tail: Optional[torch.Tensor] = None
         # Windowed-F0 history (Hz @100fps, aligned with _streaming_audio_history)
         self._streaming_f0_hz_history = None
-        # Stabilized adaptive pre-HuBERT shift state
-        self._adaptive_shift_state = None
-        self._adaptive_shift_key = None
 
     def _sync_device_for_profile(self) -> None:
         """Synchronize the device so stage wall-times reflect real GPU work.
@@ -1539,7 +1331,6 @@ class RVCPipeline:
         synth_min_frames: int | None = MIN_SYNTH_FEATURE_FRAMES,
         history_sec: float = 0.0,
         noise_scale: float = 0.66666,
-        pre_hubert_pitch_ratio: float = 0.0,
         moe_boost: float = 0.0,
         f0_lowpass_cutoff_hz: float = 16.0,
         enable_octave_flip_suppress: bool = True,
@@ -1574,12 +1365,6 @@ class RVCPipeline:
             synth_min_frames: Minimum feature frames for synthesizer decoder.
                 Set to 0 or None to disable short-input padding (test-only).
             history_sec: Prepend this many seconds of past audio for HuBERT context.
-            pre_hubert_pitch_ratio: Ratio of pitch_shift to apply before
-                HuBERT (0.0=disabled, 1.0=full). HuBERT/F0 are extracted
-                from the same shifted audio for alignment, and only the
-                residual shift is applied on F0. When moe_boost>0 and
-                pitch_shift>0, low-register input gets adaptive upward
-                assist based on an autocorrelation median-F0 estimate.
             moe_boost: Moe voice style strength for F0 contour shaping
                 (0.0=off, 1.0=strong).
 
@@ -1740,39 +1525,7 @@ class RVCPipeline:
             audio = audio.unsqueeze(0)
 
         audio = audio.to(self.device)
-        audio_for_hubert = audio
-        base_pre_shift = compute_pre_hubert_shift(pitch_shift, pre_hubert_pitch_ratio)
-        source_median_f0_hz = None
-        source_voiced_ratio = 0.0
-        source_periodicity = 0.0
-        if pitch_shift > 0 and pre_hubert_pitch_ratio > 0.0 and moe_boost > 0.0:
-            source_median_f0_hz, source_voiced_ratio, source_periodicity = estimate_median_f0_autocorr(
-                chunk_audio_np, sample_rate=16000
-            )
-        effective_shift = compute_adaptive_pre_hubert_shift(
-            pitch_shift,
-            pre_hubert_pitch_ratio,
-            source_median_f0_hz=source_median_f0_hz,
-            moe_boost=moe_boost,
-            voiced_ratio=source_voiced_ratio,
-            periodicity=source_periodicity,
-        )
-        if (
-            source_median_f0_hz is not None
-            and abs(effective_shift - base_pre_shift) > 0.1
-        ):
-            logger.debug(
-                "[INFER] Adaptive pre-HuBERT shift: "
-                f"base={base_pre_shift:.2f}st -> {effective_shift:.2f}st "
-                f"(src_med={source_median_f0_hz:.1f}Hz, "
-                f"voiced={source_voiced_ratio:.2f}, periodicity={source_periodicity:.2f})"
-            )
-        if abs(effective_shift) > 0.01:
-            audio_for_hubert = pitch_shift_resample(
-                audio, sample_rate=16000, semitones=effective_shift
-            )
-        f0_source_audio = audio_for_hubert if abs(effective_shift) > 0.01 else audio
-        residual_f0_shift = compute_post_f0_shift(pitch_shift, effective_shift)
+        residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
 
         # Debug: input audio stats
@@ -1801,23 +1554,23 @@ class RVCPipeline:
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
                     return self.hubert.extract(
-                        audio_for_hubert, output_layer=output_layer, output_dim=output_dim
+                        audio, output_layer=output_layer, output_dim=output_dim
                     )
 
             def extract_f0():
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         return self.fcpe.infer(
-                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                            audio, threshold=FCPE_VOICING_THRESHOLD
                         )
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     return self.swiftf0.infer(
-                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         return self.rmvpe.infer(
-                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                            audio, threshold=RMVPE_VOICING_THRESHOLD
                         )
                 return None
 
@@ -1835,7 +1588,7 @@ class RVCPipeline:
         if features is None:
             with torch.autocast(device_type=self.device, dtype=self.dtype):
                 features = self.hubert.extract(
-                    audio_for_hubert, output_layer=output_layer, output_dim=output_dim
+                    audio, output_layer=output_layer, output_dim=output_dim
                 )
 
         logger.info(
@@ -1939,14 +1692,14 @@ class RVCPipeline:
                 if f0_method == "fcpe" and self.fcpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.fcpe.infer(
-                            f0_source_audio, threshold=FCPE_VOICING_THRESHOLD
+                            audio, threshold=FCPE_VOICING_THRESHOLD
                         )
                     logger.debug("F0 extracted with FCPE (sequential)")
 
                 # Use SwiftF0 if requested and available
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     f0 = self.swiftf0.infer(
-                        f0_source_audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                     logger.debug("F0 extracted with SwiftF0 (sequential)")
 
@@ -1954,7 +1707,7 @@ class RVCPipeline:
                 elif self.rmvpe is not None and (f0_method == "rmvpe" or f0 is None):
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
                         f0 = self.rmvpe.infer(
-                            f0_source_audio, threshold=RMVPE_VOICING_THRESHOLD
+                            audio, threshold=RMVPE_VOICING_THRESHOLD
                         )
                     logger.debug("F0 extracted with RMVPE (sequential)")
             else:
@@ -2317,11 +2070,6 @@ class RVCPipeline:
                 (at model sample rate) to compensate for SOLA crossfade
                 deficit — consecutive outputs overlap by this amount so SOLA
                 can crossfade without losing samples.
-            pre_hubert_pitch_ratio: Ratio of pitch_shift applied before HuBERT
-                (0.0=disabled, 1.0=full); only the residual shift is applied on
-                F0. When moe_boost>0 and pitch_shift>0, low-register input gets
-                adaptive upward assist from an autocorrelation median-F0
-                estimate.
             moe_boost: Moe voice style strength for F0 contour shaping.
 
         Returns:
@@ -2348,7 +2096,6 @@ class RVCPipeline:
         use_parallel_extraction = params.use_parallel_extraction
         noise_scale = params.noise_scale
         sola_extra_samples = params.sola_extra_samples
-        pre_hubert_pitch_ratio = params.pre_hubert_pitch_ratio
         moe_boost = params.moe_boost
         f0_lowpass_cutoff_hz = params.f0_lowpass_cutoff_hz
         enable_octave_flip_suppress = params.enable_octave_flip_suppress
@@ -2487,58 +2234,7 @@ class RVCPipeline:
         audio_t = (
             torch.from_numpy(audio_padded).float().unsqueeze(0).to(self.device)
         )
-        audio_t_for_hubert = audio_t
-        base_pre_shift = compute_pre_hubert_shift(pitch_shift, pre_hubert_pitch_ratio)
-        source_median_f0_hz = None
-        source_voiced_ratio = 0.0
-        source_periodicity = 0.0
-        if pitch_shift > 0 and pre_hubert_pitch_ratio > 0.0 and moe_boost > 0.0:
-            source_median_f0_hz, source_voiced_ratio, source_periodicity = estimate_median_f0_autocorr(
-                new_hop_16k, sample_rate=16000
-            )
-        effective_shift = compute_adaptive_pre_hubert_shift(
-            pitch_shift,
-            pre_hubert_pitch_ratio,
-            source_median_f0_hz=source_median_f0_hz,
-            moe_boost=moe_boost,
-            voiced_ratio=source_voiced_ratio,
-            periodicity=source_periodicity,
-        )
-        # --- Stabilize the adaptive shift across chunks ---
-        # The per-hop median-F0 estimate is noisy, and the resample ratio it
-        # drives warps the SHARED audio history: a ratio that jitters chunk
-        # to chunk regenerates different shifted context every time (feature
-        # flutter, SOLA misalignment).  Deadband + per-second slew keeps the
-        # ratio quasi-static while still tracking register changes.
-        shift_key = (pitch_shift, pre_hubert_pitch_ratio, moe_boost)
-        if self._adaptive_shift_state is None or self._adaptive_shift_key != shift_key:
-            self._adaptive_shift_key = shift_key
-            self._adaptive_shift_state = float(effective_shift)
-        else:
-            state = self._adaptive_shift_state
-            delta = float(effective_shift) - state
-            if abs(delta) > ADAPTIVE_SHIFT_DEADBAND_ST:
-                max_step = ADAPTIVE_SHIFT_SLEW_ST_PER_SEC * (new_samples / 16000.0)
-                state += max(-max_step, min(max_step, delta))
-                self._adaptive_shift_state = state
-        effective_shift = self._adaptive_shift_state
-
-        if (
-            source_median_f0_hz is not None
-            and abs(effective_shift - base_pre_shift) > 0.1
-        ):
-            logger.debug(
-                "[INFER-STREAM] Adaptive pre-HuBERT shift: "
-                f"base={base_pre_shift:.2f}st -> {effective_shift:.2f}st "
-                f"(src_med={source_median_f0_hz:.1f}Hz, "
-                f"voiced={source_voiced_ratio:.2f}, periodicity={source_periodicity:.2f})"
-            )
-        if abs(effective_shift) > 0.01:
-            audio_t_for_hubert = pitch_shift_resample(
-                audio_t, sample_rate=16000, semitones=effective_shift
-            )
-        f0_source_audio = audio_t_for_hubert if abs(effective_shift) > 0.01 else audio_t
-        residual_f0_shift = compute_post_f0_shift(pitch_shift, effective_shift)
+        residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
         # Determine HuBERT output params
         if self.synthesizer.version == 1:
@@ -2556,7 +2252,7 @@ class RVCPipeline:
         # older than the window come from _streaming_f0_hz_history.
         f0_window_samples = 0
         f0_slice_samples = 0
-        f0_input = f0_source_audio
+        f0_input = audio_t
         if f0_context_sec > 0:
             f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
             # Fixed slice size: clamp to [F0_MIN_WINDOW_16K, hubert context].
@@ -2572,7 +2268,7 @@ class RVCPipeline:
             pad_extend = f0_slice_samples - f0_window_samples
             win_start = input_length - f0_window_samples
             win_end = t_pad + input_length + t_pad + pad_extend
-            f0_input = f0_source_audio[:, win_start:win_end]
+            f0_input = audio_t[:, win_start:win_end]
 
         # Parallel HuBERT + F0 extraction
         # HuBERT/F0 use the same source audio to preserve alignment.
@@ -2585,7 +2281,7 @@ class RVCPipeline:
                 tok = prof.start() if prof is not None else None
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
                     feats = self.hubert.extract(
-                        audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
+                        audio_t, output_layer=output_layer, output_dim=output_dim
                     )
                 if prof is not None:
                     prof.stop("hubert_ms", tok)
@@ -2635,7 +2331,7 @@ class RVCPipeline:
             tok = prof.start() if prof is not None else None
             with torch.autocast(device_type=self.device, dtype=self.dtype):
                 features = self.hubert.extract(
-                    audio_t_for_hubert, output_layer=output_layer, output_dim=output_dim
+                    audio_t, output_layer=output_layer, output_dim=output_dim
                 )
             if prof is not None:
                 prof.stop("hubert_ms", tok)

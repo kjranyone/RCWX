@@ -196,7 +196,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(
         "Processing "
         f"(pitch shift: {args.pitch}, index_rate: {args.index_rate}, "
-        f"pre_hubert: {args.pre_hubert_pitch}, moe_boost: {args.moe_boost})..."
+        f"moe_boost: {args.moe_boost})..."
     )
     output = pipeline.infer(
         audio,
@@ -205,7 +205,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         f0_method=args.f0_method if not args.no_f0 else "none",
         index_rate=args.index_rate,
         voice_gate_mode="off",
-        pre_hubert_pitch_ratio=args.pre_hubert_pitch,
         moe_boost=args.moe_boost,
         noise_scale=args.noise_scale,
         pad_mode="batch",
@@ -397,16 +396,10 @@ def main() -> int:
         help="FAISS index blending rate (0=disabled, 0.5=balanced, 1=index only)",
     )
     run_parser.add_argument(
-        "--pre-hubert-pitch",
-        type=float,
-        default=0.0,
-        help="Pre-HuBERT pitch shift ratio (0.0=off, 1.0=full pitch shift before HuBERT)",
-    )
-    run_parser.add_argument(
         "--moe-boost",
         type=float,
         default=0.0,
-        help="Moe voice style strength for F0 contour (0.0=off, 1.0=strong)",
+        help="F0-only moe style strength (0.0=off, 1.0=strong)",
     )
     run_parser.add_argument(
         "--noise-scale",

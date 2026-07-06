@@ -1,4 +1,4 @@
-"""Pitch control widget."""
+"""Pitch and F0 controls for the GUI."""
 
 from __future__ import annotations
 
@@ -8,11 +8,7 @@ import customtkinter as ctk
 
 
 class PitchControl(ctk.CTkFrame):
-    """
-    Pitch shift and F0 control widget.
-
-    Also exposes a continuous pre-HuBERT pitch ratio control.
-    """
+    """Pitch shift and F0 control widget."""
 
     def __init__(
         self,
@@ -20,7 +16,6 @@ class PitchControl(ctk.CTkFrame):
         on_pitch_changed: Optional[Callable[[int], None]] = None,
         on_f0_mode_changed: Optional[Callable[[bool], None]] = None,
         on_f0_method_changed: Optional[Callable[[str], None]] = None,
-        on_pre_hubert_pitch_changed: Optional[Callable[[float], None]] = None,
         on_moe_boost_changed: Optional[Callable[[float], None]] = None,
         on_noise_scale_changed: Optional[Callable[[float], None]] = None,
         on_fixed_harmonics_changed: Optional[Callable[[bool], None]] = None,
@@ -34,7 +29,6 @@ class PitchControl(ctk.CTkFrame):
         self.on_pitch_changed = on_pitch_changed
         self.on_f0_mode_changed = on_f0_mode_changed
         self.on_f0_method_changed = on_f0_method_changed
-        self.on_pre_hubert_pitch_changed = on_pre_hubert_pitch_changed
         self.on_moe_boost_changed = on_moe_boost_changed
         self.on_noise_scale_changed = on_noise_scale_changed
         self.on_fixed_harmonics_changed = on_fixed_harmonics_changed
@@ -45,7 +39,6 @@ class PitchControl(ctk.CTkFrame):
         self._pitch: int = 0
         self._use_f0: bool = True
         self._f0_method: str = "rmvpe"
-        self._pre_hubert_pitch_ratio: float = 0.0
         self._moe_boost: float = 0.0
         self._noise_scale: float = 0.4
         self._fixed_harmonics: bool = True
@@ -59,7 +52,7 @@ class PitchControl(ctk.CTkFrame):
         """Setup UI components."""
         self.pitch_label = ctk.CTkLabel(
             self,
-            text="ピッチシフト",
+            text="Pitch Shift",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.pitch_label.grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(5, 2))
@@ -81,23 +74,13 @@ class PitchControl(ctk.CTkFrame):
         self.max_label = ctk.CTkLabel(self, text="+24", font=ctk.CTkFont(size=10))
         self.max_label.grid(row=1, column=2, padx=(5, 10), pady=2)
 
-        self.value_label = ctk.CTkLabel(
-            self,
-            text="現在値: 0 半音",
-            font=ctk.CTkFont(size=12),
-        )
+        self.value_label = ctk.CTkLabel(self, text="Current: 0 st", font=ctk.CTkFont(size=12))
         self.value_label.grid(row=2, column=0, columnspan=3, sticky="w", padx=10, pady=2)
 
         self.preset_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.preset_frame.grid(row=3, column=0, columnspan=3, padx=10, pady=(2, 5), sticky="ew")
 
-        presets = [
-            ("-12", -12),
-            ("-5", -5),
-            ("0", 0),
-            ("+5", 5),
-            ("+12", 12),
-        ]
+        presets = [("-12", -12), ("-5", -5), ("0", 0), ("+5", 5), ("+12", 12)]
         for i, (label, value) in enumerate(presets):
             btn = ctk.CTkButton(
                 self.preset_frame,
@@ -109,7 +92,7 @@ class PitchControl(ctk.CTkFrame):
 
         self.f0_label = ctk.CTkLabel(
             self,
-            text="F0モード",
+            text="F0 Mode",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
         self.f0_label.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(8, 2))
@@ -120,7 +103,7 @@ class PitchControl(ctk.CTkFrame):
         self.f0_var = ctk.StringVar(value="rmvpe")
         self.rmvpe_rb = ctk.CTkRadioButton(
             self.f0_frame,
-            text="RMVPE (高品質)",
+            text="RMVPE",
             variable=self.f0_var,
             value="rmvpe",
             command=self._on_f0_change,
@@ -129,7 +112,7 @@ class PitchControl(ctk.CTkFrame):
 
         self.fcpe_rb = ctk.CTkRadioButton(
             self.f0_frame,
-            text="FCPE (低遅延)",
+            text="FCPE",
             variable=self.f0_var,
             value="fcpe",
             command=self._on_f0_change,
@@ -138,7 +121,7 @@ class PitchControl(ctk.CTkFrame):
 
         self.swiftf0_rb = ctk.CTkRadioButton(
             self.f0_frame,
-            text="SwiftF0 (超高速)",
+            text="SwiftF0",
             variable=self.f0_var,
             value="swiftf0",
             command=self._on_f0_change,
@@ -147,54 +130,22 @@ class PitchControl(ctk.CTkFrame):
 
         self.none_rb = ctk.CTkRadioButton(
             self.f0_frame,
-            text="なし",
+            text="None",
             variable=self.f0_var,
             value="none",
             command=self._on_f0_change,
         )
         self.none_rb.grid(row=0, column=3, padx=5, pady=2)
 
-        self.pre_hubert_label = ctk.CTkLabel(
-            self,
-            text="プレHuBERTシフト比率",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        )
-        self.pre_hubert_label.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(5, 2))
-
-        self.pre_hubert_min = ctk.CTkLabel(self, text="0.0", font=ctk.CTkFont(size=10))
-        self.pre_hubert_min.grid(row=7, column=0, padx=(10, 5), pady=2)
-
-        self.pre_hubert_slider = ctk.CTkSlider(
-            self,
-            from_=0.0,
-            to=1.0,
-            number_of_steps=20,
-            width=250,
-            command=self._on_pre_hubert_change,
-        )
-        self.pre_hubert_slider.set(0.0)
-        self.pre_hubert_slider.grid(row=7, column=1, padx=5, pady=2, sticky="ew")
-
-        self.pre_hubert_value = ctk.CTkLabel(self, text="0.00", width=40, font=ctk.CTkFont(size=11))
-        self.pre_hubert_value.grid(row=7, column=2, padx=(5, 10), pady=2)
-
-        self.pre_hubert_hint = ctk.CTkLabel(
-            self,
-            text="推奨: 0.20〜0.40",
-            font=ctk.CTkFont(size=10),
-            text_color="gray",
-        )
-        self.pre_hubert_hint.grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 5))
-
         self.moe_label = ctk.CTkLabel(
             self,
             text="Moe Boost",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.moe_label.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(5, 2))
+        self.moe_label.grid(row=6, column=0, columnspan=3, sticky="w", padx=10, pady=(5, 2))
 
         self.moe_min = ctk.CTkLabel(self, text="0.0", font=ctk.CTkFont(size=10))
-        self.moe_min.grid(row=10, column=0, padx=(10, 5), pady=2)
+        self.moe_min.grid(row=7, column=0, padx=(10, 5), pady=2)
 
         self.moe_slider = ctk.CTkSlider(
             self,
@@ -205,28 +156,28 @@ class PitchControl(ctk.CTkFrame):
             command=self._on_moe_boost_change,
         )
         self.moe_slider.set(0.0)
-        self.moe_slider.grid(row=10, column=1, padx=5, pady=2, sticky="ew")
+        self.moe_slider.grid(row=7, column=1, padx=5, pady=2, sticky="ew")
 
         self.moe_value = ctk.CTkLabel(self, text="0.00", width=40, font=ctk.CTkFont(size=11))
-        self.moe_value.grid(row=10, column=2, padx=(5, 10), pady=2)
+        self.moe_value.grid(row=7, column=2, padx=(5, 10), pady=2)
 
         self.moe_hint = ctk.CTkLabel(
             self,
-            text="Recommended: 0.40-0.80",
+            text="F0-only register and contour shaping",
             font=ctk.CTkFont(size=10),
             text_color="gray",
         )
-        self.moe_hint.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
+        self.moe_hint.grid(row=8, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 4))
 
         self.noise_scale_label = ctk.CTkLabel(
             self,
             text="Noise Scale",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.noise_scale_label.grid(row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        self.noise_scale_label.grid(row=9, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
 
         self.noise_scale_min = ctk.CTkLabel(self, text="0.0", font=ctk.CTkFont(size=10))
-        self.noise_scale_min.grid(row=14, column=0, padx=(10, 5), pady=2)
+        self.noise_scale_min.grid(row=10, column=0, padx=(10, 5), pady=2)
 
         self.noise_scale_slider = ctk.CTkSlider(
             self,
@@ -237,36 +188,36 @@ class PitchControl(ctk.CTkFrame):
             command=self._on_noise_scale_change,
         )
         self.noise_scale_slider.set(self._noise_scale)
-        self.noise_scale_slider.grid(row=14, column=1, padx=5, pady=2, sticky="ew")
+        self.noise_scale_slider.grid(row=10, column=1, padx=5, pady=2, sticky="ew")
 
         self.noise_scale_value = ctk.CTkLabel(
             self, text=f"{self._noise_scale:.2f}", width=40, font=ctk.CTkFont(size=11)
         )
-        self.noise_scale_value.grid(row=14, column=2, padx=(5, 10), pady=2)
+        self.noise_scale_value.grid(row=10, column=2, padx=(5, 10), pady=2)
 
         self.noise_scale_hint = ctk.CTkLabel(
             self,
-            text="Lower = cleaner/less breathy, Higher = more natural variance",
+            text="Lower = cleaner, Higher = more natural variance",
             font=ctk.CTkFont(size=10),
             text_color="gray",
         )
-        self.noise_scale_hint.grid(row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.noise_scale_hint.grid(row=11, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         self.fixed_harmonics_var = ctk.BooleanVar(value=self._fixed_harmonics)
         self.fixed_harmonics_cb = ctk.CTkCheckBox(
             self,
-            text="倍音位相固定 (チャンク連続性向上)",
+            text="Fixed harmonic phase",
             variable=self.fixed_harmonics_var,
             command=self._on_fixed_harmonics_toggle,
         )
-        self.fixed_harmonics_cb.grid(row=16, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.fixed_harmonics_cb.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         self.f0_stabilizer_label = ctk.CTkLabel(
             self,
             text="F0 Stabilizer",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.f0_stabilizer_label.grid(row=17, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        self.f0_stabilizer_label.grid(row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
 
         self.octave_flip_var = ctk.BooleanVar(value=self._enable_octave_flip_suppress)
         self.octave_flip_cb = ctk.CTkCheckBox(
@@ -275,7 +226,7 @@ class PitchControl(ctk.CTkFrame):
             variable=self.octave_flip_var,
             command=self._on_octave_flip_suppress_toggle,
         )
-        self.octave_flip_cb.grid(row=18, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+        self.octave_flip_cb.grid(row=14, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
 
         self.f0_slew_limit_var = ctk.BooleanVar(value=self._enable_f0_slew_limit)
         self.f0_slew_limit_cb = ctk.CTkCheckBox(
@@ -284,10 +235,10 @@ class PitchControl(ctk.CTkFrame):
             variable=self.f0_slew_limit_var,
             command=self._on_f0_slew_limit_toggle,
         )
-        self.f0_slew_limit_cb.grid(row=19, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
+        self.f0_slew_limit_cb.grid(row=15, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 2))
 
         self.f0_slew_min = ctk.CTkLabel(self, text="1.0", font=ctk.CTkFont(size=10))
-        self.f0_slew_min.grid(row=20, column=0, padx=(10, 5), pady=2)
+        self.f0_slew_min.grid(row=16, column=0, padx=(10, 5), pady=2)
 
         self.f0_slew_slider = ctk.CTkSlider(
             self,
@@ -298,12 +249,12 @@ class PitchControl(ctk.CTkFrame):
             command=self._on_f0_slew_max_step_change,
         )
         self.f0_slew_slider.set(self._f0_slew_max_step_st)
-        self.f0_slew_slider.grid(row=20, column=1, padx=5, pady=2, sticky="ew")
+        self.f0_slew_slider.grid(row=16, column=1, padx=5, pady=2, sticky="ew")
 
         self.f0_slew_value = ctk.CTkLabel(
             self, text=f"{self._f0_slew_max_step_st:.2f}", width=40, font=ctk.CTkFont(size=11)
         )
-        self.f0_slew_value.grid(row=20, column=2, padx=(5, 10), pady=2)
+        self.f0_slew_value.grid(row=16, column=2, padx=(5, 10), pady=2)
 
         self.f0_slew_hint = ctk.CTkLabel(
             self,
@@ -311,10 +262,9 @@ class PitchControl(ctk.CTkFrame):
             font=ctk.CTkFont(size=10),
             text_color="gray",
         )
-        self.f0_slew_hint.grid(row=21, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.f0_slew_hint.grid(row=17, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
 
         self._update_f0_slew_slider_state()
-
         self.grid_columnconfigure(1, weight=1)
 
     def _on_slider_change(self, value: float) -> None:
@@ -335,7 +285,7 @@ class PitchControl(ctk.CTkFrame):
     def _update_value_label(self) -> None:
         """Update pitch value label."""
         sign = "+" if self._pitch > 0 else ""
-        self.value_label.configure(text=f"現在値: {sign}{self._pitch} 半音")
+        self.value_label.configure(text=f"Current: {sign}{self._pitch} st")
 
     def _on_f0_change(self) -> None:
         """Handle F0 mode change."""
@@ -346,13 +296,6 @@ class PitchControl(ctk.CTkFrame):
             self.on_f0_mode_changed(self._use_f0)
         if self.on_f0_method_changed:
             self.on_f0_method_changed(method)
-
-    def _on_pre_hubert_change(self, value: float) -> None:
-        """Handle pre-HuBERT ratio slider change."""
-        self._pre_hubert_pitch_ratio = max(0.0, min(1.0, float(value)))
-        self.pre_hubert_value.configure(text=f"{self._pre_hubert_pitch_ratio:.2f}")
-        if self.on_pre_hubert_pitch_changed:
-            self.on_pre_hubert_pitch_changed(self._pre_hubert_pitch_ratio)
 
     def _on_moe_boost_change(self, value: float) -> None:
         """Handle moe boost slider change."""
@@ -416,7 +359,7 @@ class PitchControl(ctk.CTkFrame):
             self._use_f0 = False
 
     def set_f0_method(self, method: str) -> None:
-        """Set F0 method (rmvpe, fcpe, or none)."""
+        """Set F0 method (rmvpe, fcpe, swiftf0, or none)."""
         self.f0_var.set(method)
         self._use_f0 = method != "none"
         self._f0_method = method
@@ -426,16 +369,6 @@ class PitchControl(ctk.CTkFrame):
         self._pitch = max(-24, min(24, int(value)))
         self.pitch_slider.set(self._pitch)
         self._update_value_label()
-
-    def set_pre_hubert_pitch(self, enabled: bool) -> None:
-        """Backward-compatible bool setter."""
-        self.set_pre_hubert_pitch_ratio(0.35 if enabled else 0.0)
-
-    def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
-        """Set pre-HuBERT pitch ratio (0.0-1.0)."""
-        self._pre_hubert_pitch_ratio = max(0.0, min(1.0, float(ratio)))
-        self.pre_hubert_slider.set(self._pre_hubert_pitch_ratio)
-        self.pre_hubert_value.configure(text=f"{self._pre_hubert_pitch_ratio:.2f}")
 
     def set_moe_boost(self, strength: float) -> None:
         """Set moe boost strength (0.0-1.0)."""
@@ -483,13 +416,8 @@ class PitchControl(ctk.CTkFrame):
 
     @property
     def f0_method(self) -> str:
-        """Get current F0 method (rmvpe, fcpe, or none)."""
+        """Get current F0 method."""
         return self.f0_var.get()
-
-    @property
-    def pre_hubert_pitch_ratio(self) -> float:
-        """Get current pre-HuBERT pitch ratio."""
-        return self._pre_hubert_pitch_ratio
 
     @property
     def moe_boost(self) -> float:

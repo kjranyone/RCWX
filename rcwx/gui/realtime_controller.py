@@ -118,7 +118,6 @@ class RealtimeController:
                 pitch_shift=self.app.pitch_control.pitch,
                 use_f0=self.app.pitch_control.use_f0,
                 f0_method=self.app.pitch_control.f0_method,
-                pre_hubert_pitch_ratio=self.app.pitch_control.pre_hubert_pitch_ratio,
                 moe_boost=self.app.pitch_control.moe_boost,
                 hubert_context_sec=self.app.config.inference.hubert_context_sec,
                 f0_context_sec=self.app.config.inference.f0_context_sec,
@@ -306,10 +305,6 @@ class RealtimeController:
     def set_f0_method(self, method: str) -> None:
         if self.voice_changer:
             self.voice_changer.set_f0_method(method)
-
-    def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
-        if self.voice_changer:
-            self.voice_changer.set_pre_hubert_pitch_ratio(ratio)
 
     def set_moe_boost(self, strength: float) -> None:
         if self.voice_changer:

@@ -29,30 +29,30 @@ This gives a controllable representation for:
 For a given strength `s in [0, 1]`:
 
 1. Short-gap interpolation:
-- fill unvoiced gaps up to `2 + 6s` frames (100 fps basis).
+- fill unvoiced gaps up to `2 + 4s` frames (100 fps basis).
 
 2. Register target:
-- target median: `f_target = 165 + 75s` Hz,
+- target median: `f_target = 165 + 55s` Hz,
 - upward shift only:
-  `shift_st = clamp(12*log2(f_target / median(f_voiced)), 0, 3 + 9s)`.
+  `shift_st = clamp(12*log2(f_target / median(f_voiced)), 0, 1.5 + 4.5s)`.
 
 3. Contour shaping:
 - trend window: `w = odd(max(7, 7 + 14s))`,
 - asymmetric gain:
-  - upward: `1 + 0.80s`,
-  - downward: `1 - 0.30s`.
-- phrase bias: `0.20 + 0.90s` semitones.
+  - upward: `1 + 0.45s`,
+  - downward: `1 - 0.25s`.
+- phrase bias: `0.10 + 0.45s` semitones.
 - soft saturation for stability:
-  `d <- d / (1 + (0.10 + 0.20s)*|d|)`.
+  `d <- d / (1 + (0.08 + 0.16s)*|d|)`.
 
 4. Reconstruction:
 - `l_out = m + (d + shift_st + bias_st) / 12`,
 - `f_out = 2^(l_out)`.
 
 5. Floor/ceiling constraints:
-- relative floor: `f_target * (0.58 + 0.10s)`,
-- absolute floor: `85 + 70s` Hz,
-- applied floor: `max(relative, absolute)` clipped to `[85, 260]`,
+- relative floor: `f_target * (0.55 + 0.08s)`,
+- absolute floor: `85 + 45s` Hz,
+- applied floor: `max(relative, absolute)` clipped to `[85, 220]`,
 - final clip to `[0, 940]` Hz.
 
 ## Why This Works
@@ -75,5 +75,10 @@ It cannot directly perform formant relocation (vocal-tract resonance shift), whi
 - short-gap fill while keeping long gaps,
 - bounded behavior on already-high voices,
 - monotonic register lift with strength.
+
+`tests/integration/test_moe_f0_processing.py` validates:
+- source median-F0 autocorrelation,
+- bounded F0-only register lift,
+- removed pre-HuBERT config-key compatibility.
 
 `tests/integration/test_realtime_drift_control.py` validates runtime drift-control behavior introduced with recent callback-level fixes.

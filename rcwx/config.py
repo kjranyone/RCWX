@@ -215,9 +215,6 @@ class InferenceConfig:
     # <= 0 extracts F0 on the full context (legacy behavior).
     f0_context_sec: float = 0.32
 
-    # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift applied before HuBERT)
-    pre_hubert_pitch_ratio: float = 0.08
-
     # Moe voice style strength (0.0=off, 1.0=strong)
     moe_boost: float = 0.45
 

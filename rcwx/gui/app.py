@@ -191,7 +191,6 @@ class RCWXApp(ctk.CTk):
             on_pitch_changed=self._on_pitch_changed,
             on_f0_mode_changed=self._on_f0_mode_changed,
             on_f0_method_changed=self._on_f0_method_changed,
-            on_pre_hubert_pitch_changed=self._on_pre_hubert_pitch_changed,
             on_moe_boost_changed=self._on_moe_boost_changed,
             on_noise_scale_changed=self._on_noise_scale_changed,
             on_fixed_harmonics_changed=self._on_fixed_harmonics_changed,
@@ -205,8 +204,6 @@ class RCWXApp(ctk.CTk):
         self.pitch_control.set_f0_method(self.config.inference.f0_method)
         self.pitch_control.set_pitch(self.config.inference.pitch_shift)
 
-        # Restore saved pre-HuBERT pitch setting
-        self.pitch_control.set_pre_hubert_pitch_ratio(self.config.inference.pre_hubert_pitch_ratio)
         self.pitch_control.set_moe_boost(self.config.inference.moe_boost)
         self.pitch_control.set_noise_scale(self.config.inference.noise_scale)
         self.pitch_control.set_fixed_harmonics(self.config.inference.fixed_harmonics)
@@ -931,11 +928,6 @@ class RCWXApp(ctk.CTk):
         self._save_config()
         self.realtime_controller.set_f0_method(method)
 
-    def _on_pre_hubert_pitch_changed(self, ratio: float) -> None:
-        """Handle pre-HuBERT pitch shift toggle."""
-        self._save_config()
-        self.realtime_controller.set_pre_hubert_pitch_ratio(ratio)
-
     def _on_moe_boost_changed(self, strength: float) -> None:
         """Handle moe boost change."""
         self._save_config()
@@ -1070,7 +1062,6 @@ class RCWXApp(ctk.CTk):
             "index_rate": self._get_index_rate(),
             "voice_gate_mode": self.voice_gate_mode_var.get(),
             "energy_threshold": self.energy_threshold_slider.get(),
-            "pre_hubert_pitch_ratio": self.pitch_control.pre_hubert_pitch_ratio,
             "moe_boost": self.pitch_control.moe_boost,
             "noise_scale": self.pitch_control.noise_scale,
             "f0_lowpass_cutoff_hz": self.config.inference.f0_lowpass_cutoff_hz,
@@ -1139,7 +1130,6 @@ class RCWXApp(ctk.CTk):
             self.config.inference.index_ratio = self.index_ratio_slider.get()
             self.config.inference.pitch_shift = self.pitch_control.pitch
             self.config.inference.f0_method = self.pitch_control.f0_method
-            self.config.inference.pre_hubert_pitch_ratio = self.pitch_control.pre_hubert_pitch_ratio
             self.config.inference.moe_boost = self.pitch_control.moe_boost
             self.config.inference.noise_scale = self.pitch_control.noise_scale
             self.config.inference.fixed_harmonics = self.pitch_control.fixed_harmonics

@@ -156,7 +156,7 @@ uv run rcwx info model.pth
 │  │ ■ ピッチ制御             │   │ [🎤 テスト(3秒録音→再生)]  │        │
 │  │ -24 ──●── +24   +5半音   │   │ [ ] WAVファイルをループ    │        │
 │  │ F0: (●)RMVPE ( )FCPE     │   │                            │        │
-│  │ pre-HuBERT / Moe / noise │   │ ┌────────────────────────┐ │        │
+│  │ Moe / F0 / noise         │   │ ┌────────────────────────┐ │        │
 │  │                          │   │ │        ▶ 開始         │ │        │
 │  │ ■ FAISSインデックス      │   │ └────────────────────────┘ │        │
 │  │ [✓]有効   ratio 0.15     │   │ 出力レベル ▮▮▮▮▮▯▯  -8 dB  │        │
@@ -221,7 +221,6 @@ uv run rcwx info model.pth
 | `enable_octave_flip_suppress` | true | F0抽出のオクターブ誤検出（±1オクターブのフレーム間ジャンプ）を自動補正。隣接フレーム比が2.0±0.16の場合にトリガー |
 | `enable_f0_slew_limit` | true | フレーム間のF0変化量を制限し、ピッチの急激な飛びを抑制 |
 | `f0_slew_max_step_st` | 3.6 | スルーリミッターの最大ステップ幅（半音/フレーム）。各F0値を前フレームの `2^(±step/12)` 倍以内にクランプ |
-| `pre_hubert_pitch_ratio` | 0.08 | ピッチシフトの一部をHuBERT入力音声に事前適用する比率（0.0〜1.0）。HuBERTがシフト後の音色特徴を認識できるため、音色の精度が向上する。`scipy.signal.resample_poly` で実装（~1ms） |
 
 ### FAISS インデックス
 
@@ -274,15 +273,15 @@ uv run rcwx info model.pth
 
 | 要素 | 式 | s=0 | s=0.45 | s=1.0 |
 |------|-----|-----|--------|-------|
-| 目標メディアン | `165 + 75s` Hz | 165Hz | 199Hz | 240Hz |
-| 最大上方シフト | `3 + 9s` st | +3st | +7st | +12st |
-| 上昇ゲイン | `1 + 0.80s` | 1.0x | 1.36x | 1.80x |
-| 下降ゲイン | `1 - 0.30s` | 1.0x | 0.87x | 0.70x |
-| フレーズバイアス | `0.20 + 0.90s` st | +0.2st | +0.6st | +1.1st |
-| ギャップ補間 | `2 + 6s` frames | 20ms | 50ms | 80ms |
+| 目標メディアン | `165 + 55s` Hz | 165Hz | 190Hz | 220Hz |
+| 最大上方シフト | `1.5 + 4.5s` st | +1.5st | +3.5st | +6st |
+| 上昇ゲイン | `1 + 0.45s` | 1.0x | 1.20x | 1.45x |
+| 下降ゲイン | `1 - 0.25s` | 1.0x | 0.89x | 0.75x |
+| フレーズバイアス | `0.10 + 0.45s` st | +0.1st | +0.3st | +0.55st |
+| ギャップ補間 | `2 + 4s` frames | 20ms | 40ms | 60ms |
 | トレンド窓 | `odd(7 + 14s)` | 7 | 13 | 21 |
-| フロア（相対） | `target × (0.58 + 0.10s)` Hz | 96Hz | 125Hz | 163Hz |
-| フロア（絶対） | `85 + 70s` Hz | 85Hz | 117Hz | 155Hz |
+| フロア（相対） | `target × (0.55 + 0.08s)` Hz | 91Hz | 111Hz | 139Hz |
+| フロア（絶対） | `85 + 45s` Hz | 85Hz | 105Hz | 130Hz |
 
 ### 処理フロー
 
@@ -299,14 +298,6 @@ uv run rcwx info model.pth
   → フロア適用 [85-260Hz] + シーリング [940Hz]
   → 後段フィルタ (lowpass, octave suppress, slew limit)
 ```
-
-### Adaptive Pre-HuBERT Shift との連携
-
-`moe_boost > 0` かつ `pitch_shift > 0` の場合、HuBERT入力音声のピッチシフト量が**自動適応**される。話者の実際の声の高さ（オートコレレーションで推定）に基づき、低音域の声ほどHuBERTに渡す音声を多めにシフトアップする。
-
-- 目標メディアン: `165 + 75s` Hz（moe_boostと同一）
-- 適応ミックス: `(0.25 + 0.55s) × confidence`（声の有声率・周期性に応じた信頼度で重み付け）
-- 高音域の声（既にターゲット付近）では追加シフトはほぼゼロ
 
 ### CLI
 
@@ -417,7 +408,7 @@ explicit = true
 # 主なテスト
 uv run python tests/integration/test_diagnostic.py
 uv run python tests/integration/test_infer_streaming.py
-uv run python tests/integration/test_pre_hubert_pitch.py
+uv run python tests/integration/test_moe_f0_processing.py
 uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
 uv run python tests/models/test_rmvpe.py

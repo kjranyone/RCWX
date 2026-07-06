@@ -203,8 +203,6 @@ class RealtimeConfig:
     # <= 0 extracts F0 on the full HuBERT context (legacy behavior).
     f0_context_sec: float = 0.32
 
-    # Pre-HuBERT pitch shift ratio (0.0=disabled, 1.0=full pitch shift before HuBERT)
-    pre_hubert_pitch_ratio: float = 0.0
     # Moe voice style strength (0.0=off, 1.0=strong)
     moe_boost: float = 0.0
 
@@ -875,9 +873,6 @@ class RealtimeVoiceChangerUnified:
     def set_sola(self, enabled: bool) -> None:
         self.config.use_sola = enabled
 
-    def set_pre_hubert_pitch_ratio(self, ratio: float) -> None:
-        self.config.pre_hubert_pitch_ratio = max(0.0, min(1.0, ratio))
-
     def set_moe_boost(self, strength: float) -> None:
         self.config.moe_boost = max(0.0, min(1.0, float(strength)))
 
@@ -1534,7 +1529,6 @@ class RealtimeVoiceChangerUnified:
             use_parallel_extraction=cfg.use_parallel_extraction,
             noise_scale=cfg.noise_scale,
             sola_extra_samples=self._sola_extra_model,
-            pre_hubert_pitch_ratio=cfg.pre_hubert_pitch_ratio,
             moe_boost=cfg.moe_boost,
             f0_lowpass_cutoff_hz=cfg.f0_lowpass_cutoff_hz,
             enable_octave_flip_suppress=cfg.enable_octave_flip_suppress,

@@ -140,8 +140,7 @@ rcwx/
 | `crossfade_sec`               |   `0.08` | SOLAクロスフェード長            |
 | `use_sola`                    |   `true` | SOLA有効化                      |
 | `sola_search_ms`              |   `10.0` | SOLA探索窓                      |
-| `pre_hubert_pitch_ratio`      |   `0.08` | プレHuBERTシフト比率 (0.0-1.0)  |
-| `moe_boost`                   |   `0.45` | Moeボイススタイル強度 (0.0-1.0) |
+| `moe_boost`                   |   `0.45` | F0-only Moeボイススタイル強度 (0.0-1.0) |
 | `noise_scale`                 |   `0.45` | 合成ノイズスケール (0.0-1.0)    |
 | `f0_lowpass_cutoff_hz`        |   `16.0` | F0ローパスカットオフ (Hz)       |
 | `enable_octave_flip_suppress` |   `true` | 1オクターブF0飛び補正           |
@@ -171,7 +170,6 @@ rcwx/
 - `prebuffer_chunks` (既定 1)
 - `buffer_margin` (既定 0.5)
 - `f0_method` (既定 `rmvpe`)
-- `pre_hubert_pitch_ratio` (既定 0.08)
 - `noise_scale` (既定 0.45)
 - `f0_lowpass_cutoff_hz` (既定 16.0)
 - `max_queue_size` (既定 8)
@@ -246,7 +244,7 @@ uv run rcwx logs --open      # 最新ログを開く
 ```powershell
 uv run python tests/integration/test_diagnostic.py
 uv run python tests/integration/test_infer_streaming.py
-uv run python tests/integration/test_pre_hubert_pitch.py
+uv run python tests/integration/test_moe_f0_processing.py
 uv run python tests/integration/test_moe_clarity_scoring.py
 uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
