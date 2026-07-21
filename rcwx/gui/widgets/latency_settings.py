@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Optional
 
 import customtkinter as ctk
@@ -295,6 +296,11 @@ class LatencySettingsFrame(ctk.CTkFrame):
             inference_est = 50
             buffer_est = self.chunk_sec * 1000
         sola_est = auto["crossfade_sec"] * 1000
+        if self.latency_mode == "frontier":
+            # Frontier retains crossfade+search, rounded to a 10ms model frame.
+            sola_est = math.ceil(
+                (sola_est + auto["sola_search_ms"]) / 10
+            ) * 10
         total_est = self.chunk_sec * 1000 + inference_est + buffer_est + sola_est
 
         self.estimate_label.configure(text=f"推定レイテンシ: ~{int(total_est)}ms")

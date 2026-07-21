@@ -44,7 +44,7 @@ def _compute_sola_extra_model(
     search_samples_out: int,
     decoder_overlap_frames: int,
 ) -> int:
-    """Return the minimum aligned synthesis tail required by fixed-length SOLA.
+    """Return the minimum aligned synthesis margin required by fixed-length SOLA.
 
     At the maximum search offset, SOLA needs ``target + search + crossfade``
     samples. The previous formula added the search window twice even though
@@ -57,6 +57,16 @@ def _compute_sola_extra_model(
     ) // output_sample_rate
     required_model += int(decoder_overlap_frames) * zc_model
     return (required_model + zc_model - 1) // zc_model * zc_model
+
+
+def _effective_decoder_overlap_frames(
+    latency_mode: str,
+    configured_frames: int,
+) -> int:
+    """Drop the unused decoder margin in the 20ms Frontier path."""
+    if latency_mode == "frontier":
+        return 0
+    return max(0, int(configured_frames))
 
 
 # GPU/driver-level failure signatures (Intel level_zero / CUDA).  Once the
@@ -423,7 +433,10 @@ class RealtimeVoiceChangerUnified:
             self._runtime_output_sample_rate,
             crossfade_samples_out,
             search_samples_out,
-            self.config.decoder_overlap_frames,
+            _effective_decoder_overlap_frames(
+                self.config.latency_mode,
+                self.config.decoder_overlap_frames,
+            ),
         )
 
         # Output buffer: 4x chunk capacity (physical ring size)
@@ -590,7 +603,12 @@ class RealtimeVoiceChangerUnified:
         except Exception:
             queued_chunks = 0
         queue_ms = queued_chunks * self._hop_samples_out / self._runtime_output_sample_rate * 1000
-        sola_ms = self.config.crossfade_sec * 1000 if self.config.use_sola else 0
+        sola_extra_model = int(getattr(self, "_sola_extra_model", 0))
+        model_sample_rate = int(getattr(getattr(self, "pipeline", None), "sample_rate", 0))
+        if self.config.use_sola and sola_extra_model > 0 and model_sample_rate > 0:
+            sola_ms = sola_extra_model * 1000.0 / model_sample_rate
+        else:
+            sola_ms = self.config.crossfade_sec * 1000 if self.config.use_sola else 0
 
         self.stats.hop_latency_ms = hop_ms
         self.stats.buffer_latency_ms = buffer_ms
@@ -646,7 +664,10 @@ class RealtimeVoiceChangerUnified:
             self._runtime_output_sample_rate,
             crossfade_samples_out,
             search_samples_out,
-            self.config.decoder_overlap_frames,
+            _effective_decoder_overlap_frames(
+                self.config.latency_mode,
+                self.config.decoder_overlap_frames,
+            ),
         )
 
         # Hop change invalidates the drift-control level window

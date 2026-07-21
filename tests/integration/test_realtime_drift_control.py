@@ -320,6 +320,24 @@ def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
     assert vc.stats.latency_ms == 170.0
 
 
+def test_frontier_latency_counts_full_sola_prefix() -> None:
+    hop_out = 960
+    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="frontier")
+    vc.config.chunk_sec = 0.02
+    vc.config.crossfade_sec = 0.01
+    vc.config.use_sola = True
+    vc.pipeline = SimpleNamespace(sample_rate=48000)
+    vc._sola_extra_model = 1440
+    vc._buffer_floor_samples = 480
+
+    vc._update_latency_estimate(inference_ms=10.0)
+
+    assert vc.stats.hop_latency_ms == 20.0
+    assert vc.stats.buffer_latency_ms == 10.0
+    assert vc.stats.sola_latency_ms == 30.0
+    assert vc.stats.latency_ms == 70.0
+
+
 if __name__ == "__main__":
     test_shed_threshold_above_standing_latency()
     test_no_skip_in_steady_state_small_block()
@@ -332,4 +350,5 @@ if __name__ == "__main__":
     test_frontier_mode_uses_20ms_deadline_policy()
     test_frontier_underrun_rearms_three_hop_prebuffer()
     test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
+    test_frontier_latency_counts_full_sola_prefix()
     print("PASS: realtime drift-control tests")

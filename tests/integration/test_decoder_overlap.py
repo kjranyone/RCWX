@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from rcwx.pipeline.realtime_unified import (
     RealtimeConfig,
     _compute_sola_extra_model,
+    _effective_decoder_overlap_frames,
 )
 
 
@@ -23,6 +24,12 @@ def test_sola_extra_uses_one_search_window() -> None:
 
     # 25ms is rounded up to the decoder's 10ms (480-sample) boundary.
     assert extra == 1440
+
+
+def test_frontier_drops_decoder_overlap_tail() -> None:
+    assert _effective_decoder_overlap_frames("frontier", 5) == 0
+    assert _effective_decoder_overlap_frames("sub100", 5) == 5
+    assert _effective_decoder_overlap_frames("balanced", 5) == 5
 
 
 def test_decoder_overlap_increases_sola_extra():
@@ -104,6 +111,7 @@ def test_decoder_overlap_at_40k():
 
 
 if __name__ == "__main__":
+    test_frontier_drops_decoder_overlap_tail()
     test_decoder_overlap_default_is_5()
     test_decoder_overlap_increases_sola_extra()
     test_decoder_overlap_at_40k()

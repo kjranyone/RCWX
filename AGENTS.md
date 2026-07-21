@@ -211,6 +211,7 @@ rcwx/
 - HuBERTは推論threadから直接dispatchし、SwiftF0だけを永続workerで並列実行
 - 固定64-frame経路では未使用のstreaming feature cloneを作らない
 - SOLA境界INFOログは開始3 hopと100 hopごとに限定
+- Frontierは未参照のdecoder overlap余白を生成せず、`crossfade + search`だけを保持
 - ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
@@ -224,7 +225,7 @@ rcwx/
 - SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
 - 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
 - Sub-100/Frontierの出力guardは推論jitter統計から適応し、アンダーラン後はそれぞれ2/3 hopを再バッファします。
-- SOLA合成末尾は`crossfade + search + decoder overlap`を10msフレームへ切り上げます。
+- SOLA合成末尾は`crossfade + search + decoder overlap`を10msフレームへ切り上げます。Frontierのdecoder overlapは0です。
 
 ## CLI Commands
 
