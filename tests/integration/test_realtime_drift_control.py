@@ -179,7 +179,7 @@ def test_aggressive_mode_caps_non_asio_callback_at_10ms() -> None:
     assert vc._audio_callback_sec() == 0.025
 
 
-def test_sub100_mode_uses_five_ms_callback_and_small_floor() -> None:
+def test_sub100_mode_uses_five_ms_callback_and_jitter_guard() -> None:
     hop_out = 1920
     vc = _make_vc(
         hop_out=hop_out,
@@ -190,7 +190,43 @@ def test_sub100_mode_uses_five_ms_callback_and_small_floor() -> None:
     vc.config.chunk_sec = 0.04
 
     assert vc._audio_callback_sec() == 0.005
-    assert vc._compute_shed_threshold() == (hop_out // 2, hop_out // 8)
+    assert vc._compute_shed_threshold() == (hop_out * 3 // 4, hop_out // 2)
+
+    vc._prebuffer_chunks = 1
+    vc.config.prebuffer_chunks = 1
+    vc.set_latency_mode("sub100")
+    assert vc._prebuffer_chunks == 2
+    assert vc.config.prebuffer_chunks == 2
+
+
+def test_sub100_underrun_rearms_two_hop_prebuffer() -> None:
+    hop_out = 1920
+    frames = 480
+    vc = _make_vc(
+        hop_out=hop_out,
+        out_sr=48000,
+        prebuffer_chunks=2,
+        latency_mode="sub100",
+    )
+
+    first = vc._on_audio_output(frames)
+    assert np.count_nonzero(first) == 0
+    assert vc.stats.buffer_underruns == 1
+    assert vc._output_started is False
+    assert vc._chunks_ready == 0
+
+    vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
+    waiting = vc._on_audio_output(frames)
+    assert np.count_nonzero(waiting) == 0
+    assert vc._output_started is False
+    assert vc._chunks_ready == 1
+
+    vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
+    recovered = vc._on_audio_output(frames)
+    assert np.count_nonzero(recovered) == frames
+    assert vc._output_started is True
+    assert vc._chunks_ready == 2
+    assert vc.stats.buffer_underruns == 1
 
 
 def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
@@ -220,6 +256,7 @@ if __name__ == "__main__":
     test_skip_when_accumulated_above_threshold()
     test_aggressive_mode_sheds_one_hop_floor()
     test_aggressive_mode_caps_non_asio_callback_at_10ms()
-    test_sub100_mode_uses_five_ms_callback_and_small_floor()
+    test_sub100_mode_uses_five_ms_callback_and_jitter_guard()
+    test_sub100_underrun_rearms_two_hop_prebuffer()
     test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
     print("PASS: realtime drift-control tests")

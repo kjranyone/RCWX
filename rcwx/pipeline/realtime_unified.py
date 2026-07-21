@@ -259,6 +259,8 @@ class RealtimeConfig:
     def __post_init__(self) -> None:
         if self.latency_mode not in {"balanced", "aggressive", "sub100"}:
             object.__setattr__(self, "latency_mode", "balanced")
+        if self.latency_mode == "sub100" and self.prebuffer_chunks < 2:
+            object.__setattr__(self, "prebuffer_chunks", 2)
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
         chunk_ms = self.chunk_sec * 1000
@@ -491,8 +493,11 @@ class RealtimeVoiceChangerUnified:
         """
         margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
         if getattr(self.config, "latency_mode", "balanced") == "sub100":
-            shed_threshold = self._hop_samples_out // 2
-            shed_target = self._hop_samples_out // 8
+            # Start with two complete hops, then retain half a hop as jitter
+            # guard. The previous 1/8-hop target left only 5ms at a 40ms hop,
+            # which cannot absorb normal callback phase jitter or p99 spikes.
+            shed_threshold = self._hop_samples_out * 3 // 4
+            shed_target = self._hop_samples_out // 2
             return max(1, shed_threshold), max(0, shed_target)
         if getattr(self.config, "latency_mode", "balanced") == "aggressive":
             # The two-hop floor window filters the normal burst/drain sawtooth.
@@ -927,7 +932,8 @@ class RealtimeVoiceChangerUnified:
             self.start()
 
     def set_prebuffer_chunks(self, chunks: int) -> None:
-        self.config.prebuffer_chunks = max(0, min(3, int(chunks)))
+        minimum = 2 if self.config.latency_mode == "sub100" else 0
+        self.config.prebuffer_chunks = max(minimum, min(3, int(chunks)))
         self._prebuffer_chunks = self.config.prebuffer_chunks
 
     def set_latency_mode(self, mode: str) -> None:
@@ -936,6 +942,9 @@ class RealtimeVoiceChangerUnified:
             if mode in {"balanced", "aggressive", "sub100"}
             else "balanced"
         )
+        if self.config.latency_mode == "sub100" and self._prebuffer_chunks < 2:
+            self.config.prebuffer_chunks = 2
+            self._prebuffer_chunks = 2
 
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
@@ -1088,6 +1097,21 @@ class RealtimeVoiceChangerUnified:
                     ring_underruns,
                     frames,
                     self.output_buffer.available,
+                )
+            if getattr(self.config, "latency_mode", "balanced") == "sub100":
+                # Once a zero-padded read has consumed the jitter guard, the
+                # producer and consumer continue at the same average rate and
+                # cannot rebuild it on their own. Pause playback until two
+                # fresh hops are available instead of crackling on every
+                # following callback.
+                self._output_started = False
+                self._chunks_ready = 0
+                if self._level_window is not None:
+                    self._level_window.clear()
+                self._buffer_floor_samples = 0
+                logger.warning(
+                    "[UNDERRUN] Sub-100 playback re-armed for %d-hop prebuffer",
+                    self._prebuffer_chunks,
                 )
 
         return output

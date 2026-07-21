@@ -44,7 +44,7 @@ def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
         "crossfade_sec": crossfade_ms / 1000,
         "sola_search_ms": sola_search_ms,
         "latency_mode": "sub100" if sub100 else "aggressive" if aggressive else "balanced",
-        "prebuffer_chunks": 1,
+        "prebuffer_chunks": 2 if sub100 else 1,
         "buffer_margin": 0.1 if sub100 else 0.25 if aggressive else 0.5,
         "use_sola": True,
     }
@@ -268,7 +268,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         auto = _auto_params(self.chunk_sec, self.latency_mode)
         if self.latency_mode == "sub100":
             inference_est = 20
-            buffer_est = self.chunk_sec * 125
+            buffer_est = self.chunk_sec * 500
         elif self.latency_mode == "aggressive":
             inference_est = 35
             buffer_est = self.chunk_sec * 250

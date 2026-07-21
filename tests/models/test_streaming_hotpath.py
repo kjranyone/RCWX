@@ -22,11 +22,13 @@ def test_f0_backend_micro_hop_floors() -> None:
     assert RealtimeConfig(chunk_sec=0.01, f0_method="swiftf0").chunk_sec == 0.04
     assert RealtimeConfig(chunk_sec=0.04, f0_method="fcpe").chunk_sec == 0.10
     assert RealtimeConfig(chunk_sec=0.04, f0_method="rmvpe").chunk_sec == 0.32
+    assert RealtimeConfig(latency_mode="sub100", prebuffer_chunks=1).prebuffer_chunks == 2
 
     sub100 = _auto_params(0.04, "sub100")
     assert sub100["crossfade_sec"] == 0.01
     assert sub100["buffer_margin"] == 0.1
     assert sub100["latency_mode"] == "sub100"
+    assert sub100["prebuffer_chunks"] == 2
 
 
 def test_deadline_statistics_track_micro_hop_tail() -> None:

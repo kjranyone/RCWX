@@ -191,12 +191,13 @@ rcwx/
 - Balanced: `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
 - Aggressive: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
 - Sub-100: `chunk_sec` = F0方式の下限、`crossfade_sec` = 10ms
-- `prebuffer_chunks` = 1
+- Balanced/Aggressive: `prebuffer_chunks` = 1
+- Sub-100: `prebuffer_chunks` = 2（アンダーラン時も2 hopを再確保して再開）
 - Balanced: `buffer_margin` = 0.5
 - Aggressive: `buffer_margin` = 0.25、持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
 - Aggressiveの非ASIOコールバック長は最大10ms
 - Sub-100: SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msが下限
-- Sub-100: `buffer_margin` = 0.1、0.5 hopでtrimして0.125 hopへ戻す
+- Sub-100: `buffer_margin` = 0.1、0.75 hopでtrimして0.5 hopを維持
 - Sub-100の非ASIOコールバック長は最大5ms、実行中はDenoiserをバイパス
 - `use_sola` = true
 
