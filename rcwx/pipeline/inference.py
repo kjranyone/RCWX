@@ -19,10 +19,11 @@ from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
 from rcwx.device import get_device, get_dtype
 from rcwx.downloader import get_hubert_path, get_rmvpe_path
+from rcwx.models.fcpe import FCPE, is_fcpe_available
 from rcwx.models.hubert_loader import HuBERTLoader
 from rcwx.models.rmvpe import RMVPE
-from rcwx.models.fcpe import FCPE, is_fcpe_available
-from rcwx.models.swiftf0 import SwiftF0 as SwiftF0Model, is_swiftf0_available
+from rcwx.models.swiftf0 import SwiftF0 as SwiftF0Model
+from rcwx.models.swiftf0 import is_swiftf0_available
 from rcwx.models.synthesizer import SynthesizerLoader
 
 logger = logging.getLogger(__name__)
@@ -1173,6 +1174,10 @@ class RVCPipeline:
 
     def unload(self) -> None:
         """Unload all models to free memory."""
+        if self.hubert is not None:
+            self.hubert.clear_graph_cache()
+        if self.synthesizer is not None:
+            self.synthesizer.clear_graph_cache()
         self.hubert = None
         self.rmvpe = None
         self.fcpe = None
@@ -1518,13 +1523,18 @@ class RVCPipeline:
             f"final={len(audio_np)} (mode={pad_mode})"
         )
 
-        audio = torch.from_numpy(audio_np).float()
+        audio_cpu = torch.from_numpy(audio_np).float()
 
         # Ensure 2D for batch processing
-        if audio.dim() == 1:
-            audio = audio.unsqueeze(0)
+        if audio_cpu.dim() == 1:
+            audio_cpu = audio_cpu.unsqueeze(0)
 
-        audio = audio.to(self.device)
+        audio = audio_cpu.to(self.device)
+        f0_audio = (
+            audio_cpu
+            if f0_method == "swiftf0" and self.swiftf0 is not None
+            else audio
+        )
         residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
 
@@ -1549,7 +1559,13 @@ class RVCPipeline:
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
 
-        if use_parallel_extraction and use_f0:
+        graph_capture_pending = self.hubert.graph_capture_pending(
+            audio, output_layer, output_dim
+        )
+        if graph_capture_pending:
+            logger.info("HuBERT Accelerator Graph capture will run before parallel F0")
+
+        if use_parallel_extraction and use_f0 and not graph_capture_pending:
 
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -1565,7 +1581,7 @@ class RVCPipeline:
                         )
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     return self.swiftf0.infer(
-                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        f0_audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -1699,7 +1715,7 @@ class RVCPipeline:
                 # Use SwiftF0 if requested and available
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     f0 = self.swiftf0.infer(
-                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        f0_audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                     logger.debug("F0 extracted with SwiftF0 (sequential)")
 
@@ -1712,6 +1728,9 @@ class RVCPipeline:
                     logger.debug("F0 extracted with RMVPE (sequential)")
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
+
+            if f0 is not None and f0.device != torch.device(self.device):
+                f0 = f0.to(self.device)
 
             # Phase 5: Trim overlap frames from F0
             # These frames came from the prepended audio cache and should be discarded
@@ -2175,6 +2194,9 @@ class RVCPipeline:
             self._streaming_audio_history = (
                 self._streaming_audio_history[-max_hubert_context_16k:]
             )
+        hubert_history_full = (
+            len(self._streaming_audio_history) >= max_hubert_context_16k
+        )
 
         # Extend audio_16k with HuBERT history (capped at max_hubert_context_16k).
         pre_context_samples = 0
@@ -2231,9 +2253,8 @@ class RVCPipeline:
         trim_right = max(0, t_pad_tgt + extra_pad_tgt - hubert_deficit)
 
         # Convert to tensors
-        audio_t = (
-            torch.from_numpy(audio_padded).float().unsqueeze(0).to(self.device)
-        )
+        audio_cpu_t = torch.from_numpy(audio_padded).float().unsqueeze(0)
+        audio_t = audio_cpu_t.to(self.device)
         residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
         # Determine HuBERT output params
@@ -2252,7 +2273,12 @@ class RVCPipeline:
         # older than the window come from _streaming_f0_hz_history.
         f0_window_samples = 0
         f0_slice_samples = 0
-        f0_input = audio_t
+        f0_source = (
+            audio_cpu_t
+            if f0_method == "swiftf0" and self.swiftf0 is not None
+            else audio_t
+        )
+        f0_input = f0_source
         if f0_context_sec > 0:
             f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
             # Fixed slice size: clamp to [F0_MIN_WINDOW_16K, hubert context].
@@ -2268,7 +2294,7 @@ class RVCPipeline:
             pad_extend = f0_slice_samples - f0_window_samples
             win_start = input_length - f0_window_samples
             win_end = t_pad + input_length + t_pad + pad_extend
-            f0_input = audio_t[:, win_start:win_end]
+            f0_input = f0_source[:, win_start:win_end]
 
         # Parallel HuBERT + F0 extraction
         # HuBERT/F0 use the same source audio to preserve alignment.
@@ -2276,7 +2302,13 @@ class RVCPipeline:
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
 
-        if use_parallel_extraction and use_f0:
+        graph_capture_pending = self.hubert.graph_capture_pending(
+            audio_t, output_layer, output_dim
+        )
+        if graph_capture_pending:
+            logger.info("HuBERT Accelerator Graph capture will run before parallel F0")
+
+        if use_parallel_extraction and use_f0 and not graph_capture_pending:
             def extract_hubert():
                 tok = prof.start() if prof is not None else None
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -2391,6 +2423,9 @@ class RVCPipeline:
                         prof.stop_wall("f0_ms", wall0)
 
             if f0 is not None and f0.numel() > 0:
+                if f0.device != torch.device(self.device):
+                    f0 = f0.to(self.device)
+
                 # FCPE smoothing
                 if f0_method == "fcpe":
                     f0 = _smooth_fcpe_f0(f0)
@@ -2619,6 +2654,10 @@ class RVCPipeline:
                 skip_head=skip_head_feat,
                 return_length=return_length_feat,
                 return_length2=return_length_feat,
+                # Before history is full, skip_head moves every chunk. Capturing
+                # those transient signatures wastes graph memory and can evict
+                # the single steady-state graph needed by real-time inference.
+                use_accelerator_graph=hubert_history_full,
             )
 
         # Voice gating (output is already the target region; shared with infer)
@@ -2668,6 +2707,15 @@ class RVCPipeline:
         if not self._loaded:
             return {"loaded": False}
 
+        hubert_graph_stats = (
+            self.hubert.graph_stats() if self.hubert is not None else None
+        )
+        synthesizer_graph_stats = (
+            self.synthesizer.graph_stats()
+            if self.synthesizer is not None
+            else None
+        )
+
         return {
             "loaded": True,
             "device": self.device,
@@ -2680,4 +2728,6 @@ class RVCPipeline:
             "has_f0": self.has_f0,
             "sample_rate": self.sample_rate,
             "use_compile": self.use_compile,
+            "hubert_accelerator_graph": hubert_graph_stats,
+            "synthesizer_accelerator_graph": synthesizer_graph_stats,
         }

@@ -10,6 +10,8 @@ Reference: https://github.com/lars76/swift-f0
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -71,10 +73,35 @@ def _normalized_periodicity(frame: np.ndarray, lag: int) -> float:
         return -1.0
     a = frame[:-lag]
     b = frame[lag:]
-    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if denom < 1e-8:
+    energy = float(np.dot(a, a) * np.dot(b, b))
+    if energy < 1e-16:
         return -1.0
-    return float(np.dot(a, b) / denom)
+    return float(np.dot(a, b) / np.sqrt(energy))
+
+
+def _reflected_frames(
+    audio: np.ndarray,
+    frame_count: int,
+    frame_size: int,
+    hop_length: int,
+) -> np.ndarray:
+    """Extract all centered analysis frames with one reflection-pad operation."""
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if frame_count <= 0 or frame_size <= 0:
+        return np.empty((0, max(0, frame_size)), dtype=np.float32)
+    if audio.size <= 0:
+        return np.zeros((frame_count, frame_size), dtype=np.float32)
+    if audio.size == 1:
+        return np.zeros((frame_count, frame_size), dtype=np.float32)
+
+    half_frame = frame_size // 2
+    padded = np.pad(audio, (half_frame, half_frame), mode="reflect")
+    centers = ((np.arange(frame_count, dtype=np.float64) + 0.5) * hop_length).astype(
+        np.int64
+    )
+    offsets = np.arange(frame_size, dtype=np.int64)
+    frames = padded[centers[:, None] + offsets[None, :]]
+    return frames - np.mean(frames, axis=1, keepdims=True)
 
 
 def _resolve_octave_from_waveform(
@@ -118,6 +145,13 @@ def _resolve_octave_from_waveform(
     if frame_size % 2 != 0:
         frame_size += 1
 
+    analysis_frames = _reflected_frames(
+        audio_np,
+        frame_count=len(resolved),
+        frame_size=frame_size,
+        hop_length=hop_length,
+    )
+
     multipliers = (0.25, 0.5, 1.0, 2.0)
     prior_weight = 0.08
     trans_weight = 0.28
@@ -132,8 +166,7 @@ def _resolve_octave_from_waveform(
                 states.append([(0.0, 1.0, -1.0)])
                 continue
 
-            center = int((idx + 0.5) * hop_length)
-            frame = _reflect_frame(audio_np, center, frame_size)
+            frame = analysis_frames[idx]
             conf_i = float(conf[idx])
 
             cand: list[tuple[float, float, float]] = []
@@ -210,6 +243,7 @@ class SwiftF0:
 
     INTERNAL_HOP = 256  # SwiftF0's native hop length at 16kHz
     TARGET_HOP = 160    # RCWX standard F0 hop (100fps at 16kHz)
+    MAX_ORT_THREADS = 4
 
     def __init__(
         self,
@@ -229,7 +263,50 @@ class SwiftF0:
             f"Loading SwiftF0 (ONNX/CPU, confidence_threshold={confidence_threshold})"
         )
         self.detector = _SwiftF0Detector(confidence_threshold=confidence_threshold)
-        logger.info("SwiftF0 model loaded")
+        self.ort_intra_op_threads = self._configure_onnx_runtime()
+        logger.info(
+            "SwiftF0 model loaded (ONNX intra-op threads=%d)",
+            self.ort_intra_op_threads,
+        )
+
+    def _configure_onnx_runtime(self) -> int:
+        """Replace swift-f0's single-thread session with a bounded CPU session."""
+        threads = min(self.MAX_ORT_THREADS, max(1, os.cpu_count() or 1))
+        try:
+            import onnxruntime as ort
+
+            detector_module = __import__(
+                type(self.detector).__module__, fromlist=[type(self.detector).__name__]
+            )
+            model_path = Path(detector_module.__file__).with_name("model.onnx")
+            if not model_path.is_file():
+                raise FileNotFoundError(f"SwiftF0 ONNX model not found: {model_path}")
+
+            options = ort.SessionOptions()
+            options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            options.inter_op_num_threads = 1
+            options.intra_op_num_threads = threads
+            session = ort.InferenceSession(
+                str(model_path),
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
+            self.detector.pitch_session = session
+            self.detector.pitch_input_name = session.get_inputs()[0].name
+        except Exception as exc:
+            logger.warning(
+                "Could not configure SwiftF0 ONNX session; using dependency defaults: %s",
+                exc,
+            )
+            session = getattr(self.detector, "pitch_session", None)
+            if session is not None:
+                try:
+                    return max(1, int(session.get_session_options().intra_op_num_threads))
+                except Exception:
+                    pass
+            return 1
+        return threads
 
     @torch.no_grad()
     def infer(

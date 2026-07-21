@@ -5,6 +5,7 @@ RVC Real-time Voice Changer on Intel Arc (XPU)
 ## Features
 
 - **Intel Arc GPU対応** - PyTorch XPU による高速推論
+- **XPU Accelerator Graph** - HuBERTと定常状態のRVC合成をcapture/replayしてCPU起動オーバーヘッドを削減
 - **RVC v1/v2両対応** - 256次元・768次元特徴量モデルに対応
 - **F0あり/なしモデル対応** - RMVPE F0抽出または低遅延モード
 - **リアルタイム変換** - クロスフェード処理による低遅延・高品質変換
@@ -79,7 +80,10 @@ uv sync --extra ml-denoise
 # 3. 必要モデル (HuBERT, RMVPE) のダウンロード
 uv run rcwx download
 
-# 4. GUI起動
+# 4. XPUとAccelerator Graphの確認
+uv run rcwx diagnose
+
+# 5. GUI起動
 uv run rcwx
 ```
 
@@ -101,6 +105,32 @@ uv run rcwx
 - ノイズ除去: **ML** (Facebook Denoiser, 要 `--extra ml-denoise`) / Spectral (標準)
 - FAISS インデックス: **有効** (ratio=0.15)
 - 詳細は [Inference Settings](#inference-settings) 参照
+
+## XPU Accelerator Graph
+
+PyTorch `2.13.0+xpu` では、XPU利用時にAccelerator Graphが自動的に有効になります。HuBERT特徴抽出と、入力shapeが固定された定常状態のRVC Synthesizerが対象です。GUI側の設定操作は必要ありません。
+
+- 変換開始前のウォームアップでHuBERT履歴を満たし、定常状態のSynthesizer Graphを1回capture
+- 実ストリーム開始前に音声履歴とリサンプラー状態をリセットし、capture済みGraphだけを保持
+- Graph API非対応またはcapture失敗時はeager推論へ自動フォールバック
+- `use_compile=true` のSynthesizerはAccelerator Graphを併用せず、従来のcompile経路を使用
+
+利用可否は診断コマンドで確認できます。
+
+```powershell
+uv run rcwx diagnose
+# [OK] XPU Accelerator Graph: True
+```
+
+ドライバーやモデル固有の問題を切り分ける場合は、環境変数で無効化できます。
+
+```powershell
+$env:RCWX_ACCELERATOR_GRAPH = "0"
+uv run rcwx
+
+# 次回以降、自動判定へ戻す
+Remove-Item Env:RCWX_ACCELERATOR_GRAPH
+```
 
 ## RVC Models Directory
 
@@ -315,6 +345,7 @@ uv run rcwx run input.wav model.pth -o out.wav --pitch 6 --moe-boost 0.45
 
 ```
 rcwx/
+├── accelerator_graph.py  # XPU/CUDA固定shape Graphキャッシュ
 ├── config.py              # 設定管理 (JSON永続化)
 ├── device.py              # デバイス選択 (xpu/cuda/cpu)
 ├── downloader.py          # HuggingFace モデルダウンロード
@@ -332,6 +363,7 @@ rcwx/
 │   ├── hubert_loader.py   # ContentVec 特徴抽出 (transformers)
 │   ├── rmvpe.py           # RMVPE F0抽出
 │   ├── fcpe.py            # FCPE F0抽出 (低レイテンシ)
+│   ├── swiftf0.py         # SwiftF0 F0抽出 (ONNX/CPU)
 │   ├── synthesizer.py     # RVC合成器
 │   └── infer_pack/        # RVC コアモジュール
 ├── pipeline/
@@ -368,6 +400,16 @@ rcwx/
 4. **品質維持** - FCPE（Correlation 0.945）≈ RMVPE（Correlation 0.948）
 5. **処理速度37%向上** - FCPEはRMVPEより高速（RTF 0.56x vs 0.54x）
 
+### Accelerator Graph実測
+
+Intel Arc B570、PyTorch `2.13.0+xpu`、固定shapeのRVC v2 Synthesizerでの測定値です。モデルやチャンク設定によって結果は変動します。
+
+| 経路 | eager中央値 | Graph中央値 | 削減率 |
+|------|------------:|------------:|-------:|
+| RVC Synthesizerコア | 18.0ms | 4.5ms | 約75% |
+
+Graph定常時のストリーミング推論全体は中央値約18.6msでした。`noise_scale=0` の決定論的条件ではeager出力とのRMSEと最大絶対誤差はいずれも0です。
+
 ## Supported Models
 
 - RVC v1 (256-dim HuBERT features)
@@ -394,7 +436,8 @@ override-dependencies = [
 
 [tool.uv.sources]
 torch = { index = "pytorch-xpu" }
-torchaudio = { index = "pytorch-xpu" }
+
+# TorchAudio 2.11 is installed from PyPI and supports future Torch releases.
 
 [[tool.uv.index]]
 name = "pytorch-xpu"
@@ -412,6 +455,9 @@ uv run python tests/integration/test_moe_f0_processing.py
 uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
 uv run python tests/models/test_rmvpe.py
+uv run python tests/models/test_accelerator_graph.py
+uv run python tests/models/test_synthesizer_graph.py
+uv run python tests/models/test_runtime_graph_warmup.py
 ```
 
 ## Development
@@ -434,7 +480,7 @@ ruff format rcwx
 ```powershell
 # PyTorch バージョン確認
 uv run python -c "import torch; print(torch.__version__)"
-# → 2.10.0+xpu のように +xpu が付いていることを確認
+# → 2.13.0+xpu のように +xpu が付いていることを確認
 
 # +cpu の場合は uv.lock を再生成
 del uv.lock

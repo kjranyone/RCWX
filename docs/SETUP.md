@@ -61,17 +61,18 @@ uv sync --extra lowlatency
 
 ### XPU が認識されているか確認
 ```powershell
-python -c "import torch; print(f'XPU Available: {torch.xpu.is_available()}')"
+uv run python -c "import torch; print(torch.__version__); print(f'XPU Available: {torch.xpu.is_available()}')"
 ```
 
 **期待される出力:**
 ```
+2.13.0+xpu
 XPU Available: True
 ```
 
 ### GPU 情報の確認
 ```powershell
-python -c "import torch; print(torch.xpu.get_device_name(0))"
+uv run python -c "import torch; print(torch.xpu.get_device_name(0))"
 ```
 
 **出力例:**
@@ -81,15 +82,33 @@ Intel(R) Arc(TM) A770 Graphics
 
 ### 簡単な演算テスト
 ```powershell
-python -c "import torch; x = torch.randn(1000, 1000, device='xpu'); print(f'Tensor on XPU: {x.device}')"
+uv run python -c "import torch; x = torch.randn(1000, 1000, device='xpu'); print(f'Tensor on XPU: {x.device}')"
 ```
 
 ---
 
-## Step 5: torch.compile の確認（オプション）
+## Step 5: XPU Accelerator Graph の確認
+
+RCWXはPyTorch 2.13のAccelerator GraphをXPUで自動的に使用します。HuBERTと定常状態のRVC Synthesizerが対象で、GUI設定は不要です。
 
 ```powershell
-python -c "
+uv run rcwx diagnose
+```
+
+次の行が表示されれば利用可能です。
+
+```text
+[OK] XPU Accelerator Graph: True
+```
+
+変換開始時のウォームアップで固定shapeのGraphをcaptureします。音声履歴は実ストリーム開始前にリセットされるため、ウォームアップ音声が変換結果へ混入することはありません。captureに失敗した環境ではeager推論へ自動的にフォールバックします。
+
+---
+
+## Step 6: torch.compile の確認（オプション）
+
+```powershell
+uv run python -c "
 import torch
 
 @torch.compile
@@ -157,6 +176,21 @@ torch.xpu.empty_cache()
   # torch.compile を使わない場合
   model = model  # torch.compile(model) の代わりに
   ```
+
+### Accelerator Graphを無効化する
+
+Graph captureに関係する問題かを確認するときは、同じPowerShellセッションで無効化して起動します。
+
+```powershell
+$env:RCWX_ACCELERATOR_GRAPH = "0"
+uv run rcwx
+```
+
+自動判定へ戻すには環境変数を削除します。
+
+```powershell
+Remove-Item Env:RCWX_ACCELERATOR_GRAPH
+```
 
 ---
 

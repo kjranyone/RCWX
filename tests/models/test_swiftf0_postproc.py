@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
-from rcwx.models.swiftf0 import _resolve_octave_from_waveform
+from rcwx.models.swiftf0 import (
+    SwiftF0,
+    _reflect_frame,
+    _reflected_frames,
+    _resolve_octave_from_waveform,
+    is_swiftf0_available,
+)
 
 
 def _synthesize_voice_like_audio(
@@ -128,6 +136,33 @@ def test_waveform_viterbi_keeps_unvoiced_zero() -> None:
         confidence=conf,
     )
     assert np.all(out[~voiced] == 0.0), "Unvoiced frames should remain exactly 0"
+
+
+def test_batched_reflected_frames_match_scalar_extraction() -> None:
+    """Batched frame extraction must preserve the resolver's edge behavior."""
+    rng = np.random.default_rng(42)
+    audio = rng.standard_normal(10560).astype(np.float32)
+    frame_count = len(audio) // 160
+    frames = _reflected_frames(audio, frame_count, 1024, 160)
+
+    assert frames.shape == (frame_count, 1024)
+    for idx in (0, 1, frame_count // 2, frame_count - 1):
+        center = int((idx + 0.5) * 160)
+        expected = _reflect_frame(audio, center, 1024)
+        np.testing.assert_allclose(frames[idx], expected, rtol=0.0, atol=0.0)
+
+
+def test_swiftf0_uses_bounded_multithreaded_onnx_session() -> None:
+    """RCWX should override swift-f0's one-thread ONNX Runtime default."""
+    if not is_swiftf0_available():
+        return
+
+    model = SwiftF0(confidence_threshold=0.35)
+    options = model.detector.pitch_session.get_session_options()
+    expected = min(model.MAX_ORT_THREADS, max(1, os.cpu_count() or 1))
+    assert model.ort_intra_op_threads == expected
+    assert options.intra_op_num_threads == expected
+    assert options.inter_op_num_threads == 1
 
 
 if __name__ == "__main__":

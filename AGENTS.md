@@ -60,6 +60,9 @@ AudioInput (mic rate)
 
 - リアルタイム経路は `pipeline/realtime_unified.py` のみを使用
 - チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
+- PyTorch 2.13のAccelerator GraphをHuBERTと定常状態のRVC Synthesizerに自動適用
+- SynthesizerはHuBERT履歴が満杯になるまでeager実行し、開始前warmupで定常Graphをcapture
+- `RCWX_ACCELERATOR_GRAPH=0` でAccelerator Graphを無効化可能
 - 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
 - 旧GUIトグルの `use_feature_cache` は廃止
 - 過負荷時は一時的に `f0_method="none"` と `index_rate=0.0` に自動退避
@@ -68,6 +71,7 @@ AudioInput (mic rate)
 
 ```text
 rcwx/
+├── accelerator_graph.py  # XPU/CUDA共通の固定shape Graphキャッシュ
 ├── cli.py
 ├── config.py
 ├── device.py
@@ -253,6 +257,9 @@ uv run python tests/models/test_cumulative_context.py
 uv run python tests/models/test_pitch_clarity.py
 uv run python tests/models/test_config_wiring.py
 uv run python tests/models/test_hubert_weight_audit.py
+uv run python tests/models/test_accelerator_graph.py
+uv run python tests/models/test_synthesizer_graph.py
+uv run python tests/models/test_runtime_graph_warmup.py
 ```
 
 ## References

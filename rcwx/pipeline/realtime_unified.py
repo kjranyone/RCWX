@@ -1482,14 +1482,32 @@ class RealtimeVoiceChangerUnified:
             else:
                 chunk_16k = warmup_hop
 
-            # Warm up with the same params as production (index/gate disabled)
-            # so shape-dependent kernels match the real path.
-            output_model = self.pipeline.infer_streaming(
-                chunk_16k,
-                overlap_16k,
-                self._build_streaming_params(index_rate=0.0, voice_gate_mode="off"),
+            # Fill HuBERT history before finishing warmup. Synthesizer Graph is
+            # intentionally disabled while skip_head is moving, then captured
+            # once for the steady-state position on the final pass.
+            target_history = max(
+                8960,  # MIN_SYNTH_FEATURE_FRAMES converted to 16kHz samples
+                int(self.config.hubert_context_sec * 16000),
             )
-            _ = self.output_resampler.resample_chunk(output_model)
+            max_passes = max(
+                2,
+                (target_history + max(1, hop_16k) - 1) // max(1, hop_16k) + 2,
+            )
+            warmup_passes = 0
+            for _ in range(max_passes):
+                output_model = self.pipeline.infer_streaming(
+                    chunk_16k,
+                    overlap_16k,
+                    self._build_streaming_params(
+                        index_rate=0.0,
+                        voice_gate_mode="off",
+                    ),
+                )
+                _ = self.output_resampler.resample_chunk(output_model)
+                warmup_passes += 1
+                history = self.pipeline._streaming_audio_history
+                if history is not None and len(history) >= target_history:
+                    break
 
             # Reset warmup side-effects so first real chunk starts cleanly.
             self.pipeline.clear_cache()
@@ -1498,7 +1516,19 @@ class RealtimeVoiceChangerUnified:
             self._sola_state.buffer = None
             self._overlap_buf = None
             self._reset_boundary_continuity_state()
-            logger.info("[WARMUP] Streaming path warmup complete")
+            synth_graph = (
+                self.pipeline.synthesizer.graph_stats()
+                if self.pipeline.synthesizer is not None
+                else {}
+            )
+            logger.info(
+                "[WARMUP] Streaming path warmup complete (%d pass%s, "
+                "synth_graph_entries=%d, captures=%d)",
+                warmup_passes,
+                "" if warmup_passes == 1 else "es",
+                int(synth_graph.get("entries", 0)),
+                int(synth_graph.get("captures", 0)),
+            )
         except Exception as e:
             self._reset_boundary_continuity_state()
             logger.warning(f"[WARMUP] Streaming path warmup failed (non-fatal): {e}")

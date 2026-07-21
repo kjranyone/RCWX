@@ -6,8 +6,9 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "torch>=2.7",
-    "torchaudio>=2.7",
+    "torch==2.13.0+xpu",
+    # TorchAudio 2.11 is the maintenance release compatible with future Torch versions.
+    "torchaudio==2.11.0",
     "pytorch-triton-xpu>=3.5.0",  # XPU Triton for torch.compile on Windows
     "sounddevice>=0.4.6",
     "numpy>=1.24",
@@ -47,7 +48,6 @@ override-dependencies = [
 
 [tool.uv.sources]
 torch = { index = "pytorch-xpu" }
-torchaudio = { index = "pytorch-xpu" }
 pytorch-triton-xpu = { index = "pytorch-xpu" }
 
 [[tool.uv.index]]
