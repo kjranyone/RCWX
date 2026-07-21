@@ -15,7 +15,13 @@ from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.pipeline.realtime_unified import RealtimeStats, RealtimeVoiceChangerUnified
 
 
-def _make_vc(hop_out: int, out_sr: int = 44100, buffer_margin: float = 0.5, prebuffer_chunks: int = 1) -> RealtimeVoiceChangerUnified:
+def _make_vc(
+    hop_out: int,
+    out_sr: int = 44100,
+    buffer_margin: float = 0.5,
+    prebuffer_chunks: int = 1,
+    latency_mode: str = "balanced",
+) -> RealtimeVoiceChangerUnified:
     """Create a minimal RealtimeVoiceChangerUnified instance for output-callback tests."""
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
 
@@ -33,7 +39,10 @@ def _make_vc(hop_out: int, out_sr: int = 44100, buffer_margin: float = 0.5, preb
 
     vc._runtime_output_sample_rate = out_sr
     vc._hop_samples_out = hop_out
-    vc.config = SimpleNamespace(buffer_margin=buffer_margin)
+    vc.config = SimpleNamespace(
+        buffer_margin=buffer_margin,
+        latency_mode=latency_mode,
+    )
     vc.stats = RealtimeStats()
 
     return vc
@@ -138,9 +147,64 @@ def test_skip_when_accumulated_above_threshold() -> None:
     assert len(vc._level_window) == 1  # one fresh post-read entry appended
 
 
+def test_aggressive_mode_sheds_one_hop_floor() -> None:
+    """Aggressive mode treats a persistent one-hop floor as removable lag."""
+    hop_out = 4410
+    frames = 64
+    vc = _make_vc(
+        hop_out=hop_out,
+        buffer_margin=0.25,
+        latency_mode="aggressive",
+    )
+    threshold, target = vc._compute_shed_threshold()
+
+    assert threshold == int(hop_out * 0.75)
+    assert target == hop_out // 4
+
+    vc.output_buffer.add(np.zeros(hop_out * 2, dtype=np.float32))
+    _prime_floor(vc, frames, floor=hop_out)
+    _ = vc._on_audio_output(frames)
+
+    assert vc.stats.buffer_trims == 1
+    assert len(vc._level_window) == 1
+    assert vc._buffer_floor_samples == target
+
+
+def test_aggressive_mode_caps_non_asio_callback_at_10ms() -> None:
+    vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
+    vc.config = SimpleNamespace(chunk_sec=0.1, latency_mode="aggressive")
+    assert vc._audio_callback_sec() == 0.010
+
+    vc.config.latency_mode = "balanced"
+    assert vc._audio_callback_sec() == 0.025
+
+
+def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
+    hop_out = 4800
+    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="aggressive")
+    vc.config.chunk_sec = 0.1
+    vc.config.crossfade_sec = 0.01
+    vc.config.use_sola = True
+    vc._buffer_floor_samples = 1200
+
+    # A freshly added output hop is normal burst/drain state, not another
+    # 100ms of persistent latency.
+    vc.output_buffer.add(np.zeros(hop_out, dtype=np.float32))
+    vc._update_latency_estimate(inference_ms=35.0)
+
+    assert vc.stats.hop_latency_ms == 100.0
+    assert vc.stats.buffer_latency_ms == 25.0
+    assert vc.stats.queue_latency_ms == 0.0
+    assert vc.stats.sola_latency_ms == 10.0
+    assert vc.stats.latency_ms == 170.0
+
+
 if __name__ == "__main__":
     test_shed_threshold_above_standing_latency()
     test_no_skip_in_steady_state_small_block()
     test_no_skip_in_steady_state_large_block()
     test_skip_when_accumulated_above_threshold()
+    test_aggressive_mode_sheds_one_hop_floor()
+    test_aggressive_mode_caps_non_asio_callback_at_10ms()
+    test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
     print("PASS: realtime drift-control tests")

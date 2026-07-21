@@ -122,6 +122,7 @@ class AudioConfig:
     # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
     output_channel_selection: str = "auto"
     # Latency settings
+    latency_mode: str = "balanced"  # balanced / aggressive
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
     # ASIO buffer size in frames (0 = follow the driver control panel /
@@ -136,6 +137,8 @@ class AudioConfig:
         self.output_channel_selection = normalize_output_channel_selection(
             self.output_channel_selection
         )
+        if self.latency_mode not in {"balanced", "aggressive"}:
+            self.latency_mode = "balanced"
 
 
 @dataclass

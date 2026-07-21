@@ -108,6 +108,7 @@ class RealtimeController:
                 asio_buffer_size=self.app.audio_settings.asio_buffer_size,
                 # Latency settings
                 chunk_sec=latency["chunk_sec"],
+                latency_mode=latency["latency_mode"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
                 buffer_margin=latency["buffer_margin"],
                 overlap_sec=latency["overlap_sec"],
@@ -358,10 +359,10 @@ class RealtimeController:
         """Apply latency settings; chunk changes restart asynchronously.
 
         Non-restarting parameters (overlap/crossfade/prebuffer/margin) are
-        applied directly.  A chunk_sec change requires a pipeline restart
-        with fresh warmup, which runs through the same async path as
-        start() so the GUI does not freeze.  Settings arriving mid-restart
-        are stashed and applied once running again.
+        applied directly. Chunk or latency-mode changes require a pipeline
+        restart because the callback size and Graph shapes may change. Fresh
+        warmup runs through the same async path as start(), and settings
+        arriving mid-restart are stashed until the pipeline is running.
         """
         if not self.voice_changer:
             return
@@ -370,21 +371,29 @@ class RealtimeController:
             return
 
         vc = self.voice_changer
-        vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
-        vc.set_buffer_margin(settings["buffer_margin"])
-        vc.set_overlap(settings["overlap_sec"])
-        vc.set_crossfade(settings["crossfade_sec"])
+        mode_changed = settings["latency_mode"] != vc.config.latency_mode
+        chunk_changed = abs(settings["chunk_sec"] - vc.config.chunk_sec) >= 1e-9
+
+        def apply_values() -> None:
+            vc.set_latency_mode(settings["latency_mode"])
+            vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
+            vc.set_buffer_margin(settings["buffer_margin"])
+            vc.set_overlap(settings["overlap_sec"])
+            vc.set_crossfade(settings["crossfade_sec"])
 
         if not vc.is_running:
+            apply_values()
             vc.set_chunk_sec(settings["chunk_sec"])
             return
-        if abs(settings["chunk_sec"] - vc.config.chunk_sec) < 1e-9:
+        if not chunk_changed and not mode_changed:
+            apply_values()
             return  # no chunk change → no restart needed
 
         # Restart with new chunk size: stop synchronously (fast, streams
         # must close on the main thread), then re-warm asynchronously.
         self._begin_loading("再起動中...")
         vc.stop()
+        apply_values()
         vc.set_chunk_sec(settings["chunk_sec"])  # not running → just stores
         self._prepare_and_start_async(lambda vc=vc: vc)
 

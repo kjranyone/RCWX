@@ -119,6 +119,7 @@ rcwx/
 | `sample_rate`             |  `16000` | 内部処理入力レート      |
 | `output_sample_rate`      |  `48000` | 出力レート              |
 | `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
+| `latency_mode`            | `balanced` | `balanced` / `aggressive` |
 | `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
 | `buffer_margin`           |    `0.5` | バッファ余裕            |
 | `input_gain_db`           |    `0.0` | 入力ゲイン              |
@@ -168,6 +169,7 @@ rcwx/
 実行時にGUI設定から生成される主要値:
 
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
+- `latency_mode` (`balanced` / `aggressive`)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
@@ -180,20 +182,23 @@ rcwx/
 
 ## GUI Latency Model (Current)
 
-`LatencySettingsFrame` でユーザーが直接変更できるのは `chunk_sec` のみです。
+`LatencySettingsFrame` では `chunk_sec` と `latency_mode` を変更できます。
 他は自動導出されます。
 
 自動導出ルール (`rcwx/gui/widgets/latency_settings.py`):
 
-- `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
-- `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
+- `overlap_sec` = chunkの100%（60-300msにクランプ、20ms刻み）
+- Balanced: `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
+- Aggressive: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
 - `prebuffer_chunks` = 1
-- `buffer_margin` = 0.5
+- Balanced: `buffer_margin` = 0.5
+- Aggressive: `buffer_margin` = 0.25、持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
+- Aggressiveの非ASIOコールバック長は最大10ms
 - `use_sola` = true
 
 補足:
 
-- GUI起動時は `config.audio.chunk_sec` を復元し、上記の自動値を再計算します。
+- GUI起動時は `config.audio.chunk_sec` と `latency_mode` を復元し、上記の自動値を再計算します。
 - 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
 
 ## CLI Commands

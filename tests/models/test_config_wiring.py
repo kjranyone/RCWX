@@ -14,6 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from rcwx.config import AudioConfig, InferenceConfig, RCWXConfig
+from rcwx.gui.widgets.latency_settings import _auto_params
 from rcwx.pipeline.realtime_unified import RealtimeConfig
 
 
@@ -66,6 +67,24 @@ def test_asio_buffer_size_field():
     assert RealtimeConfig().asio_buffer_size == 0, "RealtimeConfig.asio_buffer_size default"
 
 
+def test_aggressive_latency_mode_parameters():
+    balanced = _auto_params(0.24, "balanced")
+    aggressive = _auto_params(0.24, "aggressive")
+
+    assert balanced["crossfade_sec"] == 0.06
+    assert balanced["buffer_margin"] == 0.5
+    assert aggressive["crossfade_sec"] == 0.02
+    assert _auto_params(0.1, "aggressive")["crossfade_sec"] == 0.01
+    assert aggressive["buffer_margin"] == 0.25
+    assert aggressive["prebuffer_chunks"] == 1
+
+
+def test_latency_mode_validation():
+    assert AudioConfig(latency_mode="aggressive").latency_mode == "aggressive"
+    assert AudioConfig(latency_mode="invalid").latency_mode == "balanced"
+    assert RealtimeConfig(latency_mode="invalid").latency_mode == "balanced"
+
+
 def test_hole_fill_and_uv_ramp_fields():
     """f0_hole_fill_ms / uv_ramp_ms should exist on both configs with matching defaults."""
     inf = InferenceConfig()
@@ -86,6 +105,7 @@ def test_hole_fill_and_uv_ramp_fields():
 def test_config_roundtrip_new_fields():
     """New fields should survive JSON save -> load round-trip."""
     cfg = RCWXConfig()
+    cfg.audio.latency_mode = "aggressive"
     cfg.inference.noise_scale = 0.3
     cfg.inference.f0_lowpass_cutoff_hz = 20.0
 
@@ -95,6 +115,7 @@ def test_config_roundtrip_new_fields():
     try:
         cfg.save(tmp_path)
         loaded = RCWXConfig.load(tmp_path)
+        assert loaded.audio.latency_mode == "aggressive"
         assert loaded.inference.noise_scale == 0.3, (
             f"noise_scale round-trip failed: {loaded.inference.noise_scale}"
         )
@@ -129,6 +150,7 @@ def test_config_backward_compat():
             f"Expected default 16.0, got {loaded.inference.f0_lowpass_cutoff_hz}"
         )
         assert loaded.inference.pitch_shift == 5, "Existing field should be preserved"
+        assert loaded.audio.latency_mode == "balanced"
     finally:
         tmp_path.unlink(missing_ok=True)
 

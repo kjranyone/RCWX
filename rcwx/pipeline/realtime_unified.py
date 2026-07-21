@@ -105,6 +105,10 @@ class RealtimeStats:
     """Statistics for real-time processing."""
 
     latency_ms: float = 0.0
+    hop_latency_ms: float = 0.0
+    buffer_latency_ms: float = 0.0
+    queue_latency_ms: float = 0.0
+    sola_latency_ms: float = 0.0
     inference_ms: float = 0.0
     # Per-stage breakdown of inference_ms (from RVCPipeline.stage_times)
     hubert_ms: float = 0.0
@@ -125,6 +129,10 @@ class RealtimeStats:
 
     def reset(self) -> None:
         self.latency_ms = 0.0
+        self.hop_latency_ms = 0.0
+        self.buffer_latency_ms = 0.0
+        self.queue_latency_ms = 0.0
+        self.sola_latency_ms = 0.0
         self.inference_ms = 0.0
         self.hubert_ms = 0.0
         self.f0_ms = 0.0
@@ -164,6 +172,7 @@ class RealtimeConfig:
 
     # Core parameters
     chunk_sec: float = 0.15
+    latency_mode: str = "balanced"
     overlap_sec: float = 0.10  # audio-level overlap for HuBERT continuity
     crossfade_sec: float = 0.05
     # SOLA search window (ms): one period of the lowest expected output F0
@@ -238,6 +247,8 @@ class RealtimeConfig:
     limiter_release_ms: float = 80.0
 
     def __post_init__(self) -> None:
+        if self.latency_mode not in {"balanced", "aggressive"}:
+            object.__setattr__(self, "latency_mode", "balanced")
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
         chunk_ms = self.chunk_sec * 1000
@@ -399,6 +410,7 @@ class RealtimeVoiceChangerUnified:
         # See _on_audio_output / _compute_shed_threshold.
         self._level_window: Optional[deque] = None
         self._level_window_frames = 0
+        self._buffer_floor_samples = 0
 
         # Input accumulator (ring buffer at mic rate)
         self._input_buf = np.array([], dtype=np.float32)
@@ -455,24 +467,26 @@ class RealtimeVoiceChangerUnified:
     def _compute_shed_threshold(self) -> tuple[int, int]:
         """Return (shed_threshold, shed_target) for the post-read floor.
 
-        The ring conserves roughly ``prebuffer_chunks`` hops of *standing*
-        latency: output never runs ahead of input (it tracks the mic rate),
-        so the initial prebuffer fill is never consumed — the windowed floor
-        sits at ~``prebuffer_chunks * hop`` and wobbles with the
-        burst/callback phase beat.  This standing level is NOT drift; it is
-        the latency the prebuffer setting deliberately holds, so shedding it
-        would just defeat the prebuffer (and, with small device blocks,
-        click or buzz on every callback).
+        Balanced preserves the natural prebuffer standing floor and only
+        sheds genuine accumulation above it. Aggressive uses the same two-hop
+        floor filter but bounds persistent lag to a fraction of one hop.
 
-        We only shed once the floor exceeds the natural standing level by a
-        full chunk plus a margin-scaled tolerance — anything below that is
-        harmless wobble / deliberate prebuffer.
+        Instantaneous buffer level is intentionally ignored: it includes the
+        current hop's normal burst/drain sawtooth and trimming against that
+        value on every callback produces audible modulation.
 
         Returns:
-            (shed_threshold, shed_target): skip down to ``shed_target``
-            (≈ standing + half a hop) whenever ``floor > shed_threshold``.
+            (shed_threshold, shed_target): floor limit and post-trim target.
         """
         margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
+        if getattr(self.config, "latency_mode", "balanced") == "aggressive":
+            # The two-hop floor window filters the normal burst/drain sawtooth.
+            # Any floor above this bound is persistent queued audio, so shed it
+            # to a small cushion instead of preserving a full-hop standing lag.
+            shed_threshold = int((0.5 + margin) * self._hop_samples_out)
+            shed_target = self._hop_samples_out // 4
+            return max(1, shed_threshold), max(0, shed_target)
+
         standing = self._prebuffer_chunks * self._hop_samples_out
         # Tolerance: a full chunk of wobble headroom plus margin scaling
         # (margin 0.5 → ~1.5 chunks above standing; tighter/looser below/above).
@@ -482,6 +496,39 @@ class RealtimeVoiceChangerUnified:
         # wobble doesn't immediately re-trigger a skip.
         shed_target = standing + self._hop_samples_out // 2
         return shed_threshold, shed_target
+
+    def _audio_callback_sec(self) -> float:
+        """Return the requested callback duration for non-ASIO streams."""
+        callback_sec = self.config.chunk_sec / 4
+        if self.config.latency_mode == "aggressive":
+            callback_sec = min(callback_sec, 0.010)
+        return callback_sec
+
+    def _update_latency_estimate(self, inference_ms: float) -> None:
+        """Update E2E telemetry without counting the ring's hop sawtooth."""
+        hop_ms = self.config.chunk_sec * 1000.0
+        buffer_ms = (
+            self._buffer_floor_samples
+            / self._runtime_output_sample_rate
+            * 1000
+        )
+        try:
+            queued_chunks = self._output_queue.qsize()
+        except Exception:
+            queued_chunks = 0
+        queue_ms = (
+            queued_chunks
+            * self._hop_samples_out
+            / self._runtime_output_sample_rate
+            * 1000
+        )
+        sola_ms = self.config.crossfade_sec * 1000 if self.config.use_sola else 0
+
+        self.stats.hop_latency_ms = hop_ms
+        self.stats.buffer_latency_ms = buffer_ms
+        self.stats.queue_latency_ms = queue_ms
+        self.stats.sola_latency_ms = sola_ms
+        self.stats.latency_ms = hop_ms + inference_ms + buffer_ms + queue_ms + sola_ms
 
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
@@ -517,6 +564,7 @@ class RealtimeVoiceChangerUnified:
 
         # Hop change invalidates the drift-control level window
         self._level_window = None
+        self._buffer_floor_samples = 0
 
     def _apply_runtime_sample_rates(self, mic_rate: int, output_rate: int) -> None:
         """Apply actual stream sample rates and rebuild dependent state."""
@@ -597,8 +645,9 @@ class RealtimeVoiceChangerUnified:
         # because shape-dependent kernels change with the config.
         self._prepared = False
 
-        # Audio stream block size: chunk/4 for responsive I/O
-        output_chunk_sec = self.config.chunk_sec / 4
+        # Keep device callbacks independent from the inference hop in the
+        # aggressive policy. ASIO still uses its driver-selected buffer below.
+        output_chunk_sec = self._audio_callback_sec()
         output_blocksize = int(self.config.output_sample_rate * output_chunk_sec)
 
         # --- ASIO duplex detection ---
@@ -739,6 +788,7 @@ class RealtimeVoiceChangerUnified:
 
         logger.info(
             f"Unified pipeline started: chunk={self.config.chunk_sec}s, "
+            f"latency_mode={self.config.latency_mode}, "
             f"overlap={self.config.overlap_sec}s, "
             f"hop_16k={self._hop_samples_16k}, overlap_16k={self._overlap_samples_16k}, "
             f"mic_sr={self._runtime_mic_sample_rate}, out_sr={self._runtime_output_sample_rate}, "
@@ -850,6 +900,11 @@ class RealtimeVoiceChangerUnified:
         self.config.prebuffer_chunks = max(0, min(3, int(chunks)))
         self._prebuffer_chunks = self.config.prebuffer_chunks
 
+    def set_latency_mode(self, mode: str) -> None:
+        self.config.latency_mode = (
+            mode if mode in {"balanced", "aggressive"} else "balanced"
+        )
+
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
 
@@ -938,11 +993,8 @@ class RealtimeVoiceChangerUnified:
         # level — the burst/drain oscillation and device blocksize phase
         # beats don't lift the floor, so they can't trigger false skips.
         #
-        # The ring conserves ~prebuffer_chunks hops of standing latency
-        # (output tracks the mic rate, so the prebuffer fill is never
-        # consumed), so the natural floor sits at ~prebuffer_chunks*hop and
-        # must NOT be shed.  We only skip once genuine accumulation pushes
-        # the floor a full chunk-plus-margin above the standing level.
+        # Balanced preserves the prebuffer standing floor. Aggressive applies
+        # its lower fractional-hop bound through _compute_shed_threshold().
         #
         # Shedding is done exclusively via hard-skip (one splice + fade-in),
         # NEVER per-callback time-compression: with small device blocks
@@ -954,6 +1006,7 @@ class RealtimeVoiceChangerUnified:
             self._level_window_frames = frames
             window_len = max(4, -(-2 * self._hop_samples_out // max(1, frames)))
             self._level_window = deque(maxlen=window_len)
+            self._buffer_floor_samples = 0
 
         if len(self._level_window) == self._level_window.maxlen:
             floor = min(self._level_window)
@@ -966,6 +1019,7 @@ class RealtimeVoiceChangerUnified:
                 skip_amount = max(0, floor - shed_target)
                 skipped = self.output_buffer.skip(skip_amount)
                 self._level_window.clear()  # re-measure from the new level
+                self._buffer_floor_samples = shed_target
                 self.stats.buffer_trims += 1
                 logger.info(
                     "[DRIFT] Skipped %d samples (%.0fms) of accumulated latency, "
@@ -985,6 +1039,8 @@ class RealtimeVoiceChangerUnified:
         # preceding callback captures it (pre-read sampling sits one
         # callback higher and hides the real floor).
         self._level_window.append(self.output_buffer.available)
+        if len(self._level_window) == self._level_window.maxlen:
+            self._buffer_floor_samples = min(self._level_window)
 
         # Count REAL underruns only: the ring's counter increments when a
         # read could not be fully served (zero-padded output = audible gap).
@@ -1235,21 +1291,11 @@ class RealtimeVoiceChangerUnified:
                     pass
 
                 # Estimated E2E latency (display):
-                # - input capture delay: average sample in a chunk ~= chunk/2
+                # - one full input/output hop: collection and playback phase
                 # - processing delay: measured inference thread time
-                # - playback delay: ring buffer + pending output-queue chunks
+                # - persistent ring floor + pending output-queue chunks
                 # - SOLA hold-back delay
-                capture_ms = self.config.chunk_sec * 500.0
-                buffer_ms = self.output_buffer.available / self._runtime_output_sample_rate * 1000
-                try:
-                    queued_chunks = self._output_queue.qsize()
-                except Exception:
-                    queued_chunks = 0
-                queue_ms = (
-                    queued_chunks * self._hop_samples_out / self._runtime_output_sample_rate * 1000
-                )
-                sola_ms = self.config.crossfade_sec * 1000 if self.config.use_sola else 0
-                self.stats.latency_ms = capture_ms + inference_ms + buffer_ms + queue_ms + sola_ms
+                self._update_latency_estimate(inference_ms)
 
                 try:
                     self._output_queue.put_nowait(output_48k)
@@ -1276,7 +1322,12 @@ class RealtimeVoiceChangerUnified:
                 if self.stats.frames_processed % 100 == 0:
                     logger.info(
                         f"[PERF] Stage breakdown: infer={inference_ms:.0f}ms "
-                        f"({stage_detail}) / chunk={chunk_ms:.0f}ms"
+                        f"({stage_detail}) / chunk={chunk_ms:.0f}ms / "
+                        f"latency={self.stats.latency_ms:.0f}ms "
+                        f"(hop={self.stats.hop_latency_ms:.0f} "
+                        f"buffer={self.stats.buffer_latency_ms:.0f} "
+                        f"queue={self.stats.queue_latency_ms:.0f} "
+                        f"sola={self.stats.sola_latency_ms:.0f})"
                     )
 
                 if self.stats.frames_processed <= 5:

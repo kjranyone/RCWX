@@ -1074,12 +1074,15 @@ class RCWXApp(ctk.CTk):
     def _restore_latency_settings(self) -> None:
         """Restore latency settings from config.
 
-        Only chunk_sec is restored; other parameters are auto-derived.
+        Chunk size and latency mode are restored; other parameters are auto-derived.
         """
         if not hasattr(self, "latency_settings"):
             return
 
-        self.latency_settings.set_values(chunk_sec=self.config.audio.chunk_sec)
+        self.latency_settings.set_values(
+            chunk_sec=self.config.audio.chunk_sec,
+            latency_mode=self.config.audio.latency_mode,
+        )
 
     def _on_audio_settings_changed(self) -> None:
         """Handle audio settings change."""
@@ -1146,6 +1149,7 @@ class RCWXApp(ctk.CTk):
             if hasattr(self, "latency_settings"):
                 latency = self.latency_settings.get_settings()
                 self.config.audio.chunk_sec = latency["chunk_sec"]
+                self.config.audio.latency_mode = latency["latency_mode"]
                 self.config.audio.prebuffer_chunks = latency["prebuffer_chunks"]
                 self.config.audio.buffer_margin = latency["buffer_margin"]
                 self.config.inference.overlap_sec = latency["overlap_sec"]

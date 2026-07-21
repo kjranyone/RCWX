@@ -7,7 +7,7 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 
-def _auto_params(chunk_sec: float) -> dict:
+def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
     """Derive latency parameters automatically from chunk_sec.
 
     Returns dict with overlap_sec, crossfade_sec, sola_search_ms,
@@ -18,8 +18,13 @@ def _auto_params(chunk_sec: float) -> dict:
     overlap_ms = max(60, min(300, chunk_sec * 1000))
     overlap_ms = round(overlap_ms / 20) * 20
 
-    # crossfade: 25% of chunk, clamped [10ms, 80ms], rounded to 10ms
-    crossfade_ms = min(80, chunk_sec * 1000 * 0.25)
+    aggressive = latency_mode == "aggressive"
+
+    # Aggressive keeps enough overlap for a short SOLA splice while avoiding
+    # the 50-80ms hold-back used by larger balanced chunks.
+    crossfade_ratio = 0.10 if aggressive else 0.25
+    crossfade_max_ms = 20 if aggressive else 80
+    crossfade_ms = min(crossfade_max_ms, chunk_sec * 1000 * crossfade_ratio)
     crossfade_ms = round(crossfade_ms / 10) * 10
     crossfade_ms = max(10, crossfade_ms)
 
@@ -32,8 +37,9 @@ def _auto_params(chunk_sec: float) -> dict:
         "overlap_sec": overlap_ms / 1000,
         "crossfade_sec": crossfade_ms / 1000,
         "sola_search_ms": sola_search_ms,
+        "latency_mode": "aggressive" if aggressive else "balanced",
         "prebuffer_chunks": 1,
-        "buffer_margin": 0.5,
+        "buffer_margin": 0.25 if aggressive else 0.5,
         "use_sola": True,
     }
 
@@ -42,8 +48,8 @@ class LatencySettingsFrame(ctk.CTkFrame):
     """
     Latency settings widget.
 
-    Only chunk_sec is user-controllable.  All other latency parameters
-    are derived automatically and shown as read-only labels.
+    Chunk size and latency mode are user-controllable. Other latency
+    parameters are derived automatically and shown as read-only labels.
     """
 
     def __init__(
@@ -58,6 +64,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         # Default chunk size
         self.chunk_sec = 0.15
+        self.latency_mode = "balanced"
 
         self._setup_ui()
 
@@ -80,12 +87,30 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """Setup chunk slider and read-only auto-parameter labels."""
         frame = self.advanced_frame
 
-        # --- Chunk size slider (only user control) ---
+        # --- Latency mode ---
+        mode_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        mode_frame.grid(row=0, column=0, padx=10, pady=(5, 3), sticky="ew")
+        ctk.CTkLabel(
+            mode_frame,
+            text="レイテンシモード",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, padx=(0, 10), sticky="w")
+        self.mode_control = ctk.CTkSegmentedButton(
+            mode_frame,
+            values=["Balanced", "Aggressive"],
+            command=self._on_mode_change,
+            width=170,
+        )
+        self.mode_control.set("Balanced")
+        self.mode_control.grid(row=0, column=1, sticky="e")
+        mode_frame.grid_columnconfigure(1, weight=1)
+
+        # --- Chunk size slider ---
         ctk.CTkLabel(frame, text="チャンクサイズ", font=ctk.CTkFont(size=11)).grid(
-            row=0, column=0, padx=10, pady=(5, 0), sticky="w"
+            row=1, column=0, padx=10, pady=(2, 0), sticky="w"
         )
         slider_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        slider_frame.grid(row=1, column=0, padx=10, pady=(0, 2), sticky="ew")
+        slider_frame.grid(row=2, column=0, padx=10, pady=(0, 2), sticky="ew")
 
         # Step=20ms to align with HuBERT frame boundary (320 samples @ 16kHz)
         self.chunk_slider = ctk.CTkSlider(
@@ -105,7 +130,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         # --- Separator ---
         separator = ctk.CTkFrame(frame, height=1, fg_color="gray50")
-        separator.grid(row=2, column=0, padx=10, pady=(6, 2), sticky="ew")
+        separator.grid(row=3, column=0, padx=10, pady=(6, 2), sticky="ew")
 
         # --- Auto settings header ---
         auto_header = ctk.CTkLabel(
@@ -114,10 +139,10 @@ class LatencySettingsFrame(ctk.CTkFrame):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="gray70",
         )
-        auto_header.grid(row=3, column=0, padx=10, pady=(2, 0), sticky="w")
+        auto_header.grid(row=4, column=0, padx=10, pady=(2, 0), sticky="w")
 
         # --- Read-only auto parameter labels ---
-        auto = _auto_params(self.chunk_sec)
+        auto = _auto_params(self.chunk_sec, self.latency_mode)
 
         # Each auto param: label + value in a row
         self.auto_labels: dict[str, ctk.CTkLabel] = {}
@@ -130,7 +155,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         ]
 
         for i, (key, label_text, value_text) in enumerate(auto_display):
-            row = 4 + i
+            row = 5 + i
             row_frame = ctk.CTkFrame(frame, fg_color="transparent")
             row_frame.grid(row=row, column=0, padx=10, pady=(1, 1), sticky="ew")
 
@@ -156,7 +181,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         # --- Separator ---
         separator2 = ctk.CTkFrame(frame, height=1, fg_color="gray50")
-        separator2.grid(row=8, column=0, padx=10, pady=(4, 2), sticky="ew")
+        separator2.grid(row=9, column=0, padx=10, pady=(4, 2), sticky="ew")
 
         # --- Estimated latency display ---
         self.estimate_label = ctk.CTkLabel(
@@ -165,7 +190,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#66b3ff",
         )
-        self.estimate_label.grid(row=9, column=0, padx=10, pady=(3, 5), sticky="w")
+        self.estimate_label.grid(row=10, column=0, padx=10, pady=(3, 5), sticky="w")
 
         frame.grid_columnconfigure(0, weight=1)
         self._update_estimate()
@@ -183,9 +208,16 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self._update_estimate()
         self._notify_change()
 
+    def _on_mode_change(self, value: str) -> None:
+        """Switch between the stable and low-buffer latency policies."""
+        self.latency_mode = value.lower()
+        self._update_auto_labels()
+        self._update_estimate()
+        self._notify_change()
+
     def _update_auto_labels(self) -> None:
         """Update read-only auto-parameter labels from current chunk_sec."""
-        auto = _auto_params(self.chunk_sec)
+        auto = _auto_params(self.chunk_sec, self.latency_mode)
         self.auto_labels["overlap"].configure(text=f"{int(auto['overlap_sec'] * 1000)}ms")
         self.auto_labels["crossfade"].configure(text=f"{int(auto['crossfade_sec'] * 1000)}ms")
         self.auto_labels["prebuffer"].configure(text=f"{auto['prebuffer_chunks']}チャンク")
@@ -195,16 +227,18 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """Update estimated latency display.
 
         Latency components:
-        - Input capture: chunk_sec / 2 (average sample position in chunk)
-        - Inference: ~50ms (FCPE on XPU estimate)
-        - Output buffer: avg ring ≈ 3/8 hop (cycle: 3/4→2/4→1/4→0)
+        - Input/output hop: one chunk period
+        - Inference: nominal XPU processing estimate
+        - Output buffer: policy's persistent floor target
         - SOLA hold-back: crossfade_sec
         """
-        auto = _auto_params(self.chunk_sec)
-        inference_est = 50  # ms
-        buffer_est = self.chunk_sec * 375  # avg ring ≈ 3/8 hop
+        auto = _auto_params(self.chunk_sec, self.latency_mode)
+        inference_est = 35 if self.latency_mode == "aggressive" else 50
+        buffer_est = self.chunk_sec * (
+            250 if self.latency_mode == "aggressive" else 1000
+        )
         sola_est = auto["crossfade_sec"] * 1000
-        total_est = self.chunk_sec * 500 + inference_est + buffer_est + sola_est
+        total_est = self.chunk_sec * 1000 + inference_est + buffer_est + sola_est
 
         self.estimate_label.configure(text=f"推定レイテンシ: ~{int(total_est)}ms")
 
@@ -218,9 +252,10 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         Returns all parameters including auto-derived ones.
         """
-        auto = _auto_params(self.chunk_sec)
+        auto = _auto_params(self.chunk_sec, self.latency_mode)
         return {
             "chunk_sec": self.chunk_sec,
+            "latency_mode": self.latency_mode,
             "prebuffer_chunks": auto["prebuffer_chunks"],
             "buffer_margin": auto["buffer_margin"],
             "overlap_sec": auto["overlap_sec"],
@@ -229,17 +264,25 @@ class LatencySettingsFrame(ctk.CTkFrame):
             "use_sola": auto["use_sola"],
         }
 
-    def set_values(self, chunk_sec: float) -> None:
+    def set_values(
+        self,
+        chunk_sec: float,
+        latency_mode: str = "balanced",
+    ) -> None:
         """Restore chunk_sec from saved settings.
 
         All other parameters are auto-derived.
         """
         rounded_ms = self._round_to_frame_boundary(chunk_sec * 1000)
         self.chunk_sec = rounded_ms / 1000
+        self.latency_mode = (
+            latency_mode if latency_mode in {"balanced", "aggressive"} else "balanced"
+        )
 
         # Update slider
         self.chunk_slider.set(rounded_ms)
         self.chunk_value.configure(text=f"{rounded_ms}ms")
+        self.mode_control.set(self.latency_mode.title())
 
         # Update auto labels and estimate
         self._update_auto_labels()
