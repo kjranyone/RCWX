@@ -18,17 +18,33 @@ def test_f0_backend_micro_hop_floors() -> None:
     assert _minimum_chunk_ms("none") == 40
     assert _minimum_chunk_ms("fcpe") == 100
     assert _minimum_chunk_ms("rmvpe") == 320
+    assert _minimum_chunk_ms("swiftf0", "frontier") == 20
+    assert _minimum_chunk_ms("none", "frontier") == 20
+    assert _minimum_chunk_ms("fcpe", "frontier") == 100
 
     assert RealtimeConfig(chunk_sec=0.01, f0_method="swiftf0").chunk_sec == 0.04
     assert RealtimeConfig(chunk_sec=0.04, f0_method="fcpe").chunk_sec == 0.10
     assert RealtimeConfig(chunk_sec=0.04, f0_method="rmvpe").chunk_sec == 0.32
     assert RealtimeConfig(latency_mode="sub100", prebuffer_chunks=1).prebuffer_chunks == 2
+    frontier_cfg = RealtimeConfig(
+        latency_mode="frontier",
+        chunk_sec=0.01,
+        f0_method="swiftf0",
+        prebuffer_chunks=1,
+    )
+    assert frontier_cfg.chunk_sec == 0.02
+    assert frontier_cfg.prebuffer_chunks == 3
 
     sub100 = _auto_params(0.04, "sub100")
     assert sub100["crossfade_sec"] == 0.01
     assert sub100["buffer_margin"] == 0.1
     assert sub100["latency_mode"] == "sub100"
     assert sub100["prebuffer_chunks"] == 2
+
+    frontier = _auto_params(0.02, "frontier")
+    assert frontier["crossfade_sec"] == 0.01
+    assert frontier["latency_mode"] == "frontier"
+    assert frontier["prebuffer_chunks"] == 3
 
 
 def test_deadline_statistics_track_micro_hop_tail() -> None:
@@ -47,7 +63,7 @@ def test_deadline_statistics_track_micro_hop_tail() -> None:
     assert vc.stats.inference_p95_ms > 40.0
 
 
-def test_sub100_uses_short_context_and_device_output_resample() -> None:
+def test_deadline_modes_use_short_context_and_device_output_resample() -> None:
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
     vc.config = SimpleNamespace(
         latency_mode="sub100",
@@ -57,6 +73,10 @@ def test_sub100_uses_short_context_and_device_output_resample() -> None:
     )
     vc.pipeline = SimpleNamespace(device="xpu")
 
+    assert vc._effective_streaming_contexts() == (0.56, 0.10)
+    assert vc._uses_device_output_resample() is True
+
+    vc.config.latency_mode = "frontier"
     assert vc._effective_streaming_contexts() == (0.56, 0.10)
     assert vc._uses_device_output_resample() is True
 

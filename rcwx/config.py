@@ -58,9 +58,7 @@ def normalize_input_channel_selection(value: str) -> str:
     m = re.fullmatch(r"Ch\s*(\d+)(?::.*)?", value)
     if m:
         return str(int(m.group(1)) - 1)
-    logger.warning(
-        "Unrecognized input_channel_selection %r — falling back to 'auto'", value
-    )
+    logger.warning("Unrecognized input_channel_selection %r — falling back to 'auto'", value)
     return "auto"
 
 
@@ -87,9 +85,7 @@ def normalize_output_channel_selection(value: str) -> str:
     m = re.fullmatch(r"Ch\s*(\d+)\s*-\s*(\d+)(?::.*)?", value)
     if m:
         return f"{int(m.group(1)) - 1},{int(m.group(2)) - 1}"
-    logger.warning(
-        "Unrecognized output_channel_selection %r — falling back to 'auto'", value
-    )
+    logger.warning("Unrecognized output_channel_selection %r — falling back to 'auto'", value)
     return "auto"
 
 
@@ -122,7 +118,7 @@ class AudioConfig:
     # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
     output_channel_selection: str = "auto"
     # Latency settings
-    latency_mode: str = "balanced"  # balanced / aggressive / sub100
+    latency_mode: str = "balanced"  # balanced / aggressive / sub100 / frontier
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
     # ASIO buffer size in frames (0 = follow the driver control panel /
@@ -137,7 +133,7 @@ class AudioConfig:
         self.output_channel_selection = normalize_output_channel_selection(
             self.output_channel_selection
         )
-        if self.latency_mode not in {"balanced", "aggressive", "sub100"}:
+        if self.latency_mode not in {"balanced", "aggressive", "sub100", "frontier"}:
             self.latency_mode = "balanced"
 
 
@@ -283,9 +279,7 @@ class RCWXConfig:
             audio=AudioConfig(**_filter_known(AudioConfig, audio_data)),
             inference=InferenceConfig(
                 denoise=DenoiseConfig(**_filter_known(DenoiseConfig, denoise_data)),
-                postprocess=PostprocessConfig(
-                    **_filter_known(PostprocessConfig, postprocess_data)
-                ),
+                postprocess=PostprocessConfig(**_filter_known(PostprocessConfig, postprocess_data)),
                 **_filter_known(InferenceConfig, inference_data),
             ),
             **_filter_known(RCWXConfig, data),

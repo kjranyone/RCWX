@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import sys
 from collections import deque
@@ -242,6 +242,64 @@ def test_sub100_underrun_rearms_two_hop_prebuffer() -> None:
     assert vc.stats.buffer_underruns == 1
 
 
+def test_frontier_mode_uses_20ms_deadline_policy() -> None:
+    hop_out = 960
+    vc = _make_vc(
+        hop_out=hop_out,
+        out_sr=48000,
+        buffer_margin=0.1,
+        prebuffer_chunks=3,
+        latency_mode="frontier",
+    )
+    vc.config.chunk_sec = 0.02
+
+    assert vc._audio_callback_sec() == 0.0025
+    assert vc._compute_shed_threshold() == (1200, 960)
+    assert vc.stats.jitter_guard_ms == 20.0
+
+    vc._inference_times = deque([12.0] * 20, maxlen=256)
+    vc.stats.inference_p50_ms = 12.0
+    vc.stats.inference_p99_ms = 17.0
+    assert vc._compute_shed_threshold() == (600, 480)
+    assert vc.stats.jitter_guard_ms == 10.0
+
+    vc._prebuffer_chunks = 1
+    vc.config.prebuffer_chunks = 1
+    vc.set_latency_mode("frontier")
+    assert vc._prebuffer_chunks == 3
+    assert vc.config.prebuffer_chunks == 3
+
+
+def test_frontier_underrun_rearms_three_hop_prebuffer() -> None:
+    hop_out = 960
+    frames = 120
+    vc = _make_vc(
+        hop_out=hop_out,
+        out_sr=48000,
+        prebuffer_chunks=3,
+        latency_mode="frontier",
+    )
+
+    first = vc._on_audio_output(frames)
+    assert np.count_nonzero(first) == 0
+    assert vc.stats.buffer_underruns == 1
+    assert vc._output_started is False
+
+    for chunks_ready in (1, 2):
+        vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
+        waiting = vc._on_audio_output(frames)
+        assert np.count_nonzero(waiting) == 0
+        assert vc._output_started is False
+        assert vc._chunks_ready == chunks_ready
+
+    vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
+    recovered = vc._on_audio_output(frames)
+    assert np.count_nonzero(recovered) == frames
+    assert vc._output_started is True
+    assert vc._chunks_ready == 3
+    assert vc.stats.buffer_underruns == 1
+
+
 def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
     hop_out = 4800
     vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="aggressive")
@@ -271,5 +329,7 @@ if __name__ == "__main__":
     test_aggressive_mode_caps_non_asio_callback_at_10ms()
     test_sub100_mode_uses_five_ms_callback_and_jitter_guard()
     test_sub100_underrun_rearms_two_hop_prebuffer()
+    test_frontier_mode_uses_20ms_deadline_policy()
+    test_frontier_underrun_rearms_three_hop_prebuffer()
     test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
     print("PASS: realtime drift-control tests")

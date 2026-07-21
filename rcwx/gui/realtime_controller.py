@@ -126,12 +126,10 @@ class RealtimeController:
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 output_gain_db=self.app.config.audio.output_gain_db,
                 index_rate=self.app._get_index_rate(),
-                # Sub-100 is a deadline contract. The current ML/spectral
-                # denoisers have p99 spikes above a 40ms hop, so preserve the
-                # user's checkbox while bypassing denoise only in this mode.
+                # Deadline modes bypass denoisers whose p99 exceeds the hop.
                 denoise_enabled=(
                     self.app.use_denoise_var.get()
-                    and latency["latency_mode"] != "sub100"
+                    and latency["latency_mode"] not in {"sub100", "frontier"}
                 ),
                 denoise_method=self.app.denoise_method_var.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
@@ -409,6 +407,7 @@ class RealtimeController:
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
+
         # Update UI from main thread (status bar + input/output level meters).
         # The input meter is driven from pipeline stats so it works even on
         # exclusive ASIO devices, where a standalone monitor stream cannot open.
@@ -439,9 +438,7 @@ class RealtimeController:
         if now - self._session_start < BUFFER_WARNING_GRACE_SEC:
             return
 
-        self._warn_history.append(
-            (now, stats.buffer_underruns, stats.buffer_overruns)
-        )
+        self._warn_history.append((now, stats.buffer_underruns, stats.buffer_overruns))
         while (
             len(self._warn_history) > 1
             and now - self._warn_history[0][0] > BUFFER_WARNING_WINDOW_SEC

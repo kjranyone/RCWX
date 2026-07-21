@@ -26,10 +26,13 @@ from rcwx.audio.sola import SolaState, sola_crossfade
 
 
 def _compute_sola_extra_model(
-    model_sr: int, output_sr: int, cf_out: int, search_out: int,
+    model_sr: int,
+    output_sr: int,
+    cf_out: int,
+    search_out: int,
 ) -> int:
     """Compute sola_extra_model with zc alignment (mirrors realtime_unified.py)."""
-    sola_extra_out = cf_out + 2 * search_out
+    sola_extra_out = cf_out + search_out
     zc_model = model_sr // 100
     sola_extra_raw = int(sola_extra_out * model_sr / output_sr)
     return (sola_extra_raw + zc_model - 1) // zc_model * zc_model
@@ -110,7 +113,7 @@ def _assert_no_drift(
     expected = len(lengths) * hop_out
 
     # Per-chunk check
-    bad_chunks = [(i, l) for i, l in enumerate(lengths) if l != hop_out]
+    bad_chunks = [(index, length) for index, length in enumerate(lengths) if length != hop_out]
     if bad_chunks:
         first_bad = bad_chunks[0]
         print(
@@ -183,12 +186,9 @@ def test_resampler_exact_output_count() -> None:
 
     unique_lengths = set(lengths)
     assert len(unique_lengths) == 1, (
-        f"Resampler output length varies: {unique_lengths} "
-        f"(expected constant {expected_out})"
+        f"Resampler output length varies: {unique_lengths} (expected constant {expected_out})"
     )
-    assert lengths[0] == expected_out, (
-        f"Resampler output {lengths[0]} != expected {expected_out}"
-    )
+    assert lengths[0] == expected_out, f"Resampler output {lengths[0]} != expected {expected_out}"
 
 
 def test_resampler_cumulative_no_drift() -> None:
@@ -223,9 +223,7 @@ def test_zero_drift_random_input() -> None:
         hop_out = int(hop_16k * output_sr / 16000)
         cf_out = int(output_sr * cf_sec)
         search_out = int(output_sr * search_ms / 1000)
-        sola_extra_model = _compute_sola_extra_model(
-            model_sr, output_sr, cf_out, search_out
-        )
+        sola_extra_model = _compute_sola_extra_model(model_sr, output_sr, cf_out, search_out)
         expected_model_out = int(hop_16k * model_sr / 16000) + sola_extra_model
 
         resampler = StatefulResampler(model_sr, output_sr)
@@ -251,9 +249,7 @@ def test_long_session_5000_chunks() -> None:
     hop_out = int(hop_16k * output_sr / 16000)
     cf_out = int(output_sr * cf_sec)
     search_out = int(output_sr * search_ms / 1000)
-    sola_extra_model = _compute_sola_extra_model(
-        model_sr, output_sr, cf_out, search_out
-    )
+    sola_extra_model = _compute_sola_extra_model(model_sr, output_sr, cf_out, search_out)
     expected_model_out = int(hop_16k * model_sr / 16000) + sola_extra_model
 
     resampler = StatefulResampler(model_sr, output_sr)
@@ -299,5 +295,5 @@ if __name__ == "__main__":
             print(f"  FAIL: {e}")
             failed += 1
 
-    print(f"\n{'='*40}")
+    print(f"\n{'=' * 40}")
     print(f"Results: {passed} passed, {failed} failed out of {passed + failed}")

@@ -120,7 +120,7 @@ rcwx/
 | `sample_rate`             |  `16000` | 内部処理入力レート      |
 | `output_sample_rate`      |  `48000` | 出力レート              |
 | `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
-| `latency_mode`            | `balanced` | `balanced` / `aggressive` / `sub100` |
+| `latency_mode`            | `balanced` | `balanced` / `aggressive` / `sub100` / `frontier` |
 | `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
 | `buffer_margin`           |    `0.5` | バッファ余裕            |
 | `input_gain_db`           |    `0.0` | 入力ゲイン              |
@@ -170,7 +170,7 @@ rcwx/
 実行時にGUI設定から生成される主要値:
 
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
-- `latency_mode` (`balanced` / `aggressive` / `sub100`)
+- `latency_mode` (`balanced` / `aggressive` / `sub100` / `frontier`)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
@@ -192,17 +192,21 @@ rcwx/
 - Balanced: `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
 - Aggressive: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
 - Sub-100: `chunk_sec` = F0方式の下限、`crossfade_sec` = 10ms
+- Frontier: SwiftF0/Noneの`chunk_sec` = 20ms、`crossfade_sec` = 10ms
 - Balanced/Aggressive: `prebuffer_chunks` = 1
 - Sub-100: `prebuffer_chunks` = 2（アンダーラン時も2 hopを再確保して再開）
+- Frontier: `prebuffer_chunks` = 3（アンダーラン時も3 hopを再確保して再開）
 - Balanced: `buffer_margin` = 0.5
 - Aggressive: `buffer_margin` = 0.25、持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
 - Aggressiveの非ASIOコールバック長は最大10ms
 - Sub-100: SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msが下限
 - Sub-100: 最初の20 hopは1.0 hop、その後は`p99 - p50 + callback`を20-35msにクランプしたfloorを維持
+- Frontier: 最初の20 hopは1.0 hop、その後は同じ適応式を10-17.5msにクランプ
 - Sub-100の非ASIOコールバック長は最大5ms、実行中はDenoiserをバイパス
-- Sub-100: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
-- Sub-100: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
-- Sub-100では対応するFAISS IVF indexをwarmup時にXPUへ配置し、HuBERT特徴のCPU往復を省略
+- Frontierの非ASIOコールバック長は最大2.5ms、実行中はDenoiserをバイパス
+- Sub-100/Frontier: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
+- Sub-100/Frontier: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
+- Sub-100/Frontierでは対応するFAISS IVF indexをwarmup時にXPUへ配置し、HuBERT特徴のCPU往復を省略
 - ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
@@ -215,7 +219,8 @@ rcwx/
 - XPU IVFは再構築特徴をFP16/BF16で保持し、158k×768 indexでは約240MBの追加VRAMを使います。
 - SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
 - 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
-- Sub-100の出力guardは推論jitter統計から適応し、アンダーラン後は2 hopを再バッファします。
+- Sub-100/Frontierの出力guardは推論jitter統計から適応し、アンダーラン後はそれぞれ2/3 hopを再バッファします。
+- SOLA合成末尾は`crossfade + search + decoder overlap`を10msフレームへ切り上げます。
 
 ## CLI Commands
 

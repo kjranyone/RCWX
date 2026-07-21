@@ -381,25 +381,30 @@ rcwx/
 
 ### レイテンシモード
 
-レイテンシ設定には`Balanced`、`Aggressive`、`Sub-100`があります。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。
+レイテンシ設定には`Balanced`、`Aggressive`、`Sub-100`、`Frontier`があります。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。
 
 | モード | SOLAクロスフェード | 持続リングfloor | 非ASIOコールバック | 用途 |
 |--------|-------------------|-----------------|----------------------|------|
 | Balanced | chunkの25%、最大80ms | プリバッファを維持 | chunk / 4 | 安定性優先 |
 | Aggressive | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 低遅延優先 |
 | Sub-100 | 10ms | 初期1 hop、定常20-35msを適応維持 | 最大5ms | ASIO + SwiftF0向け |
+| Frontier | 10ms | 初期1 hop、定常10-17.5msを適応維持 | 最大2.5ms | 実験的な20ms deadline |
 
 Aggressiveでも開始時に最初の生成チャンクを待つため、起動直後の無音アンダーランは発生させません。持続的なバッファ滞留だけを2 hopの観測窓で判定し、通常のチャンク内burst/drainはtrim対象から除外します。
 
 `Sub-100`はF0方式の下限へchunkを自動設定します。SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msです。開始時に2 hopを確保し、最初の20 hopは40msのfloorを維持します。その後は直近推論の`p99 - p50 + callback`から20-35msのjitter guardを選びます。アンダーラン時は2 hopを再確保して、連続した音切れを防ぎます。
 
-Sub-100実行中は保存設定を変更せず、HuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時的に短縮します。また、モデルと出力のsample rateが異なる場合は、Synthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。40ms deadlineを守るためDenoiserは実行中だけバイパスされ、Balanced/Aggressiveへ戻すと保存済みの品質設定が再び有効になります。
+`Frontier`はSwiftF0/Noneのchunk下限を20msまで下げます。開始時とアンダーラン復旧時は3 hopを確保し、20 hopの統計が揃った後は同じ適応式で10-17.5msのjitter guardへ縮めます。FCPEとRMVPEは入力要件のため、それぞれ100msと320msが下限です。
 
-Sub-100のruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768のindexで約240MBの追加VRAMを使用します。Balanced/Aggressiveやファイル変換では構築しません。
+Sub-100/Frontier実行中は保存設定を変更せず、HuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時的に短縮します。また、モデルと出力のsample rateが異なる場合は、Synthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。deadlineを守るためDenoiserは実行中だけバイパスされ、Balanced/Aggressiveへ戻すと保存済みの品質設定が再び有効になります。
+
+Sub-100/Frontierのruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768のindexで約240MBの追加VRAMを使用します。Balanced/Aggressiveやファイル変換では構築しません。
 
 Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップとGUIのSOLA/decoder余白を含む処理時間がp50 14.5ms、p95 16.4ms、p99 18.8msでした（40ms deadline miss 0/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
 
-Frontier第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。これは約1msの改善であり、次段の大幅短縮にはHuBERTとRVC TextEncoderの再計算範囲を変える必要があります。
+Frontier第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。
+
+Frontier 20ms hopでは、SOLAが必要とする合成末尾を`crossfade + search + decoder overlap`へ修正し、従来の二重search余白を除去しました。同じArc B570の定常測定はp50 11.87ms、p95 14.51ms、p99 17.37ms、20ms deadline miss 0/60です。全SOLA出力は960 samplesで一致し、HuBERT/Synthesizer/IVF Graphのfallbackは0でした。これは実機のdeadline成立を示す値であり、OSやドライバーの単発スパイクまで保証するものではありません。
 
 ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Aggressiveでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
 

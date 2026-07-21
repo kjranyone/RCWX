@@ -103,3 +103,28 @@ def test_sub100_runtime_warmup_prepares_accelerator_index() -> None:
 
     assert changer.pipeline.prepare_index_calls == 1
     assert changer.pipeline.infer_calls == 13
+
+
+def test_frontier_runtime_warmup_fills_20ms_history() -> None:
+    changer = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
+    changer.config = SimpleNamespace(
+        hubert_context_sec=0.56,
+        f0_context_sec=0.10,
+        f0_method="swiftf0",
+        latency_mode="frontier",
+        index_rate=0.45,
+    )
+    changer._hop_samples_16k = 320
+    changer._overlap_samples_16k = 960
+    changer.pipeline = _FakePipeline(history_limit=8960)
+    changer.input_resampler = _FakeResampler()
+    changer.output_resampler = _FakeResampler()
+    changer._sola_state = SimpleNamespace(buffer=None)
+    changer._overlap_buf = None
+    changer._reset_boundary_continuity_state = lambda: None
+    changer._build_streaming_params = lambda **kwargs: kwargs
+
+    changer._run_runtime_warmup()
+
+    assert changer.pipeline.prepare_index_calls == 1
+    assert changer.pipeline.infer_calls == 27

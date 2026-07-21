@@ -5,7 +5,24 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from rcwx.pipeline.realtime_unified import RealtimeConfig
+from rcwx.pipeline.realtime_unified import (
+    RealtimeConfig,
+    _compute_sola_extra_model,
+)
+
+
+def test_sola_extra_uses_one_search_window() -> None:
+    model_sr = 48000
+    extra = _compute_sola_extra_model(
+        model_sr,
+        48000,
+        crossfade_samples_out=480,
+        search_samples_out=720,
+        decoder_overlap_frames=0,
+    )
+
+    # 25ms is rounded up to the decoder's 10ms (480-sample) boundary.
+    assert extra == 1440
 
 
 def test_decoder_overlap_increases_sola_extra():
@@ -21,7 +38,7 @@ def test_decoder_overlap_increases_sola_extra():
 
     crossfade_samples_out = int(output_sr * crossfade_sec)
     search_samples_out = int(output_sr * sola_search_ms / 1000)
-    sola_extra_out = crossfade_samples_out + 2 * search_samples_out
+    sola_extra_out = crossfade_samples_out + search_samples_out
     zc_model = model_sr // 100  # 320
 
     sola_extra_raw = int(sola_extra_out * model_sr / output_sr)
@@ -33,8 +50,7 @@ def test_decoder_overlap_increases_sola_extra():
     decoder_frames = 5
     decoder_overlap_model = decoder_frames * zc_model
     extra_with_overlap = (
-        (sola_extra_raw + decoder_overlap_model + zc_model - 1)
-        // zc_model * zc_model
+        (sola_extra_raw + decoder_overlap_model + zc_model - 1) // zc_model * zc_model
     )
 
     diff = extra_with_overlap - extra_no_overlap
@@ -53,9 +69,7 @@ def test_decoder_overlap_increases_sola_extra():
 def test_decoder_overlap_default_is_5():
     """RealtimeConfig default decoder_overlap_frames should be 5."""
     cfg = RealtimeConfig()
-    assert cfg.decoder_overlap_frames == 5, (
-        f"Expected default 5, got {cfg.decoder_overlap_frames}"
-    )
+    assert cfg.decoder_overlap_frames == 5, f"Expected default 5, got {cfg.decoder_overlap_frames}"
     print("PASS: default decoder_overlap_frames == 5")
 
 
@@ -68,17 +82,14 @@ def test_decoder_overlap_at_40k():
 
     crossfade_samples_out = int(output_sr * crossfade_sec)
     search_samples_out = int(output_sr * sola_search_ms / 1000)
-    sola_extra_out = crossfade_samples_out + 2 * search_samples_out
+    sola_extra_out = crossfade_samples_out + search_samples_out
     zc_model = model_sr // 100  # 400
 
     sola_extra_raw = int(sola_extra_out * model_sr / output_sr)
 
     decoder_frames = 5
     decoder_overlap_model = decoder_frames * zc_model
-    extra = (
-        (sola_extra_raw + decoder_overlap_model + zc_model - 1)
-        // zc_model * zc_model
-    )
+    extra = (sola_extra_raw + decoder_overlap_model + zc_model - 1) // zc_model * zc_model
 
     # Must be a multiple of zc_model
     assert extra % zc_model == 0, f"Not aligned: {extra} % {zc_model} = {extra % zc_model}"

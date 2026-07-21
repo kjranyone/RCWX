@@ -7,8 +7,10 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 
-def _minimum_chunk_ms(f0_method: str) -> int:
+def _minimum_chunk_ms(f0_method: str, latency_mode: str = "sub100") -> int:
     """Return the supported micro-hop floor for an F0 backend."""
+    if latency_mode == "frontier" and f0_method in {"swiftf0", "none"}:
+        return 20
     return {"rmvpe": 320, "fcpe": 100}.get(f0_method, 40)
 
 
@@ -23,8 +25,9 @@ def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
     overlap_ms = max(60, min(300, chunk_sec * 1000))
     overlap_ms = round(overlap_ms / 20) * 20
 
-    aggressive = latency_mode in {"aggressive", "sub100"}
+    aggressive = latency_mode in {"aggressive", "sub100", "frontier"}
     sub100 = latency_mode == "sub100"
+    frontier = latency_mode == "frontier"
 
     # Aggressive keeps enough overlap for a short SOLA splice while avoiding
     # the 50-80ms hold-back used by larger balanced chunks.
@@ -43,9 +46,17 @@ def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
         "overlap_sec": overlap_ms / 1000,
         "crossfade_sec": crossfade_ms / 1000,
         "sola_search_ms": sola_search_ms,
-        "latency_mode": "sub100" if sub100 else "aggressive" if aggressive else "balanced",
-        "prebuffer_chunks": 2 if sub100 else 1,
-        "buffer_margin": 0.1 if sub100 else 0.25 if aggressive else 0.5,
+        "latency_mode": (
+            "frontier"
+            if frontier
+            else "sub100"
+            if sub100
+            else "aggressive"
+            if aggressive
+            else "balanced"
+        ),
+        "prebuffer_chunks": 3 if frontier else 2 if sub100 else 1,
+        "buffer_margin": 0.1 if frontier or sub100 else 0.25 if aggressive else 0.5,
         "use_sola": True,
     }
 
@@ -105,9 +116,9 @@ class LatencySettingsFrame(ctk.CTkFrame):
         ).grid(row=0, column=0, padx=(0, 10), sticky="w")
         self.mode_control = ctk.CTkSegmentedButton(
             mode_frame,
-            values=["Balanced", "Aggressive", "Sub-100"],
+            values=["Balanced", "Aggressive", "Sub-100", "Frontier"],
             command=self._on_mode_change,
-            width=220,
+            width=300,
         )
         self.mode_control.set("Balanced")
         self.mode_control.grid(row=0, column=1, sticky="e")
@@ -220,8 +231,13 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def _on_mode_change(self, value: str) -> None:
         """Switch between the stable and low-buffer latency policies."""
         self.latency_mode = "sub100" if value == "Sub-100" else value.lower()
-        if self.latency_mode == "sub100":
-            target_ms = _minimum_chunk_ms(self.f0_method)
+        min_ms = _minimum_chunk_ms(self.f0_method, self.latency_mode)
+        self.chunk_slider.configure(
+            from_=min_ms,
+            number_of_steps=(600 - min_ms) // 20,
+        )
+        if self.latency_mode in {"sub100", "frontier"}:
+            target_ms = min_ms
             self.chunk_sec = target_ms / 1000
             self.chunk_slider.set(target_ms)
             self.chunk_value.configure(text=f"{target_ms}ms")
@@ -232,7 +248,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def set_f0_method(self, method: str) -> bool:
         """Apply the backend-specific hop floor and return whether it clamped."""
         self.f0_method = method
-        min_ms = _minimum_chunk_ms(method)
+        min_ms = _minimum_chunk_ms(method, self.latency_mode)
         self.chunk_slider.configure(
             from_=min_ms,
             number_of_steps=(600 - min_ms) // 20,
@@ -266,7 +282,10 @@ class LatencySettingsFrame(ctk.CTkFrame):
         - SOLA hold-back: crossfade_sec
         """
         auto = _auto_params(self.chunk_sec, self.latency_mode)
-        if self.latency_mode == "sub100":
+        if self.latency_mode == "frontier":
+            inference_est = 15
+            buffer_est = self.chunk_sec * 500
+        elif self.latency_mode == "sub100":
             inference_est = 20
             buffer_est = self.chunk_sec * 500
         elif self.latency_mode == "aggressive":
@@ -314,7 +333,12 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """
         if f0_method is not None:
             self.f0_method = f0_method
-        min_ms = _minimum_chunk_ms(self.f0_method)
+        self.latency_mode = (
+            latency_mode
+            if latency_mode in {"balanced", "aggressive", "sub100", "frontier"}
+            else "balanced"
+        )
+        min_ms = _minimum_chunk_ms(self.f0_method, self.latency_mode)
         self.chunk_slider.configure(
             from_=min_ms,
             number_of_steps=(600 - min_ms) // 20,
@@ -324,12 +348,6 @@ class LatencySettingsFrame(ctk.CTkFrame):
             self._round_to_frame_boundary(chunk_sec * 1000),
         )
         self.chunk_sec = rounded_ms / 1000
-        self.latency_mode = (
-            latency_mode
-            if latency_mode in {"balanced", "aggressive", "sub100"}
-            else "balanced"
-        )
-
         # Update slider
         self.chunk_slider.set(rounded_ms)
         self.chunk_value.configure(text=f"{rounded_ms}ms")

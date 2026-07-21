@@ -17,10 +17,10 @@ from rcwx.config import AudioConfig, InferenceConfig, RCWXConfig
 from rcwx.gui.widgets.latency_settings import _auto_params, _minimum_chunk_ms
 from rcwx.pipeline.realtime_unified import RealtimeConfig
 
-
 # ---------------------------------------------------------------------------
 # RealtimeConfig tests
 # ---------------------------------------------------------------------------
+
 
 def test_realtime_config_has_noise_scale():
     """RealtimeConfig should have noise_scale=0.4 by default."""
@@ -46,6 +46,7 @@ def test_realtime_config_custom_values():
 # ---------------------------------------------------------------------------
 # InferenceConfig tests
 # ---------------------------------------------------------------------------
+
 
 def test_inference_config_has_noise_scale():
     """InferenceConfig should have noise_scale=0.45 by default."""
@@ -83,8 +84,10 @@ def test_aggressive_latency_mode_parameters():
 def test_latency_mode_validation():
     assert AudioConfig(latency_mode="aggressive").latency_mode == "aggressive"
     assert AudioConfig(latency_mode="sub100").latency_mode == "sub100"
+    assert AudioConfig(latency_mode="frontier").latency_mode == "frontier"
     assert AudioConfig(latency_mode="invalid").latency_mode == "balanced"
     assert RealtimeConfig(latency_mode="sub100").latency_mode == "sub100"
+    assert RealtimeConfig(latency_mode="frontier").latency_mode == "frontier"
     assert RealtimeConfig(latency_mode="invalid").latency_mode == "balanced"
 
 
@@ -104,6 +107,7 @@ def test_hole_fill_and_uv_ramp_fields():
 # ---------------------------------------------------------------------------
 # JSON round-trip tests
 # ---------------------------------------------------------------------------
+
 
 def test_config_roundtrip_new_fields():
     """New fields should survive JSON save -> load round-trip."""
@@ -181,10 +185,10 @@ if __name__ == "__main__":
         try:
             print(f"Running {name}...")
             t()
-            print(f"  PASS")
+            print("  PASS")
             passed += 1
         except Exception as e:
             print(f"  FAIL: {e}")
             failed += 1
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")
