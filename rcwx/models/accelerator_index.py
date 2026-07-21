@@ -49,9 +49,17 @@ class AcceleratorIVFIndex(nn.Module):
         del features_tensor, packed_ids_tensor
 
         self.max_list_size = int(max_list_size)
-        self.register_buffer("centroids", centroids_tensor)
-        self.register_buffer("centroid_norms", centroids_tensor.float().square().sum(dim=1))
+        # Distance accumulation stays in fp32. Keep the relatively small
+        # centroid table ready in that dtype instead of converting it every
+        # hop, while the much larger packed feature table remains compact.
+        centroids_float = centroids_tensor.float()
+        self.register_buffer("centroids", centroids_float)
+        self.register_buffer("centroid_norms", centroids_float.square().sum(dim=1))
         self.register_buffer("packed_features", packed_features)
+        self.register_buffer(
+            "packed_feature_norms",
+            packed_features.float().square().sum(dim=1),
+        )
         self.register_buffer(
             "list_starts",
             torch.from_numpy(list_starts).to(device=device, dtype=torch.long),
@@ -156,7 +164,7 @@ class AcceleratorIVFIndex(nn.Module):
         centroid_distances = (
             query_norms
             + self.centroid_norms.unsqueeze(0)
-            - 2.0 * (query @ self.centroids.float().transpose(0, 1))
+            - 2.0 * (query @ self.centroids.transpose(0, 1))
         )
         coarse_ids = centroid_distances.argmin(dim=1)
         starts = self.list_starts[coarse_ids]
@@ -166,7 +174,18 @@ class AcceleratorIVFIndex(nn.Module):
         locations = locations.clamp_max(self.packed_features.shape[0] - 1)
 
         candidates = self.packed_features[locations].float()
-        distances = (candidates - query.unsqueeze(1)).square().sum(dim=2)
+        # ||c-q||^2 = ||c||^2 + ||q||^2 - 2<c,q>. Candidate norms are
+        # invariant and precomputed once, avoiding two [T, list, dim]
+        # temporaries for subtraction and squaring on every 20ms hop.
+        candidate_dots = torch.bmm(
+            candidates,
+            query.unsqueeze(2),
+        ).squeeze(2)
+        distances = (
+            self.packed_feature_norms[locations]
+            + query_norms
+            - 2.0 * candidate_dots
+        ).clamp_min_(0.0)
         distances = distances.masked_fill(~valid, float("inf"))
         scores, local_ids = torch.topk(distances, k, dim=1, largest=False)
         selected = locations.gather(1, local_ids)

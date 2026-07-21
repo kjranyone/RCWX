@@ -212,6 +212,9 @@ rcwx/
 - 固定64-frame経路では未使用のstreaming feature cloneを作らない
 - SOLA境界INFOログは開始3 hopと100 hopごとに限定
 - Frontierは未参照のdecoder overlap余白を生成せず、`crossfade + search`だけを保持
+- XPU IVFはfeature normを事前計算し、候補距離をnormと内積から求める
+- streaming TextEncoderは全frame有効fast pathで全1 mask処理を省略する
+- HuBERT/IVF結果の時間軸cacheは双方向contextとの不一致が大きいため使用しない
 - ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 

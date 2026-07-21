@@ -329,17 +329,23 @@ class Encoder(nn.Module):
             self.norm_layers_2.append(LayerNorm(hidden_channels))
 
     def forward(
-        self, x: torch.Tensor, x_mask: torch.Tensor
+        self,
+        x: torch.Tensor,
+        x_mask: torch.Tensor,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
-        attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
-        x = x * x_mask
+        attn_mask = None
+        if not all_frames_valid:
+            attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
+            x = x * x_mask
         for i in range(self.n_layers):
             y = self.attn_layers[i](x, x, attn_mask)
             y = self.drop(y)
             x = self.norm_layers_1[i](x + y)
 
-            y = self.ffn_layers[i](x, x_mask)
+            y = self.ffn_layers[i](x, None if all_frames_valid else x_mask)
             y = self.drop(y)
             x = self.norm_layers_2[i](x + y)
-        x = x * x_mask
+        if not all_frames_valid:
+            x = x * x_mask
         return x

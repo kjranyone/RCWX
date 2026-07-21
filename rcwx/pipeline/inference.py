@@ -994,6 +994,7 @@ class RVCPipeline:
         # kept in lockstep with the tail of _streaming_audio_history.
         self._streaming_f0_hz_history: Optional[torch.Tensor] = None
         self._streaming_output_resamplers: dict[int, torch.nn.Module] = {}
+        self._streaming_feature_lengths: dict[int, torch.Tensor] = {}
 
         # Per-stage times (ms) of the last profiled infer_streaming() call.
         self.stage_times: dict = {}
@@ -1251,6 +1252,7 @@ class RVCPipeline:
         self.accelerator_index = None
         self._accelerator_index_attempted = False
         self._streaming_output_resamplers.clear()
+        self._streaming_feature_lengths.clear()
         self._loaded = False
         self.clear_cache()
 
@@ -2490,9 +2492,13 @@ class RVCPipeline:
             align_corners=False,
         ).permute(0, 2, 1)
 
-        feature_lengths = torch.tensor(
-            [features.shape[1]], dtype=torch.long, device=self.device
-        )
+        feature_count = int(features.shape[1])
+        feature_lengths = self._streaming_feature_lengths.get(feature_count)
+        if feature_lengths is None:
+            feature_lengths = torch.tensor(
+                [feature_count], dtype=torch.long, device=self.device
+            )
+            self._streaming_feature_lengths[feature_count] = feature_lengths
 
         # F0 processing (same audio_t as HuBERT for perfect frame alignment)
         pitch = None
@@ -2792,6 +2798,7 @@ class RVCPipeline:
                 skip_head=skip_head_feat,
                 return_length=return_length_feat,
                 return_length2=return_length_feat,
+                all_frames_valid=True,
                 # Before history is full, skip_head moves every chunk. Capturing
                 # those transient signatures wastes graph memory and can evict
                 # the single steady-state graph needed by real-time inference.

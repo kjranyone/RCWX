@@ -410,7 +410,11 @@ Frontierのホットパス監査では、音声推論以外にも毎hopのXPU ti
 
 さらに、既定5 framesのdecoder overlapはSOLA向け合成余白へ50msを追加していましたが、SOLAはその区間を参照せず、20ms hopごとに100ms分を合成していました。Frontierではdecoder overlapを0にして合成区間を50msへ半減し、出力の時間位置を約47ms前進させます。実音声比較では境界jump p95が0.0273から0.0237へ低下し、clipは0でした。Balanced/Sub-100では既定5 framesを維持します。
 
-レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論9.6-13.3ms、定常guard 10ms、ASIO入出力約12msを使ったFrontierのE2E目安は約82-85msです。
+残る定常演算では、XPU IVFの候補距離が毎hopごとに`[frames, candidates, 768]`の差分・二乗tensorを作り、TextEncoderは全64 framesが有効でも全1のattention maskを各層へ適用していました。IVF feature normを事前計算して距離をnormと内積から求め、streaming TextEncoderではpadding maskの生成、masked fill、全1 mask乗算を省略します。いずれもcontext長やattention範囲を変えない同値変換です。同じ実音声60-hop測定はp50 10.38msから8.33ms、p95 13.50msから10.93ms、p99 14.98msから11.79msへ短縮し、20ms deadline missとGraph fallbackは0でした。
+
+HuBERT/IVF結果を時間軸に沿って再利用する近似cacheも検証しましたが、HuBERTの双方向context更新により、8-hop再同期でも最終波形相関0.956、最悪hop相関0.20まで低下したため採用していません。Frontierでも560ms HuBERT contextとTextEncoderのglobal attentionは維持します。
+
+レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論8.3-11.8ms、定常guard 10ms、ASIO入出力約12msを使ったFrontierのE2E目安は約80-84msです。
 
 ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Aggressiveでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
 

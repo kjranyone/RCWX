@@ -164,6 +164,7 @@ class SynthesizerLoader:
         self.has_f0: bool = True
         self.speaker_id: int = 0
         self.sample_rate: int = 40000
+        self._speaker_id_tensors: dict[tuple[int, str], torch.Tensor] = {}
 
     def load(self) -> nn.Module:
         """
@@ -284,6 +285,7 @@ class SynthesizerLoader:
         return_length: int = 0,
         return_length2: int = 0,
         use_accelerator_graph: bool = False,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
         """
         Run inference on the loaded model.
@@ -313,17 +315,22 @@ class SynthesizerLoader:
 
         # Default speaker ID
         if speaker_id is None:
-            speaker_id = torch.zeros(
-                features.shape[0],
-                dtype=torch.long,
-                device=features.device,
-            )
+            speaker_key = (features.shape[0], str(features.device))
+            speaker_id = self._speaker_id_tensors.get(speaker_key)
+            if speaker_id is None:
+                speaker_id = torch.zeros(
+                    features.shape[0],
+                    dtype=torch.long,
+                    device=features.device,
+                )
+                self._speaker_id_tensors[speaker_key] = speaker_id
 
         namespace = self._graph_namespace(
             noise_scale=noise_scale,
             skip_head=skip_head,
             return_length=return_length,
             return_length2=return_length2,
+            all_frames_valid=all_frames_valid,
         )
 
         if self.has_f0:
@@ -347,6 +354,7 @@ class SynthesizerLoader:
                     return_length=return_length,
                     return_length2=return_length2,
                     noise_scale=noise_scale,
+                    all_frames_valid=all_frames_valid,
                 )
 
             inputs = (features, feature_lengths, pitch, pitchf, speaker_id)
@@ -364,6 +372,7 @@ class SynthesizerLoader:
                     return_length=return_length,
                     return_length2=return_length2,
                     noise_scale=noise_scale,
+                    all_frames_valid=all_frames_valid,
                 )
 
             inputs = (features, feature_lengths, speaker_id)
@@ -382,6 +391,7 @@ class SynthesizerLoader:
         skip_head: int,
         return_length: int,
         return_length2: int,
+        all_frames_valid: bool,
     ) -> str:
         """Build a key for Python values and mutable decoder control flow."""
         phase_mode = "none"
@@ -409,6 +419,7 @@ class SynthesizerLoader:
             f"-noise-{float(noise_scale).hex()}"
             f"-skip-{int(skip_head)}-return-{int(return_length)}"
             f"-return2-{int(return_length2)}"
+            f"-full-{int(all_frames_valid)}"
             f"-phase-{phase_mode}-fixed-{int(fixed_harmonics)}"
             f"-uv-{uv_ramp_ms.hex()}"
         )

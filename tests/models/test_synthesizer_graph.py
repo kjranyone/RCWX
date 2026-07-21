@@ -35,8 +35,9 @@ class _FakeF0Synthesizer(nn.Module):
         return_length: int,
         return_length2: int,
         noise_scale: float,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
-        del lengths, pitch, speaker, return_length2
+        del lengths, pitch, speaker, return_length2, all_frames_valid
         end = skip_head + return_length
         base = features[:, skip_head:end, :1].transpose(1, 2)
         base = base + pitchf[:, skip_head:end].unsqueeze(1) * 0.001
@@ -54,8 +55,9 @@ class _FakeNoF0Synthesizer(nn.Module):
         return_length: int,
         return_length2: int,
         noise_scale: float,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
-        del lengths, speaker, return_length2, noise_scale
+        del lengths, speaker, return_length2, noise_scale, all_frames_valid
         end = skip_head + return_length
         return features[:, skip_head:end, :1].transpose(1, 2)
 
@@ -105,7 +107,35 @@ def test_realtime_graph_namespace_tracks_python_controls(monkeypatch) -> None:
     assert len(namespaces) == 2
     assert namespaces[0] != namespaces[1]
     assert "skip-2-return-4-return2-4" in namespaces[0]
+    assert "full-0" in namespaces[0]
     assert "fixed-1" in namespaces[1]
+
+
+def test_realtime_graph_namespace_tracks_full_frame_fastpath(monkeypatch) -> None:
+    loader = _loader(_FakeF0Synthesizer())
+    features, lengths, pitch, pitchf = _inputs()
+    namespaces = []
+
+    def run_graph(owner, namespace, function, *inputs):
+        del owner
+        namespaces.append(namespace)
+        return function(*inputs)
+
+    monkeypatch.setattr(synthesizer_module, "run_accelerator_graph", run_graph)
+    kwargs = dict(
+        pitch=pitch,
+        pitchf=pitchf,
+        skip_head=2,
+        return_length=4,
+        return_length2=4,
+        use_accelerator_graph=True,
+    )
+
+    loader.infer(features, lengths, all_frames_valid=False, **kwargs)
+    loader.infer(features, lengths, all_frames_valid=True, **kwargs)
+
+    assert "full-0" in namespaces[0]
+    assert "full-1" in namespaces[1]
 
 
 def test_compile_mode_bypasses_accelerator_graph(monkeypatch) -> None:
