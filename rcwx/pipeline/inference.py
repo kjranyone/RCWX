@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from scipy.signal import butter, filtfilt, medfilt
 
+from rcwx.accelerator_graph import run_accelerator_graph
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
 from rcwx.device import get_device, get_dtype
@@ -40,6 +41,7 @@ F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 # minimum number of mel frames (short inputs crash in avg_pool), and a fixed
 # slice size avoids per-chunk kernel recompilation on Intel XPU.
 F0_MIN_WINDOW_16K = 8960
+SWIFTF0_MIN_WINDOW_16K = 2240  # 40ms hop + 100ms pitch context
 # Fallback stage-profiling cadence when device timing events are unavailable:
 # wall-clock + device-wide sync is only paid on every Nth infer_streaming call
 # (plus the first 5).  With event support, profiling is sync-free and runs on
@@ -167,6 +169,10 @@ class StreamingParams:
     # Voiced/unvoiced crossfade ramp (ms) for the NSF sine/noise excitation
     # switch.  0 keeps the original RVC hard switch.
     uv_ramp_ms: float = 5.0
+    # Optional device-side output resampling. A positive rate keeps the
+    # synthesizer waveform on the accelerator through sinc resampling and
+    # performs the single D2H transfer at the final output rate.
+    output_sample_rate: int = 0
 
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
@@ -982,6 +988,7 @@ class RVCPipeline:
         # Windowed-F0 history: post-shift/moe, pre-filter F0 (Hz) @100fps,
         # kept in lockstep with the tail of _streaming_audio_history.
         self._streaming_f0_hz_history: Optional[torch.Tensor] = None
+        self._streaming_output_resamplers: dict[int, torch.nn.Module] = {}
 
         # Per-stage times (ms) of the last profiled infer_streaming() call.
         self.stage_times: dict = {}
@@ -1185,6 +1192,7 @@ class RVCPipeline:
         self.synthesizer = None
         self.faiss_index = None
         self.index_features = None
+        self._streaming_output_resamplers.clear()
         self._loaded = False
         self.clear_cache()
 
@@ -1228,6 +1236,35 @@ class RVCPipeline:
                 torch.cuda.synchronize()
         except Exception:
             pass
+
+    def _resample_streaming_output(
+        self,
+        output: torch.Tensor,
+        target_sample_rate: int,
+    ) -> torch.Tensor:
+        """Resample a fixed streaming waveform before its final D2H transfer."""
+        target_sample_rate = int(target_sample_rate)
+        if target_sample_rate <= 0 or target_sample_rate == self.sample_rate:
+            return output.float()
+
+        resampler = self._streaming_output_resamplers.get(target_sample_rate)
+        if resampler is None:
+            import torchaudio
+
+            resampler = torchaudio.transforms.Resample(
+                self.sample_rate,
+                target_sample_rate,
+                dtype=torch.float32,
+            ).to(self.device)
+            resampler.eval()
+            self._streaming_output_resamplers[target_sample_rate] = resampler
+
+        return run_accelerator_graph(
+            resampler,
+            "streaming-output-resample",
+            lambda value: resampler(value),
+            output.float(),
+        )
 
     def _assemble_windowed_f0(
         self,
@@ -2284,11 +2321,19 @@ class RVCPipeline:
         f0_input = f0_source
         if f0_context_sec > 0:
             f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
-            # Fixed slice size: clamp to [F0_MIN_WINDOW_16K, hubert context].
-            # Constant shape = single XPU kernel compilation, and never below
-            # the F0 model's minimum input.
+            # SwiftF0 is local and supports the short Sub-100 window. The
+            # neural GPU extractors retain the decoder-safe 560ms floor.
+            min_f0_window = (
+                SWIFTF0_MIN_WINDOW_16K
+                if (
+                    f0_method == "swiftf0"
+                    and self.swiftf0 is not None
+                    and f0_context_sec <= 0.10
+                )
+                else F0_MIN_WINDOW_16K
+            )
             f0_slice_samples = min(
-                max(new_samples + max(0, f0_ctx), F0_MIN_WINDOW_16K),
+                max(new_samples + max(0, f0_ctx), min_f0_window),
                 max_hubert_context_16k,
             )
             # Real-audio coverage; the shortfall (early chunks with a short
@@ -2701,9 +2746,34 @@ class RVCPipeline:
                 sample_rate=self.sample_rate,
             )
 
-        # Convert to numpy (the .cpu() transfer is the device sync point, so
-        # synth_ms includes the real synthesis + gate execution time, and all
-        # pending stage timing events are complete for finalize())
+        # Trim sub-frame residual from left (skip_head rounds to feature boundaries)
+        if residual_left > 0 and output.shape[-1] > residual_left:
+            output = output[..., residual_left:]
+
+        # Adjust to exact model-rate length while the waveform is still on
+        # the accelerator.
+        # With zc-aligned sola_extra_samples, residual_left should be 0 and
+        # the output should be >= expected_output (right-trim conservative).
+        # Trim excess; if short, pad tail with edge value (typically 0-2 samples
+        # from rounding — not a quality concern).
+        output_length = int(output.shape[-1])
+        if output_length > expected_output:
+            output = output[..., :expected_output]
+        elif output_length < expected_output:
+            output = torch.nn.functional.pad(
+                output,
+                (0, expected_output - output_length),
+                mode="replicate",
+            )
+
+        target_sample_rate = int(params.output_sample_rate)
+        if target_sample_rate > 0 and target_sample_rate != self.sample_rate:
+            tok = prof.start() if prof is not None else None
+            output = self._resample_streaming_output(output, target_sample_rate)
+            if prof is not None:
+                prof.stop("output_resample_ms", tok)
+
+        # This is the single waveform D2H transfer and natural device sync.
         output = output.cpu().float().numpy()
         if prof is not None:
             prof.stop_wall("synth_ms", t_synth)
@@ -2711,20 +2781,18 @@ class RVCPipeline:
         if output.ndim == 2:
             output = output[0]
 
-        # Trim sub-frame residual from left (skip_head rounds to feature boundaries)
-        if residual_left > 0 and len(output) > residual_left:
-            output = output[residual_left:]
-
-        # Adjust to exact expected length.
-        # With zc-aligned sola_extra_samples, residual_left should be 0 and
-        # the output should be >= expected_output (right-trim conservative).
-        # Trim excess; if short, pad tail with edge value (typically 0-2 samples
-        # from rounding — not a quality concern).
-        if len(output) > expected_output:
-            output = output[:expected_output]
-        elif len(output) < expected_output:
+        expected_final = expected_output
+        if target_sample_rate > 0 and target_sample_rate != self.sample_rate:
+            expected_final = int(
+                round(expected_output * target_sample_rate / self.sample_rate)
+            )
+        if len(output) > expected_final:
+            output = output[:expected_final]
+        elif len(output) < expected_final:
             output = np.pad(
-                output, (0, expected_output - len(output)), mode="edge"
+                output,
+                (0, expected_final - len(output)),
+                mode="edge",
             )
 
         return output

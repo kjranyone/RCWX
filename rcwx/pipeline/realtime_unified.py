@@ -120,6 +120,8 @@ class RealtimeStats:
     f0_ms: float = 0.0
     faiss_ms: float = 0.0
     synth_ms: float = 0.0
+    output_resample_ms: float = 0.0
+    jitter_guard_ms: float = 0.0
     buffer_underruns: int = 0
     buffer_overruns: int = 0
     buffer_trims: int = 0
@@ -148,6 +150,8 @@ class RealtimeStats:
         self.f0_ms = 0.0
         self.faiss_ms = 0.0
         self.synth_ms = 0.0
+        self.output_resample_ms = 0.0
+        self.jitter_guard_ms = 0.0
         self.buffer_underruns = 0
         self.buffer_overruns = 0
         self.buffer_trims = 0
@@ -493,11 +497,34 @@ class RealtimeVoiceChangerUnified:
         """
         margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
         if getattr(self.config, "latency_mode", "balanced") == "sub100":
-            # Start with two complete hops, then retain half a hop as jitter
-            # guard. The previous 1/8-hop target left only 5ms at a 40ms hop,
-            # which cannot absorb normal callback phase jitter or p99 spikes.
-            shed_threshold = self._hop_samples_out * 3 // 4
-            shed_target = self._hop_samples_out // 2
+            samples = getattr(self, "_inference_times", ())
+            if len(samples) < 20:
+                # Preserve the initial one-hop standing floor until enough
+                # live samples exist to estimate scheduler/GPU jitter.
+                self.stats.jitter_guard_ms = self.config.chunk_sec * 1000.0
+                return self._hop_samples_out * 5 // 4, self._hop_samples_out
+
+            hop_ms = self.config.chunk_sec * 1000.0
+            jitter_ms = max(
+                0.0,
+                self.stats.inference_p99_ms - self.stats.inference_p50_ms,
+            )
+            callback_ms = self._audio_callback_sec() * 1000.0
+            guard_ms = max(hop_ms * 0.5, jitter_ms + callback_ms)
+            guard_ms = min(hop_ms * 0.875, guard_ms)
+            shed_target = max(
+                1,
+                int(round(guard_ms * self._runtime_output_sample_rate / 1000.0)),
+            )
+            # A small hysteresis band prevents repeated trims when callback
+            # phase moves around the target.
+            shed_threshold = min(
+                self._hop_samples_out,
+                shed_target + self._hop_samples_out // 8,
+            )
+            self.stats.jitter_guard_ms = (
+                shed_target * 1000.0 / self._runtime_output_sample_rate
+            )
             return max(1, shed_threshold), max(0, shed_target)
         if getattr(self.config, "latency_mode", "balanced") == "aggressive":
             # The two-hop floor window filters the normal burst/drain sawtooth.
@@ -798,10 +825,11 @@ class RealtimeVoiceChangerUnified:
             actual_mic_rate = actual_output_rate
         else:
             actual_mic_rate = int(round(self._input_stream.actual_sample_rate))
-        if (
+        runtime_rates_changed = (
             actual_output_rate != self.config.output_sample_rate
             or actual_mic_rate != self.config.mic_sample_rate
-        ):
+        )
+        if runtime_rates_changed:
             reason = " (ASIO native)" if use_asio_duplex else ""
             logger.warning(
                 "Using runtime sample rates different from config%s: "
@@ -812,6 +840,16 @@ class RealtimeVoiceChangerUnified:
             )
 
         self._apply_runtime_sample_rates(actual_mic_rate, actual_output_rate)
+        if runtime_rates_changed and self._uses_device_output_resample():
+            # prepare() ran before PortAudio exposed the driver's native rate.
+            # Capture the actual-rate output-resample graph while callbacks
+            # still return silence (_running is False), never on the first
+            # live hop.
+            logger.info(
+                "[WARMUP] Rewarming Sub-100 for runtime output rate %dHz",
+                actual_output_rate,
+            )
+            self._run_runtime_warmup()
         self.input_resampler.reset()
         self.output_resampler.reset()
         self._sola_state.buffer = None
@@ -1242,7 +1280,10 @@ class RealtimeVoiceChangerUnified:
                 )
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
-                output_48k = self.output_resampler.resample_chunk(output_model)
+                if self._uses_device_output_resample():
+                    output_48k = output_model
+                else:
+                    output_48k = self.output_resampler.resample_chunk(output_model)
 
                 # --- Stage 7: SOLA crossfade ---
                 # target_len = hop_out: forces output to exactly output-hop
@@ -1320,6 +1361,9 @@ class RealtimeVoiceChangerUnified:
                 self.stats.f0_ms = float(stage.get("f0_ms", 0.0))
                 self.stats.faiss_ms = float(stage.get("faiss_ms", 0.0))
                 self.stats.synth_ms = float(stage.get("synth_ms", 0.0))
+                self.stats.output_resample_ms = float(
+                    stage.get("output_resample_ms", 0.0)
+                )
                 self.stats.frames_processed += 1
 
                 # --- GPU memory usage ---
@@ -1368,7 +1412,8 @@ class RealtimeVoiceChangerUnified:
                 stage_detail = (
                     f"pre={preprocess_ms:.0f} hubert={self.stats.hubert_ms:.0f} "
                     f"f0={self.stats.f0_ms:.0f} faiss={self.stats.faiss_ms:.0f} "
-                    f"synth={self.stats.synth_ms:.0f}ms"
+                    f"synth={self.stats.synth_ms:.0f} "
+                    f"out_rs={self.stats.output_resample_ms:.0f}ms"
                 )
                 if inference_ms > chunk_ms * 0.8 and self.stats.frames_processed % 50 == 0:
                     logger.warning(
@@ -1388,7 +1433,8 @@ class RealtimeVoiceChangerUnified:
                         f"p50={self.stats.inference_p50_ms:.0f}ms "
                         f"p95={self.stats.inference_p95_ms:.0f}ms "
                         f"p99={self.stats.inference_p99_ms:.0f}ms "
-                        f"deadline_miss={self.stats.deadline_miss_rate:.1%}"
+                        f"deadline_miss={self.stats.deadline_miss_rate:.1%} "
+                        f"guard={self.stats.jitter_guard_ms:.0f}ms"
                     )
 
                 if self.stats.frames_processed <= 5:
@@ -1600,9 +1646,10 @@ class RealtimeVoiceChangerUnified:
             # Fill HuBERT history before finishing warmup. Synthesizer Graph is
             # intentionally disabled while skip_head is moving, then captured
             # once for the steady-state position on the final pass.
+            hubert_context_sec, _ = self._effective_streaming_contexts()
             target_history = max(
                 8960,  # MIN_SYNTH_FEATURE_FRAMES converted to 16kHz samples
-                int(self.config.hubert_context_sec * 16000),
+                int(hubert_context_sec * 16000),
             )
             max_passes = max(
                 2,
@@ -1618,7 +1665,8 @@ class RealtimeVoiceChangerUnified:
                         voice_gate_mode="off",
                     ),
                 )
-                _ = self.output_resampler.resample_chunk(output_model)
+                if not self._uses_device_output_resample():
+                    _ = self.output_resampler.resample_chunk(output_model)
                 warmup_passes += 1
                 history = self.pipeline._streaming_audio_history
                 if history is not None and len(history) >= target_history:
@@ -1650,6 +1698,23 @@ class RealtimeVoiceChangerUnified:
 
     # ======== Helpers ========
 
+    def _effective_streaming_contexts(self) -> tuple[float, float]:
+        """Return runtime contexts without mutating the saved quality profile."""
+        hubert_context = float(getattr(self.config, "hubert_context_sec", 1.0))
+        f0_context = float(getattr(self.config, "f0_context_sec", 0.32))
+        if getattr(self.config, "latency_mode", "balanced") == "sub100":
+            hubert_context = min(hubert_context, 0.56)
+            if getattr(self.config, "f0_method", "rmvpe") == "swiftf0":
+                f0_context = min(f0_context, 0.10)
+        return hubert_context, f0_context
+
+    def _uses_device_output_resample(self) -> bool:
+        """Use the Frontier output path only for accelerator Sub-100 runs."""
+        if getattr(self.config, "latency_mode", "balanced") != "sub100":
+            return False
+        device = str(getattr(self.pipeline, "device", "cpu"))
+        return "xpu" in device or "cuda" in device
+
     def _build_streaming_params(
         self,
         *,
@@ -1664,6 +1729,7 @@ class RealtimeVoiceChangerUnified:
         them (0.0 / "off").
         """
         cfg = self.config
+        hubert_context_sec, f0_context_sec = self._effective_streaming_contexts()
         return StreamingParams(
             pitch_shift=cfg.pitch_shift,
             f0_method=cfg.f0_method if cfg.use_f0 else "none",
@@ -1679,11 +1745,16 @@ class RealtimeVoiceChangerUnified:
             enable_octave_flip_suppress=cfg.enable_octave_flip_suppress,
             enable_f0_slew_limit=cfg.enable_f0_slew_limit,
             f0_slew_max_step_st=cfg.f0_slew_max_step_st,
-            hubert_context_sec=cfg.hubert_context_sec,
+            hubert_context_sec=hubert_context_sec,
             fixed_harmonics=cfg.fixed_harmonics,
-            f0_context_sec=cfg.f0_context_sec,
+            f0_context_sec=f0_context_sec,
             f0_hole_fill_ms=cfg.f0_hole_fill_ms,
             uv_ramp_ms=cfg.uv_ramp_ms,
+            output_sample_rate=(
+                self._runtime_output_sample_rate
+                if self._uses_device_output_resample()
+                else 0
+            ),
         )
 
     def _reset_boundary_continuity_state(self) -> None:

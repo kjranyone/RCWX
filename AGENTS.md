@@ -197,8 +197,11 @@ rcwx/
 - Aggressive: `buffer_margin` = 0.25、持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
 - Aggressiveの非ASIOコールバック長は最大10ms
 - Sub-100: SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msが下限
-- Sub-100: `buffer_margin` = 0.1、0.75 hopでtrimして0.5 hopを維持
+- Sub-100: 最初の20 hopは1.0 hop、その後は`p99 - p50 + callback`を20-35msにクランプしたfloorを維持
 - Sub-100の非ASIOコールバック長は最大5ms、実行中はDenoiserをバイパス
+- Sub-100: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
+- Sub-100: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
+- ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
 補足:
@@ -208,6 +211,7 @@ rcwx/
 - FAISSはTextEncoderのglobal self-attentionを保つため、HuBERT文脈全体を検索します。
 - SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
 - 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
+- Sub-100の出力guardは推論jitter統計から適応し、アンダーラン後は2 hopを再バッファします。
 
 ## CLI Commands
 

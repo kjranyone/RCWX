@@ -45,3 +45,21 @@ def test_deadline_statistics_track_micro_hop_tail() -> None:
     assert vc.stats.deadline_miss_rate == 0.2
     assert vc.stats.inference_p50_ms == 25.0
     assert vc.stats.inference_p95_ms > 40.0
+
+
+def test_sub100_uses_short_context_and_device_output_resample() -> None:
+    vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
+    vc.config = SimpleNamespace(
+        latency_mode="sub100",
+        f0_method="swiftf0",
+        hubert_context_sec=1.0,
+        f0_context_sec=0.32,
+    )
+    vc.pipeline = SimpleNamespace(device="xpu")
+
+    assert vc._effective_streaming_contexts() == (0.56, 0.10)
+    assert vc._uses_device_output_resample() is True
+
+    vc.config.latency_mode = "aggressive"
+    assert vc._effective_streaming_contexts() == (1.0, 0.32)
+    assert vc._uses_device_output_resample() is False

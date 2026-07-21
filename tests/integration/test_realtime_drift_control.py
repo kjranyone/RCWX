@@ -190,7 +190,20 @@ def test_sub100_mode_uses_five_ms_callback_and_jitter_guard() -> None:
     vc.config.chunk_sec = 0.04
 
     assert vc._audio_callback_sec() == 0.005
-    assert vc._compute_shed_threshold() == (hop_out * 3 // 4, hop_out // 2)
+    assert vc._compute_shed_threshold() == (hop_out * 5 // 4, hop_out)
+    assert vc.stats.jitter_guard_ms == 40.0
+
+    vc._inference_times = deque([16.0] * 20, maxlen=256)
+    vc.stats.inference_p50_ms = 16.0
+    vc.stats.inference_p99_ms = 30.0
+    assert vc._compute_shed_threshold() == (hop_out * 5 // 8, hop_out // 2)
+    assert vc.stats.jitter_guard_ms == 20.0
+
+    vc.stats.inference_p99_ms = 45.0
+    threshold, target = vc._compute_shed_threshold()
+    assert threshold == 1872
+    assert target == 1632
+    assert vc.stats.jitter_guard_ms == 34.0
 
     vc._prebuffer_chunks = 1
     vc.config.prebuffer_chunks = 1

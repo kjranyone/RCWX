@@ -387,13 +387,15 @@ rcwx/
 |--------|-------------------|-----------------|----------------------|------|
 | Balanced | chunkの25%、最大80ms | プリバッファを維持 | chunk / 4 | 安定性優先 |
 | Aggressive | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 低遅延優先 |
-| Sub-100 | 10ms | 0.75 hopでtrim、0.5 hopを維持 | 最大5ms | ASIO + SwiftF0向け |
+| Sub-100 | 10ms | 初期1 hop、定常20-35msを適応維持 | 最大5ms | ASIO + SwiftF0向け |
 
 Aggressiveでも開始時に最初の生成チャンクを待つため、起動直後の無音アンダーランは発生させません。持続的なバッファ滞留だけを2 hopの観測窓で判定し、通常のチャンク内burst/drainはtrim対象から除外します。
 
-`Sub-100`はF0方式の下限へchunkを自動設定します。SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msです。開始時に2 hopを確保してから定常floorを0.5 hopまで下げ、アンダーラン時は2 hopを再確保して連続した音切れを防ぎます。40ms deadlineを守るため、Sub-100実行中だけDenoiserをバイパスします。保存済みのDenoiser設定は変更されないため、Balanced/Aggressiveへ戻すと再び有効になります。
+`Sub-100`はF0方式の下限へchunkを自動設定します。SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msです。開始時に2 hopを確保し、最初の20 hopは40msのfloorを維持します。その後は直近推論の`p99 - p50 + callback`から20-35msのjitter guardを選びます。アンダーラン時は2 hopを再確保して、連続した音切れを防ぎます。
 
-Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップ後、入力/出力リサンプルとSOLAを含む処理時間がp50 16.3ms、p95 17.5ms、p99 40.4msでした（40ms deadline miss 1/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
+Sub-100実行中は保存設定を変更せず、HuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時的に短縮します。また、モデルと出力のsample rateが異なる場合は、Synthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。40ms deadlineを守るためDenoiserは実行中だけバイパスされ、Balanced/Aggressiveへ戻すと保存済みの品質設定が再び有効になります。
+
+Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップとGUIのSOLA/decoder余白を含む処理時間がp50 14.5ms、p95 16.4ms、p99 18.8msでした（40ms deadline miss 0/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
 
 ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Aggressiveでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
 
