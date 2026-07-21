@@ -1656,12 +1656,22 @@ class RealtimeVoiceChangerUnified:
                 (target_history + max(1, hop_16k) - 1) // max(1, hop_16k) + 2,
             )
             warmup_passes = 0
+            if (
+                getattr(self.config, "latency_mode", "balanced") == "sub100"
+                and getattr(self.config, "index_rate", 0.0) > 0
+            ):
+                self.pipeline.prepare_accelerator_index()
+            warmup_index_rate = (
+                getattr(self.config, "index_rate", 0.0)
+                if getattr(self.pipeline, "accelerator_index", None) is not None
+                else 0.0
+            )
             for _ in range(max_passes):
                 output_model = self.pipeline.infer_streaming(
                     chunk_16k,
                     overlap_16k,
                     self._build_streaming_params(
-                        index_rate=0.0,
+                        index_rate=warmup_index_rate,
                         voice_gate_mode="off",
                     ),
                 )

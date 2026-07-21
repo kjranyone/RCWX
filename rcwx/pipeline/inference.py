@@ -20,6 +20,7 @@ from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
 from rcwx.device import get_device, get_dtype
 from rcwx.downloader import get_hubert_path, get_rmvpe_path
+from rcwx.models.accelerator_index import AcceleratorIVFIndex
 from rcwx.models.fcpe import FCPE, is_fcpe_available
 from rcwx.models.hubert_loader import HuBERTLoader
 from rcwx.models.rmvpe import RMVPE
@@ -951,6 +952,8 @@ class RVCPipeline:
         # FAISS index components
         self.faiss_index = None
         self.index_features: Optional[np.ndarray] = None  # big_npy
+        self.accelerator_index: Optional[AcceleratorIVFIndex] = None
+        self._accelerator_index_attempted = False
 
         # Model properties
         self.has_f0: bool = use_f0
@@ -1114,10 +1117,39 @@ class RVCPipeline:
             logger.warning("faiss-cpu not installed, index retrieval disabled")
             self.faiss_index = None
             self.index_features = None
-        except Exception as e:
-            logger.warning(f"Failed to load FAISS index: {e}")
+        except Exception as exc:
+            logger.warning("Failed to load FAISS index: %s", exc)
             self.faiss_index = None
             self.index_features = None
+
+    def prepare_accelerator_index(self) -> bool:
+        """Build the device IVF once, before a low-latency stream starts."""
+        if self.accelerator_index is not None:
+            return True
+        if self._accelerator_index_attempted:
+            return False
+        self._accelerator_index_attempted = True
+        if (
+            self.faiss_index is None
+            or self.index_features is None
+            or str(self.device).split(":", 1)[0] not in {"xpu", "cuda"}
+        ):
+            return False
+        try:
+            self.accelerator_index = AcceleratorIVFIndex.from_faiss(
+                self.faiss_index,
+                self.index_features,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            return True
+        except Exception as exc:
+            self.accelerator_index = None
+            logger.warning(
+                "Accelerator IVF unavailable; using CPU FAISS: %s",
+                exc,
+            )
+            return False
 
     def _search_index(
         self,
@@ -1138,6 +1170,13 @@ class RVCPipeline:
         """
         if self.faiss_index is None or index_rate <= 0:
             return features
+
+        if (
+            self.accelerator_index is not None
+            and features.device.type in {"xpu", "cuda"}
+        ):
+            retrieved_tensor = self.accelerator_index.retrieve(features, k=k)
+            return index_rate * retrieved_tensor + (1 - index_rate) * features
 
         # Convert to numpy for FAISS search
         npy = features[0].cpu().numpy()
@@ -1185,6 +1224,8 @@ class RVCPipeline:
             self.hubert.clear_graph_cache()
         if self.synthesizer is not None:
             self.synthesizer.clear_graph_cache()
+        if self.accelerator_index is not None:
+            self.accelerator_index.clear_graph_cache()
         self.hubert = None
         self.rmvpe = None
         self.fcpe = None
@@ -1192,6 +1233,8 @@ class RVCPipeline:
         self.synthesizer = None
         self.faiss_index = None
         self.index_features = None
+        self.accelerator_index = None
+        self._accelerator_index_attempted = False
         self._streaming_output_resamplers.clear()
         self._loaded = False
         self.clear_cache()
@@ -2810,6 +2853,11 @@ class RVCPipeline:
             if self.synthesizer is not None
             else None
         )
+        index_graph_stats = (
+            self.accelerator_index.graph_stats()
+            if self.accelerator_index is not None
+            else None
+        )
 
         return {
             "loaded": True,
@@ -2825,4 +2873,5 @@ class RVCPipeline:
             "use_compile": self.use_compile,
             "hubert_accelerator_graph": hubert_graph_stats,
             "synthesizer_accelerator_graph": synthesizer_graph_stats,
+            "index_accelerator_graph": index_graph_stats,
         }

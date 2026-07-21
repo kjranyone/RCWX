@@ -12,10 +12,18 @@ from rcwx.pipeline.realtime_unified import RealtimeVoiceChangerUnified
 class _FakePipeline:
     def __init__(self, history_limit: int) -> None:
         self.history_limit = history_limit
+        self.device = "cpu"
         self.synthesizer = None
+        self.accelerator_index = None
         self._streaming_audio_history = None
         self.infer_calls = 0
         self.clear_calls = 0
+        self.prepare_index_calls = 0
+
+    def prepare_accelerator_index(self) -> bool:
+        self.prepare_index_calls += 1
+        self.accelerator_index = object()
+        return True
 
     def infer_streaming(self, chunk, overlap, params):
         del params
@@ -69,3 +77,29 @@ def test_runtime_warmup_reaches_full_hubert_history() -> None:
     assert changer.output_resampler.reset_calls == 1
     assert changer._sola_state.buffer is None
     assert changer._overlap_buf is None
+    assert changer.pipeline.prepare_index_calls == 0
+
+
+def test_sub100_runtime_warmup_prepares_accelerator_index() -> None:
+    changer = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
+    changer.config = SimpleNamespace(
+        hubert_context_sec=0.56,
+        f0_context_sec=0.10,
+        f0_method="swiftf0",
+        latency_mode="sub100",
+        index_rate=0.45,
+    )
+    changer._hop_samples_16k = 640
+    changer._overlap_samples_16k = 960
+    changer.pipeline = _FakePipeline(history_limit=8960)
+    changer.input_resampler = _FakeResampler()
+    changer.output_resampler = _FakeResampler()
+    changer._sola_state = SimpleNamespace(buffer=None)
+    changer._overlap_buf = None
+    changer._reset_boundary_continuity_state = lambda: None
+    changer._build_streaming_params = lambda **kwargs: kwargs
+
+    changer._run_runtime_warmup()
+
+    assert changer.pipeline.prepare_index_calls == 1
+    assert changer.pipeline.infer_calls == 13

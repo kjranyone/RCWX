@@ -88,6 +88,7 @@ rcwx/
 │   └── stream_base.py     # ストリーム基底
 ├── models/
 │   ├── hubert_loader.py
+│   ├── accelerator_index.py # XPU/CUDA常駐IVF検索
 │   ├── rmvpe.py
 │   ├── fcpe.py
 │   ├── swiftf0.py         # SwiftF0 (ONNX/CPU)
@@ -201,6 +202,7 @@ rcwx/
 - Sub-100の非ASIOコールバック長は最大5ms、実行中はDenoiserをバイパス
 - Sub-100: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
 - Sub-100: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
+- Sub-100では対応するFAISS IVF indexをwarmup時にXPUへ配置し、HuBERT特徴のCPU往復を省略
 - ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
@@ -209,6 +211,8 @@ rcwx/
 - GUI起動時は `config.audio.chunk_sec` と `latency_mode` を復元し、上記の自動値を再計算します。
 - 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
 - FAISSはTextEncoderのglobal self-attentionを保つため、HuBERT文脈全体を検索します。
+- XPU IVFはL2 / nprobe=1 / 最大list長256以下で有効です。未対応indexはCPU FAISSへfallbackします。
+- XPU IVFは再構築特徴をFP16/BF16で保持し、158k×768 indexでは約240MBの追加VRAMを使います。
 - SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
 - 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
 - Sub-100の出力guardは推論jitter統計から適応し、アンダーラン後は2 hopを再バッファします。
