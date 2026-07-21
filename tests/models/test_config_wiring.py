@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from rcwx.config import AudioConfig, InferenceConfig, RCWXConfig
-from rcwx.gui.widgets.latency_settings import _auto_params
+from rcwx.gui.widgets.latency_settings import _auto_params, _minimum_chunk_ms
 from rcwx.pipeline.realtime_unified import RealtimeConfig
 
 
@@ -77,11 +77,14 @@ def test_aggressive_latency_mode_parameters():
     assert _auto_params(0.1, "aggressive")["crossfade_sec"] == 0.01
     assert aggressive["buffer_margin"] == 0.25
     assert aggressive["prebuffer_chunks"] == 1
+    assert _minimum_chunk_ms("swiftf0") == 40
 
 
 def test_latency_mode_validation():
     assert AudioConfig(latency_mode="aggressive").latency_mode == "aggressive"
+    assert AudioConfig(latency_mode="sub100").latency_mode == "sub100"
     assert AudioConfig(latency_mode="invalid").latency_mode == "balanced"
+    assert RealtimeConfig(latency_mode="sub100").latency_mode == "sub100"
     assert RealtimeConfig(latency_mode="invalid").latency_mode == "balanced"
 
 

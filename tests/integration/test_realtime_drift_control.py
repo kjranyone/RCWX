@@ -179,6 +179,20 @@ def test_aggressive_mode_caps_non_asio_callback_at_10ms() -> None:
     assert vc._audio_callback_sec() == 0.025
 
 
+def test_sub100_mode_uses_five_ms_callback_and_small_floor() -> None:
+    hop_out = 1920
+    vc = _make_vc(
+        hop_out=hop_out,
+        out_sr=48000,
+        buffer_margin=0.1,
+        latency_mode="sub100",
+    )
+    vc.config.chunk_sec = 0.04
+
+    assert vc._audio_callback_sec() == 0.005
+    assert vc._compute_shed_threshold() == (hop_out // 2, hop_out // 8)
+
+
 def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
     hop_out = 4800
     vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="aggressive")
@@ -206,5 +220,6 @@ if __name__ == "__main__":
     test_skip_when_accumulated_above_threshold()
     test_aggressive_mode_sheds_one_hop_floor()
     test_aggressive_mode_caps_non_asio_callback_at_10ms()
+    test_sub100_mode_uses_five_ms_callback_and_small_floor()
     test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
     print("PASS: realtime drift-control tests")

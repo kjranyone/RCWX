@@ -119,7 +119,7 @@ rcwx/
 | `sample_rate`             |  `16000` | 内部処理入力レート      |
 | `output_sample_rate`      |  `48000` | 出力レート              |
 | `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
-| `latency_mode`            | `balanced` | `balanced` / `aggressive` |
+| `latency_mode`            | `balanced` | `balanced` / `aggressive` / `sub100` |
 | `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
 | `buffer_margin`           |    `0.5` | バッファ余裕            |
 | `input_gain_db`           |    `0.0` | 入力ゲイン              |
@@ -169,7 +169,7 @@ rcwx/
 実行時にGUI設定から生成される主要値:
 
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
-- `latency_mode` (`balanced` / `aggressive`)
+- `latency_mode` (`balanced` / `aggressive` / `sub100`)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
 - `crossfade_sec` (既定 0.08)
 - `sola_search_ms` (既定 10.0)
@@ -190,16 +190,23 @@ rcwx/
 - `overlap_sec` = chunkの100%（60-300msにクランプ、20ms刻み）
 - Balanced: `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
 - Aggressive: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
+- Sub-100: `chunk_sec` = F0方式の下限、`crossfade_sec` = 10ms
 - `prebuffer_chunks` = 1
 - Balanced: `buffer_margin` = 0.5
 - Aggressive: `buffer_margin` = 0.25、持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
 - Aggressiveの非ASIOコールバック長は最大10ms
+- Sub-100: SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msが下限
+- Sub-100: `buffer_margin` = 0.1、0.5 hopでtrimして0.125 hopへ戻す
+- Sub-100の非ASIOコールバック長は最大5ms、実行中はDenoiserをバイパス
 - `use_sola` = true
 
 補足:
 
 - GUI起動時は `config.audio.chunk_sec` と `latency_mode` を復元し、上記の自動値を再計算します。
 - 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
+- FAISSはTextEncoderのglobal self-attentionを保つため、HuBERT文脈全体を検索します。
+- SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
+- 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
 
 ## CLI Commands
 

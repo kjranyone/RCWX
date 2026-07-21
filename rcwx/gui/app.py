@@ -588,6 +588,7 @@ class RCWXApp(ctk.CTk):
         self.latency_settings = LatencySettingsFrame(
             self.audio_scroll,
             on_settings_changed=self._on_latency_settings_changed,
+            f0_method=self.pitch_control.f0_method,
         )
         self.latency_settings.pack(fill="x", padx=10, pady=5)
 
@@ -925,8 +926,15 @@ class RCWXApp(ctk.CTk):
 
     def _on_f0_method_changed(self, method: str) -> None:
         """Handle F0 method change (rmvpe/fcpe/none)."""
+        chunk_clamped = False
+        if hasattr(self, "latency_settings"):
+            chunk_clamped = self.latency_settings.set_f0_method(method)
         self._save_config()
         self.realtime_controller.set_f0_method(method)
+        if chunk_clamped and self.realtime_controller.is_running:
+            self.realtime_controller.apply_latency_settings(
+                self.latency_settings.get_settings()
+            )
 
     def _on_moe_boost_changed(self, strength: float) -> None:
         """Handle moe boost change."""
@@ -1082,6 +1090,7 @@ class RCWXApp(ctk.CTk):
         self.latency_settings.set_values(
             chunk_sec=self.config.audio.chunk_sec,
             latency_mode=self.config.audio.latency_mode,
+            f0_method=self.pitch_control.f0_method,
         )
 
     def _on_audio_settings_changed(self) -> None:

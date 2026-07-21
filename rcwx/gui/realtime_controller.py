@@ -126,7 +126,13 @@ class RealtimeController:
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 output_gain_db=self.app.config.audio.output_gain_db,
                 index_rate=self.app._get_index_rate(),
-                denoise_enabled=self.app.use_denoise_var.get(),
+                # Sub-100 is a deadline contract. The current ML/spectral
+                # denoisers have p99 spikes above a 40ms hop, so preserve the
+                # user's checkbox while bypassing denoise only in this mode.
+                denoise_enabled=(
+                    self.app.use_denoise_var.get()
+                    and latency["latency_mode"] != "sub100"
+                ),
                 denoise_method=self.app.denoise_method_var.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
                 fixed_harmonics=self.app.pitch_control.fixed_harmonics,

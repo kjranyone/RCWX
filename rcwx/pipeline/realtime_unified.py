@@ -110,6 +110,11 @@ class RealtimeStats:
     queue_latency_ms: float = 0.0
     sola_latency_ms: float = 0.0
     inference_ms: float = 0.0
+    inference_p50_ms: float = 0.0
+    inference_p95_ms: float = 0.0
+    inference_p99_ms: float = 0.0
+    deadline_misses: int = 0
+    deadline_miss_rate: float = 0.0
     # Per-stage breakdown of inference_ms (from RVCPipeline.stage_times)
     hubert_ms: float = 0.0
     f0_ms: float = 0.0
@@ -134,6 +139,11 @@ class RealtimeStats:
         self.queue_latency_ms = 0.0
         self.sola_latency_ms = 0.0
         self.inference_ms = 0.0
+        self.inference_p50_ms = 0.0
+        self.inference_p95_ms = 0.0
+        self.inference_p99_ms = 0.0
+        self.deadline_misses = 0
+        self.deadline_miss_rate = 0.0
         self.hubert_ms = 0.0
         self.f0_ms = 0.0
         self.faiss_ms = 0.0
@@ -247,12 +257,12 @@ class RealtimeConfig:
     limiter_release_ms: float = 80.0
 
     def __post_init__(self) -> None:
-        if self.latency_mode not in {"balanced", "aggressive"}:
+        if self.latency_mode not in {"balanced", "aggressive", "sub100"}:
             object.__setattr__(self, "latency_mode", "balanced")
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
         chunk_ms = self.chunk_sec * 1000
-        rounded_ms = round(chunk_ms / frame_ms) * frame_ms
+        rounded_ms = max(40, min(600, round(chunk_ms / frame_ms) * frame_ms))
         if rounded_ms != chunk_ms:
             logger.info(
                 f"[RealtimeConfig] Rounding chunk_sec from {self.chunk_sec:.3f}s "
@@ -427,6 +437,7 @@ class RealtimeVoiceChangerUnified:
         self._device_error_streak = 0
         self._input_queue: Queue = Queue(maxsize=self.config.max_queue_size)
         self._output_queue: Queue = Queue(maxsize=self.config.max_queue_size)
+        self._inference_times: deque[float] = deque(maxlen=256)
 
         # Pre-buffering
         self._prebuffer_chunks = self.config.prebuffer_chunks
@@ -479,6 +490,10 @@ class RealtimeVoiceChangerUnified:
             (shed_threshold, shed_target): floor limit and post-trim target.
         """
         margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
+        if getattr(self.config, "latency_mode", "balanced") == "sub100":
+            shed_threshold = self._hop_samples_out // 2
+            shed_target = self._hop_samples_out // 8
+            return max(1, shed_threshold), max(0, shed_target)
         if getattr(self.config, "latency_mode", "balanced") == "aggressive":
             # The two-hop floor window filters the normal burst/drain sawtooth.
             # Any floor above this bound is persistent queued audio, so shed it
@@ -500,7 +515,9 @@ class RealtimeVoiceChangerUnified:
     def _audio_callback_sec(self) -> float:
         """Return the requested callback duration for non-ASIO streams."""
         callback_sec = self.config.chunk_sec / 4
-        if self.config.latency_mode == "aggressive":
+        if self.config.latency_mode == "sub100":
+            callback_sec = min(callback_sec, 0.005)
+        elif self.config.latency_mode == "aggressive":
             callback_sec = min(callback_sec, 0.010)
         return callback_sec
 
@@ -529,6 +546,28 @@ class RealtimeVoiceChangerUnified:
         self.stats.queue_latency_ms = queue_ms
         self.stats.sola_latency_ms = sola_ms
         self.stats.latency_ms = hop_ms + inference_ms + buffer_ms + queue_ms + sola_ms
+
+    def _record_inference_timing(self, inference_ms: float) -> None:
+        """Track deadline-oriented rolling latency percentiles."""
+        self._inference_times.append(float(inference_ms))
+        deadline_ms = self.config.chunk_sec * 1000.0
+        if inference_ms > deadline_ms:
+            self.stats.deadline_misses += 1
+
+        # Percentiles allocate and sort; sample them at 10-hop cadence after
+        # startup so telemetry does not become part of the micro-hop problem.
+        if len(self._inference_times) > 5 and (self.stats.frames_processed + 1) % 10:
+            return
+
+        values = np.fromiter(self._inference_times, dtype=np.float64)
+        if values.size:
+            p50, p95, p99 = np.percentile(values, (50, 95, 99))
+            self.stats.inference_p50_ms = float(p50)
+            self.stats.inference_p95_ms = float(p95)
+            self.stats.inference_p99_ms = float(p99)
+            self.stats.deadline_miss_rate = float(
+                np.count_nonzero(values > deadline_ms) / values.size
+            )
 
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
@@ -625,6 +664,7 @@ class RealtimeVoiceChangerUnified:
 
         self.pipeline.clear_cache()
         self.stats.reset()
+        self._inference_times.clear()
         self.output_buffer.clear()
         self._input_buf = np.array([], dtype=np.float32)
         self._overlap_buf = None
@@ -841,16 +881,6 @@ class RealtimeVoiceChangerUnified:
     def set_f0_method(self, method: str) -> None:
         old = self.config.f0_method
         self.config.f0_method = method
-        # Enforce minimum chunk_sec for the new F0 method
-        if self.config.use_f0:
-            min_chunk = {"rmvpe": 0.32, "fcpe": 0.10}.get(method, 0.0)
-            if min_chunk > 0 and self.config.chunk_sec < min_chunk:
-                logger.info(
-                    f"F0 method {method} requires chunk_sec >= {min_chunk}s, "
-                    f"adjusting from {self.config.chunk_sec}s"
-                )
-                self.set_chunk_sec(min_chunk)
-                return
         if old != method:
             logger.info(f"F0 method changed: {old} -> {method}")
 
@@ -890,7 +920,7 @@ class RealtimeVoiceChangerUnified:
 
     def set_chunk_sec(self, chunk_sec: float) -> None:
         old = self.config.chunk_sec
-        self.config.chunk_sec = max(0.1, min(0.6, chunk_sec))
+        self.config.chunk_sec = max(0.04, min(0.6, chunk_sec))
         if self._running:
             logger.info(f"Chunk size changed ({old}s -> {self.config.chunk_sec}s), restarting...")
             self.stop()
@@ -902,7 +932,9 @@ class RealtimeVoiceChangerUnified:
 
     def set_latency_mode(self, mode: str) -> None:
         self.config.latency_mode = (
-            mode if mode in {"balanced", "aggressive"} else "balanced"
+            mode
+            if mode in {"balanced", "aggressive", "sub100"}
+            else "balanced"
         )
 
     def set_buffer_margin(self, margin: float) -> None:
@@ -1258,6 +1290,7 @@ class RealtimeVoiceChangerUnified:
                 # --- Stage 9: Queue output ---
                 inference_ms = (time.perf_counter() - start_time) * 1000
                 self.stats.inference_ms = inference_ms
+                self._record_inference_timing(inference_ms)
                 stage = getattr(self.pipeline, "stage_times", None) or {}
                 self.stats.hubert_ms = float(stage.get("hubert_ms", 0.0))
                 self.stats.f0_ms = float(stage.get("f0_ms", 0.0))
@@ -1327,7 +1360,11 @@ class RealtimeVoiceChangerUnified:
                         f"(hop={self.stats.hop_latency_ms:.0f} "
                         f"buffer={self.stats.buffer_latency_ms:.0f} "
                         f"queue={self.stats.queue_latency_ms:.0f} "
-                        f"sola={self.stats.sola_latency_ms:.0f})"
+                        f"sola={self.stats.sola_latency_ms:.0f}) / "
+                        f"p50={self.stats.inference_p50_ms:.0f}ms "
+                        f"p95={self.stats.inference_p95_ms:.0f}ms "
+                        f"p99={self.stats.inference_p99_ms:.0f}ms "
+                        f"deadline_miss={self.stats.deadline_miss_rate:.1%}"
                     )
 
                 if self.stats.frames_processed <= 5:
@@ -1505,7 +1542,10 @@ class RealtimeVoiceChangerUnified:
         if not self.config.denoise_enabled:
             return
         try:
-            warmup_len = int(max(self.config.chunk_sec, 0.2) * 16000)
+            # Runtime uses exactly one aligned 16kHz hop. Warming a minimum
+            # 200ms tensor left the actual 40-100ms shape cold, causing a
+            # large first-live-chunk compilation stall on XPU.
+            warmup_len = self._hop_samples_16k
             dummy = np.random.randn(warmup_len).astype(np.float32) * 0.001
             _ = denoise_audio(
                 dummy,

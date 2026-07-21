@@ -1271,7 +1271,10 @@ class RVCPipeline:
         hist = self._streaming_f0_hz_history
         if hist is not None and hist.shape[0] == f0_win.shape[0]:
             new_tail = f0_win[:, f0_win.shape[1] - new_frames :]
-            hist = torch.cat([hist.to(f0_win.dtype), new_tail], dim=1)
+            hist = torch.cat(
+                [hist.to(device=f0_win.device, dtype=f0_win.dtype), new_tail],
+                dim=1,
+            )
         else:
             hist = f0_win
         hist = hist[:, -hist_cap:]
@@ -2368,7 +2371,9 @@ class RVCPipeline:
             if prof is not None:
                 prof.stop("hubert_ms", tok)
 
-        # FAISS index retrieval (internally synced by the .cpu() transfer)
+        # FAISS index retrieval (internally synced by the .cpu() transfer).
+        # Keep the full context: the synthesizer TextEncoder uses global
+        # self-attention, so even trimmed prefix features affect emitted audio.
         if index_rate > 0 and self.faiss_index is not None:
             t0 = time.perf_counter()
             features = self._search_index(features, index_rate, k=index_k)
@@ -2423,7 +2428,17 @@ class RVCPipeline:
                         prof.stop_wall("f0_ms", wall0)
 
             if f0 is not None and f0.numel() > 0:
-                if f0.device != torch.device(self.device):
+                # SwiftF0 is a CPU ONNX model. Keep its result and the full
+                # post-processing chain on CPU, then upload pitch tensors once
+                # immediately before synthesis. Moving it to XPU here caused
+                # every NumPy/Scipy F0 correction below to perform another
+                # XPU->CPU->XPU synchronization.
+                keep_f0_on_cpu = (
+                    f0_method == "swiftf0"
+                    and self.swiftf0 is not None
+                    and f0.device.type == "cpu"
+                )
+                if not keep_f0_on_cpu and f0.device != torch.device(self.device):
                     f0 = f0.to(self.device)
 
                 # FCPE smoothing
@@ -2476,7 +2491,10 @@ class RVCPipeline:
                 # Prepend history for filter warmup
                 f0_history_len = 0
                 if self._streaming_f0_pre_filter_tail is not None:
-                    history = self._streaming_f0_pre_filter_tail
+                    history = self._streaming_f0_pre_filter_tail.to(
+                        device=f0.device,
+                        dtype=f0.dtype,
+                    )
                     f0_history_len = history.shape[1]
                     f0_extended = torch.cat([history, f0], dim=1)
                 else:
@@ -2503,6 +2521,15 @@ class RVCPipeline:
 
                 # Quantized pitch for embedding (shared with batch infer)
                 pitch, voiced_mask_for_gate = quantize_f0_to_pitch(f0)
+
+                # The synthesizer and optional gate run on the accelerator.
+                # SwiftF0 reaches this point on CPU, so this is its only H2D
+                # transfer after ONNX inference.
+                target_device = torch.device(self.device)
+                if pitch.device != target_device:
+                    pitch = pitch.to(target_device)
+                    pitchf = pitchf.to(target_device)
+                    voiced_mask_for_gate = voiced_mask_for_gate.to(target_device)
 
             if pitch is None:
                 logger.warning(
