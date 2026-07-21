@@ -576,6 +576,11 @@ class RealtimeVoiceChangerUnified:
             callback_sec = min(callback_sec, 0.010)
         return callback_sec
 
+    def _should_publish_stats(self) -> bool:
+        """Limit UI and device telemetry work on the 20ms hot path."""
+        interval = 5 if self.config.latency_mode == "frontier" else 1
+        return self.stats.frames_processed <= 1 or self.stats.frames_processed % interval == 0
+
     def _update_latency_estimate(self, inference_ms: float) -> None:
         """Update E2E telemetry without counting the ring's hop sawtooth."""
         hop_ms = self.config.chunk_sec * 1000.0
@@ -1327,15 +1332,7 @@ class RealtimeVoiceChangerUnified:
                 self._bdiag_n += 1
                 sola_out_len = len(output_48k)
                 self._bdiag_balance += sola_out_len - self._hop_samples_out
-                if (
-                    self._bdiag_n <= 5
-                    or self._bdiag_n % 50 == 0
-                    or (
-                        self.config.use_sola
-                        and self._sola_state.last_offset != 0
-                        and self._bdiag_n <= 200
-                    )
-                ):
+                if self._bdiag_n <= 3 or self._bdiag_n % 100 == 0:
                     off = self._sola_state.last_offset if self.config.use_sola else 0
                     logger.info(
                         "[BOUNDARY] chunk#%d sola_in=%d out=%d hop=%d offset=%d "
@@ -1387,30 +1384,36 @@ class RealtimeVoiceChangerUnified:
                 self.stats.output_resample_ms = float(stage.get("output_resample_ms", 0.0))
                 self.stats.frames_processed += 1
 
-                # --- GPU memory usage ---
-                try:
-                    import torch
+                publish_stats = self._should_publish_stats()
+                if publish_stats:
+                    # Device telemetry is for the UI, not part of inference.
+                    try:
+                        import torch
 
-                    device = self.pipeline.device
-                    device_str = str(device)
-                    if "xpu" in device_str:
-                        if self._gpu_total_memory == 0:
-                            self._gpu_total_memory = torch.xpu.get_device_properties(
-                                device
-                            ).total_memory
-                        if self._gpu_total_memory > 0:
-                            alloc = torch.xpu.memory_allocated(device)
-                            self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
-                    elif "cuda" in device_str:
-                        if self._gpu_total_memory == 0:
-                            self._gpu_total_memory = torch.cuda.get_device_properties(
-                                device
-                            ).total_memory
-                        if self._gpu_total_memory > 0:
-                            alloc = torch.cuda.memory_allocated(device)
-                            self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
-                except Exception:
-                    pass
+                        device = self.pipeline.device
+                        device_str = str(device)
+                        if "xpu" in device_str:
+                            if self._gpu_total_memory == 0:
+                                self._gpu_total_memory = torch.xpu.get_device_properties(
+                                    device
+                                ).total_memory
+                            if self._gpu_total_memory > 0:
+                                alloc = torch.xpu.memory_allocated(device)
+                                self.stats.gpu_memory_percent = (
+                                    alloc / self._gpu_total_memory * 100
+                                )
+                        elif "cuda" in device_str:
+                            if self._gpu_total_memory == 0:
+                                self._gpu_total_memory = torch.cuda.get_device_properties(
+                                    device
+                                ).total_memory
+                            if self._gpu_total_memory > 0:
+                                alloc = torch.cuda.memory_allocated(device)
+                                self.stats.gpu_memory_percent = (
+                                    alloc / self._gpu_total_memory * 100
+                                )
+                    except Exception:
+                        pass
 
                 # Estimated E2E latency (display):
                 # - one full input/output hop: collection and playback phase
@@ -1425,7 +1428,7 @@ class RealtimeVoiceChangerUnified:
                     logger.warning("Output queue full, dropping chunk")
                     self.stats.buffer_overruns += 1
 
-                if self.on_stats_update:
+                if publish_stats and self.on_stats_update:
                     self.on_stats_update(self.stats)
 
                 # Performance monitoring

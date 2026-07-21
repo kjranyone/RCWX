@@ -8,6 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -43,10 +44,8 @@ F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 # slice size avoids per-chunk kernel recompilation on Intel XPU.
 F0_MIN_WINDOW_16K = 8960
 SWIFTF0_MIN_WINDOW_16K = 2240  # 40ms hop + 100ms pitch context
-# Fallback stage-profiling cadence when device timing events are unavailable:
-# wall-clock + device-wide sync is only paid on every Nth infer_streaming call
-# (plus the first 5).  With event support, profiling is sync-free and runs on
-# every chunk.
+# Stage-profiling cadence. Even sync-free device events add submissions to the
+# 20ms hot path, so sample both event and wall-clock profiling.
 STAGE_PROFILE_INTERVAL = 10
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
@@ -176,6 +175,11 @@ class StreamingParams:
     output_sample_rate: int = 0
 
 
+@lru_cache(maxsize=8)
+def _highpass_coefficients(sr: int, cutoff: int) -> tuple[np.ndarray, np.ndarray]:
+    return butter(5, cutoff / (sr / 2), btype="high")
+
+
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
     """Apply high-pass filter to remove DC offset and low-frequency noise.
 
@@ -183,9 +187,7 @@ def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.
     """
     if len(audio) < 100:  # Too short to filter
         return audio
-    nyquist = sr / 2
-    normalized_cutoff = cutoff / nyquist
-    b, a = butter(5, normalized_cutoff, btype="high")
+    b, a = _highpass_coefficients(sr, cutoff)
     return filtfilt(b, a, audio).astype(np.float32)
 
 
@@ -998,6 +1000,16 @@ class RVCPipeline:
         self._stage_profile_counter: int = 0
         # Device timing-event support: None=unknown, resolved on first use.
         self._profile_events_ok: Optional[bool] = None
+        # Reuse the worker instead of creating and joining threads every hop.
+        self._parallel_executor: Optional[ThreadPoolExecutor] = None
+
+    def _get_parallel_executor(self) -> ThreadPoolExecutor:
+        if self._parallel_executor is None:
+            self._parallel_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="rcwx-f0",
+            )
+        return self._parallel_executor
 
     def load(self) -> None:
         """Load all models."""
@@ -1220,6 +1232,9 @@ class RVCPipeline:
 
     def unload(self) -> None:
         """Unload all models to free memory."""
+        if self._parallel_executor is not None:
+            self._parallel_executor.shutdown(wait=True, cancel_futures=True)
+            self._parallel_executor = None
         if self.hubert is not None:
             self.hubert.clear_graph_cache()
         if self.synthesizer is not None:
@@ -1673,13 +1688,12 @@ class RVCPipeline:
                         )
                 return None
 
-            # Run HuBERT and F0 extraction in parallel threads
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                hubert_future = executor.submit(extract_hubert)
-                f0_future = executor.submit(extract_f0)
-
-                features = hubert_future.result()
-                f0_raw = f0_future.result()
+            # Keep XPU dispatch on the inference thread while CPU F0 runs in
+            # parallel. Only F0 needs a worker/future.
+            executor = self._get_parallel_executor()
+            f0_future = executor.submit(extract_f0)
+            features = extract_hubert()
+            f0_raw = f0_future.result()
 
             logger.debug("Parallel extraction complete (HuBERT + F0, ThreadPool)")
 
@@ -2216,11 +2230,12 @@ class RVCPipeline:
         # path.  Without event support, fall back to wall-clock + device sync
         # on sampled chunks only.
         self._stage_profile_counter += 1
-        use_timing_events = self._profile_events_ok is not False
-        if use_timing_events or (
+        profile_now = (
             self._stage_profile_counter <= 5
             or (self._stage_profile_counter - 1) % STAGE_PROFILE_INTERVAL == 0
-        ):
+        )
+        if profile_now:
+            use_timing_events = self._profile_events_ok is not False
             prof: Optional[_StageProfiler] = _StageProfiler(self, use_timing_events)
             self.stage_times = prof.times
         else:
@@ -2445,11 +2460,10 @@ class RVCPipeline:
                         prof.stop_wall("f0_ms", wall0)
                 return result
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                hubert_future = executor.submit(extract_hubert)
-                f0_future = executor.submit(extract_f0)
-                features = hubert_future.result()
-                f0_raw = f0_future.result()
+            executor = self._get_parallel_executor()
+            f0_future = executor.submit(extract_f0)
+            features = extract_hubert()
+            f0_raw = f0_future.result()
         else:
             tok = prof.start() if prof is not None else None
             with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -2658,9 +2672,14 @@ class RVCPipeline:
         # the preceding audio, dramatically improving output quality for
         # low-latency chunk sizes.
         cache_prepend_frames = 0
-        new_features_for_cache = features.clone()
-        new_pitch_for_cache = pitch.clone() if pitch is not None else None
-        new_pitchf_for_cache = pitchf.clone() if pitchf is not None else None
+        needs_feature_cache = features.shape[1] < MIN_SYNTH_FEATURE_FRAMES
+        new_features_for_cache = features.clone() if needs_feature_cache else None
+        new_pitch_for_cache = (
+            pitch.clone() if needs_feature_cache and pitch is not None else None
+        )
+        new_pitchf_for_cache = (
+            pitchf.clone() if needs_feature_cache and pitchf is not None else None
+        )
 
         if (
             self._streaming_feat_cache is not None
@@ -2721,9 +2740,13 @@ class RVCPipeline:
 
         # Save current chunk's features for next call's cache
         self._streaming_feat_cache = (
-            new_features_for_cache,
-            new_pitch_for_cache,
-            new_pitchf_for_cache,
+            (
+                new_features_for_cache,
+                new_pitch_for_cache,
+                new_pitchf_for_cache,
+            )
+            if new_features_for_cache is not None
+            else None
         )
 
         # --- Compute skip_head/return_length for streaming synthesis ---

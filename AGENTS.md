@@ -207,6 +207,10 @@ rcwx/
 - Sub-100/Frontier: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
 - Sub-100/Frontier: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
 - Sub-100/Frontierでは対応するFAISS IVF indexをwarmup時にXPUへ配置し、HuBERT特徴のCPU往復を省略
+- FrontierではXPU stage timingを10 hopごと、GUI/GPUメモリtelemetryを10Hzで更新
+- HuBERTは推論threadから直接dispatchし、SwiftF0だけを永続workerで並列実行
+- 固定64-frame経路では未使用のstreaming feature cloneを作らない
+- SOLA境界INFOログは開始3 hopと100 hopごとに限定
 - ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
