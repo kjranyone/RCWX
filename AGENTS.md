@@ -154,6 +154,7 @@ rcwx/
 | `f0_slew_max_step_st`         |    `3.6` | 最大F0ステップ (semitones)      |
 | `denoise.enabled`             |   `true` | ノイズ除去                      |
 | `denoise.method`              |     `ml` | `auto` / `ml` / `spectral`      |
+| `denoise.strength`            |    `1.0` | 除去強度 `0.5-2.0`（MLは1.0超で2段処理） |
 
 ### `RCWXConfig` (`rcwx/config.py`) トップレベル
 

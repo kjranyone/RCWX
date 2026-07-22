@@ -10,8 +10,9 @@ removes background noise while preserving human voice.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -152,8 +153,8 @@ class MLDenoiser:
             return
 
         try:
-            from denoiser import pretrained
             import torch
+            from denoiser import pretrained
 
             # Load pre-trained DNS64 model (best quality)
             self._model = pretrained.dns64()
@@ -188,17 +189,22 @@ class MLDenoiser:
         self,
         audio: NDArray[np.float32],
         sample_rate: int = 16000,
+        strength: float = 1.0,
     ) -> NDArray[np.float32]:
         """Process audio through Facebook Denoiser.
 
         Args:
             audio: Input audio (mono, float32, -1 to 1 range)
             sample_rate: Input sample rate
+            strength: Suppression strength from 0.5 to 2.0. Up to 1.0
+                crossfades dry/clean audio; above 1.0 crossfades into a
+                second DNS64 pass for stronger residual-noise suppression.
 
         Returns:
             Denoised audio at original sample rate
         """
         self._load_model()
+        strength = max(0.5, min(2.0, float(strength)))
 
         import torch
 
@@ -225,16 +231,23 @@ class MLDenoiser:
         # fixed micro-hop shapes through the same accelerator graph cache as
         # HuBERT/Synthesizer. Unsupported devices or operators fall back to
         # eager execution inside run_accelerator_graph().
-        with torch.no_grad():
+        def enhance(value):
             if accelerator_graph_enabled(self._actual_device):
-                enhanced = run_accelerator_graph(
+                return run_accelerator_graph(
                     self,
                     "ml-denoiser",
-                    lambda value: self._graph_forward(value),
-                    audio_tensor,
+                    lambda graph_input: self._graph_forward(graph_input),
+                    value,
                 )
-            else:
-                enhanced = self._model(audio_tensor)
+            return self._model(value)
+
+        with torch.no_grad():
+            enhanced = enhance(audio_tensor)
+            if strength < 1.0:
+                enhanced = torch.lerp(audio_tensor, enhanced, strength)
+            elif strength > 1.0:
+                enhanced_twice = enhance(enhanced)
+                enhanced = torch.lerp(enhanced, enhanced_twice, strength - 1.0)
 
         # Back to numpy
         enhanced_np = enhanced.squeeze().cpu().numpy().astype(np.float32)
@@ -521,6 +534,7 @@ def denoise(
     noise_reference: Optional[NDArray[np.float32]] = None,
     threshold_db: float = 6.0,
     reduction_db: float = -24.0,
+    strength: float = 1.0,
     device: str = "cpu",
 ) -> NDArray[np.float32]:
     """Denoise audio using the best available method.
@@ -534,11 +548,15 @@ def denoise(
         noise_reference: Noise reference for spectral gate (ignored for ML)
         threshold_db: Spectral gate threshold (ignored for ML)
         reduction_db: Spectral gate reduction (ignored for ML)
+        strength: Suppression strength from 0.5 to 2.0. ML uses a blended
+            second pass above 1.0; spectral scales its threshold/reduction.
         device: Device for ML denoiser ("cpu", "cuda", "xpu")
 
     Returns:
         Denoised audio
     """
+    strength = max(0.5, min(2.0, float(strength)))
+
     # Select method
     use_ml = False
 
@@ -567,9 +585,12 @@ def denoise(
     if use_ml:
         # Use cached denoiser to avoid reloading model every call
         denoiser = _get_cached_ml_denoiser(device=device)
-        return denoiser.process(audio, sample_rate)
+        return denoiser.process(audio, sample_rate, strength=strength)
     else:
-        config = DenoiseConfig(threshold_db=threshold_db, reduction_db=reduction_db)
+        config = DenoiseConfig(
+            threshold_db=threshold_db * strength,
+            reduction_db=reduction_db * strength,
+        )
         denoiser = SpectralGateDenoiser(sample_rate, config)
 
         if noise_reference is not None:
@@ -582,8 +603,4 @@ def denoise(
 
 def is_ml_denoiser_available() -> bool:
     """Check if Facebook Denoiser is installed."""
-    try:
-        import denoiser
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("denoiser") is not None

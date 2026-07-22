@@ -143,9 +143,15 @@ class DenoiseConfig:
 
     enabled: bool = True
     method: str = "ml"  # auto, ml, spectral, off
+    # 1.0 preserves the previous behavior. Values above 1.0 apply a second
+    # ML pass, or deepen the spectral threshold/reduction below.
+    strength: float = 1.0
     # Spectral gate parameters (used when method=spectral)
     threshold_db: float = 6.0
     reduction_db: float = -24.0
+
+    def __post_init__(self) -> None:
+        self.strength = max(0.5, min(2.0, float(self.strength)))
 
 
 @dataclass

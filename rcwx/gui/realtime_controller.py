@@ -132,6 +132,7 @@ class RealtimeController:
                     and latency["latency_mode"] not in {"sub100", "frontier"}
                 ),
                 denoise_method=self.app.denoise_method_var.get(),
+                denoise_strength=self.app.denoise_strength_slider.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
                 fixed_harmonics=self.app.pitch_control.fixed_harmonics,
                 f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
@@ -339,9 +340,10 @@ class RealtimeController:
         if self.voice_changer:
             self.voice_changer.set_index_rate(rate)
 
-    def set_denoise(self, enabled: bool, method: str) -> None:
+    def set_denoise(self, enabled: bool, method: str, strength: float) -> None:
         if self.voice_changer:
-            self.voice_changer.set_denoise(enabled, method)
+            deadline_mode = self.voice_changer.config.latency_mode in {"sub100", "frontier"}
+            self.voice_changer.set_denoise(enabled and not deadline_mode, method, strength)
 
     def set_voice_gate_mode(self, mode: str) -> None:
         if self.voice_changer:
@@ -380,6 +382,12 @@ class RealtimeController:
 
         def apply_values() -> None:
             vc.set_latency_mode(settings["latency_mode"])
+            vc.set_denoise(
+                self.app.use_denoise_var.get()
+                and settings["latency_mode"] not in {"sub100", "frontier"},
+                self.app.denoise_method_var.get(),
+                self.app.denoise_strength_slider.get(),
+            )
             vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
             vc.set_buffer_margin(settings["buffer_margin"])
             vc.set_overlap(settings["overlap_sec"])

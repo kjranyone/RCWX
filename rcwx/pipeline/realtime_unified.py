@@ -245,6 +245,7 @@ class RealtimeConfig:
     # Denoise
     denoise_enabled: bool = False
     denoise_method: str = "auto"
+    denoise_strength: float = 1.0
 
     # Voice gate
     voice_gate_mode: str = "off"
@@ -297,6 +298,11 @@ class RealtimeConfig:
     def __post_init__(self) -> None:
         if self.latency_mode not in LATENCY_MODES:
             object.__setattr__(self, "latency_mode", "balanced")
+        object.__setattr__(
+            self,
+            "denoise_strength",
+            max(0.5, min(2.0, float(self.denoise_strength))),
+        )
         minimum_prebuffer = 3 if self.latency_mode == "frontier" else 2
         if self.latency_mode in DEADLINE_MODES and self.prebuffer_chunks < minimum_prebuffer:
             object.__setattr__(self, "prebuffer_chunks", minimum_prebuffer)
@@ -977,9 +983,15 @@ class RealtimeVoiceChangerUnified:
     def set_output_gain_db(self, gain_db: float) -> None:
         self.config.output_gain_db = float(gain_db)
 
-    def set_denoise(self, enabled: bool, method: str = "auto") -> None:
+    def set_denoise(
+        self,
+        enabled: bool,
+        method: str = "auto",
+        strength: float = 1.0,
+    ) -> None:
         self.config.denoise_enabled = enabled
         self.config.denoise_method = method
+        self.config.denoise_strength = max(0.5, min(2.0, float(strength)))
 
     def set_voice_gate_mode(self, mode: str) -> None:
         self.config.voice_gate_mode = mode
@@ -1263,6 +1275,7 @@ class RealtimeVoiceChangerUnified:
                         hop_16k,
                         sample_rate=16000,
                         method=self.config.denoise_method,
+                        strength=self.config.denoise_strength,
                         device=self.pipeline.device,
                     )
 
@@ -1664,6 +1677,7 @@ class RealtimeVoiceChangerUnified:
                 dummy,
                 sample_rate=16000,
                 method=self.config.denoise_method,
+                strength=self.config.denoise_strength,
                 device=self.pipeline.device,
             )
             logger.info("[WARMUP] Denoiser warmup complete")

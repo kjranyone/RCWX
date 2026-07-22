@@ -229,6 +229,9 @@ uv run rcwx info model.pth
 
 - **ML方式**: 機械学習ベースで人間の声を認識・保持しながらノイズを除去（要 `uv sync --extra ml-denoise`、CC BY-NC 4.0）
 - **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去（標準同梱）
+- **除去強度**: `0.50x-2.00x`。`1.00x`が従来動作で、MLは`1.00x`超で2回目のDNS64出力へ連続的に混合します。環境音が大きい場合は`1.25x`から上げ、声の欠けや金属音が出る手前で止めてください。Spectralでは閾値と減衰量を同時に深くします。
+
+MLの2段処理は計算量も増えます。`Sub-100` / `Frontier`ではdeadlineを守るためDenoiserを実行中だけバイパスするため、強いノイズ除去を使う場合は`Aggressive`または`Balanced`を選択します。
 
 ## Inference Settings
 
