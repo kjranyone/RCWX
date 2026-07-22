@@ -41,6 +41,11 @@ class ModelLoader:
         """
         Load model asynchronously.
 
+        Replaces any existing pipeline only after the new model loads
+        successfully, then unloads the previous one so XPU/CUDA weights,
+        FAISS tables, and accelerator graphs are not retained across
+        model switches.
+
         Args:
             path: Path to model file (.pth)
         """
@@ -57,10 +62,13 @@ class ModelLoader:
         dtype = self.app.dtype_var.get()
         use_compile = self.app.compile_var.get()
         models_dir = self.app.models_dir_entry.get()
+        # Capture the previous pipeline on the main thread so a concurrent
+        # UI action cannot drop the reference before we unload it.
+        old_pipeline = self.app.pipeline
 
         def load_thread():
             try:
-                self.app.pipeline = RVCPipeline(
+                new_pipeline = RVCPipeline(
                     path,
                     device=device,
                     dtype=dtype,
@@ -70,14 +78,28 @@ class ModelLoader:
                     use_compile=use_compile,
                     models_dir=models_dir,
                 )
-                self.app.pipeline.load()
-
-                # Update UI from main thread
-                self.app.after(0, self._on_model_loaded)
+                new_pipeline.load()
             except Exception as e:
                 logger.error(f"Failed to load model: {e}")
+                # Keep the previous pipeline so a failed switch is recoverable.
                 error_msg = str(e)
                 self.app.after(0, lambda msg=error_msg: self._on_model_load_error(msg))
+                return
+
+            # Publish the new pipeline first so a failed unload cannot
+            # leave the app without a usable model.
+            self.app.pipeline = new_pipeline
+            if old_pipeline is not None and old_pipeline is not new_pipeline:
+                try:
+                    logger.info("Unloading previous pipeline to free device memory")
+                    old_pipeline.unload()
+                except Exception:
+                    logger.exception(
+                        "Failed to unload previous pipeline; device memory may leak"
+                    )
+
+            # Update UI from main thread (errors here must not look like load failure)
+            self.app.after(0, self._on_model_loaded)
 
         thread = threading.Thread(target=load_thread, daemon=True)
         thread.start()
@@ -143,14 +165,10 @@ class ModelLoader:
     def apply_settings(self) -> None:
         """Apply settings and reload model."""
         if self.app.model_selector.model_path:
-            # Stop if running
+            # Stop if running; load_model unloads the previous pipeline only
+            # after the replacement has loaded so a failed reload keeps the
+            # last working model in memory.
             if self.app._is_running:
                 self.app.realtime_controller.stop()
 
-            # Unload current pipeline
-            if self.app.pipeline:
-                self.app.pipeline.unload()
-                self.app.pipeline = None
-
-            # Reload with new settings
             self.load_model(self.app.model_selector.model_path)
