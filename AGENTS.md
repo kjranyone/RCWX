@@ -63,8 +63,6 @@ AudioInput (mic rate)
 - PyTorch 2.13のAccelerator GraphをHuBERTと定常状態のRVC Synthesizerに自動適用
 - SynthesizerはHuBERT履歴が満杯になるまでeager実行し、開始前warmupで定常Graphをcapture
 - `RCWX_ACCELERATOR_GRAPH=0` でAccelerator Graphを無効化可能
-- 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
-- 旧GUIトグルの `use_feature_cache` は廃止
 - 過負荷時は一時的に `f0_method="none"` と `index_rate=0.0` に自動退避
 
 ## Directory Structure
@@ -121,7 +119,6 @@ rcwx/
 | `output_sample_rate`      |  `48000` | 出力レート              |
 | `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
 | `latency_mode`            | `normal` | `normal` / `aggressive` |
-| `latency_profile_version` |      `2` | 旧4モード設定の一度限りの移行管理 |
 | `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
 | `buffer_margin`           |   `0.25` | バッファ余裕            |
 | `input_gain_db`           |    `0.0` | 入力ゲイン              |
