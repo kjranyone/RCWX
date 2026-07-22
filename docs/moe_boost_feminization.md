@@ -1,84 +1,64 @@
-﻿# Moe Boost Feminization: Design Note
+# Moe Boost Feminization: Design Note
+
+F0-only の萌え声スタイリング。実装は `rcwx/pipeline/inference.py` の `apply_moe_f0_style`。
+ユーザー向け要約は [README.md の Moe Boost](../README.md#moe-boost)。
 
 ## Problem Statement
 
-`moe_boost` should push low-register male F0 trajectories toward a brighter, game-style feminine contour while preserving intelligibility and avoiding harsh artifacts.
+`moe_boost` は低音域の男声 F0 を明るいゲーム声風コンターへ寄せつつ、明瞭さとアーティファクト回避を両立する。
 
-The key constraints are:
-- no retraining,
-- real-time compatibility,
-- compatibility with existing RVC synthesis and post-filters.
+制約:
+- 再学習なし
+- リアルタイム互換
+- 既存の RVC 合成・後段 F0 フィルタと共存
 
 ## Signal Model
 
-Let voiced F0 be `f(t)` in Hz and `l(t)=log2(f(t))`.
+有声 F0 を `f(t)` Hz、`l(t)=log2(f(t))` とする。
 
-We decompose F0 into:
-- phrase trend `m(t)` (low-frequency baseline),
-- deviation `d(t)` in semitones.
+分解:
+- phrase trend `m(t)`（低周波ベースライン）
+- deviation `d(t)`（semitone）
 
 `d(t) = 12 * (l(t) - m(t))`
 
-This gives a controllable representation for:
-- register shift (move baseline up),
-- accent shaping (asymmetric gain for rising/falling motion),
-- floor control (remove chesty low dips).
+これにより次を独立に制御できる:
+- register shift（基底音域の引き上げ）
+- accent shaping（上昇/下降の非対称ゲイン）
+- floor control（胸声域の低すぎるディップ抑制）
 
-## Proposed Transform
+## Transform（strength `s ∈ [0, 1]`）
 
-For a given strength `s in [0, 1]`:
+実装係数（AS-IS）:
 
-1. Short-gap interpolation:
-- fill unvoiced gaps up to `2 + 4s` frames (100 fps basis).
+1. **短ギャップ補間** — 無声ギャップを最大 `round(2 + 4s)` frames（100fps）まで線形補間
+2. **レジスタ目標** — `f_target = 165 + 55s` Hz、上方向のみ  
+   `shift_st = clamp(12*log2(f_target / median), 0, 1.5 + 4.5s)`
+3. **コンター整形**
+   - trend 窓: `odd(max(7, 7 + 14s))`
+   - 上昇ゲイン `1 + 0.45s` / 下降 `1 - 0.25s`
+   - phrase bias `0.10 + 0.45s` st
+   - soft sat: `d / (1 + (0.08 + 0.16s)*|d|)`
+4. **再構成** — `l_out = m + (d + shift + bias) / 12`、`f_out = 2^l_out`
+5. **フロア / シーリング**
+   - relative: `f_target * (0.55 + 0.08s)`
+   - absolute: `85 + 45s` Hz
+   - applied floor: `max(rel, abs)` を `[85, 220]` にクリップ
+   - 最終クリップ `[0, 940]` Hz
 
-2. Register target:
-- target median: `f_target = 165 + 55s` Hz,
-- upward shift only:
-  `shift_st = clamp(12*log2(f_target / median(f_voiced)), 0, 1.5 + 4.5s)`.
+加えて実装では **voiced-ratio confidence** で styled と raw をブレンドする（strength とは独立軸）。有声が薄い窓でレジスタフロアへスナップしチャンク境界で段差が出るのを防ぐ。
 
-3. Contour shaping:
-- trend window: `w = odd(max(7, 7 + 14s))`,
-- asymmetric gain:
-  - upward: `1 + 0.45s`,
-  - downward: `1 - 0.25s`.
-- phrase bias: `0.10 + 0.45s` semitones.
-- soft saturation for stability:
-  `d <- d / (1 + (0.08 + 0.16s)*|d|)`.
-
-4. Reconstruction:
-- `l_out = m + (d + shift_st + bias_st) / 12`,
-- `f_out = 2^(l_out)`.
-
-5. Floor/ceiling constraints:
-- relative floor: `f_target * (0.55 + 0.08s)`,
-- absolute floor: `85 + 45s` Hz,
-- applied floor: `max(relative, absolute)` clipped to `[85, 220]`,
-- final clip to `[0, 940]` Hz.
-
-## Why This Works
-
-- Register normalization addresses the largest male/female perceptual gap directly.
-- Asymmetric contour shaping boosts "cute" rising accents while reducing downward chest drops.
-- Gap interpolation reduces raspy frame flicker often perceived as "older" timbre.
-- Existing RCWX post-filters (`lowpass_f0`, octave-flip suppression, slew limit) then stabilize the stylized contour.
+後段の RCWX フィルタ（lowpass / octave-flip / slew / hole-fill）がスタイリング後コンターを安定化する。
 
 ## Limitations
 
-This is still an F0-only style transform.
-It cannot directly perform formant relocation (vocal-tract resonance shift), which is another major component of true male-to-female conversion. For that, feature-space warping or model-level adaptation is required.
+- F0 のみ。フォルマント（声道共鳴）シフトは行わない
+- 効果は入力音域依存（男声 100–160Hz 帯で効きやすい）
+- 強度 1.0 は不自然になり得る。運用推奨はおおよそ 0.40–0.80
 
-## Validation Added
+## Validation
 
-`tests/models/test_moe_f0_style.py` validates:
-- identity at `s=0`,
-- male register lift and low-floor lift at high strength,
-- short-gap fill while keeping long gaps,
-- bounded behavior on already-high voices,
-- monotonic register lift with strength.
-
-`tests/integration/test_moe_f0_processing.py` validates:
-- source median-F0 autocorrelation,
-- bounded F0-only register lift,
-- removed pre-HuBERT config-key compatibility.
-
-`tests/integration/test_realtime_drift_control.py` validates runtime drift-control behavior introduced with recent callback-level fixes.
+- `tests/models/test_moe_f0_style.py` — identity / register lift / gap fill / high-voice bound
+- `tests/integration/test_moe_f0_processing.py` — パイプライン通し
+- `tests/integration/test_moe_clarity_scoring.py` — clarity 関連
+- `tests/integration/test_realtime_drift_control.py` — ランタイムドリフト制御

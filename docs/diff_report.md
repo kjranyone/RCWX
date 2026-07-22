@@ -1,8 +1,24 @@
 # RVC V2 オリジナル実装との差異報告
 
+> **文書の位置づけ**: RVC 互換性を揃える過程の監査メモ。下記「修正完了」は当時の作業結果。  
+> **現行コードとの乖離**は冒頭の [現行メモ](#現行メモ-as-is) を優先すること。セットアップ手順は [SETUP.md](SETUP.md)。
+
 ## 概要
 
-RCWXの推論パイプラインとRVC V2オリジナル実装（RVC-Project/Retrieval-based-Voice-Conversion-WebUI）を比較し、差異を報告する。
+RCWX の推論パイプラインと RVC V2 オリジナル実装（RVC-Project/Retrieval-based-Voice-Conversion-WebUI）を比較し、差異を報告する。
+
+## 現行メモ (AS-IS)
+
+コード確認時点の事実。本文中の古い記述と食い違う場合はこちらを正とする。
+
+| 項目 | 現行 | 本文の旧記述 |
+|------|------|-------------|
+| 特徴量 50fps→100fps 補間 | `mode="linear"`（`inference.py`） | nearest に変更済み |
+| FAISS `index_k` 既定 | **4**（品質寄りは 8 を GUI/設定で選択可） | k=8 固定 |
+| RMVPE 呼び出し閾値 | ストリーミング経路は `RMVPE_VOICING_THRESHOLD=0.015` | モデル `infer` 既定 0.03 |
+| FAISS 経路 | CPU FAISS + **Aggressive 時 XPU IVF**（L2 / nprobe=1 / list≤256） | CPU FAISS のみ |
+| 既定 F0 | config 既定 `rmvpe`（FCPE / SwiftF0 も選択可） | （本文は手法別） |
+| 対象デバイス | Intel Arc **XPU**（CUDA は未検証） | — |
 
 ---
 
@@ -131,20 +147,20 @@ pitch = torch.clamp(f0_mel_normalized, 1, 255).round().long()
 | 項目 | オリジナルRVC | RCWX実装 | 差異 |
 |------|-------------|----------|------|
 | 補間方法 | 固定2x upscale | 固定2x upscale | **一致** |
-| 補間モード | nearest | nearest | **一致** |
+| 補間モード | nearest（PyTorch 既定） | **linear**（現行） | 意図的差分の可能性。要再確認 |
 
-### 修正内容
-
-オリジナルRVCの補間方式に一致：
+### 現行コード
 
 ```python
-# Original RVC: F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
 features = torch.nn.functional.interpolate(
     features.permute(0, 2, 1),  # [B, T, C] -> [B, C, T]
-    scale_factor=2,  # Fixed 2x upscale (matches original RVC)
-    mode="nearest",  # Original RVC uses nearest (default mode)
-).permute(0, 2, 1)  # [B, C, T] -> [B, T, C]
+    scale_factor=2,
+    mode="linear",
+    align_corners=False,
+).permute(0, 2, 1)
 ```
+
+> 過去の監査では nearest への変更を記録していたが、現行 `inference.py` は `linear`。
 
 ### 関連ファイル
 
@@ -183,12 +199,12 @@ features = torch.nn.functional.interpolate(
 オリジナルRVCと同等のFAISS検索機能を実装：
 
 ```python
-def _search_index(self, features, index_rate=0.5):
+def _search_index(self, features, index_rate=0.5, k=4):
     # Convert to numpy for FAISS search
     npy = features[0].cpu().numpy()
 
-    # Search for k=8 nearest neighbors
-    score, ix = self.faiss_index.search(npy, k=8)
+    # Search for k nearest neighbors (default 4)
+    score, ix = self.faiss_index.search(npy, k=k)
 
     # Compute inverse squared distance weights
     weight = np.square(1 / (score + 1e-6))
@@ -202,11 +218,12 @@ def _search_index(self, features, index_rate=0.5):
     return blended
 ```
 
-### 機能
+### 機能（現行）
 
-- .indexファイルの自動検出（モデルと同ディレクトリ）
-- `index_rate`パラメータで融合率を制御（0=無効、0.5=バランス、1=index完全使用）
-- k=8近傍探索、逆二乗距離重み付け
+- .index ファイルの自動検出（モデルと同ディレクトリ）
+- `index_rate` で融合率を制御（0=無効、1=index 完全使用）。config 既定 ratio=0.15
+- `index_k` 既定 **4**（8=品質寄り）。逆二乗距離重み付け
+- Aggressive では対応 IVF を XPU 常駐化（`accelerator_index.py`）。未対応は CPU FAISS
 
 ### 関連ファイル
 
@@ -260,8 +277,8 @@ class TextEncoder(nn.Module):
 | 優先度 | 項目 | 状態 | 説明 |
 |--------|------|------|------|
 | **高** | TextEncoder | ✅ 完了 | nn.Conv1d→nn.Linear、入力形式修正 |
-| **高** | 特徴量アライメント | ✅ 完了 | 補間モードをnearestに変更 |
-| **高** | FAISS Index検索 | ✅ 完了 | index_rate対応、k=8検索実装 |
+| **高** | 特徴量アライメント | ⚠ 要確認 | 2x 固定は一致。モードは現行 `linear`（旧メモは nearest） |
+| **高** | FAISS Index検索 | ✅ 完了 | index_rate 対応、k 可変（既定 4）、Aggressive で XPU IVF |
 | **中** | F0量子化 | ✅ 完了 | オリジナルRVCのロジックに一致 |
 | **中** | HuBERTモデル | ✅ 完了 | transformers版使用、layer_norm問題修正済み |
 | **高** | RMVPEアーキテクチャ | ✅ 完了 | オリジナルRVC完全一致、重み正常ロード |
@@ -270,8 +287,8 @@ class TextEncoder(nn.Module):
 ### 完了した修正
 
 1. **TextEncoder** - `nn.Conv1d`→`nn.Linear`（emb_phone）、入力形式`[B,T,C]`に統一
-2. **特徴量補間** - `mode="linear"`→`mode="nearest"`
-3. **FAISS Index** - `index_rate`パラメータ、自動index検出、k=8検索実装
+2. **特徴量補間** - 2x 固定 upscale（現行 `mode="linear"`。nearest への変更は現行コードに残っていない）
+3. **FAISS Index** - `index_rate`、自動 index 検出、k 可変（既定 4）
 4. **F0量子化** - オリジナルRVCと同一ロジック
 5. **RMVPE** - 閾値判定を全360ビンの最大salience使用に修正
 6. **RMVPEアーキテクチャ** - オリジナルRVCと完全一致するよう再実装:
