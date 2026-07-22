@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections import deque
 from types import SimpleNamespace
 
-from rcwx.gui.widgets.latency_settings import _auto_params, _minimum_chunk_ms
+from rcwx.gui.widgets.latency_settings import (
+    _auto_params,
+    _chunk_slider_spec,
+    _minimum_chunk_ms,
+)
 from rcwx.pipeline.inference import _initial_streaming_history
 from rcwx.pipeline.realtime_unified import (
     RealtimeConfig,
@@ -46,6 +50,13 @@ def test_f0_backend_micro_hop_floors() -> None:
     assert frontier["crossfade_sec"] == 0.01
     assert frontier["latency_mode"] == "frontier"
     assert frontier["prebuffer_chunks"] == 3
+
+
+def test_frontier_slider_uses_compact_effective_range() -> None:
+    assert _chunk_slider_spec("swiftf0", "frontier") == (20, 100, 20)
+    assert _chunk_slider_spec("none", "frontier") == (20, 100, 20)
+    assert _chunk_slider_spec("fcpe", "frontier") == (100, 600, 20)
+    assert _chunk_slider_spec("swiftf0", "balanced") == (40, 600, 20)
 
 
 def test_deadline_statistics_track_micro_hop_tail() -> None:

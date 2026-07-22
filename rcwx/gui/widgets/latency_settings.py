@@ -15,6 +15,17 @@ def _minimum_chunk_ms(f0_method: str, latency_mode: str = "sub100") -> int:
     return {"rmvpe": 320, "fcpe": 100}.get(f0_method, 40)
 
 
+def _chunk_slider_spec(
+    f0_method: str,
+    latency_mode: str,
+) -> tuple[int, int, int]:
+    """Return the effective slider minimum, maximum, and step in ms."""
+    minimum = _minimum_chunk_ms(f0_method, latency_mode)
+    if latency_mode == "frontier" and f0_method in {"swiftf0", "none"}:
+        return minimum, 100, 20
+    return minimum, 600, 20
+
+
 def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
     """Derive latency parameters automatically from chunk_sec.
 
@@ -132,22 +143,25 @@ class LatencySettingsFrame(ctk.CTkFrame):
         slider_frame = ctk.CTkFrame(frame, fg_color="transparent")
         slider_frame.grid(row=2, column=0, padx=10, pady=(0, 2), sticky="ew")
 
-        # Step=20ms to align with HuBERT frame boundary (320 samples @ 16kHz)
-        min_chunk_ms = _minimum_chunk_ms(self.f0_method)
+        min_chunk_ms, max_chunk_ms, step_ms = _chunk_slider_spec(
+            self.f0_method,
+            self.latency_mode,
+        )
         self.chunk_slider = ctk.CTkSlider(
             slider_frame,
             from_=min_chunk_ms,
-            to=600,
-            number_of_steps=(600 - min_chunk_ms) // 20,
-            width=180,
+            to=max_chunk_ms,
+            number_of_steps=(max_chunk_ms - min_chunk_ms) // step_ms,
+            width=320,
             command=self._on_chunk_change,
         )
         rounded_ms = self._round_to_frame_boundary(self.chunk_sec * 1000)
         self.chunk_slider.set(rounded_ms)
-        self.chunk_slider.grid(row=0, column=0, padx=(0, 10))
+        self.chunk_slider.grid(row=0, column=0, padx=(0, 10), sticky="ew")
 
         self.chunk_value = ctk.CTkLabel(slider_frame, text=f"{int(rounded_ms)}ms", width=50)
         self.chunk_value.grid(row=0, column=1)
+        slider_frame.grid_columnconfigure(0, weight=1, minsize=320)
 
         # --- Separator ---
         separator = ctk.CTkFrame(frame, height=1, fg_color="gray50")
@@ -232,11 +246,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def _on_mode_change(self, value: str) -> None:
         """Switch between the stable and low-buffer latency policies."""
         self.latency_mode = "sub100" if value == "Sub-100" else value.lower()
-        min_ms = _minimum_chunk_ms(self.f0_method, self.latency_mode)
-        self.chunk_slider.configure(
-            from_=min_ms,
-            number_of_steps=(600 - min_ms) // 20,
-        )
+        min_ms, _, _ = self._configure_chunk_slider()
         if self.latency_mode in {"sub100", "frontier"}:
             target_ms = min_ms
             self.chunk_sec = target_ms / 1000
@@ -249,21 +259,30 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def set_f0_method(self, method: str) -> bool:
         """Apply the backend-specific hop floor and return whether it clamped."""
         self.f0_method = method
-        min_ms = _minimum_chunk_ms(method, self.latency_mode)
-        self.chunk_slider.configure(
-            from_=min_ms,
-            number_of_steps=(600 - min_ms) // 20,
-        )
+        min_ms, max_ms, _ = self._configure_chunk_slider()
         current_ms = self._round_to_frame_boundary(self.chunk_sec * 1000)
-        clamped = current_ms < min_ms
+        clamped = current_ms < min_ms or current_ms > max_ms
         if clamped:
-            current_ms = min_ms
+            current_ms = max(min_ms, min(max_ms, current_ms))
             self.chunk_sec = current_ms / 1000
         self.chunk_slider.set(current_ms)
         self.chunk_value.configure(text=f"{current_ms}ms")
         self._update_auto_labels()
         self._update_estimate()
         return clamped
+
+    def _configure_chunk_slider(self) -> tuple[int, int, int]:
+        """Apply the range matching the active mode and F0 backend."""
+        min_ms, max_ms, step_ms = _chunk_slider_spec(
+            self.f0_method,
+            self.latency_mode,
+        )
+        self.chunk_slider.configure(
+            from_=min_ms,
+            to=max_ms,
+            number_of_steps=(max_ms - min_ms) // step_ms,
+        )
+        return min_ms, max_ms, step_ms
 
     def _update_auto_labels(self) -> None:
         """Update read-only auto-parameter labels from current chunk_sec."""
@@ -344,15 +363,12 @@ class LatencySettingsFrame(ctk.CTkFrame):
             if latency_mode in {"balanced", "aggressive", "sub100", "frontier"}
             else "balanced"
         )
-        min_ms = _minimum_chunk_ms(self.f0_method, self.latency_mode)
-        self.chunk_slider.configure(
-            from_=min_ms,
-            number_of_steps=(600 - min_ms) // 20,
-        )
+        min_ms, max_ms, _ = self._configure_chunk_slider()
         rounded_ms = max(
             min_ms,
             self._round_to_frame_boundary(chunk_sec * 1000),
         )
+        rounded_ms = min(max_ms, rounded_ms)
         self.chunk_sec = rounded_ms / 1000
         # Update slider
         self.chunk_slider.set(rounded_ms)

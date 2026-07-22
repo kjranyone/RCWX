@@ -192,7 +192,7 @@ rcwx/
 - Balanced: `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
 - Aggressive: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
 - Sub-100: `chunk_sec` = F0方式の下限、`crossfade_sec` = 10ms
-- Frontier: SwiftF0/Noneの`chunk_sec` = 20ms、`crossfade_sec` = 10ms
+- Frontier: SwiftF0/NoneのGUI `chunk_sec`範囲 = 20-100ms（20ms刻み）、`crossfade_sec` = 10ms
 - Balanced/Aggressive: `prebuffer_chunks` = 1
 - Sub-100: `prebuffer_chunks` = 2（アンダーラン時も2 hopを再確保して再開）
 - Frontier: `prebuffer_chunks` = 3（アンダーラン時も3 hopを再確保して再開）
