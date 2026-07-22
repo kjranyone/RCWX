@@ -26,10 +26,16 @@ class _FakePipeline:
         return True
 
     def infer_streaming(self, chunk, overlap, params):
-        del params
         new_hop = chunk[overlap:]
         if self._streaming_audio_history is None:
-            history = chunk.copy()
+            if getattr(params, "prime_hubert_history", False):
+                history = np.pad(
+                    chunk,
+                    (self.history_limit - len(chunk), 0),
+                    mode="reflect",
+                )
+            else:
+                history = chunk.copy()
         else:
             history = np.concatenate([self._streaming_audio_history, new_hop])
         self._streaming_audio_history = history[-self.history_limit :]
@@ -97,12 +103,14 @@ def test_sub100_runtime_warmup_prepares_accelerator_index() -> None:
     changer._sola_state = SimpleNamespace(buffer=None)
     changer._overlap_buf = None
     changer._reset_boundary_continuity_state = lambda: None
-    changer._build_streaming_params = lambda **kwargs: kwargs
+    changer._build_streaming_params = lambda **kwargs: SimpleNamespace(
+        prime_hubert_history=True,
+    )
 
     changer._run_runtime_warmup()
 
     assert changer.pipeline.prepare_index_calls == 1
-    assert changer.pipeline.infer_calls == 13
+    assert changer.pipeline.infer_calls == 2
 
 
 def test_frontier_runtime_warmup_fills_20ms_history() -> None:
@@ -122,9 +130,11 @@ def test_frontier_runtime_warmup_fills_20ms_history() -> None:
     changer._sola_state = SimpleNamespace(buffer=None)
     changer._overlap_buf = None
     changer._reset_boundary_continuity_state = lambda: None
-    changer._build_streaming_params = lambda **kwargs: kwargs
+    changer._build_streaming_params = lambda **kwargs: SimpleNamespace(
+        prime_hubert_history=True,
+    )
 
     changer._run_runtime_warmup()
 
     assert changer.pipeline.prepare_index_calls == 1
-    assert changer.pipeline.infer_calls == 27
+    assert changer.pipeline.infer_calls == 2

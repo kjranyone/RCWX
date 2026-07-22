@@ -173,6 +173,27 @@ class StreamingParams:
     # synthesizer waveform on the accelerator through sinc resampling and
     # performs the single D2H transfer at the final output rate.
     output_sample_rate: int = 0
+    # Deadline modes cannot afford the growing-history eager synthesizer
+    # phase. Reflect the first real chunk into the left context so the fixed
+    # steady-state graph is usable from the first hop.
+    prime_hubert_history: bool = False
+
+
+def _initial_streaming_history(
+    audio: np.ndarray,
+    max_samples: int,
+    *,
+    prime: bool,
+) -> np.ndarray:
+    """Build the first streaming context, optionally at its fixed shape."""
+    if not prime or len(audio) >= max_samples:
+        return audio[-max_samples:].copy()
+    mode = "reflect" if len(audio) > 1 else "edge"
+    return np.pad(
+        audio,
+        (max_samples - len(audio), 0),
+        mode=mode,
+    ).astype(np.float32, copy=False)
 
 
 @lru_cache(maxsize=8)
@@ -2224,6 +2245,7 @@ class RVCPipeline:
         f0_context_sec = params.f0_context_sec
         f0_hole_fill_ms = params.f0_hole_fill_ms
         uv_ramp_ms = params.uv_ramp_ms
+        prime_hubert_history = params.prime_hubert_history
 
         # Per-stage times (ms); published on self for the realtime
         # controller's [PERF] logging.  With device timing events (preferred)
@@ -2285,7 +2307,11 @@ class RVCPipeline:
             int(hubert_context_sec * 16000),
         )
         if self._streaming_audio_history is None:
-            self._streaming_audio_history = audio_16k.copy()
+            self._streaming_audio_history = _initial_streaming_history(
+                audio_16k,
+                max_hubert_context_16k,
+                prime=prime_hubert_history,
+            )
         else:
             self._streaming_audio_history = np.concatenate([
                 self._streaming_audio_history, new_hop_16k

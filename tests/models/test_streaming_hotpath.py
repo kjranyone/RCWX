@@ -6,6 +6,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from rcwx.gui.widgets.latency_settings import _auto_params, _minimum_chunk_ms
+from rcwx.pipeline.inference import _initial_streaming_history
 from rcwx.pipeline.realtime_unified import (
     RealtimeConfig,
     RealtimeStats,
@@ -83,3 +84,31 @@ def test_deadline_modes_use_short_context_and_device_output_resample() -> None:
     vc.config.latency_mode = "aggressive"
     assert vc._effective_streaming_contexts() == (1.0, 0.32)
     assert vc._uses_device_output_resample() is False
+
+
+def test_deadline_history_priming_reaches_fixed_shape_immediately() -> None:
+    import numpy as np
+
+    audio = np.arange(640, dtype=np.float32)
+    primed = _initial_streaming_history(audio, 8960, prime=True)
+    normal = _initial_streaming_history(audio, 8960, prime=False)
+
+    assert primed.shape == (8960,)
+    assert np.array_equal(primed[-len(audio):], audio)
+    assert np.array_equal(normal, audio)
+
+
+def test_frontier_streaming_params_enable_history_priming() -> None:
+    vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
+    vc.config = RealtimeConfig(
+        latency_mode="frontier",
+        chunk_sec=0.02,
+        f0_method="swiftf0",
+    )
+    vc.pipeline = SimpleNamespace(device="xpu")
+    vc._sola_extra_model = 960
+    vc._runtime_output_sample_rate = 48000
+
+    params = vc._build_streaming_params(index_rate=0.0, voice_gate_mode="off")
+
+    assert params.prime_hubert_history is True

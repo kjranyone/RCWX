@@ -1722,7 +1722,15 @@ class RealtimeVoiceChangerUnified:
                     _ = self.output_resampler.resample_chunk(output_model)
                 warmup_passes += 1
                 history = self.pipeline._streaming_audio_history
-                if history is not None and len(history) >= target_history:
+                # Primed deadline history reaches the fixed shape on pass 1,
+                # but F0/filter continuity tensors settle on pass 2 and can
+                # produce a distinct stride signature. Capture both before
+                # live callbacks start.
+                if (
+                    warmup_passes >= 2
+                    and history is not None
+                    and len(history) >= target_history
+                ):
                     break
 
             # Reset warmup side-effects so first real chunk starts cleanly.
@@ -1805,6 +1813,9 @@ class RealtimeVoiceChangerUnified:
             uv_ramp_ms=cfg.uv_ramp_ms,
             output_sample_rate=(
                 self._runtime_output_sample_rate if self._uses_device_output_resample() else 0
+            ),
+            prime_hubert_history=(
+                getattr(cfg, "latency_mode", "balanced") in DEADLINE_MODES
             ),
         )
 
