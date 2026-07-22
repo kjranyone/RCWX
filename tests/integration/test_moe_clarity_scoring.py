@@ -11,11 +11,11 @@ import json
 import logging
 import os
 from pathlib import Path
+from urllib.request import urlretrieve
 
 import numpy as np
 import torch
 from scipy.io import wavfile
-from torchaudio.utils import _download_asset
 
 from rcwx.audio.resample import resample
 from rcwx.config import RCWXConfig
@@ -27,6 +27,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+def _download_sample_asset() -> Path:
+    cache_dir = Path.home() / ".cache" / "rcwx" / "test-assets"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target = cache_dir / "1688-142285-0007.wav"
+    if not target.exists():
+        urlretrieve(
+            "https://download.pytorch.org/torchaudio/tutorial-assets/"
+            "ctc-decoding/1688-142285-0007.wav",
+            target,
+        )
+    return target
 
 
 def _to_float32(audio: np.ndarray) -> np.ndarray:
@@ -132,7 +145,7 @@ def test_moe_clarity_scoring_proof():
         logger.info(f"SKIP: model not found: {model_path}")
         return
 
-    sample_path = _download_asset("tutorial-assets/ctc-decoding/1688-142285-0007.wav")
+    sample_path = _download_sample_asset()
     sr, wav = wavfile.read(sample_path)
     audio = _to_float32(wav)
     if audio.ndim == 2:

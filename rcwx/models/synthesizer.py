@@ -9,6 +9,11 @@ from typing import Optional, Tuple, Type
 import torch
 import torch.nn as nn
 
+from rcwx.accelerator_graph import (
+    clear_accelerator_graph_cache,
+    get_accelerator_graph_stats,
+    run_accelerator_graph,
+)
 from rcwx.models.infer_pack.models import (
     SynthesizerTrnMs256NSFsid,
     SynthesizerTrnMs256NSFsidNono,
@@ -159,6 +164,7 @@ class SynthesizerLoader:
         self.has_f0: bool = True
         self.speaker_id: int = 0
         self.sample_rate: int = 40000
+        self._speaker_id_tensors: dict[tuple[int, str], torch.Tensor] = {}
 
     def load(self) -> nn.Module:
         """
@@ -278,6 +284,8 @@ class SynthesizerLoader:
         skip_head: int = 0,
         return_length: int = 0,
         return_length2: int = 0,
+        use_accelerator_graph: bool = False,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
         """
         Run inference on the loaded model.
@@ -294,6 +302,7 @@ class SynthesizerLoader:
             return_length: Number of feature frames to synthesize in Flow+Decoder.
                 0 means synthesize all remaining frames after skip_head.
             return_length2: Output resolution for NSF decoder harmonic source trim.
+            use_accelerator_graph: Capture/replay repeated real-time shapes.
 
         Returns:
             Generated audio [B, T_out]
@@ -306,38 +315,120 @@ class SynthesizerLoader:
 
         # Default speaker ID
         if speaker_id is None:
-            speaker_id = torch.zeros(
-                features.shape[0],
-                dtype=torch.long,
-                device=features.device,
-            )
+            speaker_key = (features.shape[0], str(features.device))
+            speaker_id = self._speaker_id_tensors.get(speaker_key)
+            if speaker_id is None:
+                speaker_id = torch.zeros(
+                    features.shape[0],
+                    dtype=torch.long,
+                    device=features.device,
+                )
+                self._speaker_id_tensors[speaker_key] = speaker_id
+
+        namespace = self._graph_namespace(
+            noise_scale=noise_scale,
+            skip_head=skip_head,
+            return_length=return_length,
+            return_length2=return_length2,
+            all_frames_valid=all_frames_valid,
+        )
 
         if self.has_f0:
             if pitch is None or pitchf is None:
                 raise ValueError("F0 model requires pitch and pitchf inputs")
-            output = self.model.infer(
-                features,
-                feature_lengths,
-                pitch,
-                pitchf,
-                speaker_id,
-                skip_head=skip_head,
-                return_length=return_length,
-                return_length2=return_length2,
-                noise_scale=noise_scale,
-            )
+
+            def forward(
+                input_features: torch.Tensor,
+                input_lengths: torch.Tensor,
+                input_pitch: torch.Tensor,
+                input_pitchf: torch.Tensor,
+                input_speaker: torch.Tensor,
+            ) -> torch.Tensor:
+                return self.model.infer(
+                    input_features,
+                    input_lengths,
+                    input_pitch,
+                    input_pitchf,
+                    input_speaker,
+                    skip_head=skip_head,
+                    return_length=return_length,
+                    return_length2=return_length2,
+                    noise_scale=noise_scale,
+                    all_frames_valid=all_frames_valid,
+                )
+
+            inputs = (features, feature_lengths, pitch, pitchf, speaker_id)
         else:
-            output = self.model.infer(
-                features,
-                feature_lengths,
-                speaker_id,
-                skip_head=skip_head,
-                return_length=return_length,
-                return_length2=return_length2,
-                noise_scale=noise_scale,
-            )
+            def forward(
+                input_features: torch.Tensor,
+                input_lengths: torch.Tensor,
+                input_speaker: torch.Tensor,
+            ) -> torch.Tensor:
+                return self.model.infer(
+                    input_features,
+                    input_lengths,
+                    input_speaker,
+                    skip_head=skip_head,
+                    return_length=return_length,
+                    return_length2=return_length2,
+                    noise_scale=noise_scale,
+                    all_frames_valid=all_frames_valid,
+                )
+
+            inputs = (features, feature_lengths, speaker_id)
+
+        if use_accelerator_graph and not self.use_compile:
+            output = run_accelerator_graph(self, namespace, forward, *inputs)
+        else:
+            output = forward(*inputs)
 
         return output.squeeze(1)
+
+    def _graph_namespace(
+        self,
+        *,
+        noise_scale: float,
+        skip_head: int,
+        return_length: int,
+        return_length2: int,
+        all_frames_valid: bool,
+    ) -> str:
+        """Build a key for Python values and mutable decoder control flow."""
+        phase_mode = "none"
+        fixed_harmonics = False
+        uv_ramp_ms = 0.0
+        if self.has_f0 and self.model is not None:
+            sine_gen = getattr(
+                getattr(
+                    getattr(self.model, "dec", None),
+                    "m_source",
+                    None,
+                ),
+                "l_sin_gen",
+                None,
+            )
+            if sine_gen is not None:
+                phase_mode = str(getattr(sine_gen, "phase_mode", "legacy"))
+                fixed_harmonics = bool(
+                    getattr(sine_gen, "fixed_harmonics", False)
+                )
+                uv_ramp_ms = float(getattr(sine_gen, "uv_ramp_ms", 0.0))
+
+        return (
+            f"synth-v{self.version}-f0-{int(self.has_f0)}"
+            f"-noise-{float(noise_scale).hex()}"
+            f"-skip-{int(skip_head)}-return-{int(return_length)}"
+            f"-return2-{int(return_length2)}"
+            f"-full-{int(all_frames_valid)}"
+            f"-phase-{phase_mode}-fixed-{int(fixed_harmonics)}"
+            f"-uv-{uv_ramp_ms.hex()}"
+        )
+
+    def clear_graph_cache(self) -> None:
+        clear_accelerator_graph_cache(self)
+
+    def graph_stats(self) -> dict[str, float | int]:
+        return get_accelerator_graph_stats(self)
 
 
 def load_index(index_path: str) -> Optional[object]:

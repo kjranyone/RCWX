@@ -8,6 +8,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -15,14 +16,17 @@ import numpy as np
 import torch
 from scipy.signal import butter, filtfilt, medfilt
 
+from rcwx.accelerator_graph import run_accelerator_graph
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.resample import resample
 from rcwx.device import get_device, get_dtype
 from rcwx.downloader import get_hubert_path, get_rmvpe_path
+from rcwx.models.accelerator_index import AcceleratorIVFIndex
+from rcwx.models.fcpe import FCPE, is_fcpe_available
 from rcwx.models.hubert_loader import HuBERTLoader
 from rcwx.models.rmvpe import RMVPE
-from rcwx.models.fcpe import FCPE, is_fcpe_available
-from rcwx.models.swiftf0 import SwiftF0 as SwiftF0Model, is_swiftf0_available
+from rcwx.models.swiftf0 import SwiftF0 as SwiftF0Model
+from rcwx.models.swiftf0 import is_swiftf0_available
 from rcwx.models.synthesizer import SynthesizerLoader
 
 logger = logging.getLogger(__name__)
@@ -39,10 +43,9 @@ F0_HISTORY_FRAMES = 20  # 200ms @ 100fps, Butterworth ord-2 warmup に十分
 # minimum number of mel frames (short inputs crash in avg_pool), and a fixed
 # slice size avoids per-chunk kernel recompilation on Intel XPU.
 F0_MIN_WINDOW_16K = 8960
-# Fallback stage-profiling cadence when device timing events are unavailable:
-# wall-clock + device-wide sync is only paid on every Nth infer_streaming call
-# (plus the first 5).  With event support, profiling is sync-free and runs on
-# every chunk.
+SWIFTF0_MIN_WINDOW_16K = 2240  # 40ms hop + 100ms pitch context
+# Stage-profiling cadence. Even sync-free device events add submissions to the
+# 20ms hot path, so sample both event and wall-clock profiling.
 STAGE_PROFILE_INTERVAL = 10
 FCPE_VOICING_THRESHOLD = 0.006
 RMVPE_VOICING_THRESHOLD = 0.015
@@ -166,6 +169,36 @@ class StreamingParams:
     # Voiced/unvoiced crossfade ramp (ms) for the NSF sine/noise excitation
     # switch.  0 keeps the original RVC hard switch.
     uv_ramp_ms: float = 5.0
+    # Optional device-side output resampling. A positive rate keeps the
+    # synthesizer waveform on the accelerator through sinc resampling and
+    # performs the single D2H transfer at the final output rate.
+    output_sample_rate: int = 0
+    # Deadline modes cannot afford the growing-history eager synthesizer
+    # phase. Reflect the first real chunk into the left context so the fixed
+    # steady-state graph is usable from the first hop.
+    prime_hubert_history: bool = False
+
+
+def _initial_streaming_history(
+    audio: np.ndarray,
+    max_samples: int,
+    *,
+    prime: bool,
+) -> np.ndarray:
+    """Build the first streaming context, optionally at its fixed shape."""
+    if not prime or len(audio) >= max_samples:
+        return audio[-max_samples:].copy()
+    mode = "reflect" if len(audio) > 1 else "edge"
+    return np.pad(
+        audio,
+        (max_samples - len(audio), 0),
+        mode=mode,
+    ).astype(np.float32, copy=False)
+
+
+@lru_cache(maxsize=8)
+def _highpass_coefficients(sr: int, cutoff: int) -> tuple[np.ndarray, np.ndarray]:
+    return butter(5, cutoff / (sr / 2), btype="high")
 
 
 def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.ndarray:
@@ -175,9 +208,7 @@ def highpass_filter(audio: np.ndarray, sr: int = 16000, cutoff: int = 48) -> np.
     """
     if len(audio) < 100:  # Too short to filter
         return audio
-    nyquist = sr / 2
-    normalized_cutoff = cutoff / nyquist
-    b, a = butter(5, normalized_cutoff, btype="high")
+    b, a = _highpass_coefficients(sr, cutoff)
     return filtfilt(b, a, audio).astype(np.float32)
 
 
@@ -944,6 +975,8 @@ class RVCPipeline:
         # FAISS index components
         self.faiss_index = None
         self.index_features: Optional[np.ndarray] = None  # big_npy
+        self.accelerator_index: Optional[AcceleratorIVFIndex] = None
+        self._accelerator_index_attempted = False
 
         # Model properties
         self.has_f0: bool = use_f0
@@ -981,12 +1014,24 @@ class RVCPipeline:
         # Windowed-F0 history: post-shift/moe, pre-filter F0 (Hz) @100fps,
         # kept in lockstep with the tail of _streaming_audio_history.
         self._streaming_f0_hz_history: Optional[torch.Tensor] = None
+        self._streaming_output_resamplers: dict[int, torch.nn.Module] = {}
+        self._streaming_feature_lengths: dict[int, torch.Tensor] = {}
 
         # Per-stage times (ms) of the last profiled infer_streaming() call.
         self.stage_times: dict = {}
         self._stage_profile_counter: int = 0
         # Device timing-event support: None=unknown, resolved on first use.
         self._profile_events_ok: Optional[bool] = None
+        # Reuse the worker instead of creating and joining threads every hop.
+        self._parallel_executor: Optional[ThreadPoolExecutor] = None
+
+    def _get_parallel_executor(self) -> ThreadPoolExecutor:
+        if self._parallel_executor is None:
+            self._parallel_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="rcwx-f0",
+            )
+        return self._parallel_executor
 
     def load(self) -> None:
         """Load all models."""
@@ -1106,10 +1151,39 @@ class RVCPipeline:
             logger.warning("faiss-cpu not installed, index retrieval disabled")
             self.faiss_index = None
             self.index_features = None
-        except Exception as e:
-            logger.warning(f"Failed to load FAISS index: {e}")
+        except Exception as exc:
+            logger.warning("Failed to load FAISS index: %s", exc)
             self.faiss_index = None
             self.index_features = None
+
+    def prepare_accelerator_index(self) -> bool:
+        """Build the device IVF once, before a low-latency stream starts."""
+        if self.accelerator_index is not None:
+            return True
+        if self._accelerator_index_attempted:
+            return False
+        self._accelerator_index_attempted = True
+        if (
+            self.faiss_index is None
+            or self.index_features is None
+            or str(self.device).split(":", 1)[0] not in {"xpu", "cuda"}
+        ):
+            return False
+        try:
+            self.accelerator_index = AcceleratorIVFIndex.from_faiss(
+                self.faiss_index,
+                self.index_features,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            return True
+        except Exception as exc:
+            self.accelerator_index = None
+            logger.warning(
+                "Accelerator IVF unavailable; using CPU FAISS: %s",
+                exc,
+            )
+            return False
 
     def _search_index(
         self,
@@ -1130,6 +1204,13 @@ class RVCPipeline:
         """
         if self.faiss_index is None or index_rate <= 0:
             return features
+
+        if (
+            self.accelerator_index is not None
+            and features.device.type in {"xpu", "cuda"}
+        ):
+            retrieved_tensor = self.accelerator_index.retrieve(features, k=k)
+            return index_rate * retrieved_tensor + (1 - index_rate) * features
 
         # Convert to numpy for FAISS search
         npy = features[0].cpu().numpy()
@@ -1173,6 +1254,15 @@ class RVCPipeline:
 
     def unload(self) -> None:
         """Unload all models to free memory."""
+        if self._parallel_executor is not None:
+            self._parallel_executor.shutdown(wait=True, cancel_futures=True)
+            self._parallel_executor = None
+        if self.hubert is not None:
+            self.hubert.clear_graph_cache()
+        if self.synthesizer is not None:
+            self.synthesizer.clear_graph_cache()
+        if self.accelerator_index is not None:
+            self.accelerator_index.clear_graph_cache()
         self.hubert = None
         self.rmvpe = None
         self.fcpe = None
@@ -1180,6 +1270,10 @@ class RVCPipeline:
         self.synthesizer = None
         self.faiss_index = None
         self.index_features = None
+        self.accelerator_index = None
+        self._accelerator_index_attempted = False
+        self._streaming_output_resamplers.clear()
+        self._streaming_feature_lengths.clear()
         self._loaded = False
         self.clear_cache()
 
@@ -1224,6 +1318,35 @@ class RVCPipeline:
         except Exception:
             pass
 
+    def _resample_streaming_output(
+        self,
+        output: torch.Tensor,
+        target_sample_rate: int,
+    ) -> torch.Tensor:
+        """Resample a fixed streaming waveform before its final D2H transfer."""
+        target_sample_rate = int(target_sample_rate)
+        if target_sample_rate <= 0 or target_sample_rate == self.sample_rate:
+            return output.float()
+
+        resampler = self._streaming_output_resamplers.get(target_sample_rate)
+        if resampler is None:
+            import torchaudio
+
+            resampler = torchaudio.transforms.Resample(
+                self.sample_rate,
+                target_sample_rate,
+                dtype=torch.float32,
+            ).to(self.device)
+            resampler.eval()
+            self._streaming_output_resamplers[target_sample_rate] = resampler
+
+        return run_accelerator_graph(
+            resampler,
+            "streaming-output-resample",
+            lambda value: resampler(value),
+            output.float(),
+        )
+
     def _assemble_windowed_f0(
         self,
         f0_win: torch.Tensor,
@@ -1266,7 +1389,10 @@ class RVCPipeline:
         hist = self._streaming_f0_hz_history
         if hist is not None and hist.shape[0] == f0_win.shape[0]:
             new_tail = f0_win[:, f0_win.shape[1] - new_frames :]
-            hist = torch.cat([hist.to(f0_win.dtype), new_tail], dim=1)
+            hist = torch.cat(
+                [hist.to(device=f0_win.device, dtype=f0_win.dtype), new_tail],
+                dim=1,
+            )
         else:
             hist = f0_win
         hist = hist[:, -hist_cap:]
@@ -1518,13 +1644,18 @@ class RVCPipeline:
             f"final={len(audio_np)} (mode={pad_mode})"
         )
 
-        audio = torch.from_numpy(audio_np).float()
+        audio_cpu = torch.from_numpy(audio_np).float()
 
         # Ensure 2D for batch processing
-        if audio.dim() == 1:
-            audio = audio.unsqueeze(0)
+        if audio_cpu.dim() == 1:
+            audio_cpu = audio_cpu.unsqueeze(0)
 
-        audio = audio.to(self.device)
+        audio = audio_cpu.to(self.device)
+        f0_audio = (
+            audio_cpu
+            if f0_method == "swiftf0" and self.swiftf0 is not None
+            else audio
+        )
         residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
 
@@ -1549,7 +1680,13 @@ class RVCPipeline:
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
 
-        if use_parallel_extraction and use_f0:
+        graph_capture_pending = self.hubert.graph_capture_pending(
+            audio, output_layer, output_dim
+        )
+        if graph_capture_pending:
+            logger.info("HuBERT Accelerator Graph capture will run before parallel F0")
+
+        if use_parallel_extraction and use_f0 and not graph_capture_pending:
 
             def extract_hubert():
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -1565,7 +1702,7 @@ class RVCPipeline:
                         )
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     return self.swiftf0.infer(
-                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        f0_audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                 elif self.rmvpe is not None:
                     with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -1574,13 +1711,12 @@ class RVCPipeline:
                         )
                 return None
 
-            # Run HuBERT and F0 extraction in parallel threads
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                hubert_future = executor.submit(extract_hubert)
-                f0_future = executor.submit(extract_f0)
-
-                features = hubert_future.result()
-                f0_raw = f0_future.result()
+            # Keep XPU dispatch on the inference thread while CPU F0 runs in
+            # parallel. Only F0 needs a worker/future.
+            executor = self._get_parallel_executor()
+            f0_future = executor.submit(extract_f0)
+            features = extract_hubert()
+            f0_raw = f0_future.result()
 
             logger.debug("Parallel extraction complete (HuBERT + F0, ThreadPool)")
 
@@ -1699,7 +1835,7 @@ class RVCPipeline:
                 # Use SwiftF0 if requested and available
                 elif f0_method == "swiftf0" and self.swiftf0 is not None:
                     f0 = self.swiftf0.infer(
-                        audio, threshold=SWIFTF0_VOICING_THRESHOLD
+                        f0_audio, threshold=SWIFTF0_VOICING_THRESHOLD
                     )
                     logger.debug("F0 extracted with SwiftF0 (sequential)")
 
@@ -1712,6 +1848,9 @@ class RVCPipeline:
                     logger.debug("F0 extracted with RMVPE (sequential)")
             else:
                 logger.debug(f"F0 from parallel extraction ({f0_method})")
+
+            if f0 is not None and f0.device != torch.device(self.device):
+                f0 = f0.to(self.device)
 
             # Phase 5: Trim overlap frames from F0
             # These frames came from the prepended audio cache and should be discarded
@@ -2106,6 +2245,7 @@ class RVCPipeline:
         f0_context_sec = params.f0_context_sec
         f0_hole_fill_ms = params.f0_hole_fill_ms
         uv_ramp_ms = params.uv_ramp_ms
+        prime_hubert_history = params.prime_hubert_history
 
         # Per-stage times (ms); published on self for the realtime
         # controller's [PERF] logging.  With device timing events (preferred)
@@ -2114,11 +2254,12 @@ class RVCPipeline:
         # path.  Without event support, fall back to wall-clock + device sync
         # on sampled chunks only.
         self._stage_profile_counter += 1
-        use_timing_events = self._profile_events_ok is not False
-        if use_timing_events or (
+        profile_now = (
             self._stage_profile_counter <= 5
             or (self._stage_profile_counter - 1) % STAGE_PROFILE_INTERVAL == 0
-        ):
+        )
+        if profile_now:
+            use_timing_events = self._profile_events_ok is not False
             prof: Optional[_StageProfiler] = _StageProfiler(self, use_timing_events)
             self.stage_times = prof.times
         else:
@@ -2166,7 +2307,11 @@ class RVCPipeline:
             int(hubert_context_sec * 16000),
         )
         if self._streaming_audio_history is None:
-            self._streaming_audio_history = audio_16k.copy()
+            self._streaming_audio_history = _initial_streaming_history(
+                audio_16k,
+                max_hubert_context_16k,
+                prime=prime_hubert_history,
+            )
         else:
             self._streaming_audio_history = np.concatenate([
                 self._streaming_audio_history, new_hop_16k
@@ -2175,6 +2320,9 @@ class RVCPipeline:
             self._streaming_audio_history = (
                 self._streaming_audio_history[-max_hubert_context_16k:]
             )
+        hubert_history_full = (
+            len(self._streaming_audio_history) >= max_hubert_context_16k
+        )
 
         # Extend audio_16k with HuBERT history (capped at max_hubert_context_16k).
         pre_context_samples = 0
@@ -2231,9 +2379,8 @@ class RVCPipeline:
         trim_right = max(0, t_pad_tgt + extra_pad_tgt - hubert_deficit)
 
         # Convert to tensors
-        audio_t = (
-            torch.from_numpy(audio_padded).float().unsqueeze(0).to(self.device)
-        )
+        audio_cpu_t = torch.from_numpy(audio_padded).float().unsqueeze(0)
+        audio_t = audio_cpu_t.to(self.device)
         residual_f0_shift = float(pitch_shift)
         moe_strength = max(0.0, min(MAX_MOE_BOOST, float(moe_boost)))
         # Determine HuBERT output params
@@ -2252,14 +2399,27 @@ class RVCPipeline:
         # older than the window come from _streaming_f0_hz_history.
         f0_window_samples = 0
         f0_slice_samples = 0
-        f0_input = audio_t
+        f0_source = (
+            audio_cpu_t
+            if f0_method == "swiftf0" and self.swiftf0 is not None
+            else audio_t
+        )
+        f0_input = f0_source
         if f0_context_sec > 0:
             f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
-            # Fixed slice size: clamp to [F0_MIN_WINDOW_16K, hubert context].
-            # Constant shape = single XPU kernel compilation, and never below
-            # the F0 model's minimum input.
+            # SwiftF0 is local and supports the short Aggressive window. The
+            # neural GPU extractors retain the decoder-safe 560ms floor.
+            min_f0_window = (
+                SWIFTF0_MIN_WINDOW_16K
+                if (
+                    f0_method == "swiftf0"
+                    and self.swiftf0 is not None
+                    and f0_context_sec <= 0.10
+                )
+                else F0_MIN_WINDOW_16K
+            )
             f0_slice_samples = min(
-                max(new_samples + max(0, f0_ctx), F0_MIN_WINDOW_16K),
+                max(new_samples + max(0, f0_ctx), min_f0_window),
                 max_hubert_context_16k,
             )
             # Real-audio coverage; the shortfall (early chunks with a short
@@ -2268,7 +2428,7 @@ class RVCPipeline:
             pad_extend = f0_slice_samples - f0_window_samples
             win_start = input_length - f0_window_samples
             win_end = t_pad + input_length + t_pad + pad_extend
-            f0_input = audio_t[:, win_start:win_end]
+            f0_input = f0_source[:, win_start:win_end]
 
         # Parallel HuBERT + F0 extraction
         # HuBERT/F0 use the same source audio to preserve alignment.
@@ -2276,7 +2436,13 @@ class RVCPipeline:
         f0_raw = None
         use_f0 = self.has_f0 and f0_method != "none"
 
-        if use_parallel_extraction and use_f0:
+        graph_capture_pending = self.hubert.graph_capture_pending(
+            audio_t, output_layer, output_dim
+        )
+        if graph_capture_pending:
+            logger.info("HuBERT Accelerator Graph capture will run before parallel F0")
+
+        if use_parallel_extraction and use_f0 and not graph_capture_pending:
             def extract_hubert():
                 tok = prof.start() if prof is not None else None
                 with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -2322,11 +2488,10 @@ class RVCPipeline:
                         prof.stop_wall("f0_ms", wall0)
                 return result
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                hubert_future = executor.submit(extract_hubert)
-                f0_future = executor.submit(extract_f0)
-                features = hubert_future.result()
-                f0_raw = f0_future.result()
+            executor = self._get_parallel_executor()
+            f0_future = executor.submit(extract_f0)
+            features = extract_hubert()
+            f0_raw = f0_future.result()
         else:
             tok = prof.start() if prof is not None else None
             with torch.autocast(device_type=self.device, dtype=self.dtype):
@@ -2336,7 +2501,9 @@ class RVCPipeline:
             if prof is not None:
                 prof.stop("hubert_ms", tok)
 
-        # FAISS index retrieval (internally synced by the .cpu() transfer)
+        # FAISS index retrieval (internally synced by the .cpu() transfer).
+        # Keep the full context: the synthesizer TextEncoder uses global
+        # self-attention, so even trimmed prefix features affect emitted audio.
         if index_rate > 0 and self.faiss_index is not None:
             t0 = time.perf_counter()
             features = self._search_index(features, index_rate, k=index_k)
@@ -2351,9 +2518,13 @@ class RVCPipeline:
             align_corners=False,
         ).permute(0, 2, 1)
 
-        feature_lengths = torch.tensor(
-            [features.shape[1]], dtype=torch.long, device=self.device
-        )
+        feature_count = int(features.shape[1])
+        feature_lengths = self._streaming_feature_lengths.get(feature_count)
+        if feature_lengths is None:
+            feature_lengths = torch.tensor(
+                [feature_count], dtype=torch.long, device=self.device
+            )
+            self._streaming_feature_lengths[feature_count] = feature_lengths
 
         # F0 processing (same audio_t as HuBERT for perfect frame alignment)
         pitch = None
@@ -2391,6 +2562,19 @@ class RVCPipeline:
                         prof.stop_wall("f0_ms", wall0)
 
             if f0 is not None and f0.numel() > 0:
+                # SwiftF0 is a CPU ONNX model. Keep its result and the full
+                # post-processing chain on CPU, then upload pitch tensors once
+                # immediately before synthesis. Moving it to XPU here caused
+                # every NumPy/Scipy F0 correction below to perform another
+                # XPU->CPU->XPU synchronization.
+                keep_f0_on_cpu = (
+                    f0_method == "swiftf0"
+                    and self.swiftf0 is not None
+                    and f0.device.type == "cpu"
+                )
+                if not keep_f0_on_cpu and f0.device != torch.device(self.device):
+                    f0 = f0.to(self.device)
+
                 # FCPE smoothing
                 if f0_method == "fcpe":
                     f0 = _smooth_fcpe_f0(f0)
@@ -2441,7 +2625,10 @@ class RVCPipeline:
                 # Prepend history for filter warmup
                 f0_history_len = 0
                 if self._streaming_f0_pre_filter_tail is not None:
-                    history = self._streaming_f0_pre_filter_tail
+                    history = self._streaming_f0_pre_filter_tail.to(
+                        device=f0.device,
+                        dtype=f0.dtype,
+                    )
                     f0_history_len = history.shape[1]
                     f0_extended = torch.cat([history, f0], dim=1)
                 else:
@@ -2468,6 +2655,15 @@ class RVCPipeline:
 
                 # Quantized pitch for embedding (shared with batch infer)
                 pitch, voiced_mask_for_gate = quantize_f0_to_pitch(f0)
+
+                # The synthesizer and optional gate run on the accelerator.
+                # SwiftF0 reaches this point on CPU, so this is its only H2D
+                # transfer after ONNX inference.
+                target_device = torch.device(self.device)
+                if pitch.device != target_device:
+                    pitch = pitch.to(target_device)
+                    pitchf = pitchf.to(target_device)
+                    voiced_mask_for_gate = voiced_mask_for_gate.to(target_device)
 
             if pitch is None:
                 logger.warning(
@@ -2508,9 +2704,14 @@ class RVCPipeline:
         # the preceding audio, dramatically improving output quality for
         # low-latency chunk sizes.
         cache_prepend_frames = 0
-        new_features_for_cache = features.clone()
-        new_pitch_for_cache = pitch.clone() if pitch is not None else None
-        new_pitchf_for_cache = pitchf.clone() if pitchf is not None else None
+        needs_feature_cache = features.shape[1] < MIN_SYNTH_FEATURE_FRAMES
+        new_features_for_cache = features.clone() if needs_feature_cache else None
+        new_pitch_for_cache = (
+            pitch.clone() if needs_feature_cache and pitch is not None else None
+        )
+        new_pitchf_for_cache = (
+            pitchf.clone() if needs_feature_cache and pitchf is not None else None
+        )
 
         if (
             self._streaming_feat_cache is not None
@@ -2571,9 +2772,13 @@ class RVCPipeline:
 
         # Save current chunk's features for next call's cache
         self._streaming_feat_cache = (
-            new_features_for_cache,
-            new_pitch_for_cache,
-            new_pitchf_for_cache,
+            (
+                new_features_for_cache,
+                new_pitch_for_cache,
+                new_pitchf_for_cache,
+            )
+            if new_features_for_cache is not None
+            else None
         )
 
         # --- Compute skip_head/return_length for streaming synthesis ---
@@ -2619,6 +2824,11 @@ class RVCPipeline:
                 skip_head=skip_head_feat,
                 return_length=return_length_feat,
                 return_length2=return_length_feat,
+                all_frames_valid=True,
+                # Before history is full, skip_head moves every chunk. Capturing
+                # those transient signatures wastes graph memory and can evict
+                # the single steady-state graph needed by real-time inference.
+                use_accelerator_graph=hubert_history_full,
             )
 
         # Voice gating (output is already the target region; shared with infer)
@@ -2635,9 +2845,34 @@ class RVCPipeline:
                 sample_rate=self.sample_rate,
             )
 
-        # Convert to numpy (the .cpu() transfer is the device sync point, so
-        # synth_ms includes the real synthesis + gate execution time, and all
-        # pending stage timing events are complete for finalize())
+        # Trim sub-frame residual from left (skip_head rounds to feature boundaries)
+        if residual_left > 0 and output.shape[-1] > residual_left:
+            output = output[..., residual_left:]
+
+        # Adjust to exact model-rate length while the waveform is still on
+        # the accelerator.
+        # With zc-aligned sola_extra_samples, residual_left should be 0 and
+        # the output should be >= expected_output (right-trim conservative).
+        # Trim excess; if short, pad tail with edge value (typically 0-2 samples
+        # from rounding — not a quality concern).
+        output_length = int(output.shape[-1])
+        if output_length > expected_output:
+            output = output[..., :expected_output]
+        elif output_length < expected_output:
+            output = torch.nn.functional.pad(
+                output,
+                (0, expected_output - output_length),
+                mode="replicate",
+            )
+
+        target_sample_rate = int(params.output_sample_rate)
+        if target_sample_rate > 0 and target_sample_rate != self.sample_rate:
+            tok = prof.start() if prof is not None else None
+            output = self._resample_streaming_output(output, target_sample_rate)
+            if prof is not None:
+                prof.stop("output_resample_ms", tok)
+
+        # This is the single waveform D2H transfer and natural device sync.
         output = output.cpu().float().numpy()
         if prof is not None:
             prof.stop_wall("synth_ms", t_synth)
@@ -2645,20 +2880,18 @@ class RVCPipeline:
         if output.ndim == 2:
             output = output[0]
 
-        # Trim sub-frame residual from left (skip_head rounds to feature boundaries)
-        if residual_left > 0 and len(output) > residual_left:
-            output = output[residual_left:]
-
-        # Adjust to exact expected length.
-        # With zc-aligned sola_extra_samples, residual_left should be 0 and
-        # the output should be >= expected_output (right-trim conservative).
-        # Trim excess; if short, pad tail with edge value (typically 0-2 samples
-        # from rounding — not a quality concern).
-        if len(output) > expected_output:
-            output = output[:expected_output]
-        elif len(output) < expected_output:
+        expected_final = expected_output
+        if target_sample_rate > 0 and target_sample_rate != self.sample_rate:
+            expected_final = int(
+                round(expected_output * target_sample_rate / self.sample_rate)
+            )
+        if len(output) > expected_final:
+            output = output[:expected_final]
+        elif len(output) < expected_final:
             output = np.pad(
-                output, (0, expected_output - len(output)), mode="edge"
+                output,
+                (0, expected_final - len(output)),
+                mode="edge",
             )
 
         return output
@@ -2667,6 +2900,20 @@ class RVCPipeline:
         """Get information about the loaded pipeline."""
         if not self._loaded:
             return {"loaded": False}
+
+        hubert_graph_stats = (
+            self.hubert.graph_stats() if self.hubert is not None else None
+        )
+        synthesizer_graph_stats = (
+            self.synthesizer.graph_stats()
+            if self.synthesizer is not None
+            else None
+        )
+        index_graph_stats = (
+            self.accelerator_index.graph_stats()
+            if self.accelerator_index is not None
+            else None
+        )
 
         return {
             "loaded": True,
@@ -2680,4 +2927,7 @@ class RVCPipeline:
             "has_f0": self.has_f0,
             "sample_rate": self.sample_rate,
             "use_compile": self.use_compile,
+            "hubert_accelerator_graph": hubert_graph_stats,
+            "synthesizer_accelerator_graph": synthesizer_graph_stats,
+            "index_accelerator_graph": index_graph_stats,
         }

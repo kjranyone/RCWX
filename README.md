@@ -5,6 +5,7 @@ RVC Real-time Voice Changer on Intel Arc (XPU)
 ## Features
 
 - **Intel Arc GPU対応** - PyTorch XPU による高速推論
+- **XPU Accelerator Graph** - HuBERTと定常状態のRVC合成をcapture/replayしてCPU起動オーバーヘッドを削減
 - **RVC v1/v2両対応** - 256次元・768次元特徴量モデルに対応
 - **F0あり/なしモデル対応** - RMVPE F0抽出または低遅延モード
 - **リアルタイム変換** - クロスフェード処理による低遅延・高品質変換
@@ -79,7 +80,10 @@ uv sync --extra ml-denoise
 # 3. 必要モデル (HuBERT, RMVPE) のダウンロード
 uv run rcwx download
 
-# 4. GUI起動
+# 4. XPUとAccelerator Graphの確認
+uv run rcwx diagnose
+
+# 5. GUI起動
 uv run rcwx
 ```
 
@@ -101,6 +105,32 @@ uv run rcwx
 - ノイズ除去: **ML** (Facebook Denoiser, 要 `--extra ml-denoise`) / Spectral (標準)
 - FAISS インデックス: **有効** (ratio=0.15)
 - 詳細は [Inference Settings](#inference-settings) 参照
+
+## XPU Accelerator Graph
+
+PyTorch `2.13.0+xpu` では、XPU利用時にAccelerator Graphが自動的に有効になります。HuBERT特徴抽出と、入力shapeが固定された定常状態のRVC Synthesizerが対象です。GUI側の設定操作は必要ありません。
+
+- 変換開始前のウォームアップでHuBERT履歴を満たし、定常状態のSynthesizer Graphを1回capture
+- 実ストリーム開始前に音声履歴とリサンプラー状態をリセットし、capture済みGraphだけを保持
+- Graph API非対応またはcapture失敗時はeager推論へ自動フォールバック
+- `use_compile=true` のSynthesizerはAccelerator Graphを併用せず、従来のcompile経路を使用
+
+利用可否は診断コマンドで確認できます。
+
+```powershell
+uv run rcwx diagnose
+# [OK] XPU Accelerator Graph: True
+```
+
+ドライバーやモデル固有の問題を切り分ける場合は、環境変数で無効化できます。
+
+```powershell
+$env:RCWX_ACCELERATOR_GRAPH = "0"
+uv run rcwx
+
+# 次回以降、自動判定へ戻す
+Remove-Item Env:RCWX_ACCELERATOR_GRAPH
+```
 
 ## RVC Models Directory
 
@@ -199,6 +229,9 @@ uv run rcwx info model.pth
 
 - **ML方式**: 機械学習ベースで人間の声を認識・保持しながらノイズを除去（要 `uv sync --extra ml-denoise`、CC BY-NC 4.0）
 - **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去（標準同梱）
+- **除去強度**: `0.50x-2.00x`。`1.00x`はDNS64を1回処理し、MLは`1.00x`超で2回目のDNS64出力へ連続的に混合します。環境音が大きい場合は`1.25x`から上げ、声の欠けや金属音が出る手前で止めてください。Spectralでは閾値と減衰量を同時に深くします。
+
+MLの2段処理は計算量も増えます。`Aggressive`ではdeadlineを守るためDenoiserを実行中だけバイパスするため、強いノイズ除去を使う場合は`Normal`を選択します。
 
 ## Inference Settings
 
@@ -315,6 +348,7 @@ uv run rcwx run input.wav model.pth -o out.wav --pitch 6 --moe-boost 0.45
 
 ```
 rcwx/
+├── accelerator_graph.py  # XPU/CUDA固定shape Graphキャッシュ
 ├── config.py              # 設定管理 (JSON永続化)
 ├── device.py              # デバイス選択 (xpu/cuda/cpu)
 ├── downloader.py          # HuggingFace モデルダウンロード
@@ -332,6 +366,7 @@ rcwx/
 │   ├── hubert_loader.py   # ContentVec 特徴抽出 (transformers)
 │   ├── rmvpe.py           # RMVPE F0抽出
 │   ├── fcpe.py            # FCPE F0抽出 (低レイテンシ)
+│   ├── swiftf0.py         # SwiftF0 F0抽出 (ONNX/CPU)
 │   ├── synthesizer.py     # RVC合成器
 │   └── infer_pack/        # RVC コアモジュール
 ├── pipeline/
@@ -346,6 +381,45 @@ rcwx/
 ```
 
 ## Latency
+
+### レイテンシモード
+
+レイテンシ設定は`Normal`と`Aggressive`の2モードです。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。
+
+| モード | SOLAクロスフェード | 持続リングfloor | 非ASIOコールバック | 用途 |
+|--------|-------------------|-----------------|----------------------|------|
+| Normal | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 品質機能を維持した通常利用 |
+| Aggressive | chunkの10%、最大20ms | 初期1 hop、定常0.5-0.875 hopを適応維持 | 最大2.5ms | 20ms deadlineを狙う低遅延利用 |
+
+`Normal`はSwiftF0/Noneで40ms、FCPEで100ms、RMVPEで320msがchunk下限です。プリバッファは1 hop、buffer marginは0.25です。開始時に最初の生成チャンクを待ち、持続的なバッファ滞留だけを2 hopの観測窓で判定します。通常のchunk内burst/drainはtrim対象にしません。Denoiserを含む品質機能を保存設定どおり使用します。
+
+`Aggressive`はSwiftF0/Noneのchunkを20-100ms（20ms刻み）で調整できます。FCPEとRMVPEは入力要件のため100msと320msが下限です。開始時とアンダーラン復旧時は3 hopを確保します。最初の20 hopは1 hopのguardを維持し、その後は直近推論の`p99 - p50 + callback`から0.5-0.875 hopのjitter guardを選びます。20ms chunkでは10-17.5msです。
+
+`Aggressive`ではHuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時短縮し、Denoiserを実行時だけバイパスします。初回およびcatchup直後は最初の実音声hopを左側へreflect展開してHuBERT履歴を固定shapeまで即時充填するため、1 hop目からウォームアップ済みSynthesizer Graphを使用します。
+
+モデルと出力のsample rateが異なる場合、`Aggressive`はSynthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。`Normal`へ戻すと保存済みのDenoiser設定が再び有効になります。
+
+`Aggressive`のruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768 indexで約240MBの追加VRAMを使用します。`Normal`やファイル変換では構築しません。
+
+Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップとGUIのSOLA/decoder余白を含む処理時間がp50 14.5ms、p95 16.4ms、p99 18.8msでした（40ms deadline miss 0/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
+
+Aggressive第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。
+
+Aggressive 20ms hopのSOLA合成末尾は`crossfade + search`です。同じArc B570の定常測定はp50 11.87ms、p95 14.51ms、p99 17.37ms、20ms deadline miss 0/60です。全SOLA出力は960 samplesで一致し、HuBERT/Synthesizer/IVF Graphのfallbackは0でした。これは実機のdeadline成立を示す値であり、OSやドライバーの単発スパイクまで保証するものではありません。
+
+Aggressiveのホットパス監査では、音声推論以外にも毎hopのXPU timing event、ThreadPool生成・破棄、GUI/GPUメモリtelemetry、未使用feature cache clone、SOLA境界ログが残っていました。診断を10 hopごと、GUI telemetryを10Hzへ間引き、SwiftF0 workerを永続化してHuBERTを推論threadから直接dispatchします。同一60-hop ablationではp50 12.51msから9.44ms、p95 15.98msから11.70ms、p99 16.45msから12.14msへ短縮し、20ms deadline missは0でした。音声tensor、Graph shape、SOLA出力長は変更していません。
+
+さらに、既定5 framesのdecoder overlapはSOLA向け合成余白へ50msを追加していましたが、SOLAはその区間を参照せず、20ms hopごとに100ms分を合成していました。Aggressiveではdecoder overlapを0にして合成区間を50msへ半減し、出力の時間位置を約47ms前進させます。実音声比較では境界jump p95が0.0273から0.0237へ低下し、clipは0でした。Normalでは既定5 framesを維持します。
+
+残る定常演算では、XPU IVFの候補距離が毎hopごとに`[frames, candidates, 768]`の差分・二乗tensorを作り、TextEncoderは全64 framesが有効でも全1のattention maskを各層へ適用していました。IVF feature normを事前計算して距離をnormと内積から求め、streaming TextEncoderではpadding maskの生成、masked fill、全1 mask乗算を省略します。いずれもcontext長やattention範囲を変えない同値変換です。同じ実音声60-hop測定はp50 10.38msから8.33ms、p95 13.50msから10.93ms、p99 14.98msから11.79msへ短縮し、20ms deadline missとGraph fallbackは0でした。
+
+HuBERT/IVF結果を時間軸に沿って再利用する近似cacheも検証しましたが、HuBERTの双方向context更新により、8-hop再同期でも最終波形相関0.956、最悪hop相関0.20まで低下したため採用していません。Aggressiveでも560ms HuBERT contextとTextEncoderのglobal attentionは維持します。
+
+レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論8.3-11.8ms、定常guard 10ms、ASIO入出力約12msを使ったAggressive 20msのE2E目安は約80-84msです。
+
+ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Normalでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
+
+推論表示には直近256 hopのp95も表示します。ログの100 hopごとの`p50` / `p95` / `p99` / `deadline_miss`で、短いhopを継続的に処理できているか確認できます。
 
 **最適化済み** (2026-01-31):
 
@@ -367,6 +441,16 @@ rcwx/
 3. **レイテンシ27%削減** - RMVPE 530ms → FCPE 385ms（-145ms）
 4. **品質維持** - FCPE（Correlation 0.945）≈ RMVPE（Correlation 0.948）
 5. **処理速度37%向上** - FCPEはRMVPEより高速（RTF 0.56x vs 0.54x）
+
+### Accelerator Graph実測
+
+Intel Arc B570、PyTorch `2.13.0+xpu`、固定shapeのRVC v2 Synthesizerでの測定値です。モデルやチャンク設定によって結果は変動します。
+
+| 経路 | eager中央値 | Graph中央値 | 削減率 |
+|------|------------:|------------:|-------:|
+| RVC Synthesizerコア | 18.0ms | 4.5ms | 約75% |
+
+Graph定常時のストリーミング推論全体は中央値約18.6msでした。`noise_scale=0` の決定論的条件ではeager出力とのRMSEと最大絶対誤差はいずれも0です。
 
 ## Supported Models
 
@@ -394,7 +478,8 @@ override-dependencies = [
 
 [tool.uv.sources]
 torch = { index = "pytorch-xpu" }
-torchaudio = { index = "pytorch-xpu" }
+
+# TorchAudio 2.11 is installed from PyPI and supports future Torch releases.
 
 [[tool.uv.index]]
 name = "pytorch-xpu"
@@ -412,6 +497,9 @@ uv run python tests/integration/test_moe_f0_processing.py
 uv run python tests/crossfade/test_sola_compensation.py
 uv run python tests/models/test_inference.py
 uv run python tests/models/test_rmvpe.py
+uv run python tests/models/test_accelerator_graph.py
+uv run python tests/models/test_synthesizer_graph.py
+uv run python tests/models/test_runtime_graph_warmup.py
 ```
 
 ## Development
@@ -434,7 +522,7 @@ ruff format rcwx
 ```powershell
 # PyTorch バージョン確認
 uv run python -c "import torch; print(torch.__version__)"
-# → 2.10.0+xpu のように +xpu が付いていることを確認
+# → 2.13.0+xpu のように +xpu が付いていることを確認
 
 # +cpu の場合は uv.lock を再生成
 del uv.lock

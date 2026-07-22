@@ -12,6 +12,7 @@ import customtkinter as ctk
 import sounddevice as sd
 
 from rcwx.pipeline.realtime_unified import (
+    DEADLINE_MODES,
     RealtimeConfig,
     RealtimeStats,
     RealtimeVoiceChangerUnified,
@@ -108,6 +109,7 @@ class RealtimeController:
                 asio_buffer_size=self.app.audio_settings.asio_buffer_size,
                 # Latency settings
                 chunk_sec=latency["chunk_sec"],
+                latency_mode=latency["latency_mode"],
                 prebuffer_chunks=latency["prebuffer_chunks"],
                 buffer_margin=latency["buffer_margin"],
                 overlap_sec=latency["overlap_sec"],
@@ -125,8 +127,13 @@ class RealtimeController:
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 output_gain_db=self.app.config.audio.output_gain_db,
                 index_rate=self.app._get_index_rate(),
-                denoise_enabled=self.app.use_denoise_var.get(),
+                # Deadline profiles bypass denoisers whose p99 exceeds the hop.
+                denoise_enabled=(
+                    self.app.use_denoise_var.get()
+                    and latency["latency_mode"] not in DEADLINE_MODES
+                ),
                 denoise_method=self.app.denoise_method_var.get(),
+                denoise_strength=self.app.denoise_strength_slider.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
                 fixed_harmonics=self.app.pitch_control.fixed_harmonics,
                 f0_lowpass_cutoff_hz=self.app.config.inference.f0_lowpass_cutoff_hz,
@@ -334,9 +341,10 @@ class RealtimeController:
         if self.voice_changer:
             self.voice_changer.set_index_rate(rate)
 
-    def set_denoise(self, enabled: bool, method: str) -> None:
+    def set_denoise(self, enabled: bool, method: str, strength: float) -> None:
         if self.voice_changer:
-            self.voice_changer.set_denoise(enabled, method)
+            deadline_mode = self.voice_changer.config.latency_mode in DEADLINE_MODES
+            self.voice_changer.set_denoise(enabled and not deadline_mode, method, strength)
 
     def set_voice_gate_mode(self, mode: str) -> None:
         if self.voice_changer:
@@ -358,10 +366,10 @@ class RealtimeController:
         """Apply latency settings; chunk changes restart asynchronously.
 
         Non-restarting parameters (overlap/crossfade/prebuffer/margin) are
-        applied directly.  A chunk_sec change requires a pipeline restart
-        with fresh warmup, which runs through the same async path as
-        start() so the GUI does not freeze.  Settings arriving mid-restart
-        are stashed and applied once running again.
+        applied directly. Chunk or latency-mode changes require a pipeline
+        restart because the callback size and Graph shapes may change. Fresh
+        warmup runs through the same async path as start(), and settings
+        arriving mid-restart are stashed until the pipeline is running.
         """
         if not self.voice_changer:
             return
@@ -370,21 +378,35 @@ class RealtimeController:
             return
 
         vc = self.voice_changer
-        vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
-        vc.set_buffer_margin(settings["buffer_margin"])
-        vc.set_overlap(settings["overlap_sec"])
-        vc.set_crossfade(settings["crossfade_sec"])
+        mode_changed = settings["latency_mode"] != vc.config.latency_mode
+        chunk_changed = abs(settings["chunk_sec"] - vc.config.chunk_sec) >= 1e-9
+
+        def apply_values() -> None:
+            vc.set_latency_mode(settings["latency_mode"])
+            vc.set_denoise(
+                self.app.use_denoise_var.get()
+                and settings["latency_mode"] not in DEADLINE_MODES,
+                self.app.denoise_method_var.get(),
+                self.app.denoise_strength_slider.get(),
+            )
+            vc.set_prebuffer_chunks(settings["prebuffer_chunks"])
+            vc.set_buffer_margin(settings["buffer_margin"])
+            vc.set_overlap(settings["overlap_sec"])
+            vc.set_crossfade(settings["crossfade_sec"])
 
         if not vc.is_running:
+            apply_values()
             vc.set_chunk_sec(settings["chunk_sec"])
             return
-        if abs(settings["chunk_sec"] - vc.config.chunk_sec) < 1e-9:
+        if not chunk_changed and not mode_changed:
+            apply_values()
             return  # no chunk change → no restart needed
 
         # Restart with new chunk size: stop synchronously (fast, streams
         # must close on the main thread), then re-warm asynchronously.
         self._begin_loading("再起動中...")
         vc.stop()
+        apply_values()
         vc.set_chunk_sec(settings["chunk_sec"])  # not running → just stores
         self._prepare_and_start_async(lambda vc=vc: vc)
 
@@ -394,6 +416,7 @@ class RealtimeController:
 
     def _on_stats_update(self, stats: RealtimeStats) -> None:
         """Handle stats update from voice changer."""
+
         # Update UI from main thread (status bar + input/output level meters).
         # The input meter is driven from pipeline stats so it works even on
         # exclusive ASIO devices, where a standalone monitor stream cannot open.
@@ -424,9 +447,7 @@ class RealtimeController:
         if now - self._session_start < BUFFER_WARNING_GRACE_SEC:
             return
 
-        self._warn_history.append(
-            (now, stats.buffer_underruns, stats.buffer_overruns)
-        )
+        self._warn_history.append((now, stats.buffer_underruns, stats.buffer_overruns))
         while (
             len(self._warn_history) > 1
             and now - self._warn_history[0][0] > BUFFER_WARNING_WINDOW_SEC

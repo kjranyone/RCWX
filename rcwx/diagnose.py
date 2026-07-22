@@ -176,6 +176,11 @@ def check_torch_device():
             for i in range(torch.xpu.device_count()):
                 props = torch.xpu.get_device_properties(i)
                 print(f"       [{i}] {props.name}")
+            from rcwx.accelerator_graph import accelerator_graph_enabled
+
+            graph_ok = accelerator_graph_enabled("xpu")
+            status = "OK" if graph_ok else "--"
+            print(f"  [{status}] XPU Accelerator Graph: {graph_ok}")
         else:
             print("  [--] XPU Not Available")
 

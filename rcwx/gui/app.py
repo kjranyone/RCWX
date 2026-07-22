@@ -320,6 +320,35 @@ class RCWXApp(ctk.CTk):
         )
         self.denoise_method_menu.grid(row=0, column=1, padx=5)
 
+        self.denoise_strength_frame = ctk.CTkFrame(
+            self.denoise_frame,
+            fg_color="transparent",
+        )
+        self.denoise_strength_frame.pack(fill="x", padx=10, pady=(0, 3))
+        self.denoise_strength_label = ctk.CTkLabel(
+            self.denoise_strength_frame,
+            text="除去強度",
+            font=ctk.CTkFont(size=11),
+        )
+        self.denoise_strength_label.grid(row=0, column=0, padx=(0, 5), sticky="w")
+        self.denoise_strength_slider = ctk.CTkSlider(
+            self.denoise_strength_frame,
+            from_=0.5,
+            to=2.0,
+            number_of_steps=6,
+            width=180,
+            command=self._on_denoise_strength_changed,
+        )
+        self.denoise_strength_slider.set(self.config.inference.denoise.strength)
+        self.denoise_strength_slider.grid(row=0, column=1, padx=5, sticky="ew")
+        self.denoise_strength_value = ctk.CTkLabel(
+            self.denoise_strength_frame,
+            text=f"{self.config.inference.denoise.strength:.2f}x",
+            width=45,
+        )
+        self.denoise_strength_value.grid(row=0, column=2)
+        self.denoise_strength_frame.grid_columnconfigure(1, weight=1, minsize=180)
+
         # Status label
         if ml_available:
             ml_status = "✓ 利用可能"
@@ -588,6 +617,7 @@ class RCWXApp(ctk.CTk):
         self.latency_settings = LatencySettingsFrame(
             self.audio_scroll,
             on_settings_changed=self._on_latency_settings_changed,
+            f0_method=self.pitch_control.f0_method,
         )
         self.latency_settings.pack(fill="x", padx=10, pady=5)
 
@@ -925,8 +955,15 @@ class RCWXApp(ctk.CTk):
 
     def _on_f0_method_changed(self, method: str) -> None:
         """Handle F0 method change (rmvpe/fcpe/none)."""
+        chunk_clamped = False
+        if hasattr(self, "latency_settings"):
+            chunk_clamped = self.latency_settings.set_f0_method(method)
         self._save_config()
         self.realtime_controller.set_f0_method(method)
+        if chunk_clamped and self.realtime_controller.is_running:
+            self.realtime_controller.apply_latency_settings(
+                self.latency_settings.get_settings()
+            )
 
     def _on_moe_boost_changed(self, strength: float) -> None:
         """Handle moe boost change."""
@@ -974,7 +1011,35 @@ class RCWXApp(ctk.CTk):
         self.realtime_controller.set_denoise(
             self.use_denoise_var.get(),
             self.denoise_method_var.get(),
+            self.denoise_strength_slider.get(),
         )
+        self._update_denoise_status()
+
+    def _on_denoise_strength_changed(self, value: float) -> None:
+        """Handle denoise strength slider changes."""
+        self.denoise_strength_value.configure(text=f"{value:.2f}x")
+        self._on_denoise_changed()
+
+    def _update_denoise_status(self) -> None:
+        """Show when a deadline mode is intentionally bypassing denoise."""
+        mode = self.config.audio.latency_mode
+        if hasattr(self, "latency_settings"):
+            mode = self.latency_settings.latency_mode
+        if mode == "aggressive":
+            self.denoise_status.configure(
+                text="ML Denoiser: Aggressive ではバイパス",
+                text_color="gray",
+            )
+        elif is_ml_denoiser_available():
+            self.denoise_status.configure(text="ML Denoiser: ✓ 利用可能", text_color="green")
+        else:
+            self.denoise_status.configure(
+                text=(
+                    "ML Denoiser: ✗ 未インストール "
+                    "(方式 ml は無効 / uv sync --extra ml-denoise で有効化)"
+                ),
+                text_color="gray",
+            )
 
     def _on_index_ratio_changed(self, value: float) -> None:
         """Handle index ratio slider change."""
@@ -1074,12 +1139,17 @@ class RCWXApp(ctk.CTk):
     def _restore_latency_settings(self) -> None:
         """Restore latency settings from config.
 
-        Only chunk_sec is restored; other parameters are auto-derived.
+        Chunk size and latency mode are restored; other parameters are auto-derived.
         """
         if not hasattr(self, "latency_settings"):
             return
 
-        self.latency_settings.set_values(chunk_sec=self.config.audio.chunk_sec)
+        self.latency_settings.set_values(
+            chunk_sec=self.config.audio.chunk_sec,
+            latency_mode=self.config.audio.latency_mode,
+            f0_method=self.pitch_control.f0_method,
+        )
+        self._update_denoise_status()
 
     def _on_audio_settings_changed(self) -> None:
         """Handle audio settings change."""
@@ -1097,6 +1167,7 @@ class RCWXApp(ctk.CTk):
 
     def _on_latency_settings_changed(self) -> None:
         """Handle latency settings change."""
+        self._update_denoise_status()
         # Save immediately
         self._save_config()
         # Apply changes in real-time if voice changer is running
@@ -1140,12 +1211,14 @@ class RCWXApp(ctk.CTk):
             self.config.inference.f0_slew_max_step_st = self.pitch_control.f0_slew_max_step_st
             self.config.inference.denoise.enabled = self.use_denoise_var.get()
             self.config.inference.denoise.method = self.denoise_method_var.get()
+            self.config.inference.denoise.strength = self.denoise_strength_slider.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()
             self.config.inference.energy_threshold = self.energy_threshold_slider.get()
             # Save latency settings (all from LatencySettingsFrame)
             if hasattr(self, "latency_settings"):
                 latency = self.latency_settings.get_settings()
                 self.config.audio.chunk_sec = latency["chunk_sec"]
+                self.config.audio.latency_mode = latency["latency_mode"]
                 self.config.audio.prebuffer_chunks = latency["prebuffer_chunks"]
                 self.config.audio.buffer_margin = latency["buffer_margin"]
                 self.config.inference.overlap_sec = latency["overlap_sec"]
@@ -1155,7 +1228,9 @@ class RCWXApp(ctk.CTk):
             if hasattr(self, "output_gain_slider"):
                 self.config.audio.output_gain_db = round(self.output_gain_slider.get())
             self.config.audio.input_channel_selection = self.audio_settings.get_channel_selection()
-            self.config.audio.output_channel_selection = self.audio_settings.get_output_channel_selection()
+            self.config.audio.output_channel_selection = (
+                self.audio_settings.get_output_channel_selection()
+            )
             self.config.audio.input_hostapi_filter = self.audio_settings.input_api_var.get()
             self.config.audio.output_hostapi_filter = self.audio_settings.output_api_var.get()
             self.config.audio.input_device_name = self.audio_settings.get_input_device_name()

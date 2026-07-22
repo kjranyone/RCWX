@@ -10,12 +10,15 @@ removes background noise while preserving human voice.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 from numpy.typing import NDArray
+
+from rcwx.accelerator_graph import accelerator_graph_enabled, run_accelerator_graph
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +81,71 @@ class MLDenoiser:
         self._actual_device = device if device != "auto" else "cpu"
         self._model = None
         self._loaded = False
+        self._graph_resample_patched = False
+        self._graph_upsample2 = None
+        self._graph_downsample2 = None
+
+    def _configure_graph_safe_resampling(self) -> None:
+        """Prebuild Demucs sinc kernels that its upstream forward allocates."""
+        if self._graph_resample_patched or self._actual_device == "cpu":
+            return
+
+        try:
+            import torch
+            import torch.nn.functional as functional
+            from denoiser.resample import kernel_downsample2, kernel_upsample2
+
+            up_kernel = kernel_upsample2().to(self._actual_device)
+            down_kernel = kernel_downsample2().to(self._actual_device)
+
+            def upsample2_static(x, zeros: int = 56):
+                if zeros != 56:
+                    raise ValueError("Graph-safe denoiser supports zeros=56")
+                *other, sample_count = x.shape
+                out = functional.conv1d(
+                    x.reshape(-1, 1, sample_count),
+                    up_kernel,
+                    padding=zeros,
+                )[..., 1:].reshape(*other, sample_count)
+                return torch.stack([x, out], dim=-1).reshape(*other, -1)
+
+            def downsample2_static(x, zeros: int = 56):
+                if zeros != 56:
+                    raise ValueError("Graph-safe denoiser supports zeros=56")
+                if x.shape[-1] % 2:
+                    x = functional.pad(x, (0, 1))
+                even = x[..., ::2]
+                odd = x[..., 1::2]
+                *other, sample_count = odd.shape
+                filtered = functional.conv1d(
+                    odd.reshape(-1, 1, sample_count),
+                    down_kernel,
+                    padding=zeros,
+                )[..., :-1].reshape(*other, sample_count)
+                return (even + filtered).reshape(*other, -1).mul(0.5)
+
+            self._graph_upsample2 = upsample2_static
+            self._graph_downsample2 = downsample2_static
+            self._graph_resample_patched = True
+        except Exception as exc:
+            logger.warning("Could not prebuild graph-safe denoiser kernels: %s", exc)
+
+    def _graph_forward(self, audio_tensor):
+        """Run Demucs with static sinc kernels only for this invocation."""
+        if not self._graph_resample_patched:
+            return self._model(audio_tensor)
+
+        import denoiser.demucs as demucs_module
+
+        original_up = demucs_module.upsample2
+        original_down = demucs_module.downsample2
+        demucs_module.upsample2 = self._graph_upsample2
+        demucs_module.downsample2 = self._graph_downsample2
+        try:
+            return self._model(audio_tensor)
+        finally:
+            demucs_module.upsample2 = original_up
+            demucs_module.downsample2 = original_down
 
     def _load_model(self):
         """Lazy-load the Denoiser model."""
@@ -85,8 +153,8 @@ class MLDenoiser:
             return
 
         try:
-            from denoiser import pretrained
             import torch
+            from denoiser import pretrained
 
             # Load pre-trained DNS64 model (best quality)
             self._model = pretrained.dns64()
@@ -108,6 +176,8 @@ class MLDenoiser:
             else:
                 logger.info("Facebook Denoiser model loaded on CPU")
 
+            if accelerator_graph_enabled(self._actual_device):
+                self._configure_graph_safe_resampling()
             self._loaded = True
 
         except ImportError:
@@ -119,17 +189,22 @@ class MLDenoiser:
         self,
         audio: NDArray[np.float32],
         sample_rate: int = 16000,
+        strength: float = 1.0,
     ) -> NDArray[np.float32]:
         """Process audio through Facebook Denoiser.
 
         Args:
             audio: Input audio (mono, float32, -1 to 1 range)
             sample_rate: Input sample rate
+            strength: Suppression strength from 0.5 to 2.0. Up to 1.0
+                crossfades dry/clean audio; above 1.0 crossfades into a
+                second DNS64 pass for stronger residual-noise suppression.
 
         Returns:
             Denoised audio at original sample rate
         """
         self._load_model()
+        strength = max(0.5, min(2.0, float(strength)))
 
         import torch
 
@@ -152,9 +227,27 @@ class MLDenoiser:
         if self._actual_device != "cpu":
             audio_tensor = audio_tensor.to(self._actual_device)
 
-        # Enhance
+        # Enhance. The denoiser is part of the live critical path, so replay
+        # fixed micro-hop shapes through the same accelerator graph cache as
+        # HuBERT/Synthesizer. Unsupported devices or operators fall back to
+        # eager execution inside run_accelerator_graph().
+        def enhance(value):
+            if accelerator_graph_enabled(self._actual_device):
+                return run_accelerator_graph(
+                    self,
+                    "ml-denoiser",
+                    lambda graph_input: self._graph_forward(graph_input),
+                    value,
+                )
+            return self._model(value)
+
         with torch.no_grad():
-            enhanced = self._model(audio_tensor)
+            enhanced = enhance(audio_tensor)
+            if strength < 1.0:
+                enhanced = torch.lerp(audio_tensor, enhanced, strength)
+            elif strength > 1.0:
+                enhanced_twice = enhance(enhanced)
+                enhanced = torch.lerp(enhanced, enhanced_twice, strength - 1.0)
 
         # Back to numpy
         enhanced_np = enhanced.squeeze().cpu().numpy().astype(np.float32)
@@ -441,6 +534,7 @@ def denoise(
     noise_reference: Optional[NDArray[np.float32]] = None,
     threshold_db: float = 6.0,
     reduction_db: float = -24.0,
+    strength: float = 1.0,
     device: str = "cpu",
 ) -> NDArray[np.float32]:
     """Denoise audio using the best available method.
@@ -454,11 +548,15 @@ def denoise(
         noise_reference: Noise reference for spectral gate (ignored for ML)
         threshold_db: Spectral gate threshold (ignored for ML)
         reduction_db: Spectral gate reduction (ignored for ML)
+        strength: Suppression strength from 0.5 to 2.0. ML uses a blended
+            second pass above 1.0; spectral scales its threshold/reduction.
         device: Device for ML denoiser ("cpu", "cuda", "xpu")
 
     Returns:
         Denoised audio
     """
+    strength = max(0.5, min(2.0, float(strength)))
+
     # Select method
     use_ml = False
 
@@ -487,9 +585,12 @@ def denoise(
     if use_ml:
         # Use cached denoiser to avoid reloading model every call
         denoiser = _get_cached_ml_denoiser(device=device)
-        return denoiser.process(audio, sample_rate)
+        return denoiser.process(audio, sample_rate, strength=strength)
     else:
-        config = DenoiseConfig(threshold_db=threshold_db, reduction_db=reduction_db)
+        config = DenoiseConfig(
+            threshold_db=threshold_db * strength,
+            reduction_db=reduction_db * strength,
+        )
         denoiser = SpectralGateDenoiser(sample_rate, config)
 
         if noise_reference is not None:
@@ -502,8 +603,4 @@ def denoise(
 
 def is_ml_denoiser_available() -> bool:
     """Check if Facebook Denoiser is installed."""
-    try:
-        import denoiser
-        return True
-    except ImportError:
-        return False
+    return importlib.util.find_spec("denoiser") is not None

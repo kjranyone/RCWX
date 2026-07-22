@@ -67,6 +67,7 @@ class TextEncoder(nn.Module):
         phone: torch.Tensor,
         phone_lengths: torch.Tensor,
         pitch: Optional[torch.Tensor] = None,
+        all_frames_valid: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -92,13 +93,27 @@ class TextEncoder(nn.Module):
         x = x.transpose(1, 2)
 
         # Create mask after transpose (mask is [B, 1, T])
-        x_mask = torch.unsqueeze(
-            commons.sequence_mask(phone_lengths, x.size(2)), 1
-        ).to(x.dtype)
+        if all_frames_valid:
+            x_mask = torch.ones(
+                x.shape[0], 1, x.shape[2],
+                dtype=x.dtype,
+                device=x.device,
+            )
+        else:
+            x_mask = torch.unsqueeze(
+                commons.sequence_mask(phone_lengths, x.size(2)), 1
+            ).to(x.dtype)
 
         # Encoder and projection
-        x = self.encoder(x * x_mask, x_mask)
-        stats = self.proj(x) * x_mask
+        encoder_input = x if all_frames_valid else x * x_mask
+        x = self.encoder(
+            encoder_input,
+            x_mask,
+            all_frames_valid=all_frames_valid,
+        )
+        stats = self.proj(x)
+        if not all_frames_valid:
+            stats = stats * x_mask
 
         m, logs = torch.split(stats, self.out_channels, dim=1)
         return x, m, logs, x_mask
@@ -731,6 +746,7 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         return_length: int = 0,
         return_length2: int = 0,
         noise_scale: float = 0.66666,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -743,7 +759,12 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         """
         g = self.emb_g(sid).unsqueeze(-1)
         # TextEncoder expects [B, T, C] format
-        x, m_p, logs_p, x_mask = self.enc_p(phone, phone_lengths, pitch)
+        x, m_p, logs_p, x_mask = self.enc_p(
+            phone,
+            phone_lengths,
+            pitch,
+            all_frames_valid=all_frames_valid,
+        )
 
         # Apply skip_head and return_length for streaming
         # Match original RVC: provide 24 extra context frames to flow model
@@ -886,6 +907,7 @@ class SynthesizerTrnMs256NSFsidNono(nn.Module):
         return_length: int = 0,
         return_length2: int = 0,
         noise_scale: float = 0.66666,
+        all_frames_valid: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -896,7 +918,11 @@ class SynthesizerTrnMs256NSFsidNono(nn.Module):
         """
         g = self.emb_g(sid).unsqueeze(-1)
         # TextEncoder expects [B, T, C] format, no pitch for non-F0 models
-        x, m_p, logs_p, x_mask = self.enc_p(phone, phone_lengths)
+        x, m_p, logs_p, x_mask = self.enc_p(
+            phone,
+            phone_lengths,
+            all_frames_valid=all_frames_valid,
+        )
 
         # Apply skip_head and return_length for streaming
         # Match original RVC: provide 24 extra context frames to flow model

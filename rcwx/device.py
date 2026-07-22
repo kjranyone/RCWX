@@ -34,13 +34,16 @@ def get_device(preferred: str = "auto") -> DeviceType:
     return "cpu"
 
 
-def get_dtype(device: DeviceType, preferred: str = "float16") -> torch.dtype:
+def get_dtype(
+    device: DeviceType,
+    preferred: str | torch.dtype = "float16",
+) -> torch.dtype:
     """
     Return the optimal dtype for the device.
 
     Args:
         device: Device type
-        preferred: Preferred dtype string
+        preferred: Preferred dtype string or torch dtype
 
     Returns:
         torch.dtype
@@ -51,7 +54,10 @@ def get_dtype(device: DeviceType, preferred: str = "float16") -> torch.dtype:
         "bfloat16": torch.bfloat16,
     }
 
-    preferred_dtype = dtype_map.get(preferred, torch.float16)
+    if isinstance(preferred, torch.dtype):
+        preferred_dtype = preferred
+    else:
+        preferred_dtype = dtype_map.get(preferred, torch.float16)
 
     if device == "cpu":
         return torch.float32

@@ -13,13 +13,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from rcwx.config import AudioConfig, InferenceConfig, RCWXConfig
+from rcwx.config import AudioConfig, DenoiseConfig, InferenceConfig, RCWXConfig
+from rcwx.gui.widgets.latency_settings import _auto_params, _minimum_chunk_ms
 from rcwx.pipeline.realtime_unified import RealtimeConfig
-
 
 # ---------------------------------------------------------------------------
 # RealtimeConfig tests
 # ---------------------------------------------------------------------------
+
 
 def test_realtime_config_has_noise_scale():
     """RealtimeConfig should have noise_scale=0.4 by default."""
@@ -46,6 +47,7 @@ def test_realtime_config_custom_values():
 # InferenceConfig tests
 # ---------------------------------------------------------------------------
 
+
 def test_inference_config_has_noise_scale():
     """InferenceConfig should have noise_scale=0.45 by default."""
     cfg = InferenceConfig()
@@ -66,6 +68,37 @@ def test_asio_buffer_size_field():
     assert RealtimeConfig().asio_buffer_size == 0, "RealtimeConfig.asio_buffer_size default"
 
 
+def test_denoise_strength_defaults_and_clamps():
+    assert DenoiseConfig().strength == 1.0
+    assert DenoiseConfig(strength=0.0).strength == 0.5
+    assert DenoiseConfig(strength=3.0).strength == 2.0
+    assert RealtimeConfig(denoise_strength=0.0).denoise_strength == 0.5
+    assert RealtimeConfig(denoise_strength=3.0).denoise_strength == 2.0
+
+
+def test_latency_mode_parameters():
+    normal = _auto_params(0.24, "normal")
+    aggressive = _auto_params(0.24, "aggressive")
+
+    assert normal["crossfade_sec"] == 0.02
+    assert normal["buffer_margin"] == 0.25
+    assert normal["prebuffer_chunks"] == 1
+    assert aggressive["crossfade_sec"] == 0.02
+    assert _auto_params(0.1, "aggressive")["crossfade_sec"] == 0.01
+    assert aggressive["buffer_margin"] == 0.1
+    assert aggressive["prebuffer_chunks"] == 3
+    assert _minimum_chunk_ms("swiftf0") == 40
+
+
+def test_latency_mode_validation():
+    assert AudioConfig(latency_mode="normal").latency_mode == "normal"
+    assert AudioConfig(latency_mode="aggressive").latency_mode == "aggressive"
+    assert AudioConfig(latency_mode="invalid").latency_mode == "normal"
+    assert RealtimeConfig(latency_mode="normal").latency_mode == "normal"
+    assert RealtimeConfig(latency_mode="aggressive").latency_mode == "aggressive"
+    assert RealtimeConfig(latency_mode="invalid").latency_mode == "normal"
+
+
 def test_hole_fill_and_uv_ramp_fields():
     """f0_hole_fill_ms / uv_ramp_ms should exist on both configs with matching defaults."""
     inf = InferenceConfig()
@@ -83,11 +116,14 @@ def test_hole_fill_and_uv_ramp_fields():
 # JSON round-trip tests
 # ---------------------------------------------------------------------------
 
+
 def test_config_roundtrip_new_fields():
     """New fields should survive JSON save -> load round-trip."""
     cfg = RCWXConfig()
+    cfg.audio.latency_mode = "aggressive"
     cfg.inference.noise_scale = 0.3
     cfg.inference.f0_lowpass_cutoff_hz = 20.0
+    cfg.inference.denoise.strength = 1.75
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
         tmp_path = Path(f.name)
@@ -95,12 +131,14 @@ def test_config_roundtrip_new_fields():
     try:
         cfg.save(tmp_path)
         loaded = RCWXConfig.load(tmp_path)
+        assert loaded.audio.latency_mode == "aggressive"
         assert loaded.inference.noise_scale == 0.3, (
             f"noise_scale round-trip failed: {loaded.inference.noise_scale}"
         )
         assert loaded.inference.f0_lowpass_cutoff_hz == 20.0, (
             f"f0_lowpass_cutoff_hz round-trip failed: {loaded.inference.f0_lowpass_cutoff_hz}"
         )
+        assert loaded.inference.denoise.strength == 1.75
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -129,8 +167,30 @@ def test_config_backward_compat():
             f"Expected default 16.0, got {loaded.inference.f0_lowpass_cutoff_hz}"
         )
         assert loaded.inference.pitch_shift == 5, "Existing field should be preserved"
+        assert loaded.audio.latency_mode == "normal"
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def test_legacy_latency_profiles_migrate_once():
+    expected = {
+        "balanced": "normal",
+        "aggressive": "normal",
+        "sub100": "normal",
+        "frontier": "aggressive",
+    }
+    for legacy, migrated in expected.items():
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({"audio": {"latency_mode": legacy}}, f)
+            tmp_path = Path(f.name)
+        try:
+            loaded = RCWXConfig.load(tmp_path)
+            assert loaded.audio.latency_mode == migrated
+            assert loaded.audio.latency_profile_version == 2
+            loaded.save(tmp_path)
+            assert RCWXConfig.load(tmp_path).audio.latency_mode == migrated
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +216,10 @@ if __name__ == "__main__":
         try:
             print(f"Running {name}...")
             t()
-            print(f"  PASS")
+            print("  PASS")
             passed += 1
         except Exception as e:
             print(f"  FAIL: {e}")
             failed += 1
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Results: {passed} passed, {failed} failed out of {len(tests)}")

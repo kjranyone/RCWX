@@ -58,9 +58,7 @@ def normalize_input_channel_selection(value: str) -> str:
     m = re.fullmatch(r"Ch\s*(\d+)(?::.*)?", value)
     if m:
         return str(int(m.group(1)) - 1)
-    logger.warning(
-        "Unrecognized input_channel_selection %r — falling back to 'auto'", value
-    )
+    logger.warning("Unrecognized input_channel_selection %r — falling back to 'auto'", value)
     return "auto"
 
 
@@ -87,9 +85,7 @@ def normalize_output_channel_selection(value: str) -> str:
     m = re.fullmatch(r"Ch\s*(\d+)\s*-\s*(\d+)(?::.*)?", value)
     if m:
         return f"{int(m.group(1)) - 1},{int(m.group(2)) - 1}"
-    logger.warning(
-        "Unrecognized output_channel_selection %r — falling back to 'auto'", value
-    )
+    logger.warning("Unrecognized output_channel_selection %r — falling back to 'auto'", value)
     return "auto"
 
 
@@ -122,8 +118,10 @@ class AudioConfig:
     # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
     output_channel_selection: str = "auto"
     # Latency settings
+    latency_mode: str = "normal"  # normal / aggressive
+    latency_profile_version: int = 2
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
-    buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
+    buffer_margin: float = 0.25  # Buffer margin multiplier
     # ASIO buffer size in frames (0 = follow the driver control panel /
     # preferredSize; snapped to the driver's min/max/granularity when set)
     asio_buffer_size: int = 0
@@ -136,6 +134,9 @@ class AudioConfig:
         self.output_channel_selection = normalize_output_channel_selection(
             self.output_channel_selection
         )
+        if self.latency_mode not in {"normal", "aggressive"}:
+            self.latency_mode = "normal"
+        self.latency_profile_version = 2
 
 
 @dataclass
@@ -144,9 +145,15 @@ class DenoiseConfig:
 
     enabled: bool = True
     method: str = "ml"  # auto, ml, spectral, off
+    # 1.0 preserves the previous behavior. Values above 1.0 apply a second
+    # ML pass, or deepen the spectral threshold/reduction below.
+    strength: float = 1.0
     # Spectral gate parameters (used when method=spectral)
     threshold_db: float = 6.0
     reduction_db: float = -24.0
+
+    def __post_init__(self) -> None:
+        self.strength = max(0.5, min(2.0, float(self.strength)))
 
 
 @dataclass
@@ -268,6 +275,20 @@ class RCWXConfig:
         audio_data = data.pop("audio", {})
         inference_data = data.pop("inference", {})
 
+        # Latency profile v2 removes Balanced/Sub-100 and renames the two
+        # retained policies. Removed profiles migrate to the safer Normal
+        # policy; only the former Frontier policy becomes new Aggressive.
+        try:
+            latency_profile_version = int(audio_data.get("latency_profile_version", 1))
+        except (TypeError, ValueError):
+            latency_profile_version = 1
+        if latency_profile_version < 2:
+            legacy_mode = audio_data.get("latency_mode", "balanced")
+            audio_data["latency_mode"] = (
+                "aggressive" if legacy_mode == "frontier" else "normal"
+            )
+            audio_data["latency_profile_version"] = 2
+
         # Nested configs are constructed separately; pop them so they are not
         # passed twice into InferenceConfig below.
         denoise_data = inference_data.pop("denoise", {})
@@ -280,9 +301,7 @@ class RCWXConfig:
             audio=AudioConfig(**_filter_known(AudioConfig, audio_data)),
             inference=InferenceConfig(
                 denoise=DenoiseConfig(**_filter_known(DenoiseConfig, denoise_data)),
-                postprocess=PostprocessConfig(
-                    **_filter_known(PostprocessConfig, postprocess_data)
-                ),
+                postprocess=PostprocessConfig(**_filter_known(PostprocessConfig, postprocess_data)),
                 **_filter_known(InferenceConfig, inference_data),
             ),
             **_filter_known(RCWXConfig, data),

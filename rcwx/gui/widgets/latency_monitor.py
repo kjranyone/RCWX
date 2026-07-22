@@ -148,7 +148,9 @@ class LatencyMonitor(ctk.CTkFrame):
         self._latency_ms = stats.latency_ms
 
         self.latency_label.configure(text=f"レイテンシ: {stats.latency_ms:.0f}ms")
-        self.inference_label.configure(text=f"推論: {stats.inference_ms:.0f}ms")
+        self.inference_label.configure(
+            text=f"推論: {stats.inference_ms:.0f}ms (p95 {stats.inference_p95_ms:.0f}ms)"
+        )
 
         # Update GPU memory display
         pct = stats.gpu_memory_percent

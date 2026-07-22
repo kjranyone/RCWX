@@ -10,7 +10,15 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from transformers import HubertModel, HubertConfig
+from transformers import HubertConfig, HubertModel
+
+from rcwx.accelerator_graph import (
+    accelerator_graph_capture_pending,
+    accelerator_graph_enabled,
+    clear_accelerator_graph_cache,
+    get_accelerator_graph_stats,
+    run_accelerator_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +164,7 @@ class HuBERTLoader:
         self.model = HubertModel.from_pretrained("lengyue233/content-vec-best")
         self.model.to(self.device).to(self.dtype)
         self.model.eval()
+        self._configure_attention_for_graph()
 
         # Initialize final_proj (768 -> 256) for v1 models
         self.final_proj = nn.Linear(768, 256)
@@ -209,6 +218,7 @@ class HuBERTLoader:
 
         self.model.to(self.device).to(self.dtype)
         self.model.eval()
+        self._configure_attention_for_graph()
 
         # Create final_proj for v1 models
         self.final_proj = nn.Linear(768, 256)
@@ -230,6 +240,14 @@ class HuBERTLoader:
             param.requires_grad = False
 
         logger.info("HuBERT loaded from RVC format successfully")
+
+    def _configure_attention_for_graph(self) -> None:
+        """Avoid SDPA's external XPU events, which are not graph-capturable."""
+        if not accelerator_graph_enabled(self.device):
+            return
+        if hasattr(self.model, "set_attn_implementation"):
+            self.model.set_attn_implementation("eager")
+            logger.info("HuBERT attention set to eager for Accelerator Graph capture")
 
     @torch.no_grad()
     def extract(
@@ -254,21 +272,47 @@ class HuBERTLoader:
 
         audio = audio.to(self.device).to(self.dtype)
 
-        if output_layer >= self.model.config.num_hidden_layers:
-            # Final layer: last_hidden_state already includes encoder.layer_norm
-            outputs = self.model(audio)
-            features = outputs.last_hidden_state
-        else:
-            # Intermediate layer: apply encoder.layer_norm manually to match
-            # fairseq TransformerEncoder.forward() which always applies layer_norm
-            outputs = self.model(audio, output_hidden_states=True)
-            features = outputs.hidden_states[output_layer]
-            features = self.model.encoder.layer_norm(features)
+        namespace = self._graph_namespace(output_layer, output_dim)
 
-        if output_dim == 256:
-            features = self.final_proj(features)
+        def forward(input_audio: torch.Tensor) -> torch.Tensor:
+            if output_layer >= self.model.config.num_hidden_layers:
+                # Final layer already includes encoder.layer_norm.
+                features = self.model(input_audio).last_hidden_state
+            else:
+                outputs = self.model(input_audio, output_hidden_states=True)
+                features = outputs.hidden_states[output_layer]
+                features = self.model.encoder.layer_norm(features)
+            if output_dim == 256:
+                features = self.final_proj(features)
+            return features
 
-        return features
+        return run_accelerator_graph(self, namespace, forward, audio)
+
+    @staticmethod
+    def _graph_namespace(output_layer: int, output_dim: int) -> str:
+        return f"hubert-layer-{output_layer}-dim-{output_dim}"
+
+    def graph_capture_pending(
+        self,
+        audio: torch.Tensor,
+        output_layer: int,
+        output_dim: int,
+    ) -> bool:
+        """Return whether this input signature still needs a serial capture."""
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        return accelerator_graph_capture_pending(
+            self,
+            self._graph_namespace(output_layer, output_dim),
+            audio,
+            dtype_overrides=(self.dtype,),
+        )
+
+    def clear_graph_cache(self) -> None:
+        clear_accelerator_graph_cache(self)
+
+    def graph_stats(self) -> dict[str, float | int]:
+        return get_accelerator_graph_stats(self)
 
     def forward(self, audio: torch.Tensor, output_dim: int = 768) -> torch.Tensor:
         return self.extract(audio, output_dim=output_dim)

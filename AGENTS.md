@@ -60,14 +60,16 @@ AudioInput (mic rate)
 
 - リアルタイム経路は `pipeline/realtime_unified.py` のみを使用
 - チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
-- 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
-- 旧GUIトグルの `use_feature_cache` は廃止
+- PyTorch 2.13のAccelerator GraphをHuBERTと定常状態のRVC Synthesizerに自動適用
+- SynthesizerはHuBERT履歴が満杯になるまでeager実行し、開始前warmupで定常Graphをcapture
+- `RCWX_ACCELERATOR_GRAPH=0` でAccelerator Graphを無効化可能
 - 過負荷時は一時的に `f0_method="none"` と `index_rate=0.0` に自動退避
 
 ## Directory Structure
 
 ```text
 rcwx/
+├── accelerator_graph.py  # XPU/CUDA共通の固定shape Graphキャッシュ
 ├── cli.py
 ├── config.py
 ├── device.py
@@ -84,6 +86,7 @@ rcwx/
 │   └── stream_base.py     # ストリーム基底
 ├── models/
 │   ├── hubert_loader.py
+│   ├── accelerator_index.py # XPU/CUDA常駐IVF検索
 │   ├── rmvpe.py
 │   ├── fcpe.py
 │   ├── swiftf0.py         # SwiftF0 (ONNX/CPU)
@@ -115,8 +118,9 @@ rcwx/
 | `sample_rate`             |  `16000` | 内部処理入力レート      |
 | `output_sample_rate`      |  `48000` | 出力レート              |
 | `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
+| `latency_mode`            | `normal` | `normal` / `aggressive` |
 | `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
-| `buffer_margin`           |    `0.5` | バッファ余裕            |
+| `buffer_margin`           |   `0.25` | バッファ余裕            |
 | `input_gain_db`           |    `0.0` | 入力ゲイン              |
 | `input_channel_selection` |   `auto` | left/right/average/auto |
 | `input_hostapi_filter`    | `WASAPI` | Windows向け             |
@@ -148,6 +152,7 @@ rcwx/
 | `f0_slew_max_step_st`         |    `3.6` | 最大F0ステップ (semitones)      |
 | `denoise.enabled`             |   `true` | ノイズ除去                      |
 | `denoise.method`              |     `ml` | `auto` / `ml` / `spectral`      |
+| `denoise.strength`            |    `1.0` | 除去強度 `0.5-2.0`（MLは1.0超で2段処理） |
 
 ### `RCWXConfig` (`rcwx/config.py`) トップレベル
 
@@ -164,11 +169,12 @@ rcwx/
 実行時にGUI設定から生成される主要値:
 
 - `chunk_sec` (既定 0.30、20ms境界に丸め)
+- `latency_mode` (`normal` / `aggressive`)
 - `overlap_sec` (既定 0.20、20ms境界に丸め)
-- `crossfade_sec` (既定 0.08)
-- `sola_search_ms` (既定 10.0)
+- `crossfade_sec` (既定 0.02)
+- `sola_search_ms` (既定 15.0)
 - `prebuffer_chunks` (既定 1)
-- `buffer_margin` (既定 0.5)
+- `buffer_margin` (既定 0.25)
 - `f0_method` (既定 `rmvpe`)
 - `noise_scale` (既定 0.45)
 - `f0_lowpass_cutoff_hz` (既定 16.0)
@@ -176,21 +182,48 @@ rcwx/
 
 ## GUI Latency Model (Current)
 
-`LatencySettingsFrame` でユーザーが直接変更できるのは `chunk_sec` のみです。
+`LatencySettingsFrame` では `chunk_sec` と `latency_mode` を変更できます。
 他は自動導出されます。
 
 自動導出ルール (`rcwx/gui/widgets/latency_settings.py`):
 
-- `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
-- `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
-- `prebuffer_chunks` = 1
-- `buffer_margin` = 0.5
+- `overlap_sec` = chunkの100%（60-300msにクランプ、20ms刻み）
+- 両モード: `crossfade_sec` = chunkの10%（10-20msにクランプ、10ms刻み）
+- Normal: SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msが下限
+- Normal: `prebuffer_chunks` = 1、`buffer_margin` = 0.25
+- Normal: 持続リングfloorを0.75 hopでtrimして0.25 hopへ戻す
+- Normal: 非ASIOコールバック長は最大10ms、Denoiserを使用可能
+- Aggressive: SwiftF0/NoneのGUI `chunk_sec`範囲 = 20-100ms（20ms刻み）
+- Aggressive: FCPEは100ms、RMVPEは320msが下限
+- Aggressive: `prebuffer_chunks` = 3（アンダーラン後も3 hopを再確保）
+- Aggressive: 最初の20 hopは1.0 hop、その後は`p99 - p50 + callback`を0.5-0.875 hopにクランプしたfloorを維持
+- Aggressive: 非ASIOコールバック長は最大2.5ms、実行中はDenoiserをバイパス
+- Aggressive: HuBERT contextは最大0.56秒、SwiftF0 contextは最大0.10秒
+- Aggressive: sample rate変換が必要な場合はD2H前にXPU Graph sinc resample
+- Aggressiveでは対応するFAISS IVF indexをwarmup時にXPUへ配置し、HuBERT特徴のCPU往復を省略
+- Aggressiveは初回・catchup後の実音声hopをreflect展開してHuBERT履歴を即時充填し、定常Synthesizer Graphを1 hop目から使用
+- AggressiveではXPU stage timingを10 hopごと、GUI/GPUメモリtelemetryを10Hzで更新
+- HuBERTは推論threadから直接dispatchし、SwiftF0だけを永続workerで並列実行
+- 固定64-frame経路では未使用のstreaming feature cloneを作らない
+- SOLA境界INFOログは開始3 hopと100 hopごとに限定
+- Aggressiveは未参照のdecoder overlap余白を生成せず、`crossfade + search`だけを保持
+- XPU IVFはfeature normを事前計算し、候補距離をnormと内積から求める
+- streaming TextEncoderは全frame有効fast pathで全1 mask処理を省略する
+- HuBERT/IVF結果の時間軸cacheは双方向contextとの不一致が大きいため使用しない
+- ASIO実レートが設定と異なる場合は、ストリーム開始前に実レート用Graphを再ウォームアップ
 - `use_sola` = true
 
 補足:
 
-- GUI起動時は `config.audio.chunk_sec` を復元し、上記の自動値を再計算します。
+- GUI起動時は `config.audio.chunk_sec` と `latency_mode` を復元し、上記の自動値を再計算します。
 - 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
+- FAISSはTextEncoderのglobal self-attentionを保つため、HuBERT文脈全体を検索します。
+- XPU IVFはL2 / nprobe=1 / 最大list長256以下で有効です。未対応indexはCPU FAISSへfallbackします。
+- XPU IVFは再構築特徴をFP16/BF16で保持し、158k×768 indexでは約240MBの追加VRAMを使います。
+- SwiftF0のF0補正はCPU上で完結し、pitch/pitchfを合成直前に一度だけXPUへ転送します。
+- 推論統計は直近256 hopのp50/p95/p99とdeadline miss率を保持します。
+- Aggressiveの出力guardは推論jitter統計から適応し、アンダーラン後は3 hopを再バッファします。
+- SOLA合成末尾は`crossfade + search + decoder overlap`を10msフレームへ切り上げます。Aggressiveのdecoder overlapは0です。
 
 ## CLI Commands
 
@@ -253,6 +286,9 @@ uv run python tests/models/test_cumulative_context.py
 uv run python tests/models/test_pitch_clarity.py
 uv run python tests/models/test_config_wiring.py
 uv run python tests/models/test_hubert_weight_audit.py
+uv run python tests/models/test_accelerator_graph.py
+uv run python tests/models/test_synthesizer_graph.py
+uv run python tests/models/test_runtime_graph_warmup.py
 ```
 
 ## References
