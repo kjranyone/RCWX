@@ -1,9 +1,25 @@
 # RCWX vs w-okada/voice-changer 推論パイプライン比較
 
-RVCリアルタイムボイスチェンジャーの2つの実装を、推論パイプラインの観点から詳細に比較する。
+RVC リアルタイムボイスチェンジャーの2つの実装を、推論パイプラインの観点から比較する。
 
-- **RCWX**: Intel XPU向けに最適化されたネイティブデスクトップ実装
+- **RCWX**: Intel Arc (XPU) 向けネイティブデスクトップ実装
 - **w-okada/voice-changer**: マルチモデル対応のサーバー・クライアント型フレームワーク
+
+> **注意**: 本文の構成比較は執筆時点のスナップショット。  
+> **RCWX 側の現行仕様**は [AGENTS.md](../AGENTS.md) / [README.md](../README.md) を正とする。  
+> 下記 [現行 RCWX メモ](#現行-rcwx-メモ-as-is) と食い違う旧記述はメモ側を優先。
+
+## 現行 RCWX メモ (AS-IS)
+
+| 項目 | 現行 |
+|------|------|
+| GUI | CustomTkinter（tkinter 素のままではない） |
+| 既定 F0 | `rmvpe`（選択肢: rmvpe / fcpe / swiftf0） |
+| 過負荷保護 | 直近1秒 Queue full ≥3 → **denoise のみ** 2秒バイパス。`f0_method` / `index_rate` は変更しない |
+| Aggressive | GUI で denoise 強制 OFF、HuBERT context cap、XPU IVF、Graph warmup 等（詳細は AGENTS.md） |
+| Accelerator Graph | XPU 自動（HuBERT / 定常 Synthesizer / Aggressive IVF） |
+| デバイス | XPU サポート対象。CUDA は未検証 |
+| 並列抽出 | HuBERT=推論 thread、F0=永続 worker |
 
 ---
 
@@ -72,11 +88,11 @@ graph TD
 
 | 観点 | RCWX | w-okada |
 |---|---|---|
-| アプリ形態 | ネイティブ GUI (tkinter) | Web サーバー + ブラウザ UI |
+| アプリ形態 | ネイティブ GUI (CustomTkinter) | Web サーバー + ブラウザ UI |
 | スレッドモデル | 推論専用スレッド (非同期) | コールバック内同期処理 |
-| 対応モデル | RVC v2 専用 | RVC, MMVC, DDSP-SVC, Beatrice 等 8+ |
-| 対象デバイス | Intel XPU (Arc) | CUDA / CPU / DirectML |
-| 過負荷対策 | 自動品質退避 (F0/Index無効化) | フレームドロップ (暗黙) |
+| 対応モデル | RVC v1/v2 | RVC, MMVC, DDSP-SVC, Beatrice 等 8+ |
+| 対象デバイス | Intel Arc **XPU**（CUDA 未検証） | CUDA / CPU / DirectML |
+| 過負荷対策 | denoise 一時バイパス（2秒） | フレームドロップ (暗黙) |
 
 ---
 
@@ -96,11 +112,11 @@ flowchart TB
     subgraph extract[特徴抽出 - 並列]
         direction LR
         B1[HuBERT Extract<br/>layer 12, 768d<br/>50fps]
-        B2[F0 Extract<br/>FCPE / RMVPE<br/>100fps]
+        B2[F0 Extract<br/>RMVPE / FCPE / SwiftF0<br/>100fps]
     end
 
     subgraph process[後処理]
-        C1[FAISS Index Search<br/>optional] --> C2[Feature Interpolation<br/>2x nearest 50fps->100fps]
+        C1[FAISS Index Search<br/>optional] --> C2[Feature Interpolation<br/>2x linear 50fps->100fps]
         C2 --> C3[F0 Post-processing<br/>median + lowpass + octave flip + slew limit]
         C3 --> C4[Pitch Quantization<br/>mel scale, 256 bins]
     end
@@ -295,10 +311,10 @@ flowchart LR
 | 観点 | RCWX | w-okada |
 |---|---|---|
 | 入力 SR | 16kHz (事前リサンプル済み) | 16kHz (Pipeline.exec 内でリサンプル) |
-| コンテキスト | `_streaming_audio_history` (最大 ~560ms) | `audio_buffer` 全体 (convertSize分) |
-| パディング | **固定サイズ** (XPU カーネル再コンパイル回避) | 可変サイズ (チャンク毎に変動) |
-| 出力 layer | v2: layer 12 / 768d | 設定可 (v1: layer 9/256d, v2: layer 12/768d) |
-| 補間 | `F.interpolate(scale_factor=2, mode="nearest")` | 同一 |
+| コンテキスト | `_streaming_audio_history`（既定 1.0s、Aggressive 最大 0.56s） | `audio_buffer` 全体 (convertSize分) |
+| パディング | 固定 shape 寄り（Graph / 再コンパイル回避） | 可変サイズ (チャンク毎に変動) |
+| 出力 layer | v2: layer 12 / 768d（v1 は layer 9 / 256d） | 設定可 (v1/v2) |
+| 補間 | `F.interpolate(scale_factor=2, mode="linear")` | nearest 既定の実装が多い |
 
 **RCWX の固定サイズパディング**は Intel XPU 特有の最適化。XPU (oneAPI) はチャンク毎に入力サイズが変わるとカーネルを再コンパイルするため、初回チャンクで1回だけコンパイルし以降は再利用する設計:
 
@@ -319,13 +335,13 @@ if len(audio_padded) < fixed_hubert_input:
 flowchart TB
     subgraph rcwx[RCWX の F0 パイプライン]
         direction TB
-        R1[FCPE or RMVPE<br/>パディング含む全音声] --> R3[Median Filter<br/>window=3, スパイク除去]
-        R3 --> R4[Lowpass Filter<br/>configurable cutoff Butterworth]
-        R4 --> R4b[Octave Flip Suppress<br/>1オクターブ飛び補正]
-        R4b --> R4c[Slew Rate Limiter<br/>フレーム間最大ステップ制限]
-        R4c --> R5[Pitch Shift<br/>semitone単位]
-        R5 --> R6[Length Interpolation<br/>feature長に合わせる]
-        R6 --> R7[Mel Quantization<br/>50-1100Hz -> 1-255]
+        R1[RMVPE / FCPE / SwiftF0] --> R2[Moe Boost 任意]
+        R2 --> R4[Lowpass Filter<br/>configurable cutoff]
+        R4 --> R4b[Octave Flip Suppress]
+        R4b --> R4c[Slew Rate Limiter]
+        R4c --> R5[Pitch Shift<br/>semitone]
+        R5 --> R6[Length / windowed F0 assemble]
+        R6 --> R7[Mel Quantization<br/>-> 1-255]
     end
 
     subgraph wokada[w-okada の F0 パイプライン]
@@ -341,15 +357,14 @@ flowchart TB
 
 | 観点 | RCWX | w-okada |
 |---|---|---|
-| 既定手法 | FCPE (低レイテンシ) | RMVPE |
-| 選択肢 | FCPE / RMVPE | RMVPE / Crepe / DIO / Harvest / FCPE |
-| 並列化 | HuBERT と ThreadPoolExecutor で並列 | シーケンシャル |
-| 後処理 | median + lowpass (configurable) + octave flip + slew limit | **なし** (生 F0 をそのまま使用) |
-| キャッシュ | `_f0_cache` でチャンク境界値を保持 | `pitchf_buffer` で前チャンク値を保持 |
-| 過負荷時 | `f0_method="none"` に自動退避 | なし |
+| 既定手法 | **RMVPE** | RMVPE |
+| 選択肢 | RMVPE / FCPE / SwiftF0 | RMVPE / Crepe / DIO / Harvest / FCPE |
+| 並列化 | HuBERT=推論 thread、F0=永続 worker | シーケンシャル |
+| 後処理 | lowpass + octave flip + slew + hole-fill + uv ramp + 任意 moe | **なし**（生 F0 をそのまま使用） |
+| 履歴 | streaming F0 履歴 / pre-filter tail | `pitchf_buffer` で前チャンク値を保持 |
+| 過負荷時 | **denoise のみ** 一時バイパス（F0 は落とさない） | なし |
 
-RCWX の F0 後処理（median + lowpass + octave flip suppress + slew limit）により、チャンク境界でのピッチジャンプやフレーム間ジッターが軽減される。w-okada は `extraConvertSize` による大量コンテキストでF0境界品質を間接的に担保する。
-
+RCWX の F0 後処理により、チャンク境界でのピッチジャンプやフレーム間ジッターを抑える。w-okada は `extraConvertSize` による大量コンテキストで境界品質を間接的に担保する。
 ---
 
 ## 5. SOLA クロスフェード
@@ -580,17 +595,17 @@ RCWX の `_streaming_feat_cache` は前チャンクから実際の特徴量 (HuB
 flowchart TB
     subgraph overload[過負荷保護]
         O1[Queue full 検出] --> O2{1秒間に 3回以上?}
-        O2 -->|Yes| O3[Overload Mode ON<br/>2秒間]
-        O3 --> O4[f0_method = none<br/>index_rate = 0.0]
-        O4 --> O5[推論負荷を大幅削減]
+        O2 -->|Yes| O3[Overload ON 2秒]
+        O3 --> O4[denoise のみバイパス]
+        O4 --> O5[f0_method / index_rate は維持]
         O2 -->|No| O6[通常品質維持]
-        O5 -->|2秒後| O7[自動復帰<br/>Overload Mode OFF]
+        O5 -->|2秒後| O7[denoise 復帰]
     end
 
     subgraph feedback[フィードバック検出]
-        F1[出力履歴保存<br/>1秒分リングバッファ] --> F2[10チャンク毎に<br/>入力と相関チェック]
+        F1[出力履歴リング] --> F2[間欠で入力と相関]
         F2 --> F3{corr > 0.3?}
-        F3 -->|Yes| F4[警告表示<br/>フィードバック検出]
+        F3 -->|Yes| F4[警告表示]
         F3 -->|No| F5[正常]
     end
 
@@ -606,32 +621,17 @@ w-okada にはこれらの仕組みが存在しない。推論が遅い場合は
 
 ### 10.1 レイテンシ内訳
 
-```mermaid
-gantt
-    title レイテンシ内訳 (典型的な 150ms チャンク設定)
-    dateFormat X
-    axisFormat %L ms
+レイテンシは mode / chunk / F0 / デバイスで大きく変わる。**数値の現行目安は README の Latency 節を参照**（例: Aggressive 20ms hop の E2E 約 80–84ms 台、Normal は数百 ms 帯）。
 
-    section RCWX
-    Input Accumulation    :a1, 0, 150
-    Inference (async)     :a2, 150, 100
-    Output Buffer         :a3, 250, 50
-
-    section w-okada
-    Input Capture         :b1, 0, 150
-    Inference (sync)      :b2, 150, 120
-    Output Queue          :b3, 270, 30
-```
-
-| 構成要素 | RCWX | w-okada |
+| 構成要素 | RCWX（概念） | w-okada |
 |---|---|---|
-| 入力バッファリング | chunk_sec (150ms) | block_frame (設定次第) |
-| 推論時間 | 50-100ms (並列抽出) | 80-150ms (直列抽出) |
-| 出力バッファ | RingOutputBuffer + prebuffer | outQueue |
-| SOLA holdback | crossfade_sec (50ms) | crossfadeFrame (可変) |
-| **合計** | **~300ms** | **~350ms** |
+| 入力バッファリング | `chunk_sec`（hop） | block_frame（設定次第） |
+| 推論 | 非同期 thread + 並列 F0 | コールバック内同期 |
+| 出力バッファ | RingOutputBuffer + prebuffer / adaptive floor | outQueue |
+| SOLA holdback | `crossfade + search`（Normal は + decoder overlap） | crossfadeFrame（可変） |
+| モード | Normal / Aggressive | chunk / extra 手動 |
 
-RCWX は並列特徴抽出と非同期推論により、同等のチャンクサイズでレイテンシが若干低い。
+RCWX は非同期推論と並列 F0 抽出により、同期コールバック型より deadline 管理しやすい。
 
 ---
 
@@ -652,7 +652,7 @@ mindmap
                 カーネル再コンパイル回避
             自動化
                 パラメータ自動導出
-                過負荷自動退避
+                過負荷時 denoise バイパス
                 フィードバック検出
         w-okada
             brute force型
@@ -672,11 +672,11 @@ mindmap
 
 **RCWX が優れている点**:
 - `StatefulResampler` によるチャンク境界のリサンプリング品質
-- HuBERT + F0 並列抽出による推論高速化
-- F0 後処理 (median + lowpass + octave flip suppress + slew limit) によるピッチ安定性
-- 過負荷自動退避とフィードバック検出
+- HuBERT + F0 並列抽出
+- F0 後処理（lowpass / octave / slew / hole-fill 等）と Accelerator Graph
+- 過負荷時 denoise バイパスとフィードバック検出
 - `target_len` による SOLA ドリフト防止
-- XPU 向け固定サイズパディング最適化
+- Normal / Aggressive のレイテンシモードと XPU IVF
 
 **w-okada が優れている点**:
 - `extraConvertSize` によるユーザー可変コンテキスト (品質チューニングの自由度)

@@ -1,4 +1,4 @@
-﻿# RCWX Development Guide
+# RCWX Development Guide
 
 ## Project Overview
 
@@ -7,27 +7,40 @@
 RVC v2モデルを使ったリアルタイムボイスチェンジャー。現行のリアルタイム処理は
 `RealtimeVoiceChangerUnified` を中心とした単一パス実装です。
 
+対象環境は **Windows + Intel Arc (XPU)**。CUDA / NVIDIA は未検証（コード上に分岐は残るがサポート対象外）。
+
 ## Quick Start
 
+推奨は同梱ランチャー。`uv sync` / XPU 確認 / モデル有無 / ML デノイザ確認を自動で行う。
+
 ```powershell
-# 1) 依存関係インストール（PyTorch XPU版を使用）
-uv sync
+# uv 未導入時
+irm https://astral.sh/uv/install.ps1 | iex
 
-# 2) XPU確認
-uv run python -c "import torch; print(torch.__version__, torch.xpu.is_available())"
-
-# 3) 必須モデルをダウンロード（HuBERT / RMVPE）
-uv run rcwx download
-
-# 4) (オプション) ML Denoiser利用可否を確認
-uv run python -c "from rcwx.audio.denoise import is_ml_denoiser_available; print(is_ml_denoiser_available())"
-
-# 5) (推奨) フィードバック診断
-uv run rcwx diagnose
-
-# 6) GUI起動
-uv run rcwx
+.\rcwx.ps1                    # 環境チェック → 対話メニュー
+.\rcwx.ps1 gui                # GUI 直接起動
+.\rcwx.ps1 -Denoise gui       # ML デノイザ有効化で GUI
+.\rcwx.ps1 download           # 必須モデル DL
+.\rcwx.ps1 diagnose           # 診断
 ```
+
+手動（開発者向け）:
+
+```powershell
+uv sync
+uv run rcwx download
+uv run rcwx diagnose
+uv run rcwx
+
+# (オプション) ML Denoiser — CC BY-NC 4.0
+uv sync --extra ml-denoise
+```
+
+補足:
+
+- `torchfcpe` / `swift-f0` は本体依存（`--extra lowlatency` は存在しない）
+- ML デノイザだけ optional extra `ml-denoise`。`uv run` を extra なしで実行すると prune される
+- `pyproject.toml` で PyTorch XPU インデックス設定済み。`torch.__version__` に `+xpu` が付くこと
 
 ## Current Architecture
 
@@ -42,6 +55,7 @@ AudioInput (mic rate)
        4) [overlap | new_hop] を組み立て
        5) RVCPipeline.infer_streaming()
        6) StatefulResampler (model_sr -> output_sr)
+          ※ Aggressive + XPU かつ SR 変換時は D2H 前にデバイス sinc resample
        7) soft clip + SOLA crossfade
        8) feedback detection
        9) [Output Queue]
@@ -51,37 +65,42 @@ AudioInput (mic rate)
 
 実装上の要点:
 
-- リアルタイム経路は `pipeline/realtime_unified.py` のみを使用
-- チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA で処理
-- 旧互換の `context_sec` / `lookahead_sec` / `set_context()` / `set_lookahead()` は廃止
-- 旧GUIトグルの `use_feature_cache` は廃止
-- 過負荷時（直近1秒で `Queue full` が3回以上）は一時的に **denoise をバイパス**（`f0_method` / `index_rate` は変更しない）。2秒後に自動復帰。
+- リアルタイム経路は `pipeline/realtime_unified.py` のみ
+- チャンク境界連続性は **audio-level overlap** + `infer_streaming()` + SOLA
+- PyTorch 2.13 Accelerator Graph を XPU で自動適用（HuBERT + 定常 Synthesizer + Aggressive 時 IVF）
+- Synthesizer は HuBERT 履歴が満杯になるまで eager。開始前 warmup で定常 Graph を capture
+- warmup 後に音声履歴 / リサンプラ / SOLA 状態はリセットし、capture 済み Graph は保持
+- `RCWX_ACCELERATOR_GRAPH=0` で Graph 無効化
+- 過負荷時（直近1秒で Queue full が3回以上）は一時的に **denoise のみバイパス**（`f0_method` / `index_rate` は変更しない）。2秒後に自動復帰
+- GUI の Aggressive では denoise を強制 OFF（UI の保存状態は維持。Normal 復帰で再適用）
 
 ## Directory Structure
 
 ```text
 rcwx/
+├── accelerator_graph.py   # XPU 固定shape Graph キャッシュ
 ├── cli.py
 ├── config.py
 ├── device.py
 ├── diagnose.py
 ├── downloader.py
 ├── audio/
-│   ├── input.py           # AudioInput (マイク入力)
+│   ├── input.py           # AudioInput
 │   ├── output.py          # AudioOutput
-│   ├── duplex.py          # ASIO 全二重ストリーム (input+output 単一)
+│   ├── duplex.py          # ASIO 全二重
 │   ├── buffer.py          # RingOutputBuffer
 │   ├── resample.py        # StatefulResampler
-│   ├── sola.py            # simple SOLA
+│   ├── sola.py
 │   ├── denoise.py         # auto/ml/spectral
-│   ├── postprocess.py     # treble boost + RMS normalizer + limiter
-│   ├── wav_input.py       # WAVファイルループ入力
-│   └── stream_base.py     # ストリーム基底
+│   ├── postprocess.py     # treble + normalizer + limiter
+│   ├── wav_input.py
+│   └── stream_base.py
 ├── models/
 │   ├── hubert_loader.py
+│   ├── accelerator_index.py  # デバイス常駐 IVF
 │   ├── rmvpe.py
 │   ├── fcpe.py
-│   ├── swiftf0.py         # SwiftF0 (ONNX/CPU)
+│   ├── swiftf0.py         # ONNX/CPU
 │   ├── synthesizer.py
 │   └── infer_pack/
 ├── pipeline/
@@ -90,9 +109,9 @@ rcwx/
 └── gui/
     ├── app.py
     ├── realtime_controller.py
-    ├── model_loader.py    # 非同期モデルロード
-    ├── audio_test.py      # オーディオテスト
-    ├── file_converter.py  # ファイル変換
+    ├── model_loader.py
+    ├── audio_test.py
+    ├── file_converter.py
     └── widgets/
         ├── audio_settings.py
         ├── latency_settings.py
@@ -104,152 +123,191 @@ rcwx/
 
 ## Configuration (Current)
 
+永続化: `~/.config/rcwx/config.json`（`RCWXConfig`）。
+GUI レイテンシ枠は `chunk_sec` / `latency_mode` から overlap 等を **自動導出して実行時に上書き**する。
+
 ### `AudioConfig` (`rcwx/config.py`)
 
-| Key                       |  Default | Notes                   |
-| ------------------------- | -------: | ----------------------- |
-| `sample_rate`             |  `16000` | 内部処理入力レート      |
-| `output_sample_rate`      |  `48000` | 出力レート              |
-| `chunk_sec`               |    `0.3` | 保存設定上のチャンク長  |
-| `prebuffer_chunks`        |      `1` | 出力プリバッファ        |
-| `buffer_margin`           |    `0.5` | バッファ余裕            |
-| `input_gain_db`           |    `0.0` | 入力ゲイン              |
+| Key                       |  Default | Notes |
+| ------------------------- | -------: | ----- |
+| `sample_rate`             |  `16000` | 内部処理入力レート |
+| `output_sample_rate`      |  `48000` | 出力レート |
+| `chunk_sec`               |    `0.3` | 保存設定上のチャンク長（20ms 境界） |
+| `latency_mode`            | `normal` | `normal` / `aggressive` |
+| `prebuffer_chunks`        |      `1` | GUI では mode で 1 or 3 に再設定 |
+| `buffer_margin`           |   `0.25` | GUI: Normal=0.25 / Aggressive=0.1 |
+| `input_gain_db`           |    `0.0` | 入力ゲイン |
+| `output_gain_db`          |    `0.0` | 出力レベル調整 |
 | `input_channel_selection` |   `auto` | left/right/average/auto |
-| `input_hostapi_filter`    | `WASAPI` | Windows向け             |
-| `output_hostapi_filter`   | `WASAPI` | Windows向け             |
-| `asio_buffer_size`        |      `0` | ASIOバッファ (frames、0=ドライバパネル準拠。min/max/granularityに自動スナップ) |
+| `output_channel_selection`|   `auto` | auto / `"0,1"` 等 |
+| `input_hostapi_filter`    | `WASAPI` | Windows 向け |
+| `output_hostapi_filter`   | `WASAPI` | Windows 向け |
+| `asio_buffer_size`        |      `0` | frames。0=ドライバパネル準拠 |
 
 ### `InferenceConfig` (`rcwx/config.py`)
 
-| Key                           |  Default | Notes                           |
-| ----------------------------- | -------: | ------------------------------- |
-| `f0_method`                   |  `rmvpe` | `rmvpe` / `fcpe` / `swiftf0`    |
-| `use_f0`                      |   `true` | F0有効化                        |
-| `use_index`                   |   `true` | FAISS有効化                     |
-| `index_ratio`                 |   `0.15` | FAISS混合率                     |
-| `index_k`                     |      `4` | 近傍数                          |
-| `use_compile`                 |  `false` | 既定OFF                         |
-| `resample_method`             | `linear` | `linear` / `poly`               |
-| `use_parallel_extraction`     |   `true` | HuBERT+F0並列                   |
-| `voice_gate_mode`             |    `off` | off/strict/expand/energy        |
-| `energy_threshold`            |    `0.2` | energyモード閾値                |
-| `overlap_sec`                 |   `0.20` | 音声オーバーラップ              |
-| `crossfade_sec`               |   `0.08` | SOLAクロスフェード長            |
-| `use_sola`                    |   `true` | SOLA有効化                      |
-| `sola_search_ms`              |   `15.0` | SOLA探索窓（最低出力F0 70Hzの1周期+マージン） |
-| `hubert_context_sec`          |    `1.0` | HuBERTコンテキスト窓 (秒)       |
-| `f0_context_sec`              |   `0.32` | F0抽出窓の先行コンテキスト (秒、<=0で全コンテキスト抽出) |
-| `moe_boost`                   |   `0.45` | F0-only Moeボイススタイル強度 (0.0-1.0) |
-| `noise_scale`                 |   `0.45` | 合成ノイズスケール (0.0-1.0)    |
-| `f0_lowpass_cutoff_hz`        |   `16.0` | F0ローパスカットオフ (Hz)       |
-| `enable_octave_flip_suppress` |   `true` | 1オクターブF0飛び補正           |
-| `enable_f0_slew_limit`        |   `true` | フレーム間F0変化量制限          |
-| `f0_slew_max_step_st`         |    `3.6` | 最大F0ステップ (semitones)      |
-| `f0_hole_fill_ms`             |   `30.0` | 有声区間内の短い無声穴を補間で埋める上限 (ms、<=0で無効。ノイズ励振バースト=かすれ対策) |
-| `uv_ramp_ms`                  |    `5.0` | NSF有声/無声励振のクロスフェード長 (ms、0で従来のハード切替) |
-| `denoise.enabled`             |   `true` | ノイズ除去                      |
-| `denoise.method`              |     `ml` | `auto` / `ml` / `spectral`      |
+| Key                           |  Default | Notes |
+| ----------------------------- | -------: | ----- |
+| `f0_method`                   |  `rmvpe` | `rmvpe` / `fcpe` / `swiftf0` |
+| `use_f0`                      |   `true` | |
+| `use_index`                   |   `true` | |
+| `index_ratio`                 |   `0.15` | |
+| `index_k`                     |      `4` | |
+| `use_compile`                 |  `false` | 既定 OFF。compile 時は Synthesizer Graph 非併用 |
+| `resample_method`             | `linear` | `linear` / `poly` |
+| `use_parallel_extraction`     |   `true` | HuBERT は推論 thread、F0 は永続 worker |
+| `voice_gate_mode`             |    `off` | off/strict/expand/energy |
+| `energy_threshold`            |    `0.2` | energy モード |
+| `overlap_sec`                 |   `0.20` | 設定デフォルト。GUI は chunk 100%（60–300ms）で上書き |
+| `crossfade_sec`               |   `0.08` | 設定デフォルト。GUI は chunk 10%（10–20ms）で上書き |
+| `use_sola`                    |   `true` | |
+| `sola_search_ms`              |   `15.0` | 70Hz 1周期+マージン。GUI 固定 15 |
+| `hubert_context_sec`          |    `1.0` | Aggressive runtime は最大 0.56 に cap |
+| `f0_context_sec`              |   `0.32` | Aggressive + SwiftF0 は最大 0.10 に cap。`<=0` で全コンテキスト抽出 |
+| `moe_boost`                   |   `0.45` | |
+| `noise_scale`                 |   `0.45` | |
+| `fixed_harmonics`             |   `true` | |
+| `f0_lowpass_cutoff_hz`        |   `16.0` | |
+| `f0_hole_fill_ms`             |   `30.0` | 有声内の短い無声穴補間上限。`<=0` で無効 |
+| `uv_ramp_ms`                  |    `5.0` | NSF 有声/無声励振クロスフェード |
+| `enable_octave_flip_suppress` |   `true` | |
+| `enable_f0_slew_limit`        |   `true` | |
+| `f0_slew_max_step_st`         |    `3.6` | |
+| `denoise.enabled`             |   `true` | |
+| `denoise.method`              |     `ml` | `auto` / `ml` / `spectral` |
+| `denoise.strength`            |    `1.0` | `0.5–2.0`。ML は 1.0 超で2段 |
 
-### `RCWXConfig` (`rcwx/config.py`) トップレベル
+### `RCWXConfig` トップレベル
 
-| Key               |                Default | Notes                                             |
-| ----------------- | ---------------------: | ------------------------------------------------- |
-| `models_dir`      | `~/.cache/rcwx/models` | HuBERT・RMVPEモデルディレクトリ                   |
-| `rvc_models_dir`  |                 `None` | RVCモデルディレクトリ（ドロップダウンスキャン用） |
-| `last_model_path` |                 `None` | 最後に使用したモデルパス                          |
-| `device`          |                 `auto` | auto/xpu/cuda/cpu                                 |
-| `dtype`           |              `float16` | float16/float32/bfloat16                          |
+| Key               |                Default | Notes |
+| ----------------- | ---------------------: | ----- |
+| `models_dir`      | `~/.cache/rcwx/models` | HuBERT / RMVPE |
+| `rvc_models_dir`  |                 `None` | ドロップダウンスキャン |
+| `last_model_path` |                 `None` | |
+| `device`          |                 `auto` | 実質 `auto` / `xpu` / `cpu`（`cuda` は未検証） |
+| `dtype`           |              `float16` | float16/float32/bfloat16 |
 
-### `RealtimeConfig` (`rcwx/pipeline/realtime_unified.py`)
+### `RealtimeConfig`（GUI から生成される実行時）
 
-実行時にGUI設定から生成される主要値:
+`RealtimeConfig` dataclass 自体のフィールド既定は GUI 経路と一致しない場合がある。
+製品パスは `realtime_controller` が GUI / `RCWXConfig` から埋める。
 
-- `chunk_sec` (既定 0.30、20ms境界に丸め)
-- `overlap_sec` (既定 0.20、20ms境界に丸め)
-- `crossfade_sec` (既定 0.08)
-- `sola_search_ms` (既定 15.0、最低出力F0 70Hzの1周期+マージン)
-- `hubert_context_sec` (既定 1.0)
-- `f0_context_sec` (既定 0.32、F0抽出を [コンテキスト+新規ホップ] 窓に限定。過去フレームはF0履歴キャッシュで補完。<=0で旧来の全コンテキスト抽出)
-- `prebuffer_chunks` (既定 1)
-- `buffer_margin` (既定 0.5)
-- `f0_method` (既定 `rmvpe`)
-- `noise_scale` (既定 0.45)
-- `f0_lowpass_cutoff_hz` (既定 16.0)
-- `f0_hole_fill_ms` (既定 30.0、有声区間内の短い無声穴を log2 補間で埋める。長い穴=真の無声子音は保持)
-- `uv_ramp_ms` (既定 5.0、NSFのサイン/ノイズ励振切替を~5msでクロスフェード)
-- `fixed_harmonics` (既定 true)
-- `decoder_overlap_frames` (既定 5、1フレーム=10ms、チャンク境界のデコーダ連続性用)
-- `postprocess_enabled` (既定 true) / `treble_boost_db` (既定 4.0) / `treble_cutoff_hz` (既定 2800.0) / `limiter_threshold_db` (既定 -1.0) / `limiter_release_ms` (既定 80.0)
-- `max_queue_size` (既定 8)
+GUI 既定起動時の代表値:
+
+- `chunk_sec` ≈ 0.30（20ms 境界）、`latency_mode` = `normal`
+- `overlap_sec` / `crossfade_sec` / `prebuffer_chunks` / `buffer_margin` = 下記 GUI 自動導出
+- `sola_search_ms` = 15.0、`use_sola` = true
+- `hubert_context_sec` = 1.0、`f0_context_sec` = 0.32
+- `f0_method` / `noise_scale` / denoise / postprocess は GUI・config 準拠
+- `decoder_overlap_frames` = 5（Aggressive では実行時に 0 扱い）
+- `max_queue_size` = 8
 
 ## GUI Latency Model (Current)
 
-`LatencySettingsFrame` でユーザーが直接変更できるのは `chunk_sec` のみです。
-他は自動導出されます。
+`LatencySettingsFrame` でユーザーが変えるのは **`chunk_sec` と `latency_mode`**。
+他は `_auto_params()` と runtime で決定。
 
-自動導出ルール (`rcwx/gui/widgets/latency_settings.py`):
+### 自動導出 (`latency_settings.py`)
 
-- `overlap_sec` = chunkの100%（60-200msにクランプ、20ms刻み）
-- `crossfade_sec` = chunkの25%（10-80msにクランプ、10ms刻み）
-- `sola_search_ms` = 15ms固定（最低出力F0 70Hzの1周期+マージン。レイテンシには影響しない）
-- `prebuffer_chunks` = 1
-- `buffer_margin` = 0.5
+- `overlap_sec` = chunk の 100%（60–300ms、20ms 刻み）
+- `crossfade_sec` = chunk の 10%（10–20ms、10ms 刻み）両モード共通
+- `sola_search_ms` = 15.0 固定
 - `use_sola` = true
+- Normal: `prebuffer_chunks` = 1、`buffer_margin` = 0.25
+- Aggressive: `prebuffer_chunks` = 3、`buffer_margin` = 0.1
 
-補足:
+### chunk 下限 / 範囲
 
-- GUI起動時は `config.audio.chunk_sec` を復元し、上記の自動値を再計算します。
-- 実行中変更時は `set_overlap()` / `set_crossfade()` / `set_chunk_sec()` を使用します。
+| mode | SwiftF0 / none | FCPE | RMVPE |
+|------|----------------|------|-------|
+| Normal | ≥ 40ms（〜600ms、20ms 刻み） | ≥ 100ms | ≥ 320ms |
+| Aggressive | 20–100ms（20ms 刻み） | ≥ 100ms | ≥ 320ms |
+
+### runtime 挙動 (`realtime_unified.py`)
+
+**Normal**
+
+- 非 ASIO コールバック最大 10ms
+- 持続リング floor: trim 閾値 ≈ `(0.5 + buffer_margin)` hop = 0.75 hop、復帰 0.25 hop
+- 2 hop 観測窓。chunk 内 burst/drain は trim しない
+- Denoiser は設定どおり
+- decoder overlap = 設定値（既定 5 frames = 50ms）
+
+**Aggressive**
+
+- 非 ASIO コールバック最大 2.5ms
+- 開始時・アンダーラン再アームで `prebuffer_chunks`（3）hop 確保
+- 最初の 20 hop は 1 hop guard（threshold 1.25 hop）。以降 `max(0.5·hop, p99-p50+callback)` を `0.875·hop` で上限
+- HuBERT context 最大 0.56s、SwiftF0 の f0 context 最大 0.10s（保存設定は変更しない）
+- GUI 経路で denoise 強制 OFF
+- FAISS IVF を warmup 時に XPU 配置（L2 / nprobe=1 / max list ≤256）。未対応は CPU FAISS
+- 初回・catchup は実 hop を reflect + `prime_hubert_history` で固定 shape 充填 → 1 hop 目から定常 Synthesizer Graph
+- decoder overlap 実行時 0。SOLA 余白は `crossfade + search` のみ
+- モデル SR ≠ 出力 SR 時は D2H 前に XPU Graph sinc resample
+- ASIO 実レート不一致時は開始前に実レート用 Graph を再 warmup
+
+### ホットパス（AS-IS）
+
+- stage timing プロファイル: 10 hop ごと（`STAGE_PROFILE_INTERVAL=10`）
+- GUI / GPU メモリ telemetry: Aggressive は 5 hop ごと（20ms hop で約 10Hz）、Normal は毎 hop
+- 推論 p50/p95/p99: 直近 256 hop、再計算は 10 hop ごと
+- HuBERT は推論 thread 直 dispatch、F0 は永続 `ThreadPoolExecutor(max_workers=1)`
+- streaming TextEncoder は `all_frames_valid` で mask 処理省略
+- HuBERT/IVF 時間軸 cache は未採用
+- IVF 候補距離は feature norm 事前計算 + 内積
+- PERF ログ: 100 hop ごと。slow 警告は 50 hop ごと（推論 > 0.8·chunk）
+
+### レイテンシ表示
+
+`1 hop + 推論 + 持続リング floor + 出力キュー + SOLA余白`
+
+SOLA 余白は `crossfade + search`（Normal は + decoder overlap）。リング内の通常 hop 滞留は二重計上しない。
 
 ## CLI Commands
 
 ```powershell
-uv run rcwx                  # GUI起動（command省略時デフォルト）
-uv run rcwx gui              # GUI起動
-uv run rcwx devices          # デバイス一覧
-uv run rcwx download         # 必須モデルダウンロード
+.\rcwx.ps1                   # 推奨ランチャー
+uv run rcwx                  # GUI（command 省略時デフォルト）
+uv run rcwx gui
+uv run rcwx devices
+uv run rcwx download
 uv run rcwx run in.wav model.pth -o out.wav --pitch 5 --f0-method rmvpe
-uv run rcwx info model.pth   # モデル情報
-uv run rcwx diagnose         # フィードバック診断
-uv run rcwx logs             # ログ一覧
-uv run rcwx logs --tail 50   # 最新ログ末尾
-uv run rcwx logs --open      # 最新ログを開く
+uv run rcwx info model.pth
+uv run rcwx diagnose
+uv run rcwx logs
+uv run rcwx logs --tail 50
+uv run rcwx logs --open
 ```
 
 ## Logs & Diagnostics
 
-ログ保存先:
-
-- `~/.config/rcwx/logs/rcwx_YYYYMMDD_HHMMSS.log`
+ログ: `~/.config/rcwx/logs/rcwx_YYYYMMDD_HHMMSS.log`
 
 よく出るログ:
 
 - `[INPUT] Queue full, dropping chunk`
 - `[INFER] Chunk #...`
-- `[PERF] Inference slow ...`（pre/hubert/f0/faiss/synth のステージ内訳付き）
-- `[PERF] Stage breakdown: ...`（100チャンクごとの定期内訳。GPUステージはデバイスイベントで計測しホスト同期なし。イベント非対応環境のみ10チャンクに1回のsync付きサンプリングにフォールバック。並列抽出時は hubert/f0 の時間が相互に重なるため、正確な帰属には `use_parallel_extraction=false`）
+- `[PERF] Inference slow ...`（pre/hubert/f0/faiss/synth 内訳）
+- `[PERF] Stage breakdown: ...`（100 hop ごと。GPU はデバイスイベント計測、ホスト同期なし。イベント非対応時は 10 hop サンプリング + sync フォールバック。並列抽出時 hubert/f0 は時間重複 → 正確な帰属には `use_parallel_extraction=false`）
 - `[FEEDBACK] Detected feedback (corr=...)`
 - `[WARMUP] ...`
+- `[UNDERRUN] ...`（Aggressive は prebuffer 再アーム）
 
 トラブルシュート:
 
-- Queue full が頻発: `chunk_sec` 増、デノイズOFF、F0方式見直し
-- 遅延増加: `chunk_sec`/`buffer_margin` 見直し、出力デバイス設定確認
-- フィードバック警告: `uv run rcwx diagnose` 実施、入出力ループ回避
-- XPU未認識: `uv sync` 後に `torch.__version__` が `+xpu` か確認
+- Queue full 頻発: `chunk_sec` 増、denoise OFF、F0 見直し、Aggressive 負荷確認
+- 遅延増加: mode / chunk / buffer floor / 出力デバイス確認
+- フィードバック: `.\rcwx.ps1 diagnose` または `uv run rcwx diagnose`
+- XPU 未認識: `torch.__version__` に `+xpu`。だめなら `del uv.lock` → `uv sync` または `.\rcwx.ps1`
 
 ## Models
 
-既定配置:
-
 - `~/.cache/rcwx/models/hubert/hubert_base.pt`
 - `~/.cache/rcwx/models/rmvpe/rmvpe.pt`
-- RVC本体モデル: 任意の `*.pth`
-- FAISS index: モデル隣接の `*.index`（自動検出）
+- RVC `*.pth`（任意）
+- FAISS `*.index`（モデル隣接・自動検出）
 
 ## Tests
-
-主なテスト:
 
 ```powershell
 uv run python tests/integration/test_diagnostic.py
@@ -263,6 +321,11 @@ uv run python tests/models/test_cumulative_context.py
 uv run python tests/models/test_pitch_clarity.py
 uv run python tests/models/test_config_wiring.py
 uv run python tests/models/test_hubert_weight_audit.py
+uv run python tests/models/test_accelerator_graph.py
+uv run python tests/models/test_synthesizer_graph.py
+uv run python tests/models/test_runtime_graph_warmup.py
+uv run python tests/models/test_accelerator_index.py
+uv run python tests/models/test_text_encoder_fastpath.py
 ```
 
 ## References
@@ -270,4 +333,5 @@ uv run python tests/models/test_hubert_weight_audit.py
 - RVC WebUI
 - PyTorch XPU
 - Facebook Denoiser (`denoiser`)
-- torchfcpe
+- torchfcpe / swift-f0
+- ユーザー向けセットアップ: [docs/SETUP.md](docs/SETUP.md) / [README.md](README.md)

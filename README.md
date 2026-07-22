@@ -18,93 +18,89 @@ RVC Real-time Voice Changer on Intel Arc (XPU)
 ## Requirements
 
 - Windows 10/11
-- Python 3.11 or 3.12
-- Intel Arc GPU (A770, A750, B580, etc.) または CUDA GPU
+- Python 3.11 or 3.12（`uv` が自動で用意）
+- Intel Arc GPU (A770, A750, B580, B570, etc.)
+- Intel Arc GPU ドライバ（最新版推奨）
 - [uv](https://github.com/astral-sh/uv) パッケージマネージャ
 
-## Installation
+> 本プロジェクトは **Intel Arc (XPU)** 向けです。CUDA / NVIDIA 環境は未検証のためサポート対象外です。
 
-### Intel Arc GPU (XPU) の場合
+## Installation / Quick Start
+
+初回セットアップから日常起動まで、同梱の `rcwx.ps1` が自動で行います。
 
 ```powershell
 git clone https://github.com/grand2-products/rcwx.git
 cd rcwx
 
-# PyTorch XPU版を含む全依存関係をインストール
-uv sync
+# 1. uv が未導入ならインストール（管理者権限不要）
+irm https://astral.sh/uv/install.ps1 | iex
+# または: winget install astral-sh.uv
 
-# XPU確認
-uv run python -c "import torch; print(f'XPU: {torch.xpu.is_available()}')"
+# 2. 環境チェック → 対話メニュー
+#    ・uv sync（PyTorch XPU 版を含む依存関係）
+#    ・PyTorch / XPU の確認
+#    ・必須モデル (HuBERT / RMVPE) の有無
+#    ・ML デノイザ（任意）の有効化確認
+.\rcwx.ps1
 ```
 
-> **Note**: `pyproject.toml` で PyTorch XPU インデックスが設定済みのため、`uv sync` だけで XPU 版がインストールされます。
-
-### NVIDIA GPU (CUDA) の場合
-
-pyproject.toml を編集して CUDA インデックスに変更:
-
-```toml
-[[tool.uv.index]]
-name = "pytorch-xpu"
-url = "https://download.pytorch.org/whl/cu124"  # XPU → CUDA に変更
-explicit = true
-```
+実行ポリシーで弾かれる場合:
 
 ```powershell
-uv sync
-
-# CUDA確認
-uv run python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
+powershell -ExecutionPolicy Bypass -File .\rcwx.ps1
 ```
 
-### CPU のみの場合
+### 対話メニューでできること
 
-pyproject.toml の `[tool.uv.sources]` セクションを削除またはコメントアウト:
+| 番号 | 操作 |
+|------|------|
+| 1 | GUI を起動 |
+| 2 | オーディオデバイス一覧 |
+| 3 | 必須モデル (HuBERT / RMVPE) をダウンロード |
+| 4 | フィードバック診断（XPU / Accelerator Graph 含む） |
+| 5 | 最新ログを表示 (tail 50) |
+| 6 | 環境チェックを再実行 |
+| 7 | 依存関係を同期 (`uv sync`) |
+| 8 | 任意の `rcwx` コマンドを入力 |
+| 9 | ML デノイザを有効化 (`--extra ml-denoise`) |
+
+### 直接起動（メニューを介さない）
 
 ```powershell
-uv sync
-
-# CPU版が使用される
-uv run python -c "import torch; print(torch.__version__)"
+.\rcwx.ps1 gui                # GUI を直接起動
+.\rcwx.ps1 -Denoise gui       # ML デノイザ有効化で GUI 起動
+.\rcwx.ps1 download           # 必須モデルのみダウンロード
+.\rcwx.ps1 diagnose           # 診断のみ
 ```
 
-## Quick Start
+渡した引数はそのまま `uv run rcwx ...` へ転送されます。`-Denoise` 指定時（または既存の denoiser 検出時）は、全ての `uv run` に `--extra ml-denoise` が付きます。
 
-```powershell
-# 1. 依存関係インストール
-uv sync
+> ML デノイザ（任意依存 `ml-denoise` extra、CC BY-NC 4.0）は既定で未インストールです。`uv run` / `uv sync` を extra なしで実行すると prune されるため、ランチャーは有効時に自動で `--extra ml-denoise` を付けます。
 
-# 2. (オプション) ML Denoiser をインストール (CC BY-NC 4.0)
-uv sync --extra ml-denoise
+詳細なドライバ確認・トラブルシュートは [docs/SETUP.md](docs/SETUP.md) を参照してください。
 
-# 3. 必要モデル (HuBERT, RMVPE) のダウンロード
-uv run rcwx download
-
-# 4. XPUとAccelerator Graphの確認
-uv run rcwx diagnose
-
-# 5. GUI起動
-uv run rcwx
-```
-
-### 対話式ランチャー (rcwx.ps1)
-
-配布・環境確認向けに、対話メニュー付きのランチャーを同梱しています。uv / PyTorch(XPU) / 必須モデル / ML デノイザの状態をチェックし、GUI起動・デバイス一覧・モデルDL・診断・ログ表示などをメニューから実行できます。
-
-```powershell
-.\rcwx.ps1                    # 環境チェック → 対話メニュー
-.\rcwx.ps1 gui                # メニューを介さず GUI を直接起動
-.\rcwx.ps1 -Denoise gui       # ML デノイザ有効化 (--extra ml-denoise) で起動
-```
-
-> ML デノイザ（任意依存 `ml-denoise` extra）は既定で未インストール。`uv run`/`uv sync` を extra なしで実行すると prune されるため、ランチャーは有効時に全ての `uv run` を自動で `--extra ml-denoise` 付きにします。メニューから随時インストールも可能です。
-
-**デフォルト設定** (最適化済み):
+**デフォルト設定**:
 - F0方式: **RMVPE** (高品質)
 - チャンクサイズ: **300ms**
 - ノイズ除去: **ML** (Facebook Denoiser, 要 `--extra ml-denoise`) / Spectral (標準)
 - FAISS インデックス: **有効** (ratio=0.15)
 - 詳細は [Inference Settings](#inference-settings) 参照
+### 手動セットアップ（開発者向け）
+
+ランチャーを使わずに手順を踏む場合:
+
+```powershell
+uv sync
+uv run rcwx download          # 必須モデル (HuBERT, RMVPE)
+uv run rcwx diagnose          # XPU / Accelerator Graph 確認
+uv run rcwx                   # GUI 起動
+
+# (オプション) ML Denoiser
+uv sync --extra ml-denoise
+```
+
+> `pyproject.toml` で PyTorch XPU インデックスが設定済みのため、`uv sync` だけで XPU 版が入ります。
 
 ## XPU Accelerator Graph
 
@@ -118,7 +114,8 @@ PyTorch `2.13.0+xpu` では、XPU利用時にAccelerator Graphが自動的に有
 利用可否は診断コマンドで確認できます。
 
 ```powershell
-uv run rcwx diagnose
+.\rcwx.ps1 diagnose
+# または: uv run rcwx diagnose
 # [OK] XPU Accelerator Graph: True
 ```
 
@@ -126,7 +123,7 @@ uv run rcwx diagnose
 
 ```powershell
 $env:RCWX_ACCELERATOR_GRAPH = "0"
-uv run rcwx
+.\rcwx.ps1 gui
 
 # 次回以降、自動判定へ戻す
 Remove-Item Env:RCWX_ACCELERATOR_GRAPH
@@ -208,7 +205,7 @@ uv run rcwx info model.pth
 
 ### 詳細設定タブ
 
-推論デバイス（xpu/cuda/cpu）、dtype、RVCモデルディレクトリ、モデル配置先などの設定。
+推論デバイス（xpu/cpu/auto）、dtype、RVCモデルディレクトリ、モデル配置先などの設定。
 
 ### レベルモニター
 
@@ -231,7 +228,7 @@ uv run rcwx info model.pth
 - **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去（標準同梱）
 - **除去強度**: `0.50x-2.00x`。`1.00x`はDNS64を1回処理し、MLは`1.00x`超で2回目のDNS64出力へ連続的に混合します。環境音が大きい場合は`1.25x`から上げ、声の欠けや金属音が出る手前で止めてください。Spectralでは閾値と減衰量を同時に深くします。
 
-MLの2段処理は計算量も増えます。`Aggressive`ではdeadlineを守るためDenoiserを実行中だけバイパスするため、強いノイズ除去を使う場合は`Normal`を選択します。
+MLの2段処理は計算量も増えます。GUI の `Aggressive` では deadline を守るため Denoiser を強制 OFF にするため、強いノイズ除去を使う場合は `Normal` を選択します。
 
 ## Inference Settings
 
@@ -249,7 +246,7 @@ MLの2段処理は計算量も増えます。`Aggressive`ではdeadlineを守る
 
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
-| `f0_method` | `rmvpe` | F0抽出方式。`rmvpe`=高品質（320ms最小チャンク）、`fcpe`=低遅延（100ms最小チャンク） |
+| `f0_method` | `rmvpe` | F0抽出方式。`rmvpe`=高品質（320ms最小チャンク）、`fcpe`=低遅延（100ms最小チャンク）、`swiftf0`=超低遅延 ONNX/CPU（Normal 40ms / Aggressive 20ms 最小） |
 | `f0_lowpass_cutoff_hz` | 16.0 | F0ローパスフィルタのカットオフ周波数（Hz）。100fps F0に対してButterworth 2次フィルタを適用。低い=滑らか、高い=ピッチの細かい変化を保持 |
 | `enable_octave_flip_suppress` | true | F0抽出のオクターブ誤検出（±1オクターブのフレーム間ジャンプ）を自動補正。隣接フレーム比が2.0±0.16の場合にトリガー |
 | `enable_f0_slew_limit` | true | フレーム間のF0変化量を制限し、ピッチの急激な飛びを抑制 |
@@ -265,14 +262,16 @@ MLの2段処理は計算量も増えます。`Aggressive`ではdeadlineを守る
 
 ### チャンク処理・クロスフェード
 
-リアルタイム処理におけるチャンク境界の連続性を制御するパラメータ群です。
+リアルタイム処理におけるチャンク境界の連続性を制御するパラメータ群です。GUI のレイテンシ設定では `chunk_sec` / `latency_mode` から自動導出され、保存済みの個別値より優先されます。
 
-| パラメータ | デフォルト | 説明 |
-|-----------|-----------|------|
-| `overlap_sec` | 0.20 | HuBERT入力に付加する音声オーバーラップ長。20ms境界（HuBERT 320サンプルホップ）に丸められる。長いほどHuBERTのコンテキストが豊かになり特徴抽出の精度が上がるが、計算量が増える |
-| `crossfade_sec` | 0.08 | SOLAクロスフェード長。前チャンクの末尾と次チャンクの先頭をHann窓でブレンドする区間。長いほど継ぎ目が滑らかだが遅延が増加 |
-| `use_sola` | true | SOLA（Synchronized Overlap-Add）の有効化。相互相関で最適な接合位置を探索する |
-| `sola_search_ms` | 10.0 | SOLA探索窓（ms）。±この範囲で最良の接合点を探す。広いほど良い位置が見つかるが計算コストが増える |
+| パラメータ | 設定デフォルト | GUI自動導出 | 説明 |
+|-----------|---------------|-------------|------|
+| `overlap_sec` | 0.20 | chunkの100%（60–300ms、20ms刻み） | HuBERT入力に付加する音声オーバーラップ長。20ms境界（HuBERT 320サンプルホップ）に丸められる |
+| `crossfade_sec` | 0.08 | chunkの10%（10–20ms、10ms刻み） | SOLAクロスフェード長。前チャンク末尾と次チャンク先頭をHann窓でブレンド |
+| `use_sola` | true | true固定 | SOLA（Synchronized Overlap-Add）の有効化 |
+| `sola_search_ms` | 15.0 | 15.0固定 | SOLA探索窓（ms）。最低出力F0 70Hzの1周期+マージン。レイテンシ表示には計上されるが探索幅自体は遅延を増やさない |
+| `prebuffer_chunks` | 1 | Normal=1 / Aggressive=3 | 出力開始前（および Aggressive のアンダーラン再アーム）に確保する hop 数 |
+| `buffer_margin` | 0.25 | Normal=0.25 / Aggressive=0.1 | Normal の持続リング floor 判定に使用（threshold ≈ 0.5+margin hop） |
 
 **処理フロー**: `overlap_sec` の音声を入力に付加 → HuBERT+F0抽出 → 合成 → `crossfade_sec` 区間で前チャンクとSOLAブレンド（`sola_search_ms` 窓内で最適位置探索）
 
@@ -348,9 +347,9 @@ uv run rcwx run input.wav model.pth -o out.wav --pitch 6 --moe-boost 0.45
 
 ```
 rcwx/
-├── accelerator_graph.py  # XPU/CUDA固定shape Graphキャッシュ
+├── accelerator_graph.py  # XPU固定shape Graphキャッシュ
 ├── config.py              # 設定管理 (JSON永続化)
-├── device.py              # デバイス選択 (xpu/cuda/cpu)
+├── device.py              # デバイス選択 (xpu/cpu)
 ├── downloader.py          # HuggingFace モデルダウンロード
 ├── cli.py                 # CLI エントリポイント
 ├── diagnose.py            # フィードバック診断
@@ -384,73 +383,75 @@ rcwx/
 
 ### レイテンシモード
 
-レイテンシ設定は`Normal`と`Aggressive`の2モードです。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。
+レイテンシ設定は `Normal` と `Aggressive` の2モードです。モード変更時は I/O ストリームと固定 shape Graph を再ウォームアップします。
 
 | モード | SOLAクロスフェード | 持続リングfloor | 非ASIOコールバック | 用途 |
 |--------|-------------------|-----------------|----------------------|------|
 | Normal | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 品質機能を維持した通常利用 |
-| Aggressive | chunkの10%、最大20ms | 初期1 hop、定常0.5-0.875 hopを適応維持 | 最大2.5ms | 20ms deadlineを狙う低遅延利用 |
+| Aggressive | chunkの10%、最大20ms | 初期1 hop、定常0.5–0.875 hopを適応維持 | 最大2.5ms | 短い hop の deadline を狙う低遅延利用 |
 
-`Normal`はSwiftF0/Noneで40ms、FCPEで100ms、RMVPEで320msがchunk下限です。プリバッファは1 hop、buffer marginは0.25です。開始時に最初の生成チャンクを待ち、持続的なバッファ滞留だけを2 hopの観測窓で判定します。通常のchunk内burst/drainはtrim対象にしません。Denoiserを含む品質機能を保存設定どおり使用します。
+#### Normal
 
-`Aggressive`はSwiftF0/Noneのchunkを20-100ms（20ms刻み）で調整できます。FCPEとRMVPEは入力要件のため100msと320msが下限です。開始時とアンダーラン復旧時は3 hopを確保します。最初の20 hopは1 hopのguardを維持し、その後は直近推論の`p99 - p50 + callback`から0.5-0.875 hopのjitter guardを選びます。20ms chunkでは10-17.5msです。
+- chunk 下限: SwiftF0 / None = 40ms、FCPE = 100ms、RMVPE = 320ms
+- `prebuffer_chunks` = 1、`buffer_margin` = 0.25
+- 開始時は最初の生成チャンクを待つ。持続的なバッファ滞留だけを 2 hop の観測窓で判定し、通常の chunk 内 burst/drain は trim しない
+- 持続 floor: trim 閾値 ≈ `(0.5 + buffer_margin)` hop = 0.75 hop、復帰目標 = 0.25 hop
+- Denoiser を含む品質機能は保存設定どおり使用
+- decoder overlap = 既定 5 frames（1 frame = 10ms）
 
-`Aggressive`ではHuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時短縮し、Denoiserを実行時だけバイパスします。初回およびcatchup直後は最初の実音声hopを左側へreflect展開してHuBERT履歴を固定shapeまで即時充填するため、1 hop目からウォームアップ済みSynthesizer Graphを使用します。
+#### Aggressive
 
-モデルと出力のsample rateが異なる場合、`Aggressive`はSynthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。`Normal`へ戻すと保存済みのDenoiser設定が再び有効になります。
+- chunk 範囲: SwiftF0 / None = 20–100ms（20ms 刻み）。FCPE = 100ms、RMVPE = 320ms が下限
+- `prebuffer_chunks` = 3（開始時とアンダーラン再アームで同じ hop 数を再確保）
+- 最初の 20 hop は 1 hop の guard（threshold は 1.25 hop）、その後は `max(0.5·hop, p99-p50+callback)` を `0.875·hop` で上限した jitter guard（20ms chunk では 10–17.5ms）
+- HuBERT context 最大 560ms、SwiftF0 の F0 context 最大 100ms に一時短縮（保存設定は変えず runtime のみ）
+- GUI 経路では Denoiser を強制 OFF（GUI のチェック状態は保持。`Normal` 復帰で再適用）。過負荷時（1 秒以内に Queue full が 3 回）も 2 秒間 denoise をバイパス
+- 初回および catchup 直後は実音声 hop を左側へ reflect 展開し、`prime_hubert_history` で HuBERT 履歴を固定 shape まで即時充填 → 1 hop 目からウォームアップ済み Synthesizer Graph を使用
+- decoder overlap = 0。SOLA 合成末尾は `crossfade + search` のみ保持
+- モデル SR ≠ 出力 SR のとき、Synthesizer 出力の D2H 前に torchaudio sinc resample を XPU Graph で実行
+- ASIO 実レートが設定と異なる場合は、音声開始前に実レート用 Graph を再ウォームアップ
 
-`Aggressive`のruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768 indexで約240MBの追加VRAMを使用します。`Normal`やファイル変換では構築しません。
+#### Aggressive の XPU IVF（FAISS）
 
-Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップとGUIのSOLA/decoder余白を含む処理時間がp50 14.5ms、p95 16.4ms、p99 18.8msでした（40ms deadline miss 0/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
+runtime warmup で FAISS `IndexIVFFlat`（L2、`nprobe=1`）の inverted list と再構築特徴を XPU へ常駐させ、coarse centroid 選択・候補検索・top-k 加重平均を Accelerator Graph で実行する。HuBERT 特徴を FAISS のためだけに CPU へ同期しない。
 
-Aggressive第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。
+- 有効条件: L2 / `nprobe=1` / 最大 list 長 ≤ 256。未対応 index は CPU FAISS へ自動 fallback
+- 特徴は FP16/BF16 で保持（158k×768 index で約 240MB 追加 VRAM）
+- 候補距離は feature norm 事前計算 + 内積から算出
+- `Normal` やファイル変換では構築しない
 
-Aggressive 20ms hopのSOLA合成末尾は`crossfade + search`です。同じArc B570の定常測定はp50 11.87ms、p95 14.51ms、p99 17.37ms、20ms deadline miss 0/60です。全SOLA出力は960 samplesで一致し、HuBERT/Synthesizer/IVF Graphのfallbackは0でした。これは実機のdeadline成立を示す値であり、OSやドライバーの単発スパイクまで保証するものではありません。
+#### ホットパスの現行実装
 
-Aggressiveのホットパス監査では、音声推論以外にも毎hopのXPU timing event、ThreadPool生成・破棄、GUI/GPUメモリtelemetry、未使用feature cache clone、SOLA境界ログが残っていました。診断を10 hopごと、GUI telemetryを10Hzへ間引き、SwiftF0 workerを永続化してHuBERTを推論threadから直接dispatchします。同一60-hop ablationではp50 12.51msから9.44ms、p95 15.98msから11.70ms、p99 16.45msから12.14msへ短縮し、20ms deadline missは0でした。音声tensor、Graph shape、SOLA出力長は変更していません。
+- XPU stage timing: 10 hop ごと（`STAGE_PROFILE_INTERVAL=10`。イベント非対応時も同サンプリング）
+- GUI / GPU メモリ telemetry: Aggressive は 5 hop ごと（20ms hop 時に約 10Hz）、Normal は毎 hop
+- 推論 p50/p95/p99 の再計算: 10 hop ごと（直近 256 hop の窓）
+- HuBERT は推論 thread から直接 dispatch、F0（SwiftF0 含む）のみ永続 `ThreadPoolExecutor(max_workers=1)` で並列
+- streaming TextEncoder は `all_frames_valid` 時に padding mask / 全1 attention mask を省略（attention 範囲は不変）
+- HuBERT / IVF の時間軸近似 cache は未採用。Aggressive でも HuBERT context 最大 560ms と TextEncoder global attention は維持
 
-さらに、既定5 framesのdecoder overlapはSOLA向け合成余白へ50msを追加していましたが、SOLAはその区間を参照せず、20ms hopごとに100ms分を合成していました。Aggressiveではdecoder overlapを0にして合成区間を50msへ半減し、出力の時間位置を約47ms前進させます。実音声比較では境界jump p95が0.0273から0.0237へ低下し、clipは0でした。Normalでは既定5 framesを維持します。
+### レイテンシ表示
 
-残る定常演算では、XPU IVFの候補距離が毎hopごとに`[frames, candidates, 768]`の差分・二乗tensorを作り、TextEncoderは全64 framesが有効でも全1のattention maskを各層へ適用していました。IVF feature normを事前計算して距離をnormと内積から求め、streaming TextEncoderではpadding maskの生成、masked fill、全1 mask乗算を省略します。いずれもcontext長やattention範囲を変えない同値変換です。同じ実音声60-hop測定はp50 10.38msから8.33ms、p95 13.50msから10.93ms、p99 14.98msから11.79msへ短縮し、20ms deadline missとGraph fallbackは0でした。
+- ライブ表示: `1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`
+- SOLA 分は合成余白（`crossfade + search`、Normal は + decoder overlap 5 frames）を計上。Aggressive 20ms では約 30ms
+- 通常の出力チャンクがリングに残っているだけの状態は、floor として二重計上しない（post-read の持続 floor のみ）
+- 推論表示は直近 256 hop の p95。ログは 100 hop ごとに `p50` / `p95` / `p99` / `deadline_miss`
 
-HuBERT/IVF結果を時間軸に沿って再利用する近似cacheも検証しましたが、HuBERTの双方向context更新により、8-hop再同期でも最終波形相関0.956、最悪hop相関0.20まで低下したため採用していません。Aggressiveでも560ms HuBERT contextとTextEncoderのglobal attentionは維持します。
+### 性能目安（Intel Arc B570）
 
-レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論8.3-11.8ms、定常guard 10ms、ASIO入出力約12msを使ったAggressive 20msのE2E目安は約80-84msです。
+モデル・ドライバ・OS・同時 GPU 負荷で変動する。単発スパイクの非発生を保証するものではない。
 
-ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Normalでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
+| 条件 | p50 | p95 | p99 | deadline miss | 備考 |
+|------|----:|----:|----:|--------------:|------|
+| Aggressive 20ms hop（定常） | 8.3ms | 10.9ms | 11.8ms | 0/60 | 本番同等 Graph、SOLA 余白込みの推論系 |
+| Aggressive 40ms hop | 14.5ms | 16.4ms | 18.8ms | 0/50 | SwiftF0、FAISS ratio 0.45 |
+| XPU IVF 検索単体（~158k list） | 0.62ms | — | — | — | L2 / nprobe=1 |
+| Synthesizer コア（Graph） | 4.5ms | — | — | — | eager 中央値は約 18.0ms |
+| Graph 定常のストリーミング推論全体 | ~18.6ms | — | — | — | 固定 shape RVC v2、条件により変動 |
 
-推論表示には直近256 hopのp95も表示します。ログの100 hopごとの`p50` / `p95` / `p99` / `deadline_miss`で、短いhopを継続的に処理できているか確認できます。
-
-**最適化済み** (2026-01-31):
-
-| F0方式 | チャンクサイズ | 処理時間 | プリバッファ | 総レイテンシ | RTF | 品質 |
-|--------|--------------|---------|------------|------------|-----|------|
-| **FCPE** (推奨) | **150ms** | **90ms** | **150ms** | **~385ms** | **0.56x** | ✅ 高品質 |
-| RMVPE | 250ms | 135ms | 250ms | ~530ms | 0.54x | ✅ 最高品質 |
-| F0なし | 100ms | 60ms | 100ms | ~260ms | 0.60x | ⚠️ ピッチシフト不可 |
-
-**品質検証済み**（バッチ vs ストリーミング比較）:
-- Correlation: ≥ 0.94
-- MAE: ≤ 0.02
-- Buffer underruns: 0（音切れなし）
-
-### 最適化の成果
-
-1. **FCPE NaN問題解消** - F0抽出のNaN値を自動的に0（無声）に置き換え
-2. **Buffer underrun完全解消** - prebuffer_chunks=1で安定動作
-3. **レイテンシ27%削減** - RMVPE 530ms → FCPE 385ms（-145ms）
-4. **品質維持** - FCPE（Correlation 0.945）≈ RMVPE（Correlation 0.948）
-5. **処理速度37%向上** - FCPEはRMVPEより高速（RTF 0.56x vs 0.54x）
-
-### Accelerator Graph実測
-
-Intel Arc B570、PyTorch `2.13.0+xpu`、固定shapeのRVC v2 Synthesizerでの測定値です。モデルやチャンク設定によって結果は変動します。
-
-| 経路 | eager中央値 | Graph中央値 | 削減率 |
-|------|------------:|------------:|-------:|
-| RVC Synthesizerコア | 18.0ms | 4.5ms | 約75% |
-
-Graph定常時のストリーミング推論全体は中央値約18.6msでした。`noise_scale=0` の決定論的条件ではeager出力とのRMSEと最大絶対誤差はいずれも0です。
+- Aggressive 20ms の E2E 目安: 推論 ~8–12ms + 定常 guard ~10ms + ASIO 入出力 ~12ms → **約 80–84ms**
+- Aggressive 40ms の E2E 目安（20ms 相当 guard + ASIO ~12ms を含む）: **約 90–100ms**
+- `noise_scale=0` の決定論的条件では、Synthesizer Graph と eager の RMSE / 最大絶対誤差は 0
+- バッチ vs ストリーミングの品質目安: Correlation ≥ 0.94、MAE ≤ 0.02
 
 ## Supported Models
 
@@ -463,30 +464,27 @@ Graph定常時のストリーミング推論全体は中央値約18.6msでした
 
 ## Configuration (pyproject.toml)
 
-PyTorch XPU 版は `[tool.uv]` セクションで設定:
+PyTorch XPU 版は `[tool.uv]` セクションで設定（現行 `pyproject.toml` と一致）:
 
 ```toml
 [tool.uv]
-# Windows限定 (triton-xpuはLinux専用)
+# Resolve only for Windows
 environments = ["sys_platform == 'win32'"]
 
-# triton-xpu依存を除外
+# triton-xpu is Linux-only, but pytorch-triton-xpu works on Windows
 override-dependencies = [
     "triton-xpu; sys_platform == 'linux'",
-    "pytorch-triton-xpu; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-xpu" }
-
-# TorchAudio 2.11 is installed from PyPI and supports future Torch releases.
+pytorch-triton-xpu = { index = "pytorch-xpu" }
 
 [[tool.uv.index]]
 name = "pytorch-xpu"
 url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 ```
-
 ## Testing
 
 ```powershell
@@ -520,7 +518,11 @@ ruff format rcwx
 ### XPU が認識されない
 
 ```powershell
-# PyTorch バージョン確認
+# ランチャーで環境チェックを再実行
+.\rcwx.ps1
+# メニュー 6) 環境チェック / 4) 診断
+
+# または手動確認
 uv run python -c "import torch; print(torch.__version__)"
 # → 2.13.0+xpu のように +xpu が付いていることを確認
 
@@ -532,7 +534,8 @@ uv sync
 ### uv run でパッケージが入れ替わる
 
 `uv run` は `uv.lock` に同期するため、手動インストールしたパッケージが上書きされることがあります。
-`pyproject.toml` で XPU インデックスを設定済みであれば `uv sync` で正しくインストールされます。
+`pyproject.toml` で XPU インデックスを設定済みであれば `uv sync`（または `.\rcwx.ps1`）で正しく入ります。
+ML デノイザを使う場合は `.\rcwx.ps1 -Denoise ...` かメニュー 9) で有効化し、extra 付き同期を維持してください。
 
 ## License
 
