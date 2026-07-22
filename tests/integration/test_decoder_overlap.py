@@ -26,10 +26,9 @@ def test_sola_extra_uses_one_search_window() -> None:
     assert extra == 1440
 
 
-def test_frontier_drops_decoder_overlap_tail() -> None:
-    assert _effective_decoder_overlap_frames("frontier", 5) == 0
-    assert _effective_decoder_overlap_frames("sub100", 5) == 5
-    assert _effective_decoder_overlap_frames("balanced", 5) == 5
+def test_aggressive_drops_decoder_overlap_tail() -> None:
+    assert _effective_decoder_overlap_frames("aggressive", 5) == 0
+    assert _effective_decoder_overlap_frames("normal", 5) == 5
 
 
 def test_decoder_overlap_increases_sola_extra():
@@ -111,7 +110,7 @@ def test_decoder_overlap_at_40k():
 
 
 if __name__ == "__main__":
-    test_frontier_drops_decoder_overlap_tail()
+    test_aggressive_drops_decoder_overlap_tail()
     test_decoder_overlap_default_is_5()
     test_decoder_overlap_increases_sola_extra()
     test_decoder_overlap_at_40k()

@@ -2407,7 +2407,7 @@ class RVCPipeline:
         f0_input = f0_source
         if f0_context_sec > 0:
             f0_ctx = int(round(f0_context_sec * 16000 / hubert_hop)) * hubert_hop
-            # SwiftF0 is local and supports the short Sub-100 window. The
+            # SwiftF0 is local and supports the short Aggressive window. The
             # neural GPU extractors retain the decoder-safe 560ms floor.
             min_f0_window = (
                 SWIFTF0_MIN_WINDOW_16K

@@ -86,13 +86,13 @@ def test_runtime_warmup_reaches_full_hubert_history() -> None:
     assert changer.pipeline.prepare_index_calls == 0
 
 
-def test_sub100_runtime_warmup_prepares_accelerator_index() -> None:
+def test_aggressive_40ms_warmup_prepares_accelerator_index() -> None:
     changer = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
     changer.config = SimpleNamespace(
         hubert_context_sec=0.56,
         f0_context_sec=0.10,
         f0_method="swiftf0",
-        latency_mode="sub100",
+        latency_mode="aggressive",
         index_rate=0.45,
     )
     changer._hop_samples_16k = 640
@@ -113,13 +113,13 @@ def test_sub100_runtime_warmup_prepares_accelerator_index() -> None:
     assert changer.pipeline.infer_calls == 2
 
 
-def test_frontier_runtime_warmup_fills_20ms_history() -> None:
+def test_aggressive_runtime_warmup_fills_20ms_history() -> None:
     changer = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
     changer.config = SimpleNamespace(
         hubert_context_sec=0.56,
         f0_context_sec=0.10,
         f0_method="swiftf0",
-        latency_mode="frontier",
+        latency_mode="aggressive",
         index_rate=0.45,
     )
     changer._hop_samples_16k = 320

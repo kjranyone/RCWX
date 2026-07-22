@@ -18,9 +18,9 @@ from rcwx.pipeline.realtime_unified import RealtimeStats, RealtimeVoiceChangerUn
 def _make_vc(
     hop_out: int,
     out_sr: int = 44100,
-    buffer_margin: float = 0.5,
+    buffer_margin: float = 0.25,
     prebuffer_chunks: int = 1,
-    latency_mode: str = "balanced",
+    latency_mode: str = "normal",
 ) -> RealtimeVoiceChangerUnified:
     """Create a minimal RealtimeVoiceChangerUnified instance for output-callback tests."""
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
@@ -59,102 +59,14 @@ def _prime_floor(vc: RealtimeVoiceChangerUnified, frames: int, floor: int) -> No
     vc._level_window_frames = frames
 
 
-def test_shed_threshold_above_standing_latency() -> None:
-    """Threshold must sit well above the natural standing floor (~prebuffer*hop).
-
-    With prebuffer=1 the ring conserves ~1 hop of standing latency, so the
-    steady-state floor is ~hop.  The threshold must exceed it (plus a margin)
-    or drift control would fire every callback and buzz.
-    """
-    hop_out = 4410  # chunk=0.1s @44100, matching the logged ASIO scenario
-
-    vc = _make_vc(hop_out=hop_out, prebuffer_chunks=1)
-    threshold, target = vc._compute_shed_threshold()
-    # Natural floor ≈ prebuffer_chunks*hop = 4410; threshold must be clearly above.
-    assert threshold > hop_out * 2, (
-        f"threshold {threshold} too close to standing floor {hop_out} (need >2x)"
-    )
-    # Skip target lands between the standing floor and the threshold.
-    assert hop_out < target < threshold
-
-    # Larger prebuffer raises both (more standing latency tolerated).
-    vc2 = _make_vc(hop_out=hop_out, prebuffer_chunks=2)
-    t2, _ = vc2._compute_shed_threshold()
-    assert t2 > threshold, "larger prebuffer must raise the shed threshold"
-
-    # Tighter margin lowers the threshold (less tolerance).
-    vc.config.buffer_margin = 0.3
-    t_tight, _ = vc._compute_shed_threshold()
-    assert t_tight < threshold, "tighter margin should lower threshold"
-
-
-def test_no_skip_in_steady_state_small_block() -> None:
-    """A 64-frame ASIO block with the floor at the natural level must NOT skip.
-
-    Reproduces the logged scenario (hop=4410, frames=64, floor≈4490) that
-    previously buzzed: the natural standing floor sits just above the old
-    threshold and fired a 1-sample compress every callback.
-    """
-    hop_out = 4410
-    frames = 64  # driver-preferred ASIO buffer size in the log
-
-    vc = _make_vc(hop_out=hop_out, prebuffer_chunks=1)
-    vc.output_buffer.add(np.zeros(hop_out * 2, dtype=np.float32))
-    _prime_floor(vc, frames, floor=hop_out + 80)  # natural standing + small wobble
-
-    out = vc._on_audio_output(frames)
-
-    assert len(out) == frames
-    assert vc.stats.buffer_trims == 0, "natural standing latency must not trigger a skip"
-
-
-def test_no_skip_in_steady_state_large_block() -> None:
-    """Steady state must also stay quiet for larger device blocks."""
-    cases = [
-        (18522, 4630),  # chunk=0.42s, blocksize≈hop/4
-        (15876, 3969),  # chunk=0.36s
-    ]
-    for hop_out, frames in cases:
-        vc = _make_vc(hop_out=hop_out, prebuffer_chunks=1)
-        vc.output_buffer.add(np.zeros(hop_out * 2, dtype=np.float32))
-        _prime_floor(vc, frames, floor=hop_out)  # natural standing floor
-
-        out = vc._on_audio_output(frames)
-
-        assert len(out) == frames
-        assert vc.stats.buffer_trims == 0, (
-            f"steady state trimmed: hop_out={hop_out}, frames={frames}"
-        )
-
-
-def test_skip_when_accumulated_above_threshold() -> None:
-    """Genuine accumulation (floor well above standing) must hard-skip."""
-    hop_out = 4410
-    frames = 64
-
-    vc = _make_vc(hop_out=hop_out, prebuffer_chunks=1)
-    backlog = hop_out * 5
-    vc.output_buffer.add(np.zeros(backlog, dtype=np.float32))
-    threshold, target = vc._compute_shed_threshold()
-    _prime_floor(vc, frames, floor=threshold + hop_out)  # one chunk of excess
-
-    available_before = vc.output_buffer.available
-    _ = vc._on_audio_output(frames)
-
-    assert vc.stats.buffer_trims == 1, "accumulation above threshold should skip once"
-    assert vc.output_buffer.available < available_before, "skip must discard samples"
-    # Window cleared after a skip so the post-skip level is re-measured.
-    assert len(vc._level_window) == 1  # one fresh post-read entry appended
-
-
-def test_aggressive_mode_sheds_one_hop_floor() -> None:
-    """Aggressive mode treats a persistent one-hop floor as removable lag."""
+def test_normal_mode_sheds_one_hop_floor() -> None:
+    """Normal treats a persistent one-hop floor as removable lag."""
     hop_out = 4410
     frames = 64
     vc = _make_vc(
         hop_out=hop_out,
         buffer_margin=0.25,
-        latency_mode="aggressive",
+        latency_mode="normal",
     )
     threshold, target = vc._compute_shed_threshold()
 
@@ -170,86 +82,23 @@ def test_aggressive_mode_sheds_one_hop_floor() -> None:
     assert vc._buffer_floor_samples == target
 
 
-def test_aggressive_mode_caps_non_asio_callback_at_10ms() -> None:
+def test_normal_mode_caps_non_asio_callback_at_10ms() -> None:
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
-    vc.config = SimpleNamespace(chunk_sec=0.1, latency_mode="aggressive")
+    vc.config = SimpleNamespace(chunk_sec=0.1, latency_mode="normal")
     assert vc._audio_callback_sec() == 0.010
 
-    vc.config.latency_mode = "balanced"
-    assert vc._audio_callback_sec() == 0.025
+    vc.config.latency_mode = "aggressive"
+    assert vc._audio_callback_sec() == 0.0025
 
 
-def test_sub100_mode_uses_five_ms_callback_and_jitter_guard() -> None:
-    hop_out = 1920
-    vc = _make_vc(
-        hop_out=hop_out,
-        out_sr=48000,
-        buffer_margin=0.1,
-        latency_mode="sub100",
-    )
-    vc.config.chunk_sec = 0.04
-
-    assert vc._audio_callback_sec() == 0.005
-    assert vc._compute_shed_threshold() == (hop_out * 5 // 4, hop_out)
-    assert vc.stats.jitter_guard_ms == 40.0
-
-    vc._inference_times = deque([16.0] * 20, maxlen=256)
-    vc.stats.inference_p50_ms = 16.0
-    vc.stats.inference_p99_ms = 30.0
-    assert vc._compute_shed_threshold() == (hop_out * 5 // 8, hop_out // 2)
-    assert vc.stats.jitter_guard_ms == 20.0
-
-    vc.stats.inference_p99_ms = 45.0
-    threshold, target = vc._compute_shed_threshold()
-    assert threshold == 1872
-    assert target == 1632
-    assert vc.stats.jitter_guard_ms == 34.0
-
-    vc._prebuffer_chunks = 1
-    vc.config.prebuffer_chunks = 1
-    vc.set_latency_mode("sub100")
-    assert vc._prebuffer_chunks == 2
-    assert vc.config.prebuffer_chunks == 2
-
-
-def test_sub100_underrun_rearms_two_hop_prebuffer() -> None:
-    hop_out = 1920
-    frames = 480
-    vc = _make_vc(
-        hop_out=hop_out,
-        out_sr=48000,
-        prebuffer_chunks=2,
-        latency_mode="sub100",
-    )
-
-    first = vc._on_audio_output(frames)
-    assert np.count_nonzero(first) == 0
-    assert vc.stats.buffer_underruns == 1
-    assert vc._output_started is False
-    assert vc._chunks_ready == 0
-
-    vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
-    waiting = vc._on_audio_output(frames)
-    assert np.count_nonzero(waiting) == 0
-    assert vc._output_started is False
-    assert vc._chunks_ready == 1
-
-    vc._output_queue.put_nowait(np.ones(hop_out, dtype=np.float32))
-    recovered = vc._on_audio_output(frames)
-    assert np.count_nonzero(recovered) == frames
-    assert vc._output_started is True
-    assert vc._chunks_ready == 2
-    assert vc.stats.buffer_underruns == 1
-
-
-def test_frontier_mode_uses_20ms_deadline_policy() -> None:
+def test_aggressive_mode_uses_20ms_deadline_policy() -> None:
     hop_out = 960
     vc = _make_vc(
         hop_out=hop_out,
         out_sr=48000,
         buffer_margin=0.1,
         prebuffer_chunks=3,
-        latency_mode="frontier",
+        latency_mode="aggressive",
     )
     vc.config.chunk_sec = 0.02
 
@@ -265,19 +114,19 @@ def test_frontier_mode_uses_20ms_deadline_policy() -> None:
 
     vc._prebuffer_chunks = 1
     vc.config.prebuffer_chunks = 1
-    vc.set_latency_mode("frontier")
+    vc.set_latency_mode("aggressive")
     assert vc._prebuffer_chunks == 3
     assert vc.config.prebuffer_chunks == 3
 
 
-def test_frontier_underrun_rearms_three_hop_prebuffer() -> None:
+def test_aggressive_underrun_rearms_three_hop_prebuffer() -> None:
     hop_out = 960
     frames = 120
     vc = _make_vc(
         hop_out=hop_out,
         out_sr=48000,
         prebuffer_chunks=3,
-        latency_mode="frontier",
+        latency_mode="aggressive",
     )
 
     first = vc._on_audio_output(frames)
@@ -302,7 +151,7 @@ def test_frontier_underrun_rearms_three_hop_prebuffer() -> None:
 
 def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
     hop_out = 4800
-    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="aggressive")
+    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="normal")
     vc.config.chunk_sec = 0.1
     vc.config.crossfade_sec = 0.01
     vc.config.use_sola = True
@@ -320,9 +169,9 @@ def test_latency_estimate_uses_persistent_floor_not_ring_sawtooth() -> None:
     assert vc.stats.latency_ms == 170.0
 
 
-def test_frontier_latency_counts_full_sola_prefix() -> None:
+def test_aggressive_latency_counts_full_sola_prefix() -> None:
     hop_out = 960
-    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="frontier")
+    vc = _make_vc(hop_out=hop_out, out_sr=48000, latency_mode="aggressive")
     vc.config.chunk_sec = 0.02
     vc.config.crossfade_sec = 0.01
     vc.config.use_sola = True
@@ -339,16 +188,10 @@ def test_frontier_latency_counts_full_sola_prefix() -> None:
 
 
 if __name__ == "__main__":
-    test_shed_threshold_above_standing_latency()
-    test_no_skip_in_steady_state_small_block()
-    test_no_skip_in_steady_state_large_block()
-    test_skip_when_accumulated_above_threshold()
-    test_aggressive_mode_sheds_one_hop_floor()
-    test_aggressive_mode_caps_non_asio_callback_at_10ms()
-    test_sub100_mode_uses_five_ms_callback_and_jitter_guard()
-    test_sub100_underrun_rearms_two_hop_prebuffer()
-    test_frontier_mode_uses_20ms_deadline_policy()
-    test_frontier_underrun_rearms_three_hop_prebuffer()
+    test_normal_mode_sheds_one_hop_floor()
+    test_normal_mode_caps_non_asio_callback_at_10ms()
+    test_aggressive_mode_uses_20ms_deadline_policy()
+    test_aggressive_underrun_rearms_three_hop_prebuffer()
     test_latency_estimate_uses_persistent_floor_not_ring_sawtooth()
-    test_frontier_latency_counts_full_sola_prefix()
+    test_aggressive_latency_counts_full_sola_prefix()
     print("PASS: realtime drift-control tests")

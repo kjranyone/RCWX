@@ -1025,9 +1025,9 @@ class RCWXApp(ctk.CTk):
         mode = self.config.audio.latency_mode
         if hasattr(self, "latency_settings"):
             mode = self.latency_settings.latency_mode
-        if mode in {"sub100", "frontier"}:
+        if mode == "aggressive":
             self.denoise_status.configure(
-                text=f"ML Denoiser: {mode} ではバイパス",
+                text="ML Denoiser: Aggressive ではバイパス",
                 text_color="gray",
             )
         elif is_ml_denoiser_available():

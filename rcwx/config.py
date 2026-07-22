@@ -118,9 +118,10 @@ class AudioConfig:
     # Output channel selection: "auto" (first 2ch), "0,1", "2,3", etc.
     output_channel_selection: str = "auto"
     # Latency settings
-    latency_mode: str = "balanced"  # balanced / aggressive / sub100 / frontier
+    latency_mode: str = "normal"  # normal / aggressive
+    latency_profile_version: int = 2
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
-    buffer_margin: float = 0.5  # Buffer margin multiplier (0.3=tight, 0.5=balanced, 1.0=relaxed)
+    buffer_margin: float = 0.25  # Buffer margin multiplier
     # ASIO buffer size in frames (0 = follow the driver control panel /
     # preferredSize; snapped to the driver's min/max/granularity when set)
     asio_buffer_size: int = 0
@@ -133,8 +134,9 @@ class AudioConfig:
         self.output_channel_selection = normalize_output_channel_selection(
             self.output_channel_selection
         )
-        if self.latency_mode not in {"balanced", "aggressive", "sub100", "frontier"}:
-            self.latency_mode = "balanced"
+        if self.latency_mode not in {"normal", "aggressive"}:
+            self.latency_mode = "normal"
+        self.latency_profile_version = 2
 
 
 @dataclass
@@ -272,6 +274,20 @@ class RCWXConfig:
 
         audio_data = data.pop("audio", {})
         inference_data = data.pop("inference", {})
+
+        # Latency profile v2 removes Balanced/Sub-100 and renames the two
+        # retained policies. Removed profiles migrate to the safer Normal
+        # policy; only the former Frontier policy becomes new Aggressive.
+        try:
+            latency_profile_version = int(audio_data.get("latency_profile_version", 1))
+        except (TypeError, ValueError):
+            latency_profile_version = 1
+        if latency_profile_version < 2:
+            legacy_mode = audio_data.get("latency_mode", "balanced")
+            audio_data["latency_mode"] = (
+                "aggressive" if legacy_mode == "frontier" else "normal"
+            )
+            audio_data["latency_profile_version"] = 2
 
         # Nested configs are constructed separately; pop them so they are not
         # passed twice into InferenceConfig below.

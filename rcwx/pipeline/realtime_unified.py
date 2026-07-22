@@ -33,8 +33,8 @@ from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 
 logger = logging.getLogger(__name__)
 
-LATENCY_MODES = {"balanced", "aggressive", "sub100", "frontier"}
-DEADLINE_MODES = {"sub100", "frontier"}
+LATENCY_MODES = {"normal", "aggressive"}
+DEADLINE_MODES = {"aggressive"}
 
 
 def _compute_sola_extra_model(
@@ -63,8 +63,8 @@ def _effective_decoder_overlap_frames(
     latency_mode: str,
     configured_frames: int,
 ) -> int:
-    """Drop the unused decoder margin in the 20ms Frontier path."""
-    if latency_mode == "frontier":
+    """Drop the unused decoder margin in the 20ms Aggressive path."""
+    if latency_mode == "aggressive":
         return 0
     return max(0, int(configured_frames))
 
@@ -220,14 +220,14 @@ class RealtimeConfig:
 
     # Core parameters
     chunk_sec: float = 0.15
-    latency_mode: str = "balanced"
+    latency_mode: str = "normal"
     overlap_sec: float = 0.10  # audio-level overlap for HuBERT continuity
-    crossfade_sec: float = 0.05
+    crossfade_sec: float = 0.02
     # SOLA search window (ms): one period of the lowest expected output F0
     # (70Hz -> 14.3ms) + margin, so the splice can always phase-align.
     sola_search_ms: float = 15.0
     prebuffer_chunks: int = 1
-    buffer_margin: float = 0.5
+    buffer_margin: float = 0.25
 
     # Pitch / F0
     pitch_shift: int = 0
@@ -297,19 +297,19 @@ class RealtimeConfig:
 
     def __post_init__(self) -> None:
         if self.latency_mode not in LATENCY_MODES:
-            object.__setattr__(self, "latency_mode", "balanced")
+            object.__setattr__(self, "latency_mode", "normal")
         object.__setattr__(
             self,
             "denoise_strength",
             max(0.5, min(2.0, float(self.denoise_strength))),
         )
-        minimum_prebuffer = 3 if self.latency_mode == "frontier" else 2
+        minimum_prebuffer = 3
         if self.latency_mode in DEADLINE_MODES and self.prebuffer_chunks < minimum_prebuffer:
             object.__setattr__(self, "prebuffer_chunks", minimum_prebuffer)
         # Round chunk_sec to HuBERT frame boundary (20ms)
         frame_ms = 20
         chunk_ms = self.chunk_sec * 1000
-        minimum_chunk_ms = 20 if self.latency_mode == "frontier" else 40
+        minimum_chunk_ms = 20 if self.latency_mode == "aggressive" else 40
         rounded_ms = max(
             minimum_chunk_ms,
             min(600, round(chunk_ms / frame_ms) * frame_ms),
@@ -526,9 +526,8 @@ class RealtimeVoiceChangerUnified:
     def _compute_shed_threshold(self) -> tuple[int, int]:
         """Return (shed_threshold, shed_target) for the post-read floor.
 
-        Balanced preserves the natural prebuffer standing floor and only
-        sheds genuine accumulation above it. Aggressive uses the same two-hop
-        floor filter but bounds persistent lag to a fraction of one hop.
+        Normal bounds persistent lag to a fraction of one hop. Aggressive
+        uses an adaptive deadline guard derived from observed jitter.
 
         Instantaneous buffer level is intentionally ignored: it includes the
         current hop's normal burst/drain sawtooth and trimming against that
@@ -538,7 +537,7 @@ class RealtimeVoiceChangerUnified:
             (shed_threshold, shed_target): floor limit and post-trim target.
         """
         margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
-        if getattr(self.config, "latency_mode", "balanced") in DEADLINE_MODES:
+        if getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES:
             samples = getattr(self, "_inference_times", ())
             if len(samples) < 20:
                 # Preserve the initial one-hop standing floor until enough
@@ -566,38 +565,25 @@ class RealtimeVoiceChangerUnified:
             )
             self.stats.jitter_guard_ms = shed_target * 1000.0 / self._runtime_output_sample_rate
             return max(1, shed_threshold), max(0, shed_target)
-        if getattr(self.config, "latency_mode", "balanced") == "aggressive":
-            # The two-hop floor window filters the normal burst/drain sawtooth.
-            # Any floor above this bound is persistent queued audio, so shed it
-            # to a small cushion instead of preserving a full-hop standing lag.
-            shed_threshold = int((0.5 + margin) * self._hop_samples_out)
-            shed_target = self._hop_samples_out // 4
-            return max(1, shed_threshold), max(0, shed_target)
-
-        standing = self._prebuffer_chunks * self._hop_samples_out
-        # Tolerance: a full chunk of wobble headroom plus margin scaling
-        # (margin 0.5 → ~1.5 chunks above standing; tighter/looser below/above).
-        tol = int((1.0 + margin) * self._hop_samples_out)
-        shed_threshold = standing + tol
-        # Land back near the natural floor + a small cushion so post-skip
-        # wobble doesn't immediately re-trigger a skip.
-        shed_target = standing + self._hop_samples_out // 2
-        return shed_threshold, shed_target
+        # The two-hop floor window filters the normal burst/drain sawtooth.
+        # Any floor above this bound is persistent queued audio, so Normal
+        # sheds it to a small cushion instead of preserving one full hop.
+        shed_threshold = int((0.5 + margin) * self._hop_samples_out)
+        shed_target = self._hop_samples_out // 4
+        return max(1, shed_threshold), max(0, shed_target)
 
     def _audio_callback_sec(self) -> float:
         """Return the requested callback duration for non-ASIO streams."""
         callback_sec = self.config.chunk_sec / 4
-        if self.config.latency_mode == "frontier":
+        if self.config.latency_mode == "aggressive":
             callback_sec = min(callback_sec, 0.0025)
-        elif self.config.latency_mode == "sub100":
-            callback_sec = min(callback_sec, 0.005)
-        elif self.config.latency_mode == "aggressive":
+        elif self.config.latency_mode == "normal":
             callback_sec = min(callback_sec, 0.010)
         return callback_sec
 
     def _should_publish_stats(self) -> bool:
         """Limit UI and device telemetry work on the 20ms hot path."""
-        interval = 5 if self.config.latency_mode == "frontier" else 1
+        interval = 5 if self.config.latency_mode == "aggressive" else 1
         return self.stats.frames_processed <= 1 or self.stats.frames_processed % interval == 0
 
     def _update_latency_estimate(self, inference_ms: float) -> None:
@@ -1014,7 +1000,7 @@ class RealtimeVoiceChangerUnified:
 
     def set_chunk_sec(self, chunk_sec: float) -> None:
         old = self.config.chunk_sec
-        minimum = 0.02 if self.config.latency_mode == "frontier" else 0.04
+        minimum = 0.02 if self.config.latency_mode == "aggressive" else 0.04
         self.config.chunk_sec = max(minimum, min(0.6, chunk_sec))
         if self._running:
             logger.info(f"Chunk size changed ({old}s -> {self.config.chunk_sec}s), restarting...")
@@ -1022,19 +1008,13 @@ class RealtimeVoiceChangerUnified:
             self.start()
 
     def set_prebuffer_chunks(self, chunks: int) -> None:
-        minimum = (
-            3
-            if self.config.latency_mode == "frontier"
-            else 2
-            if self.config.latency_mode == "sub100"
-            else 0
-        )
+        minimum = 3 if self.config.latency_mode == "aggressive" else 0
         self.config.prebuffer_chunks = max(minimum, min(3, int(chunks)))
         self._prebuffer_chunks = self.config.prebuffer_chunks
 
     def set_latency_mode(self, mode: str) -> None:
-        self.config.latency_mode = mode if mode in LATENCY_MODES else "balanced"
-        minimum = 3 if self.config.latency_mode == "frontier" else 2
+        self.config.latency_mode = mode if mode in LATENCY_MODES else "normal"
+        minimum = 3
         if self.config.latency_mode in DEADLINE_MODES and self._prebuffer_chunks < minimum:
             self.config.prebuffer_chunks = minimum
             self._prebuffer_chunks = minimum
@@ -1127,8 +1107,8 @@ class RealtimeVoiceChangerUnified:
         # level — the burst/drain oscillation and device blocksize phase
         # beats don't lift the floor, so they can't trigger false skips.
         #
-        # Balanced preserves the prebuffer standing floor. Aggressive applies
-        # its lower fractional-hop bound through _compute_shed_threshold().
+        # Normal applies its lower fractional-hop bound through
+        # _compute_shed_threshold().
         #
         # Shedding is done exclusively via hard-skip (one splice + fade-in),
         # NEVER per-callback time-compression: with small device blocks
@@ -1191,7 +1171,7 @@ class RealtimeVoiceChangerUnified:
                     frames,
                     self.output_buffer.available,
                 )
-            if getattr(self.config, "latency_mode", "balanced") in DEADLINE_MODES:
+            if getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES:
                 # Once a zero-padded read has consumed the jitter guard, the
                 # producer and consumer continue at the same average rate and
                 # cannot rebuild it on their own. Pause playback until two
@@ -1714,7 +1694,7 @@ class RealtimeVoiceChangerUnified:
             )
             warmup_passes = 0
             if (
-                getattr(self.config, "latency_mode", "balanced") in DEADLINE_MODES
+                getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES
                 and getattr(self.config, "index_rate", 0.0) > 0
             ):
                 self.pipeline.prepare_accelerator_index()
@@ -1777,7 +1757,7 @@ class RealtimeVoiceChangerUnified:
         """Return runtime contexts without mutating the saved quality profile."""
         hubert_context = float(getattr(self.config, "hubert_context_sec", 1.0))
         f0_context = float(getattr(self.config, "f0_context_sec", 0.32))
-        if getattr(self.config, "latency_mode", "balanced") in DEADLINE_MODES:
+        if getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES:
             hubert_context = min(hubert_context, 0.56)
             if getattr(self.config, "f0_method", "rmvpe") == "swiftf0":
                 f0_context = min(f0_context, 0.10)
@@ -1785,7 +1765,7 @@ class RealtimeVoiceChangerUnified:
 
     def _uses_device_output_resample(self) -> bool:
         """Keep the deadline-mode output path on the accelerator."""
-        if getattr(self.config, "latency_mode", "balanced") not in DEADLINE_MODES:
+        if getattr(self.config, "latency_mode", "normal") not in DEADLINE_MODES:
             return False
         device = str(getattr(self.pipeline, "device", "cpu"))
         return "xpu" in device or "cuda" in device
@@ -1829,7 +1809,7 @@ class RealtimeVoiceChangerUnified:
                 self._runtime_output_sample_rate if self._uses_device_output_resample() else 0
             ),
             prime_hubert_history=(
-                getattr(cfg, "latency_mode", "balanced") in DEADLINE_MODES
+                getattr(cfg, "latency_mode", "normal") in DEADLINE_MODES
             ),
         )
 

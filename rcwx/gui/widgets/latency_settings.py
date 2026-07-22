@@ -8,9 +8,9 @@ from typing import Callable, Optional
 import customtkinter as ctk
 
 
-def _minimum_chunk_ms(f0_method: str, latency_mode: str = "sub100") -> int:
+def _minimum_chunk_ms(f0_method: str, latency_mode: str = "normal") -> int:
     """Return the supported micro-hop floor for an F0 backend."""
-    if latency_mode == "frontier" and f0_method in {"swiftf0", "none"}:
+    if latency_mode == "aggressive" and f0_method in {"swiftf0", "none"}:
         return 20
     return {"rmvpe": 320, "fcpe": 100}.get(f0_method, 40)
 
@@ -21,12 +21,12 @@ def _chunk_slider_spec(
 ) -> tuple[int, int, int]:
     """Return the effective slider minimum, maximum, and step in ms."""
     minimum = _minimum_chunk_ms(f0_method, latency_mode)
-    if latency_mode == "frontier" and f0_method in {"swiftf0", "none"}:
+    if latency_mode == "aggressive" and f0_method in {"swiftf0", "none"}:
         return minimum, 100, 20
     return minimum, 600, 20
 
 
-def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
+def _auto_params(chunk_sec: float, latency_mode: str = "normal") -> dict:
     """Derive latency parameters automatically from chunk_sec.
 
     Returns dict with overlap_sec, crossfade_sec, sola_search_ms,
@@ -37,15 +37,10 @@ def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
     overlap_ms = max(60, min(300, chunk_sec * 1000))
     overlap_ms = round(overlap_ms / 20) * 20
 
-    aggressive = latency_mode in {"aggressive", "sub100", "frontier"}
-    sub100 = latency_mode == "sub100"
-    frontier = latency_mode == "frontier"
+    aggressive = latency_mode == "aggressive"
 
-    # Aggressive keeps enough overlap for a short SOLA splice while avoiding
-    # the 50-80ms hold-back used by larger balanced chunks.
-    crossfade_ratio = 0.10 if aggressive else 0.25
-    crossfade_max_ms = 20 if aggressive else 80
-    crossfade_ms = min(crossfade_max_ms, chunk_sec * 1000 * crossfade_ratio)
+    # Both retained policies use the former low-latency SOLA splice.
+    crossfade_ms = min(20, chunk_sec * 1000 * 0.10)
     crossfade_ms = round(crossfade_ms / 10) * 10
     crossfade_ms = max(10, crossfade_ms)
 
@@ -58,17 +53,9 @@ def _auto_params(chunk_sec: float, latency_mode: str = "balanced") -> dict:
         "overlap_sec": overlap_ms / 1000,
         "crossfade_sec": crossfade_ms / 1000,
         "sola_search_ms": sola_search_ms,
-        "latency_mode": (
-            "frontier"
-            if frontier
-            else "sub100"
-            if sub100
-            else "aggressive"
-            if aggressive
-            else "balanced"
-        ),
-        "prebuffer_chunks": 3 if frontier else 2 if sub100 else 1,
-        "buffer_margin": 0.1 if frontier or sub100 else 0.25 if aggressive else 0.5,
+        "latency_mode": "aggressive" if aggressive else "normal",
+        "prebuffer_chunks": 3 if aggressive else 1,
+        "buffer_margin": 0.1 if aggressive else 0.25,
         "use_sola": True,
     }
 
@@ -95,7 +82,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
         # Default chunk size
         self.chunk_sec = max(0.16, _minimum_chunk_ms(f0_method) / 1000)
-        self.latency_mode = "balanced"
+        self.latency_mode = "normal"
 
         self._setup_ui()
 
@@ -128,11 +115,11 @@ class LatencySettingsFrame(ctk.CTkFrame):
         ).grid(row=0, column=0, padx=(0, 10), sticky="w")
         self.mode_control = ctk.CTkSegmentedButton(
             mode_frame,
-            values=["Balanced", "Aggressive", "Sub-100", "Frontier"],
+            values=["Normal", "Aggressive"],
             command=self._on_mode_change,
-            width=300,
+            width=240,
         )
-        self.mode_control.set("Balanced")
+        self.mode_control.set("Normal")
         self.mode_control.grid(row=0, column=1, sticky="e")
         mode_frame.grid_columnconfigure(1, weight=1)
 
@@ -245,13 +232,16 @@ class LatencySettingsFrame(ctk.CTkFrame):
 
     def _on_mode_change(self, value: str) -> None:
         """Switch between the stable and low-buffer latency policies."""
-        self.latency_mode = "sub100" if value == "Sub-100" else value.lower()
-        min_ms, _, _ = self._configure_chunk_slider()
-        if self.latency_mode in {"sub100", "frontier"}:
-            target_ms = min_ms
-            self.chunk_sec = target_ms / 1000
-            self.chunk_slider.set(target_ms)
-            self.chunk_value.configure(text=f"{target_ms}ms")
+        self.latency_mode = value.lower()
+        min_ms, max_ms, _ = self._configure_chunk_slider()
+        current_ms = self._round_to_frame_boundary(self.chunk_sec * 1000)
+        target_ms = min_ms if self.latency_mode == "aggressive" else min(
+            max_ms,
+            max(min_ms, current_ms),
+        )
+        self.chunk_sec = target_ms / 1000
+        self.chunk_slider.set(target_ms)
+        self.chunk_value.configure(text=f"{target_ms}ms")
         self._update_auto_labels()
         self._update_estimate()
         self._notify_change()
@@ -302,21 +292,15 @@ class LatencySettingsFrame(ctk.CTkFrame):
         - SOLA hold-back: crossfade_sec
         """
         auto = _auto_params(self.chunk_sec, self.latency_mode)
-        if self.latency_mode == "frontier":
+        if self.latency_mode == "aggressive":
             inference_est = 15
             buffer_est = self.chunk_sec * 500
-        elif self.latency_mode == "sub100":
-            inference_est = 20
-            buffer_est = self.chunk_sec * 500
-        elif self.latency_mode == "aggressive":
+        else:
             inference_est = 35
             buffer_est = self.chunk_sec * 250
-        else:
-            inference_est = 50
-            buffer_est = self.chunk_sec * 1000
         sola_est = auto["crossfade_sec"] * 1000
-        if self.latency_mode == "frontier":
-            # Frontier retains crossfade+search, rounded to a 10ms model frame.
+        if self.latency_mode == "aggressive":
+            # Aggressive retains crossfade+search, rounded to a 10ms model frame.
             sola_est = math.ceil(
                 (sola_est + auto["sola_search_ms"]) / 10
             ) * 10
@@ -349,7 +333,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
     def set_values(
         self,
         chunk_sec: float,
-        latency_mode: str = "balanced",
+        latency_mode: str = "normal",
         f0_method: Optional[str] = None,
     ) -> None:
         """Restore chunk_sec from saved settings.
@@ -360,8 +344,8 @@ class LatencySettingsFrame(ctk.CTkFrame):
             self.f0_method = f0_method
         self.latency_mode = (
             latency_mode
-            if latency_mode in {"balanced", "aggressive", "sub100", "frontier"}
-            else "balanced"
+            if latency_mode in {"normal", "aggressive"}
+            else "normal"
         )
         min_ms, max_ms, _ = self._configure_chunk_slider()
         rounded_ms = max(
@@ -373,9 +357,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         # Update slider
         self.chunk_slider.set(rounded_ms)
         self.chunk_value.configure(text=f"{rounded_ms}ms")
-        self.mode_control.set(
-            "Sub-100" if self.latency_mode == "sub100" else self.latency_mode.title()
-        )
+        self.mode_control.set(self.latency_mode.title())
 
         # Update auto labels and estimate
         self._update_auto_labels()

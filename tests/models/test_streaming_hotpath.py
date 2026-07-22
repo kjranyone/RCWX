@@ -23,40 +23,39 @@ def test_f0_backend_micro_hop_floors() -> None:
     assert _minimum_chunk_ms("none") == 40
     assert _minimum_chunk_ms("fcpe") == 100
     assert _minimum_chunk_ms("rmvpe") == 320
-    assert _minimum_chunk_ms("swiftf0", "frontier") == 20
-    assert _minimum_chunk_ms("none", "frontier") == 20
-    assert _minimum_chunk_ms("fcpe", "frontier") == 100
+    assert _minimum_chunk_ms("swiftf0", "aggressive") == 20
+    assert _minimum_chunk_ms("none", "aggressive") == 20
+    assert _minimum_chunk_ms("fcpe", "aggressive") == 100
 
     assert RealtimeConfig(chunk_sec=0.01, f0_method="swiftf0").chunk_sec == 0.04
     assert RealtimeConfig(chunk_sec=0.04, f0_method="fcpe").chunk_sec == 0.10
     assert RealtimeConfig(chunk_sec=0.04, f0_method="rmvpe").chunk_sec == 0.32
-    assert RealtimeConfig(latency_mode="sub100", prebuffer_chunks=1).prebuffer_chunks == 2
-    frontier_cfg = RealtimeConfig(
-        latency_mode="frontier",
+    aggressive_cfg = RealtimeConfig(
+        latency_mode="aggressive",
         chunk_sec=0.01,
         f0_method="swiftf0",
         prebuffer_chunks=1,
     )
-    assert frontier_cfg.chunk_sec == 0.02
-    assert frontier_cfg.prebuffer_chunks == 3
+    assert aggressive_cfg.chunk_sec == 0.02
+    assert aggressive_cfg.prebuffer_chunks == 3
 
-    sub100 = _auto_params(0.04, "sub100")
-    assert sub100["crossfade_sec"] == 0.01
-    assert sub100["buffer_margin"] == 0.1
-    assert sub100["latency_mode"] == "sub100"
-    assert sub100["prebuffer_chunks"] == 2
+    normal = _auto_params(0.04, "normal")
+    assert normal["crossfade_sec"] == 0.01
+    assert normal["buffer_margin"] == 0.25
+    assert normal["latency_mode"] == "normal"
+    assert normal["prebuffer_chunks"] == 1
 
-    frontier = _auto_params(0.02, "frontier")
-    assert frontier["crossfade_sec"] == 0.01
-    assert frontier["latency_mode"] == "frontier"
-    assert frontier["prebuffer_chunks"] == 3
+    aggressive = _auto_params(0.02, "aggressive")
+    assert aggressive["crossfade_sec"] == 0.01
+    assert aggressive["latency_mode"] == "aggressive"
+    assert aggressive["prebuffer_chunks"] == 3
 
 
-def test_frontier_slider_uses_compact_effective_range() -> None:
-    assert _chunk_slider_spec("swiftf0", "frontier") == (20, 100, 20)
-    assert _chunk_slider_spec("none", "frontier") == (20, 100, 20)
-    assert _chunk_slider_spec("fcpe", "frontier") == (100, 600, 20)
-    assert _chunk_slider_spec("swiftf0", "balanced") == (40, 600, 20)
+def test_aggressive_slider_uses_compact_effective_range() -> None:
+    assert _chunk_slider_spec("swiftf0", "aggressive") == (20, 100, 20)
+    assert _chunk_slider_spec("none", "aggressive") == (20, 100, 20)
+    assert _chunk_slider_spec("fcpe", "aggressive") == (100, 600, 20)
+    assert _chunk_slider_spec("swiftf0", "normal") == (40, 600, 20)
 
 
 def test_deadline_statistics_track_micro_hop_tail() -> None:
@@ -78,7 +77,7 @@ def test_deadline_statistics_track_micro_hop_tail() -> None:
 def test_deadline_modes_use_short_context_and_device_output_resample() -> None:
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
     vc.config = SimpleNamespace(
-        latency_mode="sub100",
+        latency_mode="aggressive",
         f0_method="swiftf0",
         hubert_context_sec=1.0,
         f0_context_sec=0.32,
@@ -88,11 +87,7 @@ def test_deadline_modes_use_short_context_and_device_output_resample() -> None:
     assert vc._effective_streaming_contexts() == (0.56, 0.10)
     assert vc._uses_device_output_resample() is True
 
-    vc.config.latency_mode = "frontier"
-    assert vc._effective_streaming_contexts() == (0.56, 0.10)
-    assert vc._uses_device_output_resample() is True
-
-    vc.config.latency_mode = "aggressive"
+    vc.config.latency_mode = "normal"
     assert vc._effective_streaming_contexts() == (1.0, 0.32)
     assert vc._uses_device_output_resample() is False
 
@@ -109,10 +104,10 @@ def test_deadline_history_priming_reaches_fixed_shape_immediately() -> None:
     assert np.array_equal(normal, audio)
 
 
-def test_frontier_streaming_params_enable_history_priming() -> None:
+def test_aggressive_streaming_params_enable_history_priming() -> None:
     vc = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
     vc.config = RealtimeConfig(
-        latency_mode="frontier",
+        latency_mode="aggressive",
         chunk_sec=0.02,
         f0_method="swiftf0",
     )

@@ -37,9 +37,9 @@ def test_parallel_extraction_executor_is_reused_and_released() -> None:
     assert pipeline._parallel_executor is None
 
 
-def test_frontier_publishes_telemetry_at_10hz() -> None:
+def test_aggressive_publishes_telemetry_at_10hz() -> None:
     changer = RealtimeVoiceChangerUnified.__new__(RealtimeVoiceChangerUnified)
-    changer.config = SimpleNamespace(latency_mode="frontier")
+    changer.config = SimpleNamespace(latency_mode="aggressive")
     changer.stats = SimpleNamespace(frames_processed=1)
 
     assert changer._should_publish_stats() is True
@@ -48,6 +48,6 @@ def test_frontier_publishes_telemetry_at_10hz() -> None:
     changer.stats.frames_processed = 5
     assert changer._should_publish_stats() is True
 
-    changer.config.latency_mode = "sub100"
+    changer.config.latency_mode = "normal"
     changer.stats.frames_processed = 2
     assert changer._should_publish_stats() is True

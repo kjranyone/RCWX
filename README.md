@@ -231,7 +231,7 @@ uv run rcwx info model.pth
 - **Spectral方式**: 周波数スペクトルの閾値処理による従来型ノイズ除去（標準同梱）
 - **除去強度**: `0.50x-2.00x`。`1.00x`が従来動作で、MLは`1.00x`超で2回目のDNS64出力へ連続的に混合します。環境音が大きい場合は`1.25x`から上げ、声の欠けや金属音が出る手前で止めてください。Spectralでは閾値と減衰量を同時に深くします。
 
-MLの2段処理は計算量も増えます。`Sub-100` / `Frontier`ではdeadlineを守るためDenoiserを実行中だけバイパスするため、強いノイズ除去を使う場合は`Aggressive`または`Balanced`を選択します。
+MLの2段処理は計算量も増えます。`Aggressive`ではdeadlineを守るためDenoiserを実行中だけバイパスするため、強いノイズ除去を使う場合は`Normal`を選択します。
 
 ## Inference Settings
 
@@ -384,42 +384,42 @@ rcwx/
 
 ### レイテンシモード
 
-レイテンシ設定には`Balanced`、`Aggressive`、`Sub-100`、`Frontier`があります。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。FrontierでSwiftF0/Noneを使う場合、チャンクスライダーは実効HuBERT hopに合わせて20–100ms（20ms刻み）へ絞り、低遅延域を広い操作幅で調整できます。
+レイテンシ設定は`Normal`と`Aggressive`の2モードです。`Normal`は従来のAggressive、`Aggressive`は従来のFrontierと同じ処理方針です。BalancedとSub-100は削除しました。モード変更時はI/Oストリームと固定shape Graphを再ウォームアップします。
+
+旧設定は初回ロード時に自動移行します。旧Balanced・Aggressive・Sub-100は安全側の`Normal`へ、旧Frontierは新しい`Aggressive`へ変換し、設定バージョンを保存するため次回以降に再変換されません。
 
 | モード | SOLAクロスフェード | 持続リングfloor | 非ASIOコールバック | 用途 |
 |--------|-------------------|-----------------|----------------------|------|
-| Balanced | chunkの25%、最大80ms | プリバッファを維持 | chunk / 4 | 安定性優先 |
-| Aggressive | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 低遅延優先 |
-| Sub-100 | 10ms | 初期1 hop、定常20-35msを適応維持 | 最大5ms | ASIO + SwiftF0向け |
-| Frontier | 10ms | 初期1 hop、定常10-17.5msを適応維持 | 最大2.5ms | 実験的な20ms deadline |
+| Normal | chunkの10%、最大20ms | 0.75 hopでtrim、0.25 hopへ復帰 | 最大10ms | 品質機能を維持した通常利用 |
+| Aggressive | chunkの10%、最大20ms | 初期1 hop、定常0.5-0.875 hopを適応維持 | 最大2.5ms | 20ms deadlineを狙う低遅延利用 |
 
-Aggressiveでも開始時に最初の生成チャンクを待つため、起動直後の無音アンダーランは発生させません。持続的なバッファ滞留だけを2 hopの観測窓で判定し、通常のチャンク内burst/drainはtrim対象から除外します。
+`Normal`はSwiftF0/Noneで40ms、FCPEで100ms、RMVPEで320msがchunk下限です。プリバッファは1 hop、buffer marginは0.25です。開始時に最初の生成チャンクを待ち、持続的なバッファ滞留だけを2 hopの観測窓で判定します。通常のchunk内burst/drainはtrim対象にしません。Denoiserを含む品質機能を保存設定どおり使用します。
 
-`Sub-100`はF0方式の下限へchunkを自動設定します。SwiftF0/Noneは40ms、FCPEは100ms、RMVPEは320msです。開始時に2 hopを確保し、最初の20 hopは40msのfloorを維持します。その後は直近推論の`p99 - p50 + callback`から20-35msのjitter guardを選びます。アンダーラン時は2 hopを再確保して、連続した音切れを防ぎます。
+`Aggressive`はSwiftF0/Noneのchunkを20-100ms（20ms刻み）で調整できます。FCPEとRMVPEは入力要件のため100msと320msが下限です。開始時とアンダーラン復旧時は3 hopを確保します。最初の20 hopは1 hopのguardを維持し、その後は直近推論の`p99 - p50 + callback`から0.5-0.875 hopのjitter guardを選びます。20ms chunkでは10-17.5msです。
 
-`Frontier`はSwiftF0/Noneのchunk下限を20msまで下げます。開始時とアンダーラン復旧時は3 hopを確保し、20 hopの統計が揃った後は同じ適応式で10-17.5msのjitter guardへ縮めます。初回およびcatchup直後は最初の実音声hopを左側へreflect展開してHuBERT履歴を固定shapeまで即時充填するため、履歴成長中のeager Synthesizerへ戻らず、1 hop目からウォームアップ済みGraphを使用します。FCPEとRMVPEは入力要件のため、それぞれ100msと320msが下限です。
+`Aggressive`ではHuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時短縮し、Denoiserを実行時だけバイパスします。初回およびcatchup直後は最初の実音声hopを左側へreflect展開してHuBERT履歴を固定shapeまで即時充填するため、1 hop目からウォームアップ済みSynthesizer Graphを使用します。
 
-Sub-100/Frontier実行中は保存設定を変更せず、HuBERT contextを最大560ms、SwiftF0 contextを最大100msへ一時的に短縮します。また、モデルと出力のsample rateが異なる場合は、Synthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。deadlineを守るためDenoiserは実行中だけバイパスされ、Balanced/Aggressiveへ戻すと保存済みの品質設定が再び有効になります。
+モデルと出力のsample rateが異なる場合、`Aggressive`はSynthesizer出力をCPUへ戻す前にtorchaudio sinc resampleをXPU Graphで実行します。ASIOの実レートが設定値と異なる場合も、音声開始前に実レート用Graphを再ウォームアップします。`Normal`へ戻すと保存済みのDenoiser設定が再び有効になります。
 
-Sub-100/Frontierのruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768のindexで約240MBの追加VRAMを使用します。Balanced/Aggressiveやファイル変換では構築しません。
+`Aggressive`のruntime warmupでは、FAISS `IndexIVFFlat`（L2、`nprobe=1`）のinverted listと再構築特徴をXPUへ常駐させ、coarse centroid選択、候補L2検索、top-k加重平均をAccelerator Graphで実行します。これによりHuBERT特徴をFAISS検索のためだけにCPUへ同期する経路を除去します。最大list長が256を超えるindexや未対応形式では、自動的に既存のCPU FAISSへ戻ります。XPU側ではindex特徴をFP16/BF16で保持するため、158k×768 indexで約240MBの追加VRAMを使用します。`Normal`やファイル変換では構築しません。
 
 Intel Arc B570、SwiftF0、FAISS ratio 0.45、40ms hopの実モデル測定では、本番同等のGraphウォームアップとGUIのSOLA/decoder余白を含む処理時間がp50 14.5ms、p95 16.4ms、p99 18.8msでした（40ms deadline miss 0/50）。20msの定常jitter guardとASIO入出力約12msを含む通常時のE2E目安は90-100msです。ドライバー、モデル、OSスケジューリング、同時GPU負荷による単発スパイクは残ります。
 
-Frontier第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。
+Aggressive第1段のXPU IVF検索では、同じArc B570と158,193件のindexで検索単体が中央値0.62ms、RVCストリーミング全経路のp50がCPU FAISSの13.56msから12.59msへ短縮しました。全158,193候補を保持した比較で最終波形相関は0.999956、40ms deadline missは0/40、IVF Graphはcapture 1回、replay 140回、fallback 0でした。
 
-Frontier 20ms hopでは、SOLAが必要とする合成末尾を`crossfade + search`へ修正し、従来の二重search余白を除去しました。同じArc B570の定常測定はp50 11.87ms、p95 14.51ms、p99 17.37ms、20ms deadline miss 0/60です。全SOLA出力は960 samplesで一致し、HuBERT/Synthesizer/IVF Graphのfallbackは0でした。これは実機のdeadline成立を示す値であり、OSやドライバーの単発スパイクまで保証するものではありません。
+Aggressive 20ms hopでは、SOLAが必要とする合成末尾を`crossfade + search`へ修正し、従来の二重search余白を除去しました。同じArc B570の定常測定はp50 11.87ms、p95 14.51ms、p99 17.37ms、20ms deadline miss 0/60です。全SOLA出力は960 samplesで一致し、HuBERT/Synthesizer/IVF Graphのfallbackは0でした。これは実機のdeadline成立を示す値であり、OSやドライバーの単発スパイクまで保証するものではありません。
 
-Frontierのホットパス監査では、音声推論以外にも毎hopのXPU timing event、ThreadPool生成・破棄、GUI/GPUメモリtelemetry、未使用feature cache clone、SOLA境界ログが残っていました。診断を10 hopごと、GUI telemetryを10Hzへ間引き、SwiftF0 workerを永続化してHuBERTを推論threadから直接dispatchします。同一60-hop ablationではp50 12.51msから9.44ms、p95 15.98msから11.70ms、p99 16.45msから12.14msへ短縮し、20ms deadline missは0でした。音声tensor、Graph shape、SOLA出力長は変更していません。
+Aggressiveのホットパス監査では、音声推論以外にも毎hopのXPU timing event、ThreadPool生成・破棄、GUI/GPUメモリtelemetry、未使用feature cache clone、SOLA境界ログが残っていました。診断を10 hopごと、GUI telemetryを10Hzへ間引き、SwiftF0 workerを永続化してHuBERTを推論threadから直接dispatchします。同一60-hop ablationではp50 12.51msから9.44ms、p95 15.98msから11.70ms、p99 16.45msから12.14msへ短縮し、20ms deadline missは0でした。音声tensor、Graph shape、SOLA出力長は変更していません。
 
-さらに、既定5 framesのdecoder overlapはSOLA向け合成余白へ50msを追加していましたが、SOLAはその区間を参照せず、20ms hopごとに100ms分を合成していました。Frontierではdecoder overlapを0にして合成区間を50msへ半減し、出力の時間位置を約47ms前進させます。実音声比較では境界jump p95が0.0273から0.0237へ低下し、clipは0でした。Balanced/Sub-100では既定5 framesを維持します。
+さらに、既定5 framesのdecoder overlapはSOLA向け合成余白へ50msを追加していましたが、SOLAはその区間を参照せず、20ms hopごとに100ms分を合成していました。Aggressiveではdecoder overlapを0にして合成区間を50msへ半減し、出力の時間位置を約47ms前進させます。実音声比較では境界jump p95が0.0273から0.0237へ低下し、clipは0でした。Normalでは既定5 framesを維持します。
 
 残る定常演算では、XPU IVFの候補距離が毎hopごとに`[frames, candidates, 768]`の差分・二乗tensorを作り、TextEncoderは全64 framesが有効でも全1のattention maskを各層へ適用していました。IVF feature normを事前計算して距離をnormと内積から求め、streaming TextEncoderではpadding maskの生成、masked fill、全1 mask乗算を省略します。いずれもcontext長やattention範囲を変えない同値変換です。同じ実音声60-hop測定はp50 10.38msから8.33ms、p95 13.50msから10.93ms、p99 14.98msから11.79msへ短縮し、20ms deadline missとGraph fallbackは0でした。
 
-HuBERT/IVF結果を時間軸に沿って再利用する近似cacheも検証しましたが、HuBERTの双方向context更新により、8-hop再同期でも最終波形相関0.956、最悪hop相関0.20まで低下したため採用していません。Frontierでも560ms HuBERT contextとTextEncoderのglobal attentionは維持します。
+HuBERT/IVF結果を時間軸に沿って再利用する近似cacheも検証しましたが、HuBERTの双方向context更新により、8-hop再同期でも最終波形相関0.956、最悪hop相関0.20まで低下したため採用していません。Aggressiveでも560ms HuBERT contextとTextEncoderのglobal attentionは維持します。
 
-レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論8.3-11.8ms、定常guard 10ms、ASIO入出力約12msを使ったFrontierのE2E目安は約80-84msです。
+レイテンシ表示はcrossfadeだけでなく、実際に保持する`crossfade + search`の30ms prefixを計上します。実測推論8.3-11.8ms、定常guard 10ms、ASIO入出力約12msを使ったAggressive 20msのE2E目安は約80-84msです。
 
-ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Aggressiveでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
+ライブのレイテンシ表示は`1 hop + 推論 + 持続リングfloor + 出力キュー + SOLA`です。100ms Normalでは、通常の100ms出力チャンクがリング内に残っているだけの状態を追加レイテンシとして二重計上しません。
 
 推論表示には直近256 hopのp95も表示します。ログの100 hopごとの`p50` / `p95` / `p99` / `deadline_miss`で、短いhopを継続的に処理できているか確認できます。
 

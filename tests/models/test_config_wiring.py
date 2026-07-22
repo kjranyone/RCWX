@@ -76,27 +76,27 @@ def test_denoise_strength_defaults_and_clamps():
     assert RealtimeConfig(denoise_strength=3.0).denoise_strength == 2.0
 
 
-def test_aggressive_latency_mode_parameters():
-    balanced = _auto_params(0.24, "balanced")
+def test_latency_mode_parameters():
+    normal = _auto_params(0.24, "normal")
     aggressive = _auto_params(0.24, "aggressive")
 
-    assert balanced["crossfade_sec"] == 0.06
-    assert balanced["buffer_margin"] == 0.5
+    assert normal["crossfade_sec"] == 0.02
+    assert normal["buffer_margin"] == 0.25
+    assert normal["prebuffer_chunks"] == 1
     assert aggressive["crossfade_sec"] == 0.02
     assert _auto_params(0.1, "aggressive")["crossfade_sec"] == 0.01
-    assert aggressive["buffer_margin"] == 0.25
-    assert aggressive["prebuffer_chunks"] == 1
+    assert aggressive["buffer_margin"] == 0.1
+    assert aggressive["prebuffer_chunks"] == 3
     assert _minimum_chunk_ms("swiftf0") == 40
 
 
 def test_latency_mode_validation():
+    assert AudioConfig(latency_mode="normal").latency_mode == "normal"
     assert AudioConfig(latency_mode="aggressive").latency_mode == "aggressive"
-    assert AudioConfig(latency_mode="sub100").latency_mode == "sub100"
-    assert AudioConfig(latency_mode="frontier").latency_mode == "frontier"
-    assert AudioConfig(latency_mode="invalid").latency_mode == "balanced"
-    assert RealtimeConfig(latency_mode="sub100").latency_mode == "sub100"
-    assert RealtimeConfig(latency_mode="frontier").latency_mode == "frontier"
-    assert RealtimeConfig(latency_mode="invalid").latency_mode == "balanced"
+    assert AudioConfig(latency_mode="invalid").latency_mode == "normal"
+    assert RealtimeConfig(latency_mode="normal").latency_mode == "normal"
+    assert RealtimeConfig(latency_mode="aggressive").latency_mode == "aggressive"
+    assert RealtimeConfig(latency_mode="invalid").latency_mode == "normal"
 
 
 def test_hole_fill_and_uv_ramp_fields():
@@ -167,9 +167,30 @@ def test_config_backward_compat():
             f"Expected default 16.0, got {loaded.inference.f0_lowpass_cutoff_hz}"
         )
         assert loaded.inference.pitch_shift == 5, "Existing field should be preserved"
-        assert loaded.audio.latency_mode == "balanced"
+        assert loaded.audio.latency_mode == "normal"
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def test_legacy_latency_profiles_migrate_once():
+    expected = {
+        "balanced": "normal",
+        "aggressive": "normal",
+        "sub100": "normal",
+        "frontier": "aggressive",
+    }
+    for legacy, migrated in expected.items():
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w") as f:
+            json.dump({"audio": {"latency_mode": legacy}}, f)
+            tmp_path = Path(f.name)
+        try:
+            loaded = RCWXConfig.load(tmp_path)
+            assert loaded.audio.latency_mode == migrated
+            assert loaded.audio.latency_profile_version == 2
+            loaded.save(tmp_path)
+            assert RCWXConfig.load(tmp_path).audio.latency_mode == migrated
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
