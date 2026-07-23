@@ -226,6 +226,79 @@ def sigmoid_blend_weights(steps: int, steepness: float = 4.0) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(x))
 
 
+def _f0_to_numpy(f0: torch.Tensor) -> np.ndarray:
+    """Detach F0 to a contiguous float32 numpy array [B, T]."""
+    return f0.detach().cpu().to(torch.float32).numpy()
+
+
+def _f0_from_numpy(
+    f0_np: np.ndarray,
+    *,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Upload a float32 numpy F0 track back to the caller's device/dtype."""
+    return torch.from_numpy(np.ascontiguousarray(f0_np, dtype=np.float32)).to(
+        device=device, dtype=dtype
+    )
+
+
+@lru_cache(maxsize=16)
+def _f0_lowpass_ba(cutoff_hz: float, sample_rate: float) -> tuple[np.ndarray, np.ndarray]:
+    """Cached Butterworth lowpass coefficients for the F0 contour filter."""
+    nyquist = sample_rate / 2.0
+    return butter(2, cutoff_hz / nyquist, btype="low")
+
+
+def _smooth_f0_spikes_np(f0_np: np.ndarray, window: int = 3) -> np.ndarray:
+    """Median-filter voiced regions of an F0 track (numpy, in-place safe copy)."""
+    if f0_np.shape[1] < window:
+        return f0_np
+    result = np.empty_like(f0_np, dtype=np.float32)
+    for b in range(f0_np.shape[0]):
+        row = f0_np[b]
+        voiced = row > 0
+        if np.any(voiced):
+            filtered = medfilt(row.astype(np.float64), window).astype(np.float32)
+            result[b] = np.where(voiced, filtered, row)
+        else:
+            result[b] = row
+    return result
+
+
+def _lowpass_f0_np(
+    f0_np: np.ndarray,
+    cutoff_hz: float = 16.0,
+    sample_rate: float = 100.0,
+) -> np.ndarray:
+    """Zero-phase Butterworth lowpass on voiced F0 (log2 domain, numpy)."""
+    if f0_np.shape[1] < 10:
+        return f0_np
+
+    b, a = _f0_lowpass_ba(float(cutoff_hz), float(sample_rate))
+    result = np.empty_like(f0_np, dtype=np.float32)
+    idx = np.arange(f0_np.shape[1])
+
+    for batch in range(f0_np.shape[0]):
+        row = f0_np[batch]
+        voiced = row > 0
+        if int(np.sum(voiced)) > 10:
+            voiced_indices = idx[voiced]
+            log_contour = np.interp(
+                idx, voiced_indices, np.log2(row[voiced_indices])
+            )
+            try:
+                filtered = filtfilt(b, a, log_contour)
+                result[batch] = np.where(
+                    voiced, np.exp2(filtered).astype(np.float32), 0.0
+                )
+            except ValueError:
+                result[batch] = row
+        else:
+            result[batch] = row
+    return result
+
+
 def smooth_f0_spikes(f0: torch.Tensor, window: int = 3) -> torch.Tensor:
     """Remove F0 spikes using median filter on voiced regions.
 
@@ -238,26 +311,11 @@ def smooth_f0_spikes(f0: torch.Tensor, window: int = 3) -> torch.Tensor:
     """
     if f0.shape[1] < window:
         return f0
-
-    # Convert to numpy for scipy median filter (must be float32 for medfilt)
-    f0_np = f0.cpu().to(torch.float32).numpy()
-    result = np.zeros_like(f0_np)
-
-    for b in range(f0_np.shape[0]):
-        # Get voiced mask (f0 > 0)
-        voiced = f0_np[b] > 0
-
-        # Apply median filter only to voiced regions
-        if np.any(voiced):
-            # medfilt preserves array length
-            filtered = medfilt(f0_np[b].astype(np.float64), window).astype(np.float32)
-
-            # Only apply to voiced regions (keep unvoiced as 0)
-            result[b] = np.where(voiced, filtered, f0_np[b])
-        else:
-            result[b] = f0_np[b]
-
-    return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
+    return _f0_from_numpy(
+        _smooth_f0_spikes_np(_f0_to_numpy(f0), window=window),
+        device=f0.device,
+        dtype=f0.dtype,
+    )
 
 
 def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 16.0, sample_rate: float = 100.0) -> torch.Tensor:
@@ -276,47 +334,11 @@ def lowpass_f0(f0: torch.Tensor, cutoff_hz: float = 16.0, sample_rate: float = 1
     """
     if f0.shape[1] < 10:  # Too short to filter
         return f0
-
-    # Convert to numpy
-    f0_np = f0.cpu().to(torch.float32).numpy()
-    result = np.zeros_like(f0_np)
-
-    # Design lowpass filter
-    nyquist = sample_rate / 2
-    normalized_cutoff = cutoff_hz / nyquist
-    # Use order 2 for gentler filtering
-    b, a = butter(2, normalized_cutoff, btype="low")
-
-    for batch in range(f0_np.shape[0]):
-        voiced = f0_np[batch] > 0
-
-        if np.sum(voiced) > 10:  # Need enough voiced samples
-            # Build a gap-free contour in log2 domain (pitch is log-scale):
-            # np.interp fills interior unvoiced gaps AND extends the leading/
-            # trailing unvoiced regions with the first/last voiced value.
-            # Leaving those edges at 0 Hz would feed a 0->F0 step into the
-            # zero-phase filter, smearing an onset scoop / offset droop tens
-            # of ms into the voiced region.
-            idx = np.arange(f0_np.shape[1])
-            voiced_indices = idx[voiced]
-            log_contour = np.interp(
-                idx, voiced_indices, np.log2(f0_np[batch, voiced_indices])
-            )
-
-            # Apply lowpass filter on the log contour
-            try:
-                filtered = filtfilt(b, a, log_contour)
-                # Only keep filtered values in voiced regions
-                result[batch] = np.where(
-                    voiced, np.exp2(filtered).astype(np.float32), 0.0
-                )
-            except ValueError:
-                # Filter failed, return original
-                result[batch] = f0_np[batch]
-        else:
-            result[batch] = f0_np[batch]
-
-    return torch.from_numpy(result).to(f0.device, dtype=f0.dtype)
+    return _f0_from_numpy(
+        _lowpass_f0_np(_f0_to_numpy(f0), cutoff_hz=cutoff_hz, sample_rate=sample_rate),
+        device=f0.device,
+        dtype=f0.dtype,
+    )
 
 
 def _smooth_fcpe_f0(f0: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
@@ -526,25 +548,17 @@ def apply_moe_f0_style(f0: torch.Tensor, strength: float) -> torch.Tensor:
     return styled
 
 
-def suppress_octave_flips(
-    f0: torch.Tensor,
+def _suppress_octave_flips_np(
+    f0_np: np.ndarray,
     octave_ratio_center: float = 2.0,
     octave_ratio_tolerance: float = 0.16,
     sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
-) -> torch.Tensor:
-    """Suppress transient +-1 octave frame-to-frame F0 flips.
+) -> np.ndarray:
+    """Suppress transient +-1 octave flips on a numpy F0 track."""
+    if f0_np.size == 0 or f0_np.shape[1] < 2:
+        return f0_np
 
-    Corrections are made relative to the previous *corrected* frame, so a
-    genuine octave transition would keep matching the flip band forever and
-    get halved/doubled indefinitely.  The sustain counter breaks that latch:
-    once the correction persists ``sustain_frames`` consecutive frames in
-    the same direction, the raw values are restored and tracking resumes at
-    the new octave.
-    """
-    if f0.numel() == 0 or f0.shape[1] < 2:
-        return f0
-
-    f0_np = f0.detach().cpu().to(torch.float32).numpy()
+    raw = f0_np
     corrected = f0_np.copy()
     low = octave_ratio_center - octave_ratio_tolerance
     high = octave_ratio_center + octave_ratio_tolerance
@@ -557,7 +571,7 @@ def suppress_octave_flips(
         streak_len = 0
         for i in range(1, corrected.shape[1]):
             prev = float(corrected[b, i - 1])
-            cur = float(f0_np[b, i])
+            cur = float(raw[b, i])
             # Only compare adjacent voiced frames.
             # Never carry references across unvoiced gaps.
             if prev <= 0.0 or cur <= 0.0:
@@ -586,30 +600,23 @@ def suppress_octave_flips(
 
             if streak_len >= sustain_frames:
                 # Sustained -> genuine transition: accept the raw octave.
-                corrected[b, streak_start : i + 1] = f0_np[b, streak_start : i + 1]
+                corrected[b, streak_start : i + 1] = raw[b, streak_start : i + 1]
                 streak_dir = 0
                 streak_len = 0
 
-    return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
+    return corrected
 
 
-def limit_f0_slew(
-    f0: torch.Tensor,
+def _limit_f0_slew_np(
+    f0_np: np.ndarray,
     max_step_st: float = 2.8,
     sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
-) -> torch.Tensor:
-    """Limit frame-to-frame F0 step to suppress short flutter artifacts.
+) -> np.ndarray:
+    """Clamp short frame-to-frame F0 flutter on a numpy F0 track."""
+    if f0_np.size == 0 or f0_np.shape[1] < 2:
+        return f0_np
 
-    A genuine pitch jump would otherwise be turned into a multi-frame
-    portamento (clamped max_step_st per frame until it catches up).  When
-    the clamp persists ``sustain_frames`` consecutive frames in the same
-    direction, the raw values are restored — flutter is 1-2 frames; anything
-    longer is the singer actually moving.
-    """
-    if f0.numel() == 0 or f0.shape[1] < 2:
-        return f0
-
-    f0_np = f0.detach().cpu().to(torch.float32).numpy()
+    raw = f0_np
     corrected = f0_np.copy()
     max_ratio = float(2 ** (max_step_st / 12.0))
 
@@ -619,7 +626,7 @@ def limit_f0_slew(
         streak_len = 0
         for i in range(1, corrected.shape[1]):
             prev = float(corrected[b, i - 1])
-            cur = float(f0_np[b, i])
+            cur = float(raw[b, i])
             if prev <= 0.0 or cur <= 0.0:
                 streak_dir = 0
                 streak_len = 0
@@ -648,11 +655,66 @@ def limit_f0_slew(
 
             if streak_len >= sustain_frames:
                 # Sustained -> genuine jump: accept the raw values.
-                corrected[b, streak_start : i + 1] = f0_np[b, streak_start : i + 1]
+                corrected[b, streak_start : i + 1] = raw[b, streak_start : i + 1]
                 streak_dir = 0
                 streak_len = 0
 
-    return torch.from_numpy(corrected).to(f0.device, dtype=f0.dtype)
+    return corrected
+
+
+def suppress_octave_flips(
+    f0: torch.Tensor,
+    octave_ratio_center: float = 2.0,
+    octave_ratio_tolerance: float = 0.16,
+    sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
+) -> torch.Tensor:
+    """Suppress transient +-1 octave frame-to-frame F0 flips.
+
+    Corrections are made relative to the previous *corrected* frame, so a
+    genuine octave transition would keep matching the flip band forever and
+    get halved/doubled indefinitely.  The sustain counter breaks that latch:
+    once the correction persists ``sustain_frames`` consecutive frames in
+    the same direction, the raw values are restored and tracking resumes at
+    the new octave.
+    """
+    if f0.numel() == 0 or f0.shape[1] < 2:
+        return f0
+    return _f0_from_numpy(
+        _suppress_octave_flips_np(
+            _f0_to_numpy(f0),
+            octave_ratio_center=octave_ratio_center,
+            octave_ratio_tolerance=octave_ratio_tolerance,
+            sustain_frames=sustain_frames,
+        ),
+        device=f0.device,
+        dtype=f0.dtype,
+    )
+
+
+def limit_f0_slew(
+    f0: torch.Tensor,
+    max_step_st: float = 2.8,
+    sustain_frames: int = F0_CORRECTION_SUSTAIN_FRAMES,
+) -> torch.Tensor:
+    """Limit frame-to-frame F0 step to suppress short flutter artifacts.
+
+    A genuine pitch jump would otherwise be turned into a multi-frame
+    portamento (clamped max_step_st per frame until it catches up).  When
+    the clamp persists ``sustain_frames`` consecutive frames in the same
+    direction, the raw values are restored — flutter is 1-2 frames; anything
+    longer is the singer actually moving.
+    """
+    if f0.numel() == 0 or f0.shape[1] < 2:
+        return f0
+    return _f0_from_numpy(
+        _limit_f0_slew_np(
+            _f0_to_numpy(f0),
+            max_step_st=max_step_st,
+            sustain_frames=sustain_frames,
+        ),
+        device=f0.device,
+        dtype=f0.dtype,
+    )
 
 
 def stabilize_f0_boundaries(
@@ -710,6 +772,41 @@ def stabilize_f0_boundaries(
     return corrected
 
 
+def _fill_short_unvoiced_gaps_np(
+    f0_np: np.ndarray,
+    max_gap_frames: int = 3,
+) -> np.ndarray:
+    """Fill short unvoiced holes by log2 interpolation (numpy, may copy)."""
+    if max_gap_frames <= 0 or f0_np.shape[1] < 3:
+        return f0_np
+
+    # Work on a copy only if we actually write a fill.
+    out = f0_np
+    wrote = False
+    for b in range(f0_np.shape[0]):
+        row_src = f0_np[b]
+        vidx = np.flatnonzero(row_src > 0)
+        if vidx.size < 2:
+            continue
+        gaps = np.diff(vidx) - 1
+        fillable = np.flatnonzero((gaps > 0) & (gaps <= max_gap_frames))
+        if fillable.size == 0:
+            continue
+        if not wrote:
+            out = f0_np.copy()
+            wrote = True
+        row = out[b]
+        for gi in fillable:
+            left = int(vidx[gi])
+            right = int(vidx[gi + 1])
+            n = right - left
+            t = np.arange(1, n, dtype=np.float32) / n
+            lv = np.log2(row[left])
+            rv = np.log2(row[right])
+            row[left + 1 : right] = np.exp2(lv * (1.0 - t) + rv * t)
+    return out
+
+
 def fill_short_unvoiced_gaps(f0: torch.Tensor, max_gap_frames: int = 3) -> torch.Tensor:
     """Fill short unvoiced holes inside voiced runs by log2 interpolation.
 
@@ -740,28 +837,11 @@ def fill_short_unvoiced_gaps(f0: torch.Tensor, max_gap_frames: int = 3) -> torch
     if n_voiced < 2 or n_voiced == f0.numel():
         return f0
 
-    f0_np = f0.detach().cpu().to(torch.float32).numpy().copy()
-    changed = False
-    for b in range(f0_np.shape[0]):
-        row = f0_np[b]
-        vidx = np.flatnonzero(row > 0)
-        if vidx.size < 2:
-            continue
-        # Unvoiced frame count between consecutive voiced frames
-        gaps = np.diff(vidx) - 1
-        for gi in np.flatnonzero((gaps > 0) & (gaps <= max_gap_frames)):
-            left = int(vidx[gi])
-            right = int(vidx[gi + 1])
-            n = right - left
-            t = np.arange(1, n, dtype=np.float32) / n
-            lv = np.log2(row[left])
-            rv = np.log2(row[right])
-            row[left + 1:right] = np.exp2(lv * (1.0 - t) + rv * t)
-            changed = True
-
-    if not changed:
+    f0_np = _f0_to_numpy(f0)
+    filled = _fill_short_unvoiced_gaps_np(f0_np, max_gap_frames=max_gap_frames)
+    if filled is f0_np:
         return f0
-    return torch.from_numpy(f0_np).to(device=f0.device, dtype=f0.dtype)
+    return _f0_from_numpy(filled, device=f0.device, dtype=f0.dtype)
 
 
 def apply_f0_filter_chain(
@@ -779,15 +859,24 @@ def apply_f0_filter_chain(
     octave-flip suppression -> (optional) slew limiting. Used identically by
     ``infer`` (on the final F0) and ``infer_streaming`` (on the
     history-extended F0).
+
+    Hot path: one host transfer, all stages in numpy, one upload.  The previous
+    staged implementation paid 4-5 torch<->numpy round-trips per hop.
     """
-    f0 = fill_short_unvoiced_gaps(f0, max_gap_frames=int(round(f0_hole_fill_ms / 10.0)))
-    f0 = smooth_f0_spikes(f0, window=3)
-    f0 = lowpass_f0(f0, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
+    if f0.numel() == 0:
+        return f0
+
+    max_gap_frames = int(round(f0_hole_fill_ms / 10.0))
+    # Single D2H (no-op when already on CPU, as with SwiftF0).
+    x = _f0_to_numpy(f0)
+    x = _fill_short_unvoiced_gaps_np(x, max_gap_frames=max_gap_frames)
+    x = _smooth_f0_spikes_np(x, window=3)
+    x = _lowpass_f0_np(x, cutoff_hz=f0_lowpass_cutoff_hz, sample_rate=100.0)
     if enable_octave_flip_suppress:
-        f0 = suppress_octave_flips(f0)
+        x = _suppress_octave_flips_np(x)
     if enable_f0_slew_limit:
-        f0 = limit_f0_slew(f0, max_step_st=f0_slew_max_step_st)
-    return f0
+        x = _limit_f0_slew_np(x, max_step_st=f0_slew_max_step_st)
+    return _f0_from_numpy(x, device=f0.device, dtype=f0.dtype)
 
 
 def quantize_f0_to_pitch(f0: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

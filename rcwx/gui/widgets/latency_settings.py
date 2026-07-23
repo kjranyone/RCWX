@@ -72,7 +72,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self,
         master: ctk.CTk,
         on_settings_changed: Optional[Callable[[], None]] = None,
-        f0_method: str = "rmvpe",
+        f0_method: str = "swiftf0",
         **kwargs,
     ):
         super().__init__(master, **kwargs)
@@ -235,9 +235,13 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.latency_mode = value.lower()
         min_ms, max_ms, _ = self._configure_chunk_slider()
         current_ms = self._round_to_frame_boundary(self.chunk_sec * 1000)
-        target_ms = min_ms if self.latency_mode == "aggressive" else min(
-            max_ms,
-            max(min_ms, current_ms),
+        target_ms = (
+            min_ms
+            if self.latency_mode == "aggressive"
+            else min(
+                max_ms,
+                max(min_ms, current_ms),
+            )
         )
         self.chunk_sec = target_ms / 1000
         self.chunk_slider.set(target_ms)
@@ -301,9 +305,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         sola_est = auto["crossfade_sec"] * 1000
         if self.latency_mode == "aggressive":
             # Aggressive retains crossfade+search, rounded to a 10ms model frame.
-            sola_est = math.ceil(
-                (sola_est + auto["sola_search_ms"]) / 10
-            ) * 10
+            sola_est = math.ceil((sola_est + auto["sola_search_ms"]) / 10) * 10
         total_est = self.chunk_sec * 1000 + inference_est + buffer_est + sola_est
 
         self.estimate_label.configure(text=f"推定レイテンシ: ~{int(total_est)}ms")
@@ -342,11 +344,7 @@ class LatencySettingsFrame(ctk.CTkFrame):
         """
         if f0_method is not None:
             self.f0_method = f0_method
-        self.latency_mode = (
-            latency_mode
-            if latency_mode in {"normal", "aggressive"}
-            else "normal"
-        )
+        self.latency_mode = latency_mode if latency_mode in {"normal", "aggressive"} else "normal"
         min_ms, max_ms, _ = self._configure_chunk_slider()
         rounded_ms = max(
             min_ms,

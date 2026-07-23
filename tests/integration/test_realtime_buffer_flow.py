@@ -11,6 +11,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from rcwx.audio.buffer import RingOutputBuffer
+from rcwx.pipeline.drift_control import FloorTracker
 from rcwx.pipeline.realtime_unified import RealtimeStats, RealtimeVoiceChangerUnified
 
 
@@ -28,14 +29,15 @@ def _make_vc(
     vc._running = True
     vc._output_started = False
     vc._prebuffer_chunks = 1
+    vc._required_prebuffer_chunks = 1
     vc._chunks_ready = 0
 
     vc._output_queue = Queue(maxsize=output_queue_size)
     vc.output_buffer = RingOutputBuffer(capacity_samples=hop_out * 4, fade_samples=0)
 
     # Drift-control state (floor-based, skip-only).
-    vc._level_window = None
-    vc._level_window_frames = 0
+    vc._floor = FloorTracker()
+    vc._observed_callback_sec = 0.0
 
     vc._runtime_output_sample_rate = out_sr
     vc._hop_samples_out = hop_out

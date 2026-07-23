@@ -38,7 +38,7 @@ class PitchControl(ctk.CTkFrame):
 
         self._pitch: int = 0
         self._use_f0: bool = True
-        self._f0_method: str = "rmvpe"
+        self._f0_method: str = "swiftf0"
         self._moe_boost: float = 0.0
         self._noise_scale: float = 0.4
         self._fixed_harmonics: bool = True
@@ -100,7 +100,16 @@ class PitchControl(ctk.CTkFrame):
         self.f0_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.f0_frame.grid(row=5, column=0, columnspan=3, padx=10, pady=(0, 5), sticky="ew")
 
-        self.f0_var = ctk.StringVar(value="rmvpe")
+        self.f0_var = ctk.StringVar(value="swiftf0")
+        self.swiftf0_rb = ctk.CTkRadioButton(
+            self.f0_frame,
+            text="SwiftF0",
+            variable=self.f0_var,
+            value="swiftf0",
+            command=self._on_f0_change,
+        )
+        self.swiftf0_rb.grid(row=0, column=0, padx=5, pady=2)
+
         self.rmvpe_rb = ctk.CTkRadioButton(
             self.f0_frame,
             text="RMVPE",
@@ -108,7 +117,7 @@ class PitchControl(ctk.CTkFrame):
             value="rmvpe",
             command=self._on_f0_change,
         )
-        self.rmvpe_rb.grid(row=0, column=0, padx=5, pady=2)
+        self.rmvpe_rb.grid(row=0, column=1, padx=5, pady=2)
 
         self.fcpe_rb = ctk.CTkRadioButton(
             self.f0_frame,
@@ -117,16 +126,7 @@ class PitchControl(ctk.CTkFrame):
             value="fcpe",
             command=self._on_f0_change,
         )
-        self.fcpe_rb.grid(row=0, column=1, padx=5, pady=2)
-
-        self.swiftf0_rb = ctk.CTkRadioButton(
-            self.f0_frame,
-            text="SwiftF0",
-            variable=self.f0_var,
-            value="swiftf0",
-            command=self._on_f0_change,
-        )
-        self.swiftf0_rb.grid(row=0, column=2, padx=5, pady=2)
+        self.fcpe_rb.grid(row=0, column=2, padx=5, pady=2)
 
         self.none_rb = ctk.CTkRadioButton(
             self.f0_frame,
@@ -210,14 +210,18 @@ class PitchControl(ctk.CTkFrame):
             variable=self.fixed_harmonics_var,
             command=self._on_fixed_harmonics_toggle,
         )
-        self.fixed_harmonics_cb.grid(row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6))
+        self.fixed_harmonics_cb.grid(
+            row=12, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 6)
+        )
 
         self.f0_stabilizer_label = ctk.CTkLabel(
             self,
             text="F0 Stabilizer",
             font=ctk.CTkFont(size=14, weight="bold"),
         )
-        self.f0_stabilizer_label.grid(row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2))
+        self.f0_stabilizer_label.grid(
+            row=13, column=0, columnspan=3, sticky="w", padx=10, pady=(2, 2)
+        )
 
         self.octave_flip_var = ctk.BooleanVar(value=self._enable_octave_flip_suppress)
         self.octave_flip_cb = ctk.CTkCheckBox(
@@ -349,7 +353,7 @@ class PitchControl(ctk.CTkFrame):
             self.fcpe_rb.configure(state="normal")
             self.swiftf0_rb.configure(state="normal")
             if self.f0_var.get() == "none":
-                self.f0_var.set("rmvpe")
+                self.f0_var.set("swiftf0")
             self._use_f0 = True
         else:
             self.rmvpe_rb.configure(state="disabled")

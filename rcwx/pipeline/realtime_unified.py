@@ -9,11 +9,11 @@ Single processing path with:
 
 from __future__ import annotations
 
+import gc
 import logging
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import Callable, Optional
 
@@ -29,12 +29,27 @@ from rcwx.audio.postprocess import PostprocessConfig, Postprocessor
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
 from rcwx.audio.stream_base import is_device_on_asio, parse_output_channel_pair
+from rcwx.pipeline.drift_control import FloorTracker, compute_shed_policy
 from rcwx.pipeline.inference import RVCPipeline, StreamingParams
+from rcwx.pipeline.realtime_config import (
+    DEADLINE_MODES,
+    LATENCY_MODES,
+    RealtimeConfig,
+    RealtimeStats,
+)
+from rcwx.win_gpu_priority import boost_gpu_scheduling_priority
 
 logger = logging.getLogger(__name__)
 
-LATENCY_MODES = {"normal", "aggressive"}
-DEADLINE_MODES = {"aggressive"}
+# Re-exported for backward compatibility (GUI widgets and tests import
+# RealtimeConfig / RealtimeStats from this module).
+__all__ = [
+    "DEADLINE_MODES",
+    "LATENCY_MODES",
+    "RealtimeConfig",
+    "RealtimeStats",
+    "RealtimeVoiceChangerUnified",
+]
 
 
 def _compute_sola_extra_model(
@@ -127,212 +142,6 @@ def _max_normalized_lag_correlation(needle: np.ndarray, haystack: np.ndarray) ->
         return 0.0
     corrs = np.abs(dots[valid]) / (needle_norm * norms[valid])
     return float(np.max(corrs))
-
-
-# ---------------------------------------------------------------------------
-# RealtimeConfig / RealtimeStats
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RealtimeStats:
-    """Statistics for real-time processing."""
-
-    latency_ms: float = 0.0
-    hop_latency_ms: float = 0.0
-    buffer_latency_ms: float = 0.0
-    queue_latency_ms: float = 0.0
-    sola_latency_ms: float = 0.0
-    inference_ms: float = 0.0
-    inference_p50_ms: float = 0.0
-    inference_p95_ms: float = 0.0
-    inference_p99_ms: float = 0.0
-    deadline_misses: int = 0
-    deadline_miss_rate: float = 0.0
-    # Per-stage breakdown of inference_ms (from RVCPipeline.stage_times)
-    hubert_ms: float = 0.0
-    f0_ms: float = 0.0
-    faiss_ms: float = 0.0
-    synth_ms: float = 0.0
-    output_resample_ms: float = 0.0
-    jitter_guard_ms: float = 0.0
-    buffer_underruns: int = 0
-    buffer_overruns: int = 0
-    buffer_trims: int = 0
-    frames_processed: int = 0
-    feedback_detected: bool = False
-    feedback_correlation: float = 0.0
-    gpu_memory_percent: float = 0.0
-    input_rms_db: float = -60.0
-    input_peak_db: float = -60.0
-    output_rms_db: float = -60.0
-    output_peak_db: float = -60.0
-
-    def reset(self) -> None:
-        self.latency_ms = 0.0
-        self.hop_latency_ms = 0.0
-        self.buffer_latency_ms = 0.0
-        self.queue_latency_ms = 0.0
-        self.sola_latency_ms = 0.0
-        self.inference_ms = 0.0
-        self.inference_p50_ms = 0.0
-        self.inference_p95_ms = 0.0
-        self.inference_p99_ms = 0.0
-        self.deadline_misses = 0
-        self.deadline_miss_rate = 0.0
-        self.hubert_ms = 0.0
-        self.f0_ms = 0.0
-        self.faiss_ms = 0.0
-        self.synth_ms = 0.0
-        self.output_resample_ms = 0.0
-        self.jitter_guard_ms = 0.0
-        self.buffer_underruns = 0
-        self.buffer_overruns = 0
-        self.buffer_trims = 0
-        self.frames_processed = 0
-        self.feedback_detected = False
-        self.feedback_correlation = 0.0
-        self.gpu_memory_percent = 0.0
-        self.input_rms_db = -60.0
-        self.input_peak_db = -60.0
-        self.output_rms_db = -60.0
-        self.output_peak_db = -60.0
-
-
-@dataclass
-class RealtimeConfig:
-    """Configuration for unified real-time processing."""
-
-    # Device selection
-    input_device: Optional[int] = None
-    output_device: Optional[int] = None
-
-    # Sample rates
-    mic_sample_rate: int = 48000
-    input_sample_rate: int = 16000  # internal processing rate
-    output_sample_rate: int = 48000
-
-    # Channels
-    input_channels: int = 1
-    output_channels: int = 1
-    input_channel_selection: str = "auto"
-    output_channel_selection: str = "auto"  # "auto", "0,1", "2,3", ...
-
-    # Core parameters
-    chunk_sec: float = 0.15
-    latency_mode: str = "normal"
-    overlap_sec: float = 0.10  # audio-level overlap for HuBERT continuity
-    crossfade_sec: float = 0.02
-    # SOLA search window (ms): one period of the lowest expected output F0
-    # (70Hz -> 14.3ms) + margin, so the splice can always phase-align.
-    sola_search_ms: float = 15.0
-    prebuffer_chunks: int = 1
-    buffer_margin: float = 0.25
-
-    # Pitch / F0
-    pitch_shift: int = 0
-    use_f0: bool = True
-    f0_method: str = "fcpe"
-
-    # Processing
-    max_queue_size: int = 8
-    input_gain_db: float = 0.0
-    output_gain_db: float = 0.0  # Output level adjustment (post-processing)
-    index_rate: float = 0.0
-    index_k: int = 4
-    use_parallel_extraction: bool = True
-
-    # Denoise
-    denoise_enabled: bool = False
-    denoise_method: str = "auto"
-    denoise_strength: float = 1.0
-
-    # Voice gate
-    voice_gate_mode: str = "off"
-    energy_threshold: float = 0.05
-
-    # SOLA
-    use_sola: bool = True
-
-    # HuBERT context window in seconds (longer = more stable timbre across chunks)
-    hubert_context_sec: float = 1.0
-
-    # F0 extraction window: leading context (sec) before the new hop.
-    # <= 0 extracts F0 on the full HuBERT context (legacy behavior).
-    f0_context_sec: float = 0.32
-
-    # Moe voice style strength (0.0=off, 1.0=strong)
-    moe_boost: float = 0.0
-
-    # WAV file input (empty string = use microphone)
-    wav_input_path: str = ""
-
-    # Synthesizer
-    synth_min_frames: int = 64
-
-    # Pitch clarity
-    noise_scale: float = 0.4
-    fixed_harmonics: bool = True
-    f0_lowpass_cutoff_hz: float = 16.0
-    enable_octave_flip_suppress: bool = True
-    enable_f0_slew_limit: bool = True
-    f0_slew_max_step_st: float = 2.8
-    # Longest unvoiced hole (ms) inside a voiced run to fill (<= 0 disables)
-    f0_hole_fill_ms: float = 30.0
-    # Voiced/unvoiced excitation crossfade ramp in ms (0 = hard switch)
-    uv_ramp_ms: float = 5.0
-
-    # ASIO buffer size in frames (0 = follow the driver control panel)
-    asio_buffer_size: int = 0
-
-    # Decoder overlap for cross-chunk continuity (feature frames, 1 frame = 10ms)
-    decoder_overlap_frames: int = 5
-
-    # Post-processing (treble boost + limiter)
-    postprocess_enabled: bool = True
-    treble_boost_db: float = 4.0
-    treble_cutoff_hz: float = 2800.0
-    limiter_threshold_db: float = -1.0
-    limiter_release_ms: float = 80.0
-
-    def __post_init__(self) -> None:
-        if self.latency_mode not in LATENCY_MODES:
-            object.__setattr__(self, "latency_mode", "normal")
-        object.__setattr__(
-            self,
-            "denoise_strength",
-            max(0.5, min(2.0, float(self.denoise_strength))),
-        )
-        minimum_prebuffer = 3
-        if self.latency_mode in DEADLINE_MODES and self.prebuffer_chunks < minimum_prebuffer:
-            object.__setattr__(self, "prebuffer_chunks", minimum_prebuffer)
-        # Round chunk_sec to HuBERT frame boundary (20ms)
-        frame_ms = 20
-        chunk_ms = self.chunk_sec * 1000
-        minimum_chunk_ms = 20 if self.latency_mode == "aggressive" else 40
-        rounded_ms = max(
-            minimum_chunk_ms,
-            min(600, round(chunk_ms / frame_ms) * frame_ms),
-        )
-        if rounded_ms != chunk_ms:
-            logger.info(
-                f"[RealtimeConfig] Rounding chunk_sec from {self.chunk_sec:.3f}s "
-                f"to {rounded_ms / 1000:.3f}s (HuBERT frame alignment)"
-            )
-            object.__setattr__(self, "chunk_sec", rounded_ms / 1000)
-
-        # Round overlap_sec to HuBERT frame boundary
-        overlap_ms = self.overlap_sec * 1000
-        rounded_overlap = round(overlap_ms / frame_ms) * frame_ms
-        if rounded_overlap != overlap_ms:
-            object.__setattr__(self, "overlap_sec", rounded_overlap / 1000)
-
-        # Validate F0 method minimum chunk
-        if self.use_f0:
-            if self.f0_method == "fcpe" and self.chunk_sec < 0.10:
-                object.__setattr__(self, "chunk_sec", 0.10)
-            elif self.f0_method == "rmvpe" and self.chunk_sec < 0.32:
-                object.__setattr__(self, "chunk_sec", 0.32)
 
 
 # ---------------------------------------------------------------------------
@@ -466,9 +275,19 @@ class RealtimeVoiceChangerUnified:
         # small device blocks (e.g. 64-frame ASIO) an np.interp every
         # callback restarts the resampling phase each block and buzzes.
         # See _on_audio_output / _compute_shed_threshold.
-        self._level_window: Optional[deque] = None
-        self._level_window_frames = 0
-        self._buffer_floor_samples = 0
+        self._floor = FloorTracker()
+        # Actual device callback duration observed at runtime.  ASIO ignores
+        # the requested blocksize (the driver panel decides), so the shed
+        # guard must be derived from the real callback, not the request.
+        self._observed_callback_sec = 0.0
+
+        # Spike forensics: GC pauses observed process-wide, and throttle state
+        # for the per-hop spike report.  Written from gc callbacks (any
+        # thread) and read on the inference thread; deque append is GIL-safe.
+        self._gc_events: deque = deque(maxlen=32)
+        self._gc_start_t: Optional[float] = None
+        self._last_spike_log_t = 0.0
+        self._prev_hop_end_t = 0.0
 
         # Input accumulator (ring buffer at mic rate)
         self._input_buf = np.array([], dtype=np.float32)
@@ -487,8 +306,13 @@ class RealtimeVoiceChangerUnified:
         self._output_queue: Queue = Queue(maxsize=self.config.max_queue_size)
         self._inference_times: deque[float] = deque(maxlen=256)
 
-        # Pre-buffering
+        # Pre-buffering.  _required_prebuffer_chunks is the count the output
+        # callback waits for before (re)starting playback: the full configured
+        # prebuffer at session start, but fewer after an underrun re-arm —
+        # a re-arm cushion sized like the initial prebuffer just becomes
+        # standing latency that the drift control immediately trims away.
         self._prebuffer_chunks = self.config.prebuffer_chunks
+        self._required_prebuffer_chunks = self._prebuffer_chunks
         self._chunks_ready = 0
         self._output_started = False
 
@@ -526,51 +350,25 @@ class RealtimeVoiceChangerUnified:
     def _compute_shed_threshold(self) -> tuple[int, int]:
         """Return (shed_threshold, shed_target) for the post-read floor.
 
-        Normal bounds persistent lag to a fraction of one hop. Aggressive
-        uses an adaptive deadline guard derived from observed jitter.
-
-        Instantaneous buffer level is intentionally ignored: it includes the
-        current hop's normal burst/drain sawtooth and trimming against that
-        value on every callback produces audible modulation.
-
-        Returns:
-            (shed_threshold, shed_target): floor limit and post-trim target.
+        Delegates to :func:`compute_shed_policy`; kept as a method so the
+        deadline guard telemetry (jitter_guard_ms) updates alongside.
         """
-        margin = max(0.1, min(2.0, float(self.config.buffer_margin)))
-        if getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES:
-            samples = getattr(self, "_inference_times", ())
-            if len(samples) < 20:
-                # Preserve the initial one-hop standing floor until enough
-                # live samples exist to estimate scheduler/GPU jitter.
-                self.stats.jitter_guard_ms = self.config.chunk_sec * 1000.0
-                return self._hop_samples_out * 5 // 4, self._hop_samples_out
-
-            hop_ms = self.config.chunk_sec * 1000.0
-            jitter_ms = max(
-                0.0,
-                self.stats.inference_p99_ms - self.stats.inference_p50_ms,
-            )
-            callback_ms = self._audio_callback_sec() * 1000.0
-            guard_ms = max(hop_ms * 0.5, jitter_ms + callback_ms)
-            guard_ms = min(hop_ms * 0.875, guard_ms)
-            shed_target = max(
-                1,
-                int(round(guard_ms * self._runtime_output_sample_rate / 1000.0)),
-            )
-            # A small hysteresis band prevents repeated trims when callback
-            # phase moves around the target.
-            shed_threshold = min(
-                self._hop_samples_out,
-                shed_target + self._hop_samples_out // 8,
-            )
-            self.stats.jitter_guard_ms = shed_target * 1000.0 / self._runtime_output_sample_rate
-            return max(1, shed_threshold), max(0, shed_target)
-        # The two-hop floor window filters the normal burst/drain sawtooth.
-        # Any floor above this bound is persistent queued audio, so Normal
-        # sheds it to a small cushion instead of preserving one full hop.
-        shed_threshold = int((0.5 + margin) * self._hop_samples_out)
-        shed_target = self._hop_samples_out // 4
-        return max(1, shed_threshold), max(0, shed_target)
+        deadline = getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES
+        policy = compute_shed_policy(
+            deadline_mode=deadline,
+            hop_samples_out=self._hop_samples_out,
+            output_sample_rate=self._runtime_output_sample_rate,
+            chunk_sec=getattr(self.config, "chunk_sec", 0.0),
+            buffer_margin=getattr(self.config, "buffer_margin", 0.25),
+            inference_sample_count=len(getattr(self, "_inference_times", ())),
+            inference_p50_ms=self.stats.inference_p50_ms,
+            inference_p99_ms=self.stats.inference_p99_ms,
+            requested_callback_sec=self._audio_callback_sec() if deadline else 0.0,
+            observed_callback_sec=getattr(self, "_observed_callback_sec", 0.0),
+        )
+        if deadline:
+            self.stats.jitter_guard_ms = policy.guard_ms
+        return policy.threshold, policy.target
 
     def _audio_callback_sec(self) -> float:
         """Return the requested callback duration for non-ASIO streams."""
@@ -589,7 +387,7 @@ class RealtimeVoiceChangerUnified:
     def _update_latency_estimate(self, inference_ms: float) -> None:
         """Update E2E telemetry without counting the ring's hop sawtooth."""
         hop_ms = self.config.chunk_sec * 1000.0
-        buffer_ms = self._buffer_floor_samples / self._runtime_output_sample_rate * 1000
+        buffer_ms = self._floor.floor_samples / self._runtime_output_sample_rate * 1000
         try:
             queued_chunks = self._output_queue.qsize()
         except Exception:
@@ -630,6 +428,80 @@ class RealtimeVoiceChangerUnified:
                 np.count_nonzero(values > deadline_ms) / values.size
             )
 
+    # ======== Spike forensics ========
+
+    def _on_gc_event(self, phase: str, info: dict) -> None:
+        """Record CPython GC pauses (fires on whichever thread collects)."""
+        if phase == "start":
+            self._gc_start_t = time.perf_counter()
+        elif phase == "stop" and self._gc_start_t is not None:
+            now = time.perf_counter()
+            self._gc_events.append(
+                (now, (now - self._gc_start_t) * 1000.0, int(info.get("generation", -1)))
+            )
+            self._gc_start_t = None
+
+    def _register_gc_forensics(self) -> None:
+        if self._on_gc_event not in gc.callbacks:
+            gc.callbacks.append(self._on_gc_event)
+
+    def _unregister_gc_forensics(self) -> None:
+        try:
+            gc.callbacks.remove(self._on_gc_event)
+        except ValueError:
+            pass
+
+    def _maybe_log_spike(
+        self,
+        inference_ms: float,
+        preprocess_ms: float,
+        infer_call_ms: float,
+        hop_start_t: float,
+        idle_gap_ms: float,
+        queue_depth: int,
+    ) -> None:
+        """One-shot report for a hop that blew past its deadline budget.
+
+        The rolling stage breakdown is sampled every 10 hops and usually
+        misses the spiking hop, so attribute with this hop's own wall-clock
+        segments: pre (resample/denoise/overlap), infer (GPU pipeline incl.
+        D2H sync), post (SOLA/postprocess/metering).  GC pauses overlapping
+        the hop are listed to separate collector stalls from GPU stalls.
+        """
+        deadline_ms = self.config.chunk_sec * 1000.0
+        if inference_ms < deadline_ms * 0.9:
+            return
+        now = time.perf_counter()
+        if now - self._last_spike_log_t < 0.5:
+            return
+        self._last_spike_log_t = now
+
+        post_ms = max(0.0, inference_ms - preprocess_ms - infer_call_ms)
+        gc_in_hop = [
+            (dur, gen)
+            for (t_end, dur, gen) in tuple(self._gc_events)
+            if t_end >= hop_start_t
+        ]
+        gc_detail = (
+            "+".join(f"{dur:.1f}ms(g{gen})" for dur, gen in gc_in_hop)
+            if gc_in_hop
+            else "none"
+        )
+        logger.warning(
+            "[SPIKE] hop took %.1fms (budget %.0fms): pre=%.1f infer=%.1f "
+            "post=%.1f | idle_gap=%.1fms qdepth=%d gc=%s p50=%.1f p99=%.1f",
+            inference_ms,
+            deadline_ms,
+            preprocess_ms,
+            infer_call_ms,
+            post_ms,
+            idle_gap_ms,
+            queue_depth,
+            gc_detail,
+            self.stats.inference_p50_ms,
+            self.stats.inference_p99_ms,
+        )
+
     def _recalculate_sizes(self) -> None:
         """Recalculate derived sample counts from current config."""
         hubert_hop = 320
@@ -663,8 +535,7 @@ class RealtimeVoiceChangerUnified:
         )
 
         # Hop change invalidates the drift-control level window
-        self._level_window = None
-        self._buffer_floor_samples = 0
+        self._floor.reset()
 
     def _apply_runtime_sample_rates(self, mic_rate: int, output_rate: int) -> None:
         """Apply actual stream sample rates and rebuild dependent state."""
@@ -732,6 +603,7 @@ class RealtimeVoiceChangerUnified:
         self._reset_boundary_continuity_state()
         self._chunks_ready = 0
         self._output_started = False
+        self._required_prebuffer_chunks = self._prebuffer_chunks
         self.input_resampler.reset()
         self.output_resampler.reset()
         self._sola_state.buffer = None
@@ -891,9 +763,15 @@ class RealtimeVoiceChangerUnified:
         self._reset_boundary_continuity_state()
         self._chunks_ready = 0
         self._output_started = False
+        self._required_prebuffer_chunks = self._prebuffer_chunks
         self._clear_queues()
         self._feedback_warning_shown = False
 
+        # DWM composition preempts XPU compute during window drag/resize;
+        # favor our submissions in the WDDM scheduler (no-op off Windows).
+        boost_gpu_scheduling_priority()
+
+        self._register_gc_forensics()
         self._running = True
         self._thread = threading.Thread(
             target=self._inference_thread,
@@ -921,6 +799,7 @@ class RealtimeVoiceChangerUnified:
             return
 
         self._running = False
+        self._unregister_gc_forensics()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
@@ -1007,10 +886,14 @@ class RealtimeVoiceChangerUnified:
             self.stop()
             self.start()
 
+    def _sync_required_prebuffer(self) -> None:
+        self._required_prebuffer_chunks = self._prebuffer_chunks
+
     def set_prebuffer_chunks(self, chunks: int) -> None:
         minimum = 3 if self.config.latency_mode == "aggressive" else 0
         self.config.prebuffer_chunks = max(minimum, min(3, int(chunks)))
         self._prebuffer_chunks = self.config.prebuffer_chunks
+        self._sync_required_prebuffer()
 
     def set_latency_mode(self, mode: str) -> None:
         self.config.latency_mode = mode if mode in LATENCY_MODES else "normal"
@@ -1018,6 +901,7 @@ class RealtimeVoiceChangerUnified:
         if self.config.latency_mode in DEADLINE_MODES and self._prebuffer_chunks < minimum:
             self.config.prebuffer_chunks = minimum
             self._prebuffer_chunks = minimum
+        self._sync_required_prebuffer()
 
     def set_buffer_margin(self, margin: float) -> None:
         self.config.buffer_margin = max(0.1, min(2.0, float(margin)))
@@ -1095,35 +979,21 @@ class RealtimeVoiceChangerUnified:
         except Empty:
             pass
 
+        self._observed_callback_sec = frames / float(self._runtime_output_sample_rate)
+
         if not self._output_started:
-            if self._chunks_ready >= self._prebuffer_chunks:
+            if self._chunks_ready >= self._required_prebuffer_chunks:
                 self._output_started = True
             else:
                 return np.zeros(frames, dtype=np.float32)
 
         # --- Adaptive drift control (floor-based, skip-only) ---
-        # Latency state is judged on the MINIMUM post-read ring level over
-        # the last ~2 chunk periods (the floor), never on the instantaneous
-        # level — the burst/drain oscillation and device blocksize phase
-        # beats don't lift the floor, so they can't trigger false skips.
-        #
-        # Normal applies its lower fractional-hop bound through
-        # _compute_shed_threshold().
-        #
-        # Shedding is done exclusively via hard-skip (one splice + fade-in),
-        # NEVER per-callback time-compression: with small device blocks
-        # (e.g. 64-frame ASIO) an np.interp every callback restarts the
-        # resampling phase each block, producing a audible tone at
-        # sample_rate/blocksize.  A periodic clean skip is inaudible by
-        # comparison.
-        if self._level_window is None or self._level_window_frames != frames:
-            self._level_window_frames = frames
-            window_len = max(4, -(-2 * self._hop_samples_out // max(1, frames)))
-            self._level_window = deque(maxlen=window_len)
-            self._buffer_floor_samples = 0
+        # Policy and mechanics live in rcwx.pipeline.drift_control; this
+        # callback wires them to the ring buffer and stats.
+        self._floor.ensure_window(frames, self._hop_samples_out)
 
-        if len(self._level_window) == self._level_window.maxlen:
-            floor = min(self._level_window)
+        if self._floor.full:
+            floor = self._floor.floor
             shed_threshold, shed_target = self._compute_shed_threshold()
             if floor > shed_threshold:
                 # Drop the accumulated excess in one splice.  Land below the
@@ -1132,8 +1002,7 @@ class RealtimeVoiceChangerUnified:
                 # fade-in, so the splice doesn't click.
                 skip_amount = max(0, floor - shed_target)
                 skipped = self.output_buffer.skip(skip_amount)
-                self._level_window.clear()  # re-measure from the new level
-                self._buffer_floor_samples = shed_target
+                self._floor.after_skip(shed_target)
                 self.stats.buffer_trims += 1
                 logger.info(
                     "[DRIFT] Skipped %d samples (%.0fms) of accumulated latency, "
@@ -1147,14 +1016,7 @@ class RealtimeVoiceChangerUnified:
                 )
 
         output = self.output_buffer.get(frames)
-
-        # Record the post-read level: the true sawtooth trough occurs right
-        # before a burst lands, and only the post-read sample at the
-        # preceding callback captures it (pre-read sampling sits one
-        # callback higher and hides the real floor).
-        self._level_window.append(self.output_buffer.available)
-        if len(self._level_window) == self._level_window.maxlen:
-            self._buffer_floor_samples = min(self._level_window)
+        self._floor.record_post_read(self.output_buffer.available)
 
         # Count REAL underruns only: the ring's counter increments when a
         # read could not be fully served (zero-padded output = audible gap).
@@ -1174,17 +1036,19 @@ class RealtimeVoiceChangerUnified:
             if getattr(self.config, "latency_mode", "normal") in DEADLINE_MODES:
                 # Once a zero-padded read has consumed the jitter guard, the
                 # producer and consumer continue at the same average rate and
-                # cannot rebuild it on their own. Pause playback until two
-                # configured fresh hops are available instead of crackling on every
-                # following callback.
+                # cannot rebuild it on their own.  Pause playback until fresh
+                # hops are available instead of crackling on every following
+                # callback.  Re-arm with LESS than the initial prebuffer: any
+                # cushion beyond the shed guard is standing latency that the
+                # drift control skips right back out (~1 hop of discarded
+                # speech per underrun at the full 3-hop re-arm).
                 self._output_started = False
                 self._chunks_ready = 0
-                if self._level_window is not None:
-                    self._level_window.clear()
-                self._buffer_floor_samples = 0
+                self._required_prebuffer_chunks = min(2, self._prebuffer_chunks)
+                self._floor.clear()
                 logger.warning(
                     "[UNDERRUN] Deadline mode playback re-armed for %d-hop prebuffer",
-                    self._prebuffer_chunks,
+                    self._required_prebuffer_chunks,
                 )
 
         return output
@@ -1229,6 +1093,17 @@ class RealtimeVoiceChangerUnified:
 
             try:
                 start_time = time.perf_counter()
+                # Idle gap ≈ hop period when keeping up; ≈0 means the input
+                # queue already had a backlog when this hop was picked up.
+                idle_gap_ms = (
+                    (start_time - self._prev_hop_end_t) * 1000.0
+                    if self._prev_hop_end_t > 0
+                    else 0.0
+                )
+                try:
+                    queue_depth = self._input_queue.qsize()
+                except Exception:
+                    queue_depth = -1
 
                 # --- Stage 1: Input gain ---
                 if self.config.input_gain_db != 0.0:
@@ -1306,6 +1181,7 @@ class RealtimeVoiceChangerUnified:
                 # --- Stage 5: Inference ---
                 preprocess_ms = (time.perf_counter() - start_time) * 1000
 
+                infer_call_t0 = time.perf_counter()
                 output_model = self.pipeline.infer_streaming(
                     chunk_16k,
                     overlap_samples,
@@ -1314,6 +1190,7 @@ class RealtimeVoiceChangerUnified:
                         voice_gate_mode=self.config.voice_gate_mode,
                     ),
                 )
+                infer_call_ms = (time.perf_counter() - infer_call_t0) * 1000.0
 
                 # --- Stage 6: Resample model_sr -> 48kHz ---
                 if self._uses_device_output_resample():
@@ -1390,6 +1267,15 @@ class RealtimeVoiceChangerUnified:
                 inference_ms = (time.perf_counter() - start_time) * 1000
                 self.stats.inference_ms = inference_ms
                 self._record_inference_timing(inference_ms)
+                self._prev_hop_end_t = time.perf_counter()
+                self._maybe_log_spike(
+                    inference_ms,
+                    preprocess_ms,
+                    infer_call_ms,
+                    start_time,
+                    idle_gap_ms,
+                    queue_depth,
+                )
                 stage = getattr(self.pipeline, "stage_times", None) or {}
                 self.stats.hubert_ms = float(stage.get("hubert_ms", 0.0))
                 self.stats.f0_ms = float(stage.get("f0_ms", 0.0))

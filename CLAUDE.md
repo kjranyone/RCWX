@@ -105,6 +105,8 @@ rcwx/
 │   └── infer_pack/
 ├── pipeline/
 │   ├── inference.py       # infer / infer_streaming
+│   ├── realtime_config.py # RealtimeConfig / RealtimeStats
+│   ├── drift_control.py   # shed policy + FloorTracker
 │   └── realtime_unified.py
 └── gui/
     ├── app.py
@@ -236,8 +238,10 @@ GUI 既定起動時の代表値:
 **Aggressive**
 
 - 非 ASIO コールバック最大 2.5ms
-- 開始時・アンダーラン再アームで `prebuffer_chunks`（3）hop 確保
-- 最初の 20 hop は 1 hop guard（threshold 1.25 hop）。以降 `max(0.5·hop, p99-p50+callback)` を `0.875·hop` で上限
+- 開始時は `prebuffer_chunks`（3）hop 確保。アンダーラン再アームは 2 hop（余剰が即 trim されるのを防ぐ）
+- 最初の 20 hop は 1 hop guard（threshold 1.25 hop）。以降 `max(0.5·hop, p99-p50+callback)` を `0.875·hop` で上限。callback は実測コールバック長（ASIO 実ブロック）を反映、ヒステリシス帯は `max(hop/4, callback)`
+- 推論が budget の 90% 超の hop は `[SPIKE]` ログ（pre/infer/post 内訳 + idle_gap + queue 深度 + GC 停止時間、0.5s スロットル）
+- start 時に WDDM GPU スケジューリング優先度を HIGH（不可なら ABOVE_NORMAL）へ引き上げ、DWM プリエンプション対策（`rcwx/win_gpu_priority.py`、`RCWX_GPU_PRIORITY=0` で無効）
 - HuBERT context 最大 0.56s、SwiftF0 の f0 context 最大 0.10s（保存設定は変更しない）
 - GUI 経路で denoise 強制 OFF
 - FAISS IVF を warmup 時に XPU 配置（L2 / nprobe=1 / max list ≤256）。未対応は CPU FAISS

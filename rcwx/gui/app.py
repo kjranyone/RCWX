@@ -954,16 +954,14 @@ class RCWXApp(ctk.CTk):
         self.realtime_controller.set_f0_mode(use_f0)
 
     def _on_f0_method_changed(self, method: str) -> None:
-        """Handle F0 method change (rmvpe/fcpe/none)."""
+        """Handle F0 method change (swiftf0/rmvpe/fcpe/none)."""
         chunk_clamped = False
         if hasattr(self, "latency_settings"):
             chunk_clamped = self.latency_settings.set_f0_method(method)
         self._save_config()
         self.realtime_controller.set_f0_method(method)
         if chunk_clamped and self.realtime_controller.is_running:
-            self.realtime_controller.apply_latency_settings(
-                self.latency_settings.get_settings()
-            )
+            self.realtime_controller.apply_latency_settings(self.latency_settings.get_settings())
 
     def _on_moe_boost_changed(self, strength: float) -> None:
         """Handle moe boost change."""
@@ -1251,6 +1249,7 @@ class RCWXApp(ctk.CTk):
             # startup become visible. Only safe while no stream is running.
             if not self._is_running:
                 from rcwx.audio.stream_base import reinit_portaudio
+
                 if reinit_portaudio():
                     self.audio_settings._refresh_devices()
             # Start auto-refresh when audio tab is selected
