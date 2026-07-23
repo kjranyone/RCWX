@@ -179,8 +179,9 @@ class InferenceConfig:
 
     pitch_shift: int = 0  # semitones
     use_f0: bool = True
-    # F0 extraction method: "rmvpe" (accurate), "fcpe" (fast), or "swiftf0" (ultra-fast ONNX/CPU)
-    f0_method: str = "rmvpe"
+    # F0 extraction method: "swiftf0" (ultra-fast ONNX/CPU, Graph-friendly),
+    # "rmvpe" (accurate), or "fcpe" (fast GPU)
+    f0_method: str = "swiftf0"
     use_index: bool = True
     index_ratio: float = 0.15
     index_k: int = 4  # FAISS neighbors to search (4=fast, 8=quality)
@@ -284,9 +285,7 @@ class RCWXConfig:
             latency_profile_version = 1
         if latency_profile_version < 2:
             legacy_mode = audio_data.get("latency_mode", "balanced")
-            audio_data["latency_mode"] = (
-                "aggressive" if legacy_mode == "frontier" else "normal"
-            )
+            audio_data["latency_mode"] = "aggressive" if legacy_mode == "frontier" else "normal"
             audio_data["latency_profile_version"] = 2
 
         # Nested configs are constructed separately; pop them so they are not

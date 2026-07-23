@@ -246,7 +246,7 @@ MLの2段処理は計算量も増えます。GUI の `Aggressive` では deadlin
 
 | パラメータ | デフォルト | 説明 |
 |-----------|-----------|------|
-| `f0_method` | `rmvpe` | F0抽出方式。`rmvpe`=高品質（320ms最小チャンク）、`fcpe`=低遅延（100ms最小チャンク）、`swiftf0`=超低遅延 ONNX/CPU（Normal 40ms / Aggressive 20ms 最小） |
+| `f0_method` | `swiftf0` | F0抽出方式。`swiftf0`=超低遅延 ONNX/CPU（Normal 40ms / Aggressive 20ms 最小）、`rmvpe`=高品質（320ms最小チャンク）、`fcpe`=低遅延（100ms最小チャンク） |
 | `f0_lowpass_cutoff_hz` | 16.0 | F0ローパスフィルタのカットオフ周波数（Hz）。100fps F0に対してButterworth 2次フィルタを適用。低い=滑らか、高い=ピッチの細かい変化を保持 |
 | `enable_octave_flip_suppress` | true | F0抽出のオクターブ誤検出（±1オクターブのフレーム間ジャンプ）を自動補正。隣接フレーム比が2.0±0.16の場合にトリガー |
 | `enable_f0_slew_limit` | true | フレーム間のF0変化量を制限し、ピッチの急激な飛びを抑制 |

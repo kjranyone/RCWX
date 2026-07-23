@@ -181,41 +181,43 @@ class LookaheadLimiter:
 
         lookahead = self._lookahead_samples
         threshold = self._threshold
+        n = int(audio.shape[0])
 
         if self._delay_buffer is None:
             self._delay_buffer = np.zeros(lookahead, dtype=np.float32)
             self._delay_idx = 0
 
-        output = np.zeros_like(audio)
-        delay_buf = self._delay_buffer
-        delay_idx = self._delay_idx
-        envelope = self._envelope_state
+        # Sliding delay line (equivalent to the previous circular buffer, but
+        # without a per-sample modulo).  On the 20ms hot path this alone cuts
+        # most of the Python-loop cost; the envelope follower still needs a
+        # short recursive pass (instant attack / exponential release).
+        combined = np.empty(lookahead + n, dtype=np.float32)
+        combined[:lookahead] = self._delay_buffer
+        np.copyto(combined[lookahead:], audio)
+        delayed = combined[:n]
+        self._delay_buffer = combined[n:]
+        self._delay_idx = 0
 
-        for i in range(len(audio)):
-            in_sample = audio[i]
-
-            out_sample = delay_buf[delay_idx]
-            delay_buf[delay_idx] = in_sample
-            delay_idx = (delay_idx + 1) % lookahead
-
-            peak = abs(in_sample)
-            if peak > envelope:
-                envelope = peak
+        peak = np.abs(audio, dtype=np.float32)
+        envelope = np.empty(n, dtype=np.float32)
+        env = float(self._envelope_state)
+        rc = float(self._release_coeff)
+        one_m_rc = 1.0 - rc
+        # Local bindings keep the tight loop in LOAD_FAST territory.
+        for i in range(n):
+            v = float(peak[i])
+            if v > env:
+                env = v
             else:
-                envelope = self._release_coeff * envelope + (1 - self._release_coeff) * peak
+                env = rc * env + one_m_rc * v
+            envelope[i] = env
+        self._envelope_state = env
 
-            if envelope > threshold:
-                gain = threshold / envelope
-            else:
-                gain = 1.0
-
-            output[i] = out_sample * gain
-
-        self._delay_buffer = delay_buf
-        self._delay_idx = delay_idx
-        self._envelope_state = envelope
-
-        return output
+        gain = np.ones(n, dtype=np.float32)
+        over = envelope > threshold
+        if np.any(over):
+            gain[over] = threshold / envelope[over]
+        return delayed * gain
 
 
 class Postprocessor:
