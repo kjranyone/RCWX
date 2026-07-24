@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -18,6 +19,14 @@ HUBERT_FILE = "hubert_base.pt"
 RMVPE_REPO = "lj1995/VoiceConversionWebUI"
 RMVPE_FILE = "rmvpe.pt"
 
+# GTCRN streaming denoiser (MIT license, CPU ONNX, ~0.5MB).
+# Official simplified streaming graph from the GTCRN repository.
+GTCRN_URL = (
+    "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/main/"
+    "stream/onnx_models/gtcrn_simple.onnx"
+)
+GTCRN_FILE = "gtcrn_simple.onnx"
+
 
 def get_hubert_path(models_dir: Path) -> Path:
     """Return the path to the HuBERT/ContentVec model."""
@@ -27,6 +36,38 @@ def get_hubert_path(models_dir: Path) -> Path:
 def get_rmvpe_path(models_dir: Path) -> Path:
     """Return the path to the RMVPE model."""
     return models_dir / "rmvpe" / RMVPE_FILE
+
+
+def get_gtcrn_path(models_dir: Path) -> Path:
+    """Return the path to the GTCRN streaming denoiser ONNX model."""
+    return models_dir / "gtcrn" / GTCRN_FILE
+
+
+def download_gtcrn(models_dir: Path, force: bool = False) -> Path:
+    """Download the GTCRN streaming ONNX model (~0.5MB) from GitHub.
+
+    Args:
+        models_dir: Directory to store models
+        force: Force re-download even if exists
+
+    Returns:
+        Path to the downloaded model
+    """
+    target_path = get_gtcrn_path(models_dir)
+
+    if target_path.exists() and not force:
+        logger.info(f"GTCRN model already exists: {target_path}")
+        return target_path
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Downloading GTCRN from {GTCRN_URL}...")
+    tmp_path = target_path.with_suffix(".onnx.part")
+    urllib.request.urlretrieve(GTCRN_URL, tmp_path)
+    tmp_path.replace(target_path)
+
+    logger.info(f"GTCRN downloaded to: {target_path}")
+    return target_path
 
 
 def download_hubert(models_dir: Path, force: bool = False) -> Path:
@@ -122,6 +163,18 @@ def download_all(
     results["rmvpe"] = download_rmvpe(models_dir, force)
     if callback:
         callback("rmvpe", "done")
+
+    # Optional (denoise method "gtcrn") — non-fatal on network failure.
+    try:
+        if callback:
+            callback("gtcrn", "downloading")
+        results["gtcrn"] = download_gtcrn(models_dir, force)
+        if callback:
+            callback("gtcrn", "done")
+    except Exception as e:
+        logger.warning(f"GTCRN download failed (optional, non-fatal): {e}")
+        if callback:
+            callback("gtcrn", "failed")
 
     return results
 

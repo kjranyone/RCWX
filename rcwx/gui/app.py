@@ -304,8 +304,14 @@ class RCWXApp(ctk.CTk):
         # the optional 'denoiser' package (extra "ml-denoise"); hide it when it
         # is not installed and fall back a saved "ml" selection to "spectral",
         # so the user can't pick a method that would silently degrade / fail.
+        # "gtcrn" runs on CPU via onnxruntime (always a base dependency) and
+        # auto-downloads its ~0.5MB model on first use.
         ml_available = is_ml_denoiser_available()
-        method_values = ["auto", "ml", "spectral"] if ml_available else ["auto", "spectral"]
+        method_values = (
+            ["auto", "gtcrn", "ml", "spectral"]
+            if ml_available
+            else ["auto", "gtcrn", "spectral"]
+        )
         saved_method = self.config.inference.denoise.method
         if not ml_available and saved_method == "ml":
             saved_method = "spectral"

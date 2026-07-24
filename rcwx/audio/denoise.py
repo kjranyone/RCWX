@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from rcwx.accelerator_graph import accelerator_graph_enabled, run_accelerator_graph
+from rcwx.audio.gtcrn import get_cached_gtcrn, is_gtcrn_available
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +544,8 @@ def denoise(
         audio: Input audio (mono, float32)
         sample_rate: Sample rate
         method: "auto" (try ML denoiser, fallback to spectral gate),
-                "ml" (Facebook Denoiser, ML-based),
+                "ml" (Facebook Denoiser, ML-based, GPU),
+                "gtcrn" (GTCRN, MIT license, CPU ONNX, 16kHz only),
                 "spectral" (traditional DSP)
         noise_reference: Noise reference for spectral gate (ignored for ML)
         threshold_db: Spectral gate threshold (ignored for ML)
@@ -559,6 +561,25 @@ def denoise(
 
     # Select method
     use_ml = False
+
+    if method == "gtcrn":
+        # MIT-licensed streaming denoiser on CPU (no GPU contention).
+        # Degrades to spectral gate when onnxruntime is unavailable or the
+        # model cannot be loaded (e.g. first-use download fails offline).
+        if is_gtcrn_available():
+            try:
+                return get_cached_gtcrn().process(
+                    audio, sample_rate, strength=strength
+                )
+            except Exception as e:
+                logger.warning(
+                    f"GTCRN denoiser failed ({e}); falling back to spectral gate"
+                )
+        else:
+            logger.warning(
+                "GTCRN denoiser requested but onnxruntime is not installed; "
+                "falling back to spectral gate"
+            )
 
     if method == "ml":
         # Explicit ML request still degrades gracefully when the optional

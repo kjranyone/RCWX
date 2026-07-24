@@ -144,7 +144,7 @@ class DenoiseConfig:
     """Noise cancellation configuration."""
 
     enabled: bool = True
-    method: str = "ml"  # auto, ml, spectral, off
+    method: str = "ml"  # auto, ml, gtcrn, spectral, off
     # 1.0 preserves the previous behavior. Values above 1.0 apply a second
     # ML pass, or deepen the spectral threshold/reduction below.
     strength: float = 1.0
