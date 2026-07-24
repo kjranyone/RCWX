@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -18,6 +19,7 @@ from queue import Empty, Queue
 from typing import Callable, Optional
 
 import numpy as np
+import torch
 from scipy.signal import resample_poly
 
 from rcwx.audio.buffer import RingOutputBuffer
@@ -28,7 +30,12 @@ from rcwx.audio.output import AudioOutput
 from rcwx.audio.postprocess import PostprocessConfig, Postprocessor
 from rcwx.audio.resample import StatefulResampler, resample
 from rcwx.audio.sola import SolaState, sola_crossfade, sola_flush
-from rcwx.audio.stream_base import is_device_on_asio, parse_output_channel_pair
+from rcwx.audio.stream_base import (
+    get_default_device,
+    is_device_on_asio,
+    parse_output_channel_pair,
+)
+from rcwx.audio.wav_input import WavFileInput
 from rcwx.pipeline.drift_control import FloorTracker, compute_shed_policy
 from rcwx.pipeline.inference import RVCPipeline, StreamingParams
 from rcwx.pipeline.realtime_config import (
@@ -305,11 +312,21 @@ class RealtimeVoiceChangerUnified:
         # Threading
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._preproc_thread: Optional[threading.Thread] = None
+        # Experimental: run gain/resample/denoise on a dedicated thread,
+        # pipelined one hop ahead of inference.  On the reference machine
+        # this INCREASED p95/p99 hop times (~2x) and deadline misses — the
+        # concurrent thread perturbs the inference thread's scheduling —
+        # so the default is the inline path.  Kept behind an env flag for
+        # further investigation.
+        self._use_preproc_thread = os.environ.get("RCWX_PREPROC_THREAD", "0") == "1"
         # Consecutive GPU/driver-level failures (device lost, VRAM exhausted).
         # After a device loss every subsequent chunk fails the same way, so
         # the inference thread stops itself instead of error-spamming.
         self._device_error_streak = 0
         self._input_queue: Queue = Queue(maxsize=self.config.max_queue_size)
+        # Preprocessed hops (gain/resample/denoise done): (hop_16k, hop_mic)
+        self._preproc_queue: Queue = Queue(maxsize=self.config.max_queue_size)
         self._output_queue: Queue = Queue(maxsize=self.config.max_queue_size)
         self._inference_times: deque[float] = deque(maxlen=256)
 
@@ -587,43 +604,26 @@ class RealtimeVoiceChangerUnified:
             self._on_warmup_progress(2, 2, "準備完了")
         self._prepared = True
 
-    def start(self) -> None:
-        if self._running:
-            return
-
-        # Reset runtime rates to configured values; may be corrected after stream open.
-        self._apply_runtime_sample_rates(
-            self.config.mic_sample_rate,
-            self.config.output_sample_rate,
-        )
-
-        self.pipeline.clear_cache()
-        self.stats.reset()
-        self._inference_times.clear()
-        self.output_buffer.clear()
+    def _reset_stream_state(self) -> None:
+        """Reset per-stream continuity state (buffers, resamplers, SOLA, queues)."""
+        self.input_resampler.reset()
+        self.output_resampler.reset()
+        self._sola_state.buffer = None
         self._input_buf = np.array([], dtype=np.float32)
         self._overlap_buf = None
         self._reset_boundary_continuity_state()
         self._chunks_ready = 0
         self._output_started = False
         self._required_prebuffer_chunks = self._prebuffer_chunks
-        self.input_resampler.reset()
-        self.output_resampler.reset()
-        self._sola_state.buffer = None
-        self._output_history.fill(0)
-        self._output_history_pos = 0
-        self._feedback_warning_shown = False
         self._clear_queues()
-        if not self._prepared:
-            self._run_denoise_warmup()
-            self._run_runtime_warmup()
-        # Consumed: restarts (e.g. after a chunk-size change) must re-warm
-        # because shape-dependent kernels change with the config.
-        self._prepared = False
+        self._feedback_warning_shown = False
 
-        # Keep device callbacks independent from the inference hop in the
-        # aggressive policy. ASIO still uses its driver-selected buffer below.
-        output_chunk_sec = self._audio_callback_sec()
+    def _open_audio_streams(self, output_chunk_sec: float) -> bool:
+        """Open and start the audio streams (ASIO duplex when possible).
+
+        Sets ``self._input_stream`` / ``self._output_stream``. Returns True
+        when a single ASIO duplex stream serves both directions.
+        """
         output_blocksize = int(self.config.output_sample_rate * output_chunk_sec)
 
         # --- ASIO duplex detection ---
@@ -635,18 +635,14 @@ class RealtimeVoiceChangerUnified:
             and is_device_on_asio(self.config.output_device, "output")
         )
 
+        in_dev = self.config.input_device
+        out_dev = self.config.output_device
         if use_asio_duplex:
             logger.info("Both devices are ASIO — using duplex stream")
-            in_dev = self.config.input_device
-            out_dev = self.config.output_device
             # Resolve None → default device index for sd.Stream(device=(...))
             if in_dev is None:
-                from rcwx.audio.stream_base import get_default_device
-
                 in_dev = get_default_device("input")
             if out_dev is None:
-                from rcwx.audio.stream_base import get_default_device
-
                 out_dev = get_default_device("output")
             if in_dev is None or out_dev is None:
                 logger.warning(
@@ -687,45 +683,47 @@ class RealtimeVoiceChangerUnified:
             # Both references point to the same object so stop() only closes once.
             self._input_stream = duplex
             self._output_stream = duplex
+            return True
+
+        # --- Separate streams (WASAPI / DirectSound / MME) ---
+        # Start output stream FIRST so its callback is active before any
+        # audio arrives.  AudioOutput.start() may take time due to API
+        # fallback (WASAPI → DirectSound → MME), and during that time the
+        # input stream would queue audio with no output drain — causing a
+        # burst of buffered audio and large initial trims.
+        self._output_stream = AudioOutput(
+            device=self.config.output_device,
+            sample_rate=self.config.output_sample_rate,
+            channels=output_channels,
+            blocksize=output_blocksize,
+            callback=self._on_audio_output,
+            output_channel_selection=self.config.output_channel_selection,
+            asio_buffer_size=self.config.asio_buffer_size,
+        )
+        self._output_stream.start()
+
+        if self.config.wav_input_path:
+            self._input_stream = WavFileInput(
+                path=self.config.wav_input_path,
+                sample_rate=self.config.mic_sample_rate,
+                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                callback=self._on_audio_input,
+            )
         else:
-            # --- Separate streams (WASAPI / DirectSound / MME) ---
-            # Start output stream FIRST so its callback is active before any
-            # audio arrives.  AudioOutput.start() may take time due to API
-            # fallback (WASAPI → DirectSound → MME), and during that time the
-            # input stream would queue audio with no output drain — causing a
-            # burst of buffered audio and large initial trims.
-            self._output_stream = AudioOutput(
-                device=self.config.output_device,
-                sample_rate=self.config.output_sample_rate,
-                channels=output_channels,
-                blocksize=output_blocksize,
-                callback=self._on_audio_output,
-                output_channel_selection=self.config.output_channel_selection,
+            self._input_stream = AudioInput(
+                device=self.config.input_device,
+                sample_rate=self.config.mic_sample_rate,
+                channels=self.config.input_channels,
+                blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
+                callback=self._on_audio_input,
+                channel_selection=self.config.input_channel_selection,
                 asio_buffer_size=self.config.asio_buffer_size,
             )
-            self._output_stream.start()
+        self._input_stream.start()
+        return False
 
-            if self.config.wav_input_path:
-                from rcwx.audio.wav_input import WavFileInput
-
-                self._input_stream = WavFileInput(
-                    path=self.config.wav_input_path,
-                    sample_rate=self.config.mic_sample_rate,
-                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                    callback=self._on_audio_input,
-                )
-            else:
-                self._input_stream = AudioInput(
-                    device=self.config.input_device,
-                    sample_rate=self.config.mic_sample_rate,
-                    channels=self.config.input_channels,
-                    blocksize=int(self.config.mic_sample_rate * output_chunk_sec),
-                    callback=self._on_audio_input,
-                    channel_selection=self.config.input_channel_selection,
-                    asio_buffer_size=self.config.asio_buffer_size,
-                )
-            self._input_stream.start()
-
+    def _resolve_runtime_rates(self, use_asio_duplex: bool) -> None:
+        """Adopt actual device rates; rewarm when the output-resample graph moves."""
         actual_output_rate = int(round(self._output_stream.actual_sample_rate))
         # For ASIO duplex, input and output share a single stream at one rate.
         if use_asio_duplex:
@@ -758,17 +756,38 @@ class RealtimeVoiceChangerUnified:
                 actual_output_rate,
             )
             self._run_runtime_warmup()
-        self.input_resampler.reset()
-        self.output_resampler.reset()
-        self._sola_state.buffer = None
-        self._input_buf = np.array([], dtype=np.float32)
-        self._overlap_buf = None
-        self._reset_boundary_continuity_state()
-        self._chunks_ready = 0
-        self._output_started = False
-        self._required_prebuffer_chunks = self._prebuffer_chunks
-        self._clear_queues()
-        self._feedback_warning_shown = False
+
+    def start(self) -> None:
+        if self._running:
+            return
+
+        # Reset runtime rates to configured values; may be corrected after stream open.
+        self._apply_runtime_sample_rates(
+            self.config.mic_sample_rate,
+            self.config.output_sample_rate,
+        )
+
+        self.pipeline.clear_cache()
+        self.stats.reset()
+        self._inference_times.clear()
+        self.output_buffer.clear()
+        self._output_history.fill(0)
+        self._output_history_pos = 0
+        self._reset_stream_state()
+        if not self._prepared:
+            self._run_denoise_warmup()
+            self._run_runtime_warmup()
+        # Consumed: restarts (e.g. after a chunk-size change) must re-warm
+        # because shape-dependent kernels change with the config.
+        self._prepared = False
+
+        # Keep device callbacks independent from the inference hop in the
+        # aggressive policy. ASIO still uses its driver-selected buffer below.
+        output_chunk_sec = self._audio_callback_sec()
+
+        use_asio_duplex = self._open_audio_streams(output_chunk_sec)
+        self._resolve_runtime_rates(use_asio_duplex)
+        self._reset_stream_state()
 
         # DWM composition preempts XPU compute during window drag/resize;
         # favor our submissions in the WDDM scheduler (no-op off Windows).
@@ -776,6 +795,14 @@ class RealtimeVoiceChangerUnified:
 
         self._register_gc_forensics()
         self._running = True
+        if self._use_preproc_thread:
+            logger.info("Experimental preprocess thread enabled (RCWX_PREPROC_THREAD=1)")
+            self._preproc_thread = threading.Thread(
+                target=self._preproc_thread_loop,
+                daemon=True,
+                name="RCWX-Preproc",
+            )
+            self._preproc_thread.start()
         self._thread = threading.Thread(
             target=self._inference_thread,
             daemon=True,
@@ -803,6 +830,9 @@ class RealtimeVoiceChangerUnified:
 
         self._running = False
         self._unregister_gc_forensics()
+        if self._preproc_thread is not None:
+            self._preproc_thread.join(timeout=1.0)
+            self._preproc_thread = None
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
@@ -1058,33 +1088,328 @@ class RealtimeVoiceChangerUnified:
 
     # ======== Inference Thread ========
 
+    def _preproc_thread_loop(self) -> None:
+        """EXPERIMENTAL (RCWX_PREPROC_THREAD=1): preprocessing pipelined one
+        stage ahead of inference on a dedicated thread.
+
+        Intended to move the denoiser's per-hop cost and device sync out of
+        the inference hop budget.  In practice, on the reference machine the
+        concurrent thread roughly DOUBLED p95/p99 hop times and deadline
+        misses (cause not yet isolated: CPU scheduling / GIL interference,
+        or concurrent XPU submissions), so the inline path is the default.
+
+        When enabled, the stateful input resampler is owned by this thread
+        and sees every hop in arrival order, so its continuity survives even
+        when the inference thread drops stale preprocessed hops.
+        """
+        logger.info("Preprocess thread started")
+        while self._running:
+            try:
+                hop_mic = self._input_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            try:
+                item = self._preprocess_hop(hop_mic)
+                try:
+                    self._preproc_queue.put_nowait(item)
+                except Exception:
+                    # Backlog pressure counts toward the overload bypass so a
+                    # too-slow denoiser sheds itself instead of the stream.
+                    logger.warning("[PREPROC] Queue full, dropping chunk")
+                    self._record_queue_full()
+            except Exception as e:
+                logger.error(f"Preprocess error: {e}", exc_info=True)
+                if self.on_error:
+                    self.on_error(f"前処理エラー: {e}")
+        logger.info("Preprocess thread stopped")
+
+    def _preprocess_hop(self, hop_mic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Stages 1-3: input gain -> level meter -> mic->16k -> optional denoise.
+
+        Returns ``(hop_16k, hop_at_mic_rate)``.
+        """
+        # --- Stage 1: Input gain ---
+        if self.config.input_gain_db != 0.0:
+            gain = 10 ** (self.config.input_gain_db / 20)
+            hop_mic = hop_mic * gain
+
+        chunk_at_mic_rate = hop_mic.copy()
+
+        # Measure input level (post-gain) for the GUI input meter. This
+        # is the only way to monitor input on exclusive ASIO devices,
+        # which cannot be opened by a separate standalone InputStream.
+        if chunk_at_mic_rate.size:
+            in_rms = float(np.sqrt(np.mean(chunk_at_mic_rate**2)))
+            in_peak = float(np.max(np.abs(chunk_at_mic_rate)))
+            self.stats.input_rms_db = max(-60.0, 20.0 * np.log10(max(in_rms, 1e-6)))
+            self.stats.input_peak_db = max(-60.0, 20.0 * np.log10(max(in_peak, 1e-6)))
+
+        # --- Stage 2: Resample mic_sr -> 16k ---
+        hop_16k = self.input_resampler.resample_chunk(hop_mic)
+
+        # --- Stage 3: Optional denoise ---
+        if not self._is_overloaded() and self.config.denoise_enabled:
+            hop_16k = denoise_audio(
+                hop_16k,
+                sample_rate=16000,
+                method=self.config.denoise_method,
+                strength=self.config.denoise_strength,
+                device=self.pipeline.device,
+            )
+
+        return hop_16k, chunk_at_mic_rate
+
+    def _next_input_hop(self):
+        """Block for the next hop; drop stale backlog to bound latency.
+
+        Returns a raw mic-rate hop on the default inline path, or a
+        preprocessed ``(hop_16k, hop_at_mic_rate)`` tuple when the
+        experimental preprocess thread is enabled.  Raises ``queue.Empty``
+        when no hop arrives within the wait timeout.
+        """
+        queue = self._preproc_queue if self._use_preproc_thread else self._input_queue
+        item = queue.get(timeout=0.5)
+        stale_dropped = 0
+        while True:
+            try:
+                item = queue.get_nowait()
+                stale_dropped += 1
+            except Empty:
+                break
+        if stale_dropped > 0:
+            # Dropped hops break audio continuity — reset all chunk-boundary
+            # state so the newest hop starts a fresh stream segment.  With the
+            # preprocess thread, the input resampler is NOT reset: it consumed
+            # every mic hop in arrival order, so its state is still continuous
+            # with the hop we are about to process.
+            self._overlap_buf = None
+            self.pipeline.clear_cache()
+            if not self._use_preproc_thread:
+                self.input_resampler.reset()
+            self.output_resampler.reset()
+            self._sola_state.buffer = None
+            self._reset_boundary_continuity_state()
+            logger.warning(
+                "[CATCHUP] Dropped %d stale input chunk(s) to bound latency",
+                stale_dropped,
+            )
+        return item
+
+    def _assemble_chunk_16k(
+        self, hop_16k: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        """Assemble [overlap | new_hop] at 16kHz, HuBERT-frame aligned.
+
+        Aligns the hop to the 320-sample HuBERT frame boundary, prepends the
+        stored overlap tail (reflection padding on the first chunk), and
+        updates the accumulating overlap buffer for the next hop.
+
+        Returns (aligned_hop_16k, chunk_16k, overlap_samples).
+        """
+        # Align hop to HuBERT frame boundary (320 samples)
+        hubert_hop = 320
+        aligned_hop = self._align_to_hop(len(hop_16k), hubert_hop)
+        if len(hop_16k) < aligned_hop:
+            hop_16k = np.pad(hop_16k, (0, aligned_hop - len(hop_16k)))
+        elif len(hop_16k) > aligned_hop:
+            hop_16k = hop_16k[:aligned_hop]
+
+        if self._overlap_buf is not None:
+            # Ensure overlap is aligned
+            overlap = self._overlap_buf
+            if len(overlap) % hubert_hop != 0:
+                aligned_ovl = self._align_to_hop(len(overlap), hubert_hop)
+                if len(overlap) < aligned_ovl:
+                    overlap = np.pad(overlap, (aligned_ovl - len(overlap), 0))
+                else:
+                    overlap = overlap[-aligned_ovl:]
+
+            chunk_16k = np.concatenate([overlap, hop_16k])
+            overlap_samples = len(overlap)
+        else:
+            # First chunk: use reflection padding as overlap
+            # Cap at hop length (can't reflect more than we have)
+            overlap_len = min(self._overlap_samples_16k, len(hop_16k))
+            if overlap_len > 0:
+                reflection = hop_16k[:overlap_len][::-1].copy()
+                chunk_16k = np.concatenate([reflection, hop_16k])
+                overlap_samples = overlap_len
+            else:
+                chunk_16k = hop_16k
+                overlap_samples = 0
+
+        # Store tail for next chunk's overlap (accumulating)
+        if self._overlap_samples_16k > 0:
+            if self._overlap_buf is not None:
+                combined = np.concatenate([self._overlap_buf, hop_16k])
+                self._overlap_buf = combined[-self._overlap_samples_16k :]
+            else:
+                tail = min(self._overlap_samples_16k, len(hop_16k))
+                self._overlap_buf = hop_16k[-tail:].copy()
+        else:
+            self._overlap_buf = None
+
+        return hop_16k, chunk_16k, overlap_samples
+
+    def _finalize_output(
+        self, output_model: np.ndarray, chunk_at_mic_rate: np.ndarray
+    ) -> np.ndarray:
+        """Post-inference output chain at the output rate.
+
+        Resample model_sr -> output_sr (unless already done on-device), SOLA
+        crossfade, boundary gain, postprocess (treble/limiter), user output
+        gain, hard clip, GUI output meter, feedback detection.
+        """
+        # --- Stage 6: Resample model_sr -> 48kHz ---
+        if self._uses_device_output_resample():
+            output_48k = output_model
+        else:
+            output_48k = self.output_resampler.resample_chunk(output_model)
+
+        # --- Stage 7: SOLA crossfade ---
+        # target_len = hop_out: forces output to exactly output-hop
+        # samples and places the hold-back contiguously after
+        # the output boundary, preventing latency drift.
+        sola_in_len = len(output_48k)
+        if self.config.use_sola:
+            output_48k = sola_crossfade(
+                output_48k,
+                self._sola_state,
+                target_len=self._hop_samples_out,
+            )
+
+        # --- Boundary-continuity diagnostics ---
+        # Tracks the per-chunk content advance vs the expected
+        # hop.  A non-zero SOLA offset skips that many samples of
+        # the new chunk (replaced by the held-back prev tail), and a
+        # SOLA output shorter than hop_out is a content deficit —
+        # both manifest as "phonemes cut at the boundary" / periodic
+        # stutter on sustained tones.  Logged throttled.
+        if not hasattr(self, "_bdiag_n"):
+            self._bdiag_n = 0
+            self._bdiag_balance = 0  # emitted - expected (samples)
+        self._bdiag_n += 1
+        sola_out_len = len(output_48k)
+        self._bdiag_balance += sola_out_len - self._hop_samples_out
+        if self._bdiag_n <= 3 or self._bdiag_n % 100 == 0:
+            off = self._sola_state.last_offset if self.config.use_sola else 0
+            logger.info(
+                "[BOUNDARY] chunk#%d sola_in=%d out=%d hop=%d offset=%d "
+                "balance=%d (%.1fms)",
+                self._bdiag_n,
+                sola_in_len,
+                sola_out_len,
+                self._hop_samples_out,
+                off,
+                self._bdiag_balance,
+                self._bdiag_balance * 1000.0 / self._runtime_output_sample_rate,
+            )
+
+        # --- Stage 7.5: Boundary gain continuity ---
+        # Keep this after SOLA so splice alignment is unaffected.
+        output_48k = self._apply_output_boundary_gain(output_48k)
+
+        # --- Stage 7.6: Post-processing (treble boost + limiter) ---
+        output_48k = self._postprocessor.process(output_48k)
+
+        # --- Stage 7.7: User output level adjustment ---
+        if self.config.output_gain_db != 0.0:
+            output_48k = output_48k * (10.0 ** (self.config.output_gain_db / 20.0))
+
+        # Hard clip final output (safety net after limiter)
+        output_48k = np.clip(output_48k, -1.0, 1.0)
+
+        # Measure final output level for the GUI output meter
+        if output_48k.size:
+            out_rms = float(np.sqrt(np.mean(output_48k**2)))
+            out_peak = float(np.max(np.abs(output_48k)))
+            self.stats.output_rms_db = max(-60.0, 20.0 * np.log10(max(out_rms, 1e-6)))
+            self.stats.output_peak_db = max(-60.0, 20.0 * np.log10(max(out_peak, 1e-6)))
+
+        # --- Stage 8: Feedback detection ---
+        if not self.config.wav_input_path:
+            self._store_output_history(output_48k)
+            self._maybe_check_feedback(chunk_at_mic_rate)
+
+        return output_48k
+
+    def _update_gpu_telemetry(self) -> None:
+        """Refresh stats.gpu_memory_percent (UI only, not part of inference)."""
+        try:
+            device = self.pipeline.device
+            device_str = str(device)
+            if "xpu" in device_str:
+                if self._gpu_total_memory == 0:
+                    self._gpu_total_memory = torch.xpu.get_device_properties(
+                        device
+                    ).total_memory
+                if self._gpu_total_memory > 0:
+                    alloc = torch.xpu.memory_allocated(device)
+                    self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
+            elif "cuda" in device_str:
+                if self._gpu_total_memory == 0:
+                    self._gpu_total_memory = torch.cuda.get_device_properties(
+                        device
+                    ).total_memory
+                if self._gpu_total_memory > 0:
+                    alloc = torch.cuda.memory_allocated(device)
+                    self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
+        except Exception:
+            pass
+
+    def _log_perf(
+        self,
+        inference_ms: float,
+        preprocess_ms: float,
+        hop_16k: np.ndarray,
+        overlap_samples: int,
+        output_model: np.ndarray,
+        output_48k: np.ndarray,
+    ) -> None:
+        """Throttled [PERF]/[INFER] hot-path logging."""
+        chunk_ms = self.config.chunk_sec * 1000
+        stage_detail = (
+            f"pre={preprocess_ms:.0f} hubert={self.stats.hubert_ms:.0f} "
+            f"f0={self.stats.f0_ms:.0f} faiss={self.stats.faiss_ms:.0f} "
+            f"synth={self.stats.synth_ms:.0f} "
+            f"out_rs={self.stats.output_resample_ms:.0f}ms"
+        )
+        if inference_ms > chunk_ms * 0.8 and self.stats.frames_processed % 50 == 0:
+            logger.warning(
+                f"[PERF] Inference slow: {inference_ms:.0f}ms "
+                f"({stage_detail}) > {chunk_ms:.0f}ms chunk"
+            )
+
+        if self.stats.frames_processed % 100 == 0:
+            logger.info(
+                f"[PERF] Stage breakdown: infer={inference_ms:.0f}ms "
+                f"({stage_detail}) / chunk={chunk_ms:.0f}ms / "
+                f"latency={self.stats.latency_ms:.0f}ms "
+                f"(hop={self.stats.hop_latency_ms:.0f} "
+                f"buffer={self.stats.buffer_latency_ms:.0f} "
+                f"queue={self.stats.queue_latency_ms:.0f} "
+                f"sola={self.stats.sola_latency_ms:.0f}) / "
+                f"p50={self.stats.inference_p50_ms:.0f}ms "
+                f"p95={self.stats.inference_p95_ms:.0f}ms "
+                f"p99={self.stats.inference_p99_ms:.0f}ms "
+                f"deadline_miss={self.stats.deadline_miss_rate:.1%} "
+                f"guard={self.stats.jitter_guard_ms:.0f}ms"
+            )
+
+        if self.stats.frames_processed <= 5:
+            logger.info(
+                f"[INFER] Chunk #{self.stats.frames_processed}: "
+                f"hop_16k={len(hop_16k)}, overlap={overlap_samples}, "
+                f"out_model={len(output_model)}, out_48k={len(output_48k)}, "
+                f"infer={inference_ms:.0f}ms ({stage_detail})"
+            )
+
     def _inference_thread(self) -> None:
         logger.info("Unified inference thread started")
 
         while self._running:
             try:
-                # Get hop audio at mic rate
-                hop_mic = self._input_queue.get(timeout=0.5)
-                # Keep latency bounded: if backlog exists, drop stale hops and
-                # process only the newest chunk.
-                stale_dropped = 0
-                while True:
-                    try:
-                        hop_mic = self._input_queue.get_nowait()
-                        stale_dropped += 1
-                    except Empty:
-                        break
-                if stale_dropped > 0:
-                    self._overlap_buf = None
-                    self.pipeline.clear_cache()
-                    self.input_resampler.reset()
-                    self.output_resampler.reset()
-                    self._sola_state.buffer = None
-                    self._reset_boundary_continuity_state()
-                    logger.warning(
-                        "[CATCHUP] Dropped %d stale input chunk(s) to bound latency",
-                        stale_dropped,
-                    )
+                item = self._next_input_hop()
             except Empty:
                 continue
             except Exception as e:
@@ -1104,82 +1429,20 @@ class RealtimeVoiceChangerUnified:
                     else 0.0
                 )
                 try:
-                    queue_depth = self._input_queue.qsize()
+                    queue_depth = self._preproc_queue.qsize() + self._input_queue.qsize()
                 except Exception:
                     queue_depth = -1
 
-                # --- Stage 1: Input gain ---
-                if self.config.input_gain_db != 0.0:
-                    gain = 10 ** (self.config.input_gain_db / 20)
-                    hop_mic = hop_mic * gain
-
-                chunk_at_mic_rate = hop_mic.copy()
-
-                # Measure input level (post-gain) for the GUI input meter. This
-                # is the only way to monitor input on exclusive ASIO devices,
-                # which cannot be opened by a separate standalone InputStream.
-                if chunk_at_mic_rate.size:
-                    in_rms = float(np.sqrt(np.mean(chunk_at_mic_rate**2)))
-                    in_peak = float(np.max(np.abs(chunk_at_mic_rate)))
-                    self.stats.input_rms_db = max(-60.0, 20.0 * np.log10(max(in_rms, 1e-6)))
-                    self.stats.input_peak_db = max(-60.0, 20.0 * np.log10(max(in_peak, 1e-6)))
-
-                # --- Stage 2: Resample mic_sr -> 16k ---
-                hop_16k = self.input_resampler.resample_chunk(hop_mic)
-
-                # --- Stage 3: Optional denoise ---
-                if not self._is_overloaded() and self.config.denoise_enabled:
-                    hop_16k = denoise_audio(
-                        hop_16k,
-                        sample_rate=16000,
-                        method=self.config.denoise_method,
-                        strength=self.config.denoise_strength,
-                        device=self.pipeline.device,
-                    )
+                # --- Stages 1-3: gain / meter / resample / denoise ---
+                # Inline by default; already done on the preprocess thread
+                # when RCWX_PREPROC_THREAD=1 (see _preproc_thread_loop).
+                if self._use_preproc_thread:
+                    hop_16k, chunk_at_mic_rate = item
+                else:
+                    hop_16k, chunk_at_mic_rate = self._preprocess_hop(item)
 
                 # --- Stage 4: Assemble chunk with overlap ---
-                # Align hop to HuBERT frame boundary (320 samples)
-                hubert_hop = 320
-                aligned_hop = self._align_to_hop(len(hop_16k), hubert_hop)
-                if len(hop_16k) < aligned_hop:
-                    hop_16k = np.pad(hop_16k, (0, aligned_hop - len(hop_16k)))
-                elif len(hop_16k) > aligned_hop:
-                    hop_16k = hop_16k[:aligned_hop]
-
-                if self._overlap_buf is not None:
-                    # Ensure overlap is aligned
-                    overlap = self._overlap_buf
-                    if len(overlap) % hubert_hop != 0:
-                        aligned_ovl = self._align_to_hop(len(overlap), hubert_hop)
-                        if len(overlap) < aligned_ovl:
-                            overlap = np.pad(overlap, (aligned_ovl - len(overlap), 0))
-                        else:
-                            overlap = overlap[-aligned_ovl:]
-
-                    chunk_16k = np.concatenate([overlap, hop_16k])
-                    overlap_samples = len(overlap)
-                else:
-                    # First chunk: use reflection padding as overlap
-                    # Cap at hop length (can't reflect more than we have)
-                    overlap_len = min(self._overlap_samples_16k, len(hop_16k))
-                    if overlap_len > 0:
-                        reflection = hop_16k[:overlap_len][::-1].copy()
-                        chunk_16k = np.concatenate([reflection, hop_16k])
-                        overlap_samples = overlap_len
-                    else:
-                        chunk_16k = hop_16k
-                        overlap_samples = 0
-
-                # Store tail for next chunk's overlap (accumulating)
-                if self._overlap_samples_16k > 0:
-                    if self._overlap_buf is not None:
-                        combined = np.concatenate([self._overlap_buf, hop_16k])
-                        self._overlap_buf = combined[-self._overlap_samples_16k :]
-                    else:
-                        tail = min(self._overlap_samples_16k, len(hop_16k))
-                        self._overlap_buf = hop_16k[-tail:].copy()
-                else:
-                    self._overlap_buf = None
+                hop_16k, chunk_16k, overlap_samples = self._assemble_chunk_16k(hop_16k)
 
                 # --- Stage 5: Inference ---
                 preprocess_ms = (time.perf_counter() - start_time) * 1000
@@ -1195,76 +1458,8 @@ class RealtimeVoiceChangerUnified:
                 )
                 infer_call_ms = (time.perf_counter() - infer_call_t0) * 1000.0
 
-                # --- Stage 6: Resample model_sr -> 48kHz ---
-                if self._uses_device_output_resample():
-                    output_48k = output_model
-                else:
-                    output_48k = self.output_resampler.resample_chunk(output_model)
-
-                # --- Stage 7: SOLA crossfade ---
-                # target_len = hop_out: forces output to exactly output-hop
-                # samples and places the hold-back contiguously after
-                # the output boundary, preventing latency drift.
-                sola_in_len = len(output_48k)
-                if self.config.use_sola:
-                    output_48k = sola_crossfade(
-                        output_48k,
-                        self._sola_state,
-                        target_len=self._hop_samples_out,
-                    )
-
-                # --- Boundary-continuity diagnostics ---
-                # Tracks the per-chunk content advance vs the expected
-                # hop.  A non-zero SOLA offset skips that many samples of
-                # the new chunk (replaced by the held-back prev tail), and a
-                # SOLA output shorter than hop_out is a content deficit —
-                # both manifest as "phonemes cut at the boundary" / periodic
-                # stutter on sustained tones.  Logged throttled.
-                if not hasattr(self, "_bdiag_n"):
-                    self._bdiag_n = 0
-                    self._bdiag_balance = 0  # emitted - expected (samples)
-                self._bdiag_n += 1
-                sola_out_len = len(output_48k)
-                self._bdiag_balance += sola_out_len - self._hop_samples_out
-                if self._bdiag_n <= 3 or self._bdiag_n % 100 == 0:
-                    off = self._sola_state.last_offset if self.config.use_sola else 0
-                    logger.info(
-                        "[BOUNDARY] chunk#%d sola_in=%d out=%d hop=%d offset=%d "
-                        "balance=%d (%.1fms)",
-                        self._bdiag_n,
-                        sola_in_len,
-                        sola_out_len,
-                        self._hop_samples_out,
-                        off,
-                        self._bdiag_balance,
-                        self._bdiag_balance * 1000.0 / self._runtime_output_sample_rate,
-                    )
-
-                # --- Stage 7.5: Boundary gain continuity ---
-                # Keep this after SOLA so splice alignment is unaffected.
-                output_48k = self._apply_output_boundary_gain(output_48k)
-
-                # --- Stage 7.6: Post-processing (treble boost + limiter) ---
-                output_48k = self._postprocessor.process(output_48k)
-
-                # --- Stage 7.7: User output level adjustment ---
-                if self.config.output_gain_db != 0.0:
-                    output_48k = output_48k * (10.0 ** (self.config.output_gain_db / 20.0))
-
-                # Hard clip final output (safety net after limiter)
-                output_48k = np.clip(output_48k, -1.0, 1.0)
-
-                # Measure final output level for the GUI output meter
-                if output_48k.size:
-                    out_rms = float(np.sqrt(np.mean(output_48k**2)))
-                    out_peak = float(np.max(np.abs(output_48k)))
-                    self.stats.output_rms_db = max(-60.0, 20.0 * np.log10(max(out_rms, 1e-6)))
-                    self.stats.output_peak_db = max(-60.0, 20.0 * np.log10(max(out_peak, 1e-6)))
-
-                # --- Stage 8: Feedback detection ---
-                if not self.config.wav_input_path:
-                    self._store_output_history(output_48k)
-                    self._maybe_check_feedback(chunk_at_mic_rate)
+                # --- Stages 6-8: Resample -> SOLA -> postprocess -> feedback ---
+                output_48k = self._finalize_output(output_model, chunk_at_mic_rate)
 
                 # --- Stage 9: Queue output ---
                 inference_ms = (time.perf_counter() - start_time) * 1000
@@ -1289,30 +1484,7 @@ class RealtimeVoiceChangerUnified:
 
                 publish_stats = self._should_publish_stats()
                 if publish_stats:
-                    # Device telemetry is for the UI, not part of inference.
-                    try:
-                        import torch
-
-                        device = self.pipeline.device
-                        device_str = str(device)
-                        if "xpu" in device_str:
-                            if self._gpu_total_memory == 0:
-                                self._gpu_total_memory = torch.xpu.get_device_properties(
-                                    device
-                                ).total_memory
-                            if self._gpu_total_memory > 0:
-                                alloc = torch.xpu.memory_allocated(device)
-                                self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
-                        elif "cuda" in device_str:
-                            if self._gpu_total_memory == 0:
-                                self._gpu_total_memory = torch.cuda.get_device_properties(
-                                    device
-                                ).total_memory
-                            if self._gpu_total_memory > 0:
-                                alloc = torch.cuda.memory_allocated(device)
-                                self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
-                    except Exception:
-                        pass
+                    self._update_gpu_telemetry()
 
                 # Estimated E2E latency (display):
                 # - one full input/output hop: collection and playback phase
@@ -1331,42 +1503,14 @@ class RealtimeVoiceChangerUnified:
                     self.on_stats_update(self.stats)
 
                 # Performance monitoring
-                chunk_ms = self.config.chunk_sec * 1000
-                stage_detail = (
-                    f"pre={preprocess_ms:.0f} hubert={self.stats.hubert_ms:.0f} "
-                    f"f0={self.stats.f0_ms:.0f} faiss={self.stats.faiss_ms:.0f} "
-                    f"synth={self.stats.synth_ms:.0f} "
-                    f"out_rs={self.stats.output_resample_ms:.0f}ms"
+                self._log_perf(
+                    inference_ms,
+                    preprocess_ms,
+                    hop_16k,
+                    overlap_samples,
+                    output_model,
+                    output_48k,
                 )
-                if inference_ms > chunk_ms * 0.8 and self.stats.frames_processed % 50 == 0:
-                    logger.warning(
-                        f"[PERF] Inference slow: {inference_ms:.0f}ms "
-                        f"({stage_detail}) > {chunk_ms:.0f}ms chunk"
-                    )
-
-                if self.stats.frames_processed % 100 == 0:
-                    logger.info(
-                        f"[PERF] Stage breakdown: infer={inference_ms:.0f}ms "
-                        f"({stage_detail}) / chunk={chunk_ms:.0f}ms / "
-                        f"latency={self.stats.latency_ms:.0f}ms "
-                        f"(hop={self.stats.hop_latency_ms:.0f} "
-                        f"buffer={self.stats.buffer_latency_ms:.0f} "
-                        f"queue={self.stats.queue_latency_ms:.0f} "
-                        f"sola={self.stats.sola_latency_ms:.0f}) / "
-                        f"p50={self.stats.inference_p50_ms:.0f}ms "
-                        f"p95={self.stats.inference_p95_ms:.0f}ms "
-                        f"p99={self.stats.inference_p99_ms:.0f}ms "
-                        f"deadline_miss={self.stats.deadline_miss_rate:.1%} "
-                        f"guard={self.stats.jitter_guard_ms:.0f}ms"
-                    )
-
-                if self.stats.frames_processed <= 5:
-                    logger.info(
-                        f"[INFER] Chunk #{self.stats.frames_processed}: "
-                        f"hop_16k={len(hop_16k)}, overlap={overlap_samples}, "
-                        f"out_model={len(output_model)}, out_48k={len(output_48k)}, "
-                        f"infer={inference_ms:.0f}ms ({stage_detail})"
-                    )
 
                 self._device_error_streak = 0
 
@@ -1716,6 +1860,11 @@ class RealtimeVoiceChangerUnified:
         while not self._input_queue.empty():
             try:
                 self._input_queue.get_nowait()
+            except Empty:
+                break
+        while not self._preproc_queue.empty():
+            try:
+                self._preproc_queue.get_nowait()
             except Empty:
                 break
         while not self._output_queue.empty():
