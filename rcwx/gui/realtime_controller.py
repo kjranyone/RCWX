@@ -12,7 +12,6 @@ import customtkinter as ctk
 import sounddevice as sd
 
 from rcwx.pipeline.realtime_unified import (
-    DEADLINE_MODES,
     RealtimeConfig,
     RealtimeStats,
     RealtimeVoiceChangerUnified,
@@ -127,11 +126,10 @@ class RealtimeController:
                 input_gain_db=self.app.audio_settings.input_gain_db,
                 output_gain_db=self.app.config.audio.output_gain_db,
                 index_rate=self.app._get_index_rate(),
-                # Deadline profiles bypass denoisers whose p99 exceeds the hop.
-                denoise_enabled=(
-                    self.app.use_denoise_var.get()
-                    and latency["latency_mode"] not in DEADLINE_MODES
-                ),
+                # Denoise follows the user toggle in all modes; the runtime's
+                # overload protection temporarily bypasses it if it blows the
+                # hop budget (e.g. ML denoiser under Aggressive).
+                denoise_enabled=self.app.use_denoise_var.get(),
                 denoise_method=self.app.denoise_method_var.get(),
                 denoise_strength=self.app.denoise_strength_slider.get(),
                 noise_scale=self.app.pitch_control.noise_scale,
@@ -343,8 +341,7 @@ class RealtimeController:
 
     def set_denoise(self, enabled: bool, method: str, strength: float) -> None:
         if self.voice_changer:
-            deadline_mode = self.voice_changer.config.latency_mode in DEADLINE_MODES
-            self.voice_changer.set_denoise(enabled and not deadline_mode, method, strength)
+            self.voice_changer.set_denoise(enabled, method, strength)
 
     def set_voice_gate_mode(self, mode: str) -> None:
         if self.voice_changer:
@@ -384,8 +381,7 @@ class RealtimeController:
         def apply_values() -> None:
             vc.set_latency_mode(settings["latency_mode"])
             vc.set_denoise(
-                self.app.use_denoise_var.get()
-                and settings["latency_mode"] not in DEADLINE_MODES,
+                self.app.use_denoise_var.get(),
                 self.app.denoise_method_var.get(),
                 self.app.denoise_strength_slider.get(),
             )

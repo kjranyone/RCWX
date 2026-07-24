@@ -119,7 +119,7 @@ class AudioConfig:
     output_channel_selection: str = "auto"
     # Latency settings
     latency_mode: str = "normal"  # normal / aggressive
-    latency_profile_version: int = 2
+    latency_profile_version: int = 3
     prebuffer_chunks: int = 1  # Chunks to buffer before output (0=lowest latency)
     buffer_margin: float = 0.25  # Buffer margin multiplier
     # ASIO buffer size in frames (0 = follow the driver control panel /
@@ -136,7 +136,7 @@ class AudioConfig:
         )
         if self.latency_mode not in {"normal", "aggressive"}:
             self.latency_mode = "normal"
-        self.latency_profile_version = 2
+        self.latency_profile_version = 3
 
 
 @dataclass
@@ -287,6 +287,18 @@ class RCWXConfig:
             legacy_mode = audio_data.get("latency_mode", "balanced")
             audio_data["latency_mode"] = "aggressive" if legacy_mode == "frontier" else "normal"
             audio_data["latency_profile_version"] = 2
+        # Profile v3: SwiftF0 default.  Old configs saved chunk_sec for
+        # RMVPE (300ms+); clamp to a SwiftF0-appropriate range so migration
+        # doesn't inherit RMVPE-era latency.
+        try:
+            latency_profile_version = int(audio_data.get("latency_profile_version", 2))
+        except (TypeError, ValueError):
+            latency_profile_version = 2
+        if latency_profile_version < 3:
+            chunk = float(audio_data.get("chunk_sec", 0.3))
+            if chunk > 0.1:
+                audio_data["chunk_sec"] = 0.04
+            audio_data["latency_profile_version"] = 3
 
         # Nested configs are constructed separately; pop them so they are not
         # passed twice into InferenceConfig below.

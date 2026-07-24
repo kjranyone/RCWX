@@ -54,7 +54,7 @@ def _auto_params(chunk_sec: float, latency_mode: str = "normal") -> dict:
         "crossfade_sec": crossfade_ms / 1000,
         "sola_search_ms": sola_search_ms,
         "latency_mode": "aggressive" if aggressive else "normal",
-        "prebuffer_chunks": 3 if aggressive else 1,
+        "prebuffer_chunks": 2 if aggressive else 1,
         "buffer_margin": 0.1 if aggressive else 0.25,
         "use_sola": True,
     }
@@ -80,8 +80,8 @@ class LatencySettingsFrame(ctk.CTkFrame):
         self.on_settings_changed = on_settings_changed
         self.f0_method = f0_method
 
-        # Default chunk size
-        self.chunk_sec = max(0.16, _minimum_chunk_ms(f0_method) / 1000)
+        # Default chunk size: f0_method minimum (SwiftF0=40ms, FCPE=100ms, RMVPE=320ms)
+        self.chunk_sec = _minimum_chunk_ms(f0_method) / 1000
         self.latency_mode = "normal"
 
         self._setup_ui()

@@ -78,9 +78,16 @@ def _effective_decoder_overlap_frames(
     latency_mode: str,
     configured_frames: int,
 ) -> int:
-    """Drop the unused decoder margin in the 20ms Aggressive path."""
+    """Decoder warmup frames for the streaming synthesis boundary.
+
+    Aggressive uses a reduced overlap (2 frames = 20ms) to keep the NSF
+    generator's convolutional receptive field near steady state at each
+    chunk boundary.  This prevents sustained-tone modulation artifacts
+    that were audible with overlap=0.  The cost is ~30% extra synthesis
+    compute, affordable under Graph replay (~11ms inference).
+    """
     if latency_mode == "aggressive":
-        return 0
+        return 2
     return max(0, int(configured_frames))
 
 
@@ -478,14 +485,10 @@ class RealtimeVoiceChangerUnified:
 
         post_ms = max(0.0, inference_ms - preprocess_ms - infer_call_ms)
         gc_in_hop = [
-            (dur, gen)
-            for (t_end, dur, gen) in tuple(self._gc_events)
-            if t_end >= hop_start_t
+            (dur, gen) for (t_end, dur, gen) in tuple(self._gc_events) if t_end >= hop_start_t
         ]
         gc_detail = (
-            "+".join(f"{dur:.1f}ms(g{gen})" for dur, gen in gc_in_hop)
-            if gc_in_hop
-            else "none"
+            "+".join(f"{dur:.1f}ms(g{gen})" for dur, gen in gc_in_hop) if gc_in_hop else "none"
         )
         logger.warning(
             "[SPIKE] hop took %.1fms (budget %.0fms): pre=%.1f infer=%.1f "
@@ -890,14 +893,14 @@ class RealtimeVoiceChangerUnified:
         self._required_prebuffer_chunks = self._prebuffer_chunks
 
     def set_prebuffer_chunks(self, chunks: int) -> None:
-        minimum = 3 if self.config.latency_mode == "aggressive" else 0
+        minimum = 2 if self.config.latency_mode == "aggressive" else 0
         self.config.prebuffer_chunks = max(minimum, min(3, int(chunks)))
         self._prebuffer_chunks = self.config.prebuffer_chunks
         self._sync_required_prebuffer()
 
     def set_latency_mode(self, mode: str) -> None:
         self.config.latency_mode = mode if mode in LATENCY_MODES else "normal"
-        minimum = 3
+        minimum = 2
         if self.config.latency_mode in DEADLINE_MODES and self._prebuffer_chunks < minimum:
             self.config.prebuffer_chunks = minimum
             self._prebuffer_chunks = minimum
@@ -1038,10 +1041,10 @@ class RealtimeVoiceChangerUnified:
                 # producer and consumer continue at the same average rate and
                 # cannot rebuild it on their own.  Pause playback until fresh
                 # hops are available instead of crackling on every following
-                # callback.  Re-arm with LESS than the initial prebuffer: any
-                # cushion beyond the shed guard is standing latency that the
-                # drift control skips right back out (~1 hop of discarded
-                # speech per underrun at the full 3-hop re-arm).
+                # callback.  Cap the re-arm at 2 hops (min with the initial
+                # prebuffer): any cushion beyond the shed guard is standing
+                # latency that the drift control skips right back out (~1 hop
+                # of discarded speech per underrun at a larger re-arm).
                 self._output_started = False
                 self._chunks_ready = 0
                 self._required_prebuffer_chunks = min(2, self._prebuffer_chunks)
@@ -1299,9 +1302,7 @@ class RealtimeVoiceChangerUnified:
                                 ).total_memory
                             if self._gpu_total_memory > 0:
                                 alloc = torch.xpu.memory_allocated(device)
-                                self.stats.gpu_memory_percent = (
-                                    alloc / self._gpu_total_memory * 100
-                                )
+                                self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
                         elif "cuda" in device_str:
                             if self._gpu_total_memory == 0:
                                 self._gpu_total_memory = torch.cuda.get_device_properties(
@@ -1309,9 +1310,7 @@ class RealtimeVoiceChangerUnified:
                                 ).total_memory
                             if self._gpu_total_memory > 0:
                                 alloc = torch.cuda.memory_allocated(device)
-                                self.stats.gpu_memory_percent = (
-                                    alloc / self._gpu_total_memory * 100
-                                )
+                                self.stats.gpu_memory_percent = alloc / self._gpu_total_memory * 100
                     except Exception:
                         pass
 
@@ -1606,11 +1605,7 @@ class RealtimeVoiceChangerUnified:
                 # but F0/filter continuity tensors settle on pass 2 and can
                 # produce a distinct stride signature. Capture both before
                 # live callbacks start.
-                if (
-                    warmup_passes >= 2
-                    and history is not None
-                    and len(history) >= target_history
-                ):
+                if warmup_passes >= 2 and history is not None and len(history) >= target_history:
                     break
 
             # Reset warmup side-effects so first real chunk starts cleanly.
@@ -1694,9 +1689,7 @@ class RealtimeVoiceChangerUnified:
             output_sample_rate=(
                 self._runtime_output_sample_rate if self._uses_device_output_resample() else 0
             ),
-            prime_hubert_history=(
-                getattr(cfg, "latency_mode", "normal") in DEADLINE_MODES
-            ),
+            prime_hubert_history=(getattr(cfg, "latency_mode", "normal") in DEADLINE_MODES),
         )
 
     def _reset_boundary_continuity_state(self) -> None:
