@@ -209,6 +209,10 @@ class RealtimeConfig:
     voice_gate_mode: str = "off"
     energy_threshold: float = 0.05
 
+    # Input-side noise gate (post-denoise, pre-inference)
+    noise_gate_enabled: bool = False
+    noise_gate_threshold_db: float = -40.0
+
     # SOLA
     use_sola: bool = True
 
@@ -260,6 +264,24 @@ class RealtimeConfig:
             self,
             "denoise_strength",
             max(0.5, min(2.0, float(self.denoise_strength))),
+        )
+        # Aggressive hops (20-100ms = 320-1600 samples) are shorter than the
+        # spectral gate's 2048-sample analysis window (overlap-add would emit
+        # silence), and per-hop ML calls waste the hop budget.  GTCRN is the
+        # streaming-safe denoiser for Aggressive.  Runtime override only: the
+        # saved GUI/config preference is not modified.
+        if self.latency_mode == "aggressive" and self.denoise_method != "gtcrn":
+            logger.info(
+                "[RealtimeConfig] Denoise method '%s' -> 'gtcrn' (Aggressive mode)",
+                self.denoise_method,
+            )
+            object.__setattr__(self, "denoise_method", "gtcrn")
+        # GUI slider range is [-60, -20] dBFS; clamp stale or hand-edited
+        # configs so display, config, and runtime agree.
+        object.__setattr__(
+            self,
+            "noise_gate_threshold_db",
+            max(-60.0, min(-20.0, float(self.noise_gate_threshold_db))),
         )
         minimum_prebuffer = 3
         if self.latency_mode in DEADLINE_MODES and self.prebuffer_chunks < minimum_prebuffer:

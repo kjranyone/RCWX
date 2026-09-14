@@ -52,6 +52,7 @@ AudioInput (mic rate)
        1) input gain + 入力メーター
        2) StatefulResampler (mic -> 16k)
        3) optional denoise (auto/ml/gtcrn/spectral)
+       3.5) optional input noise gate（dBFS閾値のダウンワードエクスパンダー）
        4) [overlap | new_hop] を組み立て
        5) RVCPipeline.infer_streaming()
        6) StatefulResampler (model_sr -> output_sr)
@@ -72,7 +73,8 @@ AudioInput (mic rate)
 - warmup 後に音声履歴 / リサンプラ / SOLA 状態はリセットし、capture 済み Graph は保持
 - `RCWX_ACCELERATOR_GRAPH=0` で Graph 無効化
 - 過負荷時（直近1秒で Queue full が3回以上）は一時的に **denoise のみバイパス**（`f0_method` / `index_rate` は変更しない）。2秒後に自動復帰
-- denoise は全モードでユーザートグルに従う（Aggressive でも強制 OFF しない）。負荷が hop を超える場合は上記の過負荷バイパスが受け止める
+- denoise は全モードでユーザートグルに従う（Aggressive でも強制 OFF しない）。**方式は Aggressive で `gtcrn` に固定**（spectral は hop が解析窓 2048 samples 未満だと無音を返すため。保存設定・GUI 表示は変更しない）。負荷が hop を超える場合は上記の過負荷バイパスが受け止める
+- 入力ノイズゲート（`noise_gate_enabled`）は denoise 後・推論前に residual noise を減衰し、ノイズの誤変換を防ぐ（guitar NS 風: 開閾値 + 3dB ヒステリシス + 60ms hold、attack/release 固定、減衰下限 -40dB）
 - `RCWX_PREPROC_THREAD=1`（実験的・既定 OFF）: gain / リサンプル / denoise を専用スレッドで 1 段先行実行。参考機では並走スレッドの干渉で p95/p99 が悪化したため既定はインライン
 
 ## Directory Structure
@@ -94,6 +96,7 @@ rcwx/
 │   ├── sola.py
 │   ├── denoise.py         # auto/ml/gtcrn/spectral
 │   ├── gtcrn.py           # GTCRN streaming denoiser (MIT, CPU ONNX)
+│   ├── noise_gate.py      # 入力側ノイズゲート（guitar NS 風エクスパンダー）
 │   ├── postprocess.py     # treble + normalizer + limiter
 │   ├── wav_input.py
 │   └── stream_base.py
@@ -141,7 +144,7 @@ GUI レイテンシ枠は `chunk_sec` / `latency_mode` から overlap 等を **�
 | `latency_mode`            | `normal` | `normal` / `aggressive` |
 | `prebuffer_chunks`        |      `1` | GUI では mode で 1 or 2 に再設定 |
 | `buffer_margin`           |   `0.25` | GUI: Normal=0.25 / Aggressive=0.1 |
-| `input_gain_db`           |    `0.0` | 入力ゲイン |
+| `input_gain_db`           |    `0.0` | 入力ゲイン（GUI スライダー -30〜+24 dB） |
 | `output_gain_db`          |    `0.0` | 出力レベル調整 |
 | `input_channel_selection` |   `auto` | left/right/average/auto |
 | `output_channel_selection`|   `auto` | auto / `"0,1"` 等 |
@@ -179,8 +182,10 @@ GUI レイテンシ枠は `chunk_sec` / `latency_mode` から overlap 等を **�
 | `enable_f0_slew_limit`        |   `true` | |
 | `f0_slew_max_step_st`         |    `3.6` | |
 | `denoise.enabled`             |   `true` | |
-| `denoise.method`              |     `ml` | `auto` / `ml` / `gtcrn` / `spectral`。`gtcrn` は MIT/CPU(onnxruntime、16kHz)。リアルタイムは投機的右端処理で**追加遅延ゼロ**(~2ms/hop、最新 ≤16ms は近似) |
+| `denoise.method`              |     `ml` | `auto` / `ml` / `gtcrn` / `spectral`。`gtcrn` は MIT/CPU(onnxruntime、16kHz)。リアルタイムは投機的右端処理で**追加遅延ゼロ**(~2ms/hop、最新 ≤16ms は近似)。**Aggressive では `gtcrn` に固定** |
 | `denoise.strength`            |    `1.0` | `0.5–2.0`。ML は 1.0 超で2段 |
+| `noise_gate_enabled`          |  `false` | 入力側ノイズゲート（denoise後・推論前）。ノイズ誤変換防止 |
+| `noise_gate_threshold_db`     |   `-40.0` | 開閾値 dBFS。閉は -3dB・60ms hold。attack 2ms / release 80ms / 減衰下限 -40dB 固定 |
 
 ### `RCWXConfig` トップレベル
 
@@ -337,6 +342,8 @@ uv run python tests/models/test_accelerator_index.py
 uv run python tests/models/test_text_encoder_fastpath.py
 uv run python tests/models/test_preproc_pipeline.py
 uv run python tests/audio/test_gtcrn_denoise.py
+uv run python tests/audio/test_noise_gate.py
+uv run python tests/audio/test_denoise_aggressive_policy.py
 ```
 
 ## References

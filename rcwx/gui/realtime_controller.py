@@ -142,6 +142,8 @@ class RealtimeController:
                 uv_ramp_ms=self.app.config.inference.uv_ramp_ms,
                 voice_gate_mode=self.app.voice_gate_mode_var.get(),
                 energy_threshold=self.app.energy_threshold_slider.get(),
+                noise_gate_enabled=self.app.noise_gate_var.get(),
+                noise_gate_threshold_db=self.app.noise_gate_threshold_slider.get(),
                 # Post-processing
                 postprocess_enabled=self.app.config.inference.postprocess.enabled,
                 treble_boost_db=self.app.config.inference.postprocess.treble_boost_db,
@@ -350,6 +352,10 @@ class RealtimeController:
     def set_energy_threshold(self, value: float) -> None:
         if self.voice_changer:
             self.voice_changer.set_energy_threshold(value)
+
+    def set_noise_gate(self, enabled: bool, threshold_db: float) -> None:
+        if self.voice_changer:
+            self.voice_changer.set_noise_gate(enabled, threshold_db)
 
     def set_input_gain_db(self, gain_db: float) -> None:
         if self.voice_changer:

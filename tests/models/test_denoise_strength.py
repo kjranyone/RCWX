@@ -48,7 +48,8 @@ def test_spectral_strength_scales_gate_parameters(monkeypatch: pytest.MonkeyPatc
             return audio
 
     monkeypatch.setattr(denoise_module, "SpectralGateDenoiser", _FakeSpectralDenoiser)
-    audio = np.ones(32, dtype=np.float32)
+    # >= 2048 samples: shorter inputs pass through before the gate is built.
+    audio = np.ones(4096, dtype=np.float32)
 
     output = denoise_module.denoise(audio, method="spectral", strength=1.5)
 

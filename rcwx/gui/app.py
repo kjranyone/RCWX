@@ -432,11 +432,59 @@ class RCWXApp(ctk.CTk):
         if self.config.inference.voice_gate_mode != "energy":
             self.energy_threshold_frame.pack_forget()
 
+        # Input-side noise gate (guitar-NS style, after denoise / before
+        # inference): prevents residual noise from being mis-converted.
+        self.noise_gate_frame = ctk.CTkFrame(self.voice_gate_frame, fg_color="transparent")
+        self.noise_gate_frame.pack(fill="x", padx=10, pady=(3, 0))
+
+        self.noise_gate_var = ctk.BooleanVar(
+            value=self.config.inference.noise_gate_enabled
+        )
+        self.noise_gate_check = ctk.CTkCheckBox(
+            self.noise_gate_frame,
+            text="入力ノイズゲート",
+            variable=self.noise_gate_var,
+            command=self._on_noise_gate_changed,
+        )
+        self.noise_gate_check.grid(row=0, column=0, padx=(0, 5))
+
+        self.noise_gate_threshold_slider = ctk.CTkSlider(
+            self.noise_gate_frame,
+            from_=-60,
+            to=-20,
+            number_of_steps=40,
+            width=120,
+            command=self._on_noise_gate_threshold_changed,
+        )
+        # Normalize to the slider range so display, config, and runtime agree.
+        self.config.inference.noise_gate_threshold_db = max(
+            -60.0, min(-20.0, self.config.inference.noise_gate_threshold_db)
+        )
+        self.noise_gate_threshold_slider.set(
+            self.config.inference.noise_gate_threshold_db
+        )
+        self.noise_gate_threshold_slider.grid(row=0, column=1, padx=5)
+
+        self.noise_gate_threshold_value = ctk.CTkLabel(
+            self.noise_gate_frame,
+            text=f"{self.config.inference.noise_gate_threshold_db:.0f} dB",
+            width=50,
+        )
+        self.noise_gate_threshold_value.grid(row=0, column=2)
+
+        if not self.config.inference.noise_gate_enabled:
+            self.noise_gate_threshold_slider.grid_remove()
+            self.noise_gate_threshold_value.grid_remove()
+
         self.voice_gate_desc = ctk.CTkLabel(
             self.voice_gate_frame,
-            text="off=全通過 / strict=F0のみ / expand=破裂音対応 / energy=エネルギー併用",
+            text=(
+                "off=全通過 / strict=F0のみ / expand=破裂音対応 / energy=エネルギー併用\n"
+                "入力ゲート=ノイズの誤変換防止（denoise後・推論前に減衰）"
+            ),
             font=ctk.CTkFont(size=9),
             text_color="gray",
+            justify="left",
         )
         self.voice_gate_desc.pack(anchor="w", padx=10, pady=(0, 5))
 
@@ -1030,10 +1078,16 @@ class RCWXApp(ctk.CTk):
         if hasattr(self, "latency_settings"):
             mode = self.latency_settings.latency_mode
         if mode == "aggressive":
-            self.denoise_status.configure(
-                text="ML Denoiser: Aggressive ではバイパス",
-                text_color="gray",
-            )
+            if self.use_denoise_var.get():
+                self.denoise_status.configure(
+                    text="Denoise: Aggressive では GTCRN 固定",
+                    text_color="gray",
+                )
+            else:
+                self.denoise_status.configure(
+                    text="Denoise: OFF",
+                    text_color="gray",
+                )
         elif is_ml_denoiser_available():
             self.denoise_status.configure(text="ML Denoiser: ✓ 利用可能", text_color="green")
         else:
@@ -1069,6 +1123,28 @@ class RCWXApp(ctk.CTk):
         self._save_config()
         # Update voice changer if running
         self.realtime_controller.set_voice_gate_mode(mode)
+
+    def _on_noise_gate_changed(self) -> None:
+        """Handle input noise gate toggle."""
+        enabled = self.noise_gate_var.get()
+        if enabled:
+            self.noise_gate_threshold_slider.grid()
+            self.noise_gate_threshold_value.grid()
+        else:
+            self.noise_gate_threshold_slider.grid_remove()
+            self.noise_gate_threshold_value.grid_remove()
+        self._save_config()
+        self.realtime_controller.set_noise_gate(
+            enabled, self.noise_gate_threshold_slider.get()
+        )
+
+    def _on_noise_gate_threshold_changed(self, value: float) -> None:
+        """Handle input noise gate threshold slider change."""
+        self.noise_gate_threshold_value.configure(text=f"{value:.0f} dB")
+        self._save_config()
+        self.realtime_controller.set_noise_gate(
+            self.noise_gate_var.get(), value
+        )
 
     def _on_energy_threshold_changed(self, value: float) -> None:
         """Handle energy threshold slider change."""
@@ -1218,6 +1294,10 @@ class RCWXApp(ctk.CTk):
             self.config.inference.denoise.strength = self.denoise_strength_slider.get()
             self.config.inference.voice_gate_mode = self.voice_gate_mode_var.get()
             self.config.inference.energy_threshold = self.energy_threshold_slider.get()
+            self.config.inference.noise_gate_enabled = self.noise_gate_var.get()
+            self.config.inference.noise_gate_threshold_db = (
+                self.noise_gate_threshold_slider.get()
+            )
             # Save latency settings (all from LatencySettingsFrame)
             if hasattr(self, "latency_settings"):
                 latency = self.latency_settings.get_settings()

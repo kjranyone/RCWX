@@ -26,6 +26,7 @@ from rcwx.audio.buffer import RingOutputBuffer
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.duplex import AsioDuplexStream
 from rcwx.audio.input import AudioInput
+from rcwx.audio.noise_gate import NoiseGate
 from rcwx.audio.output import AudioOutput
 from rcwx.audio.postprocess import PostprocessConfig, Postprocessor
 from rcwx.audio.resample import StatefulResampler, resample
@@ -201,6 +202,14 @@ class RealtimeVoiceChangerUnified:
             limiter_release_ms=getattr(self.config, "limiter_release_ms", 80.0),
         )
         self._postprocessor = Postprocessor(self._runtime_output_sample_rate, pp_cfg)
+
+        # Input-side noise gate (post-denoise, pre-inference).  Pure numpy,
+        # cheap enough for every latency mode; state is per-sample so it
+        # survives arbitrary hop sizes.
+        self._noise_gate = NoiseGate(
+            sample_rate=16000,
+            threshold_db=getattr(self.config, "noise_gate_threshold_db", -40.0),
+        )
 
         # SOLA state + the synthesis margin its windows require
         self._sola_state = SolaState()
@@ -853,8 +862,20 @@ class RealtimeVoiceChangerUnified:
         method: str = "auto",
         strength: float = 1.0,
     ) -> None:
+        effective = method
+        if self.config.latency_mode == "aggressive" and method != "gtcrn":
+            # Aggressive hops are shorter than the spectral gate's analysis
+            # window (it would emit silence) and per-hop ML calls waste the
+            # hop budget; GTCRN is the streaming-safe choice.  See
+            # RealtimeConfig.__post_init__ for the construction-time remap.
+            effective = "gtcrn"
+        if effective != self.config.denoise_method:
+            suffix = " (Aggressive mode)" if effective != method else ""
+            logger.info(
+                f"Denoise method changed: {self.config.denoise_method} -> {effective}{suffix}"
+            )
         self.config.denoise_enabled = enabled
-        self.config.denoise_method = method
+        self.config.denoise_method = effective
         self.config.denoise_strength = max(0.5, min(2.0, float(strength)))
 
     def set_voice_gate_mode(self, mode: str) -> None:
@@ -862,6 +883,16 @@ class RealtimeVoiceChangerUnified:
 
     def set_energy_threshold(self, value: float) -> None:
         self.config.energy_threshold = value
+
+    def set_noise_gate(self, enabled: bool, threshold_db: float) -> None:
+        was_enabled = self.config.noise_gate_enabled
+        self.config.noise_gate_enabled = bool(enabled)
+        self.config.noise_gate_threshold_db = float(threshold_db)
+        self._noise_gate.threshold_db = float(threshold_db)
+        if bool(enabled) != was_enabled:
+            # Toggle starts a fresh envelope/gain state; threshold-only
+            # tweaks keep it so the gain doesn't dip mid-stream.
+            self._noise_gate.reset()
 
     def set_postprocess_config(self, cfg) -> None:
         if hasattr(self, "_postprocessor"):
@@ -905,6 +936,13 @@ class RealtimeVoiceChangerUnified:
         change.  This setter stays a pure policy switch.
         """
         self.config.latency_mode = mode if mode in LATENCY_MODES else "normal"
+        # getattr: tests drive this setter with bare SimpleNamespace configs.
+        current_method = getattr(self.config, "denoise_method", "gtcrn")
+        if self.config.latency_mode == "aggressive" and current_method != "gtcrn":
+            logger.info(
+                f"Denoise method '{current_method}' -> 'gtcrn' (Aggressive mode)"
+            )
+            self.config.denoise_method = "gtcrn"
         minimum = 2
         if self.config.latency_mode in DEADLINE_MODES and self._prebuffer_chunks < minimum:
             self.config.prebuffer_chunks = minimum
@@ -1108,7 +1146,8 @@ class RealtimeVoiceChangerUnified:
         logger.info("Preprocess thread stopped")
 
     def _preprocess_hop(self, hop_mic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Stages 1-3: input gain -> level meter -> mic->16k -> optional denoise.
+        """Stages 1-3.5: input gain -> level meter -> mic->16k -> optional
+        denoise -> optional input noise gate.
 
         Returns ``(hop_16k, hop_at_mic_rate)``.
         """
@@ -1140,6 +1179,12 @@ class RealtimeVoiceChangerUnified:
                 strength=self.config.denoise_strength,
                 device=self.pipeline.device,
             )
+
+        # --- Stage 3.5: Optional input noise gate ---
+        # Attenuates residual noise before HuBERT/F0 see it, preventing
+        # noise from being mis-converted as speech in noisy environments.
+        if self.config.noise_gate_enabled:
+            hop_16k = self._noise_gate.process(hop_16k)
 
         return hop_16k, chunk_at_mic_rate
 
@@ -1824,6 +1869,7 @@ class RealtimeVoiceChangerUnified:
         """Reset chunk-boundary gain continuity state."""
         self._prev_tail_rms = 0.0
         self._postprocessor.reset()
+        self._noise_gate.reset()
 
     def _apply_output_boundary_gain(self, output: np.ndarray) -> np.ndarray:
         """Apply a mild post-SOLA gain ramp to smooth boundary loudness.

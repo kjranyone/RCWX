@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +23,24 @@ from rcwx.accelerator_graph import accelerator_graph_enabled, run_accelerator_gr
 from rcwx.audio.gtcrn import get_cached_gtcrn, is_gtcrn_available
 
 logger = logging.getLogger(__name__)
+
+# Throttle for the short-hop spectral warning (fired per hop otherwise).
+_SHORT_HOP_WARN_INTERVAL = 5.0
+_last_short_hop_warning = 0.0
+
+
+def _warn_short_spectral_hop(length: int, n_fft: int) -> None:
+    global _last_short_hop_warning
+    now = time.time()
+    if now - _last_short_hop_warning < _SHORT_HOP_WARN_INTERVAL:
+        return
+    _last_short_hop_warning = now
+    logger.warning(
+        "Spectral gate needs at least n_fft (%d) samples, got %d — passing "
+        "audio through unchanged (use denoise method 'gtcrn' for short hops)",
+        n_fft,
+        length,
+    )
 
 
 @dataclass
@@ -612,6 +631,14 @@ def denoise(
             threshold_db=threshold_db * strength,
             reduction_db=reduction_db * strength,
         )
+        if len(audio) < config.n_fft:
+            # The spectral gate needs one full analysis window (n_fft = 2048
+            # samples = 128ms @16k).  Shorter realtime hops (all Aggressive
+            # chunks, and Normal chunks below 128ms) yield no analysis frame
+            # and the overlap-add loop would return pure silence — pass the
+            # audio through unchanged instead of muting the stream.
+            _warn_short_spectral_hop(len(audio), config.n_fft)
+            return audio.astype(np.float32, copy=False)
         denoiser = SpectralGateDenoiser(sample_rate, config)
 
         if noise_reference is not None:

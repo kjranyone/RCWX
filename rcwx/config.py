@@ -201,6 +201,13 @@ class InferenceConfig:
     # Lower = more sensitive (catches quieter sounds but may pass noise)
     # Higher = less sensitive (better noise rejection but may cut soft sounds)
     energy_threshold: float = 0.2
+    # Input-side noise gate (guitar noise-suppressor style downward
+    # expander) applied after denoise, before inference.  Attenuates
+    # residual noise below the threshold so HuBERT/F0 never mis-convert
+    # it as speech (noisy offices etc.).  Attack/hold/release fixed.
+    noise_gate_enabled: bool = False
+    # Open threshold in dBFS (RMS envelope); closes 3dB lower after 60ms.
+    noise_gate_threshold_db: float = -40.0
 
     # Audio-level overlap for HuBERT continuity
     overlap_sec: float = 0.20

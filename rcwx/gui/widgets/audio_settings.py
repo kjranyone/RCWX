@@ -302,9 +302,9 @@ class AudioSettingsFrame(ctk.CTkFrame):
 
         self.gain_slider = ctk.CTkSlider(
             self.gain_frame,
-            from_=-12,
+            from_=-30,
             to=24,
-            number_of_steps=36,
+            number_of_steps=54,
             width=200,
             command=self._on_gain_change,
         )
@@ -616,8 +616,8 @@ class AudioSettingsFrame(ctk.CTkFrame):
         target_peak = -6.0
         self._recommended_gain = target_peak - peak_db
 
-        # Clamp to reasonable range
-        self._recommended_gain = max(-12, min(24, self._recommended_gain))
+        # Clamp to the slider range
+        self._recommended_gain = max(-30, min(24, self._recommended_gain))
 
         if peak_db <= -60:
             self.recommended_label.configure(text="推奨: -- dB (信号なし)")
