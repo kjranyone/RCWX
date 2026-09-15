@@ -7,27 +7,63 @@ preventing noise from being mis-converted as speech.
 
 Classic noise-suppressor topology:
 
-* peak/RMS envelope follower (fast attack, slow release)
+* RMS envelope follower (one-pole, ~20ms) — stable on stationary noise,
+  fast on genuine onsets
 * hysteresis state machine: opens at ``threshold_db``, closes at
   ``threshold_db - hysteresis_db`` only after ``hold_ms`` below the close
   level (no chatter on signals riding the threshold)
 * smoothed gain: fast attack to unity, slow release down to a fixed
   ``range_db`` attenuation floor (not hard silence, so downstream
   resamplers and SOLA never see discontinuities)
+* optional auto threshold (``auto_threshold``): the open level follows a
+  sliding-window minimum of the power envelope (the noise floor) plus a
+  sensitivity margin (``set_sensitivity``), so users never tune dBFS
 """
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
-# Fixed defaults; only the threshold is user-facing (GUI keeps it simple).
-ENV_ATTACK_MS = 0.5
-ENV_RELEASE_MS = 60.0
+# Fixed defaults; only the sensitivity is user-facing in the GUI (the
+# threshold itself is tracked automatically).
+# Sidechain level detector: one symmetric one-pole RMS envelope.  A
+# peak-hugging attack/release follower sits several dB above the mean
+# power of stationary noise (inflating the auto floor and slowing the
+# post-signal close); an RMS envelope holds within ~±0.5dB of it, so the
+# sensitivity margins below keep their meaning, while a genuine onset
+# still crosses the threshold within ~1ms.
+ENV_TAU_MS = 20.0
 GAIN_ATTACK_MS = 2.0
 GAIN_RELEASE_MS = 80.0
 HOLD_MS = 60.0
 HYSTERESIS_DB = 3.0
 RANGE_DB = 40.0
+
+# Auto-threshold sensitivity: margin (power domain) above the tracked
+# noise floor at which the gate opens.  Higher sensitivity = smaller
+# margin = opens on quieter sounds.
+SENSITIVITY_MARGIN_DB = {"low": 10.0, "mid": 6.0, "high": 3.0}
+# The floor estimate is a sliding-window minimum of the smoothed power
+# envelope: a fixed-rise "min so far" locks near zero when a stream opens
+# loud and then never closes the gate.  The window also picks up
+# inter-syllable dips during continuous speech.
+_FLOOR_WINDOW_SEC = 1.0
+_FLOOR_BLOCK_MS = 50.0
+# Skip the first blocks from the floor window: the envelope rises from
+# zero at stream start and their minima (≈0) would poison the windowed
+# minimum, holding the gate open until they slide out.
+_FLOOR_WARMUP_BLOCKS = 2
+# Absolute floor seed (~-60dBFS power): post-denoise residual noise never
+# sits below this, and it bounds the threshold from below so a bad floor
+# cannot hold the gate open; a digital-silence prefix likewise cannot
+# produce a near-zero open threshold.
+_FLOOR_SEED = 1e-6
+# Auto mode never gates above -30dBFS: post-denoise residual noise never
+# gets that loud, and a sustained signal that fills the floor window
+# (held vowel, tone) would otherwise close on its own contaminated floor.
+_OPEN_GUARD_POWER = 10 ** (-30.0 / 10)
 
 
 def _one_pole_coeff(time_ms: float, sample_rate: int) -> float:
@@ -52,14 +88,30 @@ class NoiseGate:
         self.hysteresis_db = float(hysteresis_db)
         self.hold_ms = float(hold_ms)
         self.range_db = float(range_db)
-        self._env_attack = _one_pole_coeff(ENV_ATTACK_MS, sample_rate)
-        self._env_release = _one_pole_coeff(ENV_RELEASE_MS, sample_rate)
+        self._env_coeff = _one_pole_coeff(ENV_TAU_MS, sample_rate)
         self._gain_attack = _one_pole_coeff(GAIN_ATTACK_MS, sample_rate)
         self._gain_release = _one_pole_coeff(GAIN_RELEASE_MS, sample_rate)
         self._hold_samples = max(1, int(sample_rate * self.hold_ms / 1000))
         self._floor_gain = 10 ** (-self.range_db / 20)
+        # Auto threshold: sliding-window minimum of the power envelope,
+        # maintained as per-block minima in a small ring.
+        self._block_len = max(1, int(sample_rate * _FLOOR_BLOCK_MS / 1000))
+        self._window_blocks = max(
+            1, int(round(_FLOOR_WINDOW_SEC * 1000 / _FLOOR_BLOCK_MS))
+        )
+        self._hyst_close = 10 ** (-self.hysteresis_db / 10)
+        self.auto_threshold = False
+        self.margin_db = SENSITIVITY_MARGIN_DB["mid"]
+        self._margin_lin = 10 ** (self.margin_db / 10)
         self.threshold_db = threshold_db  # property setter computes levels
         self.reset()
+
+    def set_sensitivity(self, sensitivity: str) -> None:
+        """Set the auto-threshold margin from a low/mid/high choice."""
+        self.margin_db = SENSITIVITY_MARGIN_DB.get(
+            sensitivity, SENSITIVITY_MARGIN_DB["mid"]
+        )
+        self._margin_lin = 10 ** (self.margin_db / 10)
 
     @property
     def threshold_db(self) -> float:
@@ -77,6 +129,11 @@ class NoiseGate:
         self._open = False
         self._hold_count = 0
         self._gain = self._floor_gain
+        self._floor_hist = deque(maxlen=self._window_blocks)
+        self._hist_min = float("inf")
+        self._block_min = float("inf")
+        self._block_pos = 0
+        self._blocks_seen = 0
 
     def process(self, audio: np.ndarray) -> np.ndarray:
         """Gate ``audio`` (mono float32); returns the same length."""
@@ -85,34 +142,68 @@ class NoiseGate:
         if n == 0:
             return audio
 
-        env_atk = self._env_attack
-        env_rel = self._env_release
+        env_c = self._env_coeff
         g_atk = self._gain_attack
         g_rel = self._gain_release
         open_level = self._open_level
         close_level = self._close_level
         hold_limit = self._hold_samples
-        floor = self._floor_gain
+        gain_floor = self._floor_gain
+
+        auto = self.auto_threshold
+        margin = self._margin_lin
+        hyst_close = self._hyst_close
+        block_len = self._block_len
+        floor_seed = _FLOOR_SEED
+        open_guard = _OPEN_GUARD_POWER
 
         env = self._env_power
         is_open = self._open
         hold = self._hold_count
         gain = self._gain
+        floor_hist = self._floor_hist
+        hist_min = self._hist_min
+        block_min = self._block_min
+        block_pos = self._block_pos
+        blocks_seen = self._blocks_seen
 
         out = np.empty(n, dtype=np.float32)
         for i in range(n):
             x = audio[i]
             p = x * x
-            if p > env:
-                env = env_atk * env + (1.0 - env_atk) * p
-            else:
-                env = env_rel * env + (1.0 - env_rel) * p
+            env = env_c * env + (1.0 - env_c) * p
 
-            if not is_open and env >= open_level:
+            if auto:
+                # Sliding-window minimum of the smoothed envelope, kept as
+                # 50ms block minima: drops to new minima within one block,
+                # forgets old (louder) blocks as the window slides.
+                if env < block_min:
+                    block_min = env
+                block_pos += 1
+                if block_pos >= block_len:
+                    if blocks_seen >= _FLOOR_WARMUP_BLOCKS:
+                        floor_hist.append(block_min)
+                        hist_min = min(floor_hist)
+                    blocks_seen += 1
+                    block_min = float("inf")
+                    block_pos = 0
+                noise_floor = max(min(hist_min, block_min), floor_seed)
+                open_lvl = noise_floor * margin
+                close_lvl = open_lvl * hyst_close
+            else:
+                open_lvl = open_level
+                close_lvl = close_level
+
+            if auto and env >= open_guard:
+                # Loud sustained signal (>-30dBFS): always signal, never
+                # noise — bypass the (possibly contaminated) floor logic.
+                is_open = True
+                hold = 0
+            elif not is_open and env >= open_lvl:
                 is_open = True
                 hold = 0
             elif is_open:
-                if env < close_level:
+                if env < close_lvl:
                     hold += 1
                     if hold >= hold_limit:
                         is_open = False
@@ -124,7 +215,7 @@ class NoiseGate:
                 target = 1.0
                 gain = g_atk * gain + (1.0 - g_atk) * target
             else:
-                target = floor
+                target = gain_floor
                 gain = g_rel * gain + (1.0 - g_rel) * target
             out[i] = x * gain
 
@@ -132,4 +223,8 @@ class NoiseGate:
         self._open = is_open
         self._hold_count = hold
         self._gain = gain
+        self._hist_min = hist_min
+        self._block_min = block_min
+        self._block_pos = block_pos
+        self._blocks_seen = blocks_seen
         return out

@@ -73,8 +73,9 @@ AudioInput (mic rate)
 - warmup 後に音声履歴 / リサンプラ / SOLA 状態はリセットし、capture 済み Graph は保持
 - `RCWX_ACCELERATOR_GRAPH=0` で Graph 無効化
 - 過負荷時（直近1秒で Queue full が3回以上）は一時的に **denoise のみバイパス**（`f0_method` / `index_rate` は変更しない）。2秒後に自動復帰
-- denoise は全モードでユーザートグルに従う（Aggressive でも強制 OFF しない）。**方式は Aggressive で `gtcrn` に固定**（spectral は hop が解析窓 2048 samples 未満だと無音を返すため。保存設定・GUI 表示は変更しない）。負荷が hop を超える場合は上記の過負荷バイパスが受け止める
-- 入力ノイズゲート（`noise_gate_enabled`）は denoise 後・推論前に residual noise を減衰し、ノイズの誤変換を防ぐ（guitar NS 風: 開閾値 + 3dB ヒステリシス + 60ms hold、attack/release 固定、減衰下限 -40dB）
+- denoise は全モードでユーザートグルに従う（Aggressive でも強制 OFF しない）。**方式は Aggressive で `gtcrn` に固定**（品質ポリシー: 学習型ストリーミング・CPU ~2ms/hop。保存設定・GUI 表示は変更しない）。負荷が hop を超える場合は上記の過負荷バイパスが受け止める
+- リアルタイムの spectral は `StreamingSpectralGate`（永続 STFT、n_fft=512/hop=256、最小統計ノイズ追跡、追加遅延ゼロ: 最新 ≤16ms は dry クロスフェード近似）。ステートレス呼び出し（オフライン・直呼び）は hop が n_fft 2048 未満だとパススルー
+- 入力ノイズゲート（`noise_gate_enabled`）は denoise 後・推論前に residual noise を減衰し、ノイズの誤変換を防ぐ（guitar NS 風: 3dB ヒステリシス + 60ms hold、減衰下限 -40dB 固定）。しきい値は自動: RMS エンベロープ（τ=20ms）の 1s 窓最小フロア + 感度マージン、-30dBFS 超では無条件で開放（loud 持続信号保護）。GUI はチェックボックス + 感度（低/中/高）のみで `ノイズキャンセリング` セクション内。手動 dBFS は `noise_gate_auto=false`（config 経由のみ）
 - `RCWX_PREPROC_THREAD=1`（実験的・既定 OFF）: gain / リサンプル / denoise を専用スレッドで 1 段先行実行。参考機では並走スレッドの干渉で p95/p99 が悪化したため既定はインライン
 
 ## Directory Structure
@@ -185,7 +186,9 @@ GUI レイテンシ枠は `chunk_sec` / `latency_mode` から overlap 等を **�
 | `denoise.method`              |     `ml` | `auto` / `ml` / `gtcrn` / `spectral`。`gtcrn` は MIT/CPU(onnxruntime、16kHz)。リアルタイムは投機的右端処理で**追加遅延ゼロ**(~2ms/hop、最新 ≤16ms は近似)。**Aggressive では `gtcrn` に固定** |
 | `denoise.strength`            |    `1.0` | `0.5–2.0`。ML は 1.0 超で2段 |
 | `noise_gate_enabled`          |  `false` | 入力側ノイズゲート（denoise後・推論前）。ノイズ誤変換防止 |
-| `noise_gate_threshold_db`     |   `-40.0` | 開閾値 dBFS。閉は -3dB・60ms hold。attack 2ms / release 80ms / 減衰下限 -40dB 固定 |
+| `noise_gate_auto`             |   `true` | しきい値自動（1s 窓最小フロア + 感度マージン）。GUI は自動のみ |
+| `noise_gate_sensitivity`      |    `mid` | `low`(+10dB) / `mid`(+6dB) / `high`(+3dB) マージン |
+| `noise_gate_threshold_db`     |   `-40.0` | 手動閾値 dBFS（`noise_gate_auto=false` 時のみ・config 経由） |
 
 ### `RCWXConfig` トップレベル
 
@@ -342,6 +345,7 @@ uv run python tests/models/test_accelerator_index.py
 uv run python tests/models/test_text_encoder_fastpath.py
 uv run python tests/models/test_preproc_pipeline.py
 uv run python tests/audio/test_gtcrn_denoise.py
+uv run python tests/audio/test_spectral_stream.py
 uv run python tests/audio/test_noise_gate.py
 uv run python tests/audio/test_denoise_aggressive_policy.py
 ```

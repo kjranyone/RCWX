@@ -535,6 +535,223 @@ class SpectralGateDenoiser:
         return output
 
 
+class StreamingSpectralGate:
+    """Persistent STFT spectral gate for the realtime path.
+
+    ``SpectralGateDenoiser`` is self-contained per call: rebuilt every hop,
+    it can never finish auto-learning (10 frames = 416ms of audio), so per-hop
+    use degenerated to a windowed passthrough — spectral "denoising" did no
+    denoising at all for chunks below ~416ms.  This class instead carries the
+    STFT state across hops:
+
+    * sqrt-Hann analysis+synthesis at n_fft=512 / hop=256 (GTCRN geometry):
+      adjacent window pairs satisfy COLA exactly (w²(n) + w²(n+H) = 1), so
+      finalized samples need no per-sample normalization — the chunk-edge
+      amplification of the offline overlap-add cannot occur.
+    * the noise profile is tracked continuously with asymmetric one-pole
+      smoothing (fast toward quieter frames, slow toward louder ones), so it
+      settles to the noise floor during speech pauses instead of freezing
+      on whatever the first 416ms contained.
+    * zero added latency: everything except the newest ``n_fft - hop``
+      samples is exact WOLA output; the newest region is crossfaded toward
+      the dry signal (the same bounded approximation GTCRN makes for its
+      newest 16ms).
+    """
+
+    N_FFT = 512
+    HOP = 256
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        threshold_db: float = 6.0,
+        reduction_db: float = -24.0,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.window = np.sqrt(np.hanning(self.N_FFT).astype(np.float32))
+        self.n_bins = self.N_FFT // 2 + 1
+
+        hop_sec = self.HOP / sample_rate
+        # Per-bin magnitudes of stationary noise are Rayleigh-distributed
+        # (high variance); track a short symmetric average so the estimate is
+        # low-variance, then apply minimum statistics: drop to minima
+        # instantly (noise floor appears during speech pauses / spectral
+        # valleys) and rise at a capped +6dB/s so sustained speech cannot
+        # drag the floor estimate up.
+        self._mag_smooth_coeff = float(np.exp(-hop_sec / 0.25))
+        self._rise_factor = float(10 ** (6.0 / 20.0 * hop_sec))
+        # Pass the first ~250ms at unity while mag_smooth converges: gating
+        # on a single-frame profile is erratic per-bin.
+        self._bootstrap_frames = max(1, int(round(0.25 / hop_sec)))
+        # Per-bin gain temporal smoothing (fast open, slow close).
+        self._g_attack = float(np.exp(-hop_sec / 0.01))
+        self._g_release = float(np.exp(-hop_sec / 0.05))
+        self._freq_kernel = np.ones(3) / 3.0
+        self._noise_floor = 1e-4
+
+        self._threshold_db = 0.0
+        self._reduction_db = 0.0
+        self.configure(threshold_db, reduction_db)
+        self.reset()
+
+    # -- configuration -------------------------------------------------
+
+    def configure(self, threshold_db: float, reduction_db: float) -> None:
+        """Update gate parameters in place (strength slider, live)."""
+        self._threshold_mult = 10 ** (float(threshold_db) / 20)
+        # Cap the floor at -60dB; deeper suppression just trades residual
+        # musical noise for pumping.
+        reduction_db = max(-60.0, min(-3.0, float(reduction_db)))
+        self._reduction_mult = 10 ** (reduction_db / 20)
+
+    def reset(self) -> None:
+        """Reset stream state (new session / stream restart)."""
+        self.noise_profile: Optional[NDArray[np.float32]] = None
+        self._mag_smooth: Optional[NDArray[np.float32]] = None
+        self._frames_seen = 0
+        self._prev_gain = np.ones(self.n_bins, dtype=np.float32)
+        # Absolute timeline: 256 zero samples precede the stream so the first
+        # input samples land in full-coverage window positions.  ``_buf``
+        # starts at absolute position ``_pos``; ``_ola``/``_win`` accumulate
+        # from ``_ola_start``; everything below ``_next_out`` is emitted.
+        self._buf = np.zeros(self.HOP, dtype=np.float32)
+        self._pos = 0
+        self._ola_start = 0
+        self._ola = np.zeros(0, dtype=np.float32)
+        self._win = np.zeros(0, dtype=np.float32)
+        self._next_out = self.HOP
+
+    # -- frame pipeline ------------------------------------------------
+
+    def _update_profile(self, magnitude: NDArray[np.float32]) -> None:
+        self._frames_seen += 1
+        if self._mag_smooth is None:
+            self._mag_smooth = magnitude.copy()
+        else:
+            b = self._mag_smooth_coeff
+            self._mag_smooth = b * self._mag_smooth + (1.0 - b) * magnitude
+        if self.noise_profile is None:
+            self.noise_profile = np.maximum(self._mag_smooth, self._noise_floor)
+            return
+        risen = self.noise_profile * self._rise_factor
+        self.noise_profile = np.maximum(
+            np.minimum(self._mag_smooth, risen), self._noise_floor
+        )
+
+    def _compute_gain(self, magnitude: NDArray[np.float32]) -> NDArray[np.float32]:
+        if self.noise_profile is None or self._frames_seen < self._bootstrap_frames:
+            return np.ones(self.n_bins, dtype=np.float32)
+        threshold = self.noise_profile * self._threshold_mult
+        ratio = magnitude / (threshold + 1e-10)
+        soft_gain = 0.5 * (1.0 + np.tanh(2.0 * (ratio - 1.0)))
+        gain = self._reduction_mult + soft_gain * (1.0 - self._reduction_mult)
+        return np.convolve(gain, self._freq_kernel, mode="same").astype(np.float32)
+
+    def _gate_frame(self, frame: NDArray[np.float32], learn: bool) -> NDArray[np.float32]:
+        """Gate one n_fft frame; returns the windowed output frame."""
+        spectrum = np.fft.rfft(frame * self.window)
+        magnitude = np.abs(spectrum)
+        if learn:
+            self._update_profile(magnitude)
+        gain = self._compute_gain(magnitude)
+        # Temporal smoothing from the finalized gain sequence; speculative
+        # frames read prev_gain without advancing it, so their smoothing
+        # matches what the finalized recomputation will apply.
+        prev = self._prev_gain
+        smoothed = np.where(
+            gain > prev,
+            self._g_attack * prev + (1.0 - self._g_attack) * gain,
+            self._g_release * prev + (1.0 - self._g_release) * gain,
+        ).astype(np.float32)
+        if learn:
+            self._prev_gain = smoothed
+        return np.fft.irfft(spectrum * smoothed, n=self.N_FFT) * self.window
+
+    @staticmethod
+    def _grow(array: NDArray[np.float32], needed: int) -> NDArray[np.float32]:
+        if needed <= len(array):
+            return array
+        return np.concatenate(
+            [array, np.zeros(needed - len(array), dtype=np.float32)]
+        )
+
+    # -- streaming API -------------------------------------------------
+
+    def process(self, audio: NDArray[np.float32]) -> NDArray[np.float32]:
+        """Denoise one hop; returns exactly ``len(audio)`` samples."""
+        audio = audio.astype(np.float32, copy=False)
+        n = len(audio)
+        if n == 0:
+            return audio
+
+        self._buf = np.concatenate([self._buf, audio])
+        s_end = self._pos + len(self._buf)
+        emit_start = self._next_out
+
+        # Finalized frames: frames advance by hop, so every sample below the
+        # next frame start (_pos) has all of its covering frames processed.
+        while len(self._buf) >= self.N_FFT:
+            enhanced = self._gate_frame(self._buf[: self.N_FFT], learn=True)
+            lo = self._pos - self._ola_start
+            needed = lo + self.N_FFT
+            self._ola = self._grow(self._ola, needed)
+            self._win = self._grow(self._win, needed)
+            self._ola[lo : lo + self.N_FFT] += enhanced
+            self._win[lo : lo + self.N_FFT] += self.window**2
+            self._buf = self._buf[self.HOP :]
+            self._pos += self.HOP
+
+        exact_end = min(self._pos, s_end)
+        if exact_end > emit_start:
+            lo = emit_start - self._ola_start
+            exact = self._ola[lo : lo + (exact_end - emit_start)].copy()
+        else:
+            exact = np.zeros(0, dtype=np.float32)
+
+        # Speculative tail: frames beyond _pos need future input.  Run them
+        # zero-padded without touching persistent state, then crossfade to
+        # dry by window coverage so the approximation neither attenuates nor
+        # amplifies the newest audio.
+        spec_lo = max(self._pos, emit_start)
+        spec_len = s_end - spec_lo
+        spec = np.zeros(max(0, spec_len), dtype=np.float32)
+        if spec_len > 0:
+            base = self._pos - self._ola_start
+            spec_ola = self._ola[base:].copy()
+            spec_win = self._win[base:].copy()
+            gain_snapshot = self._prev_gain.copy()
+            spec_pos = self._pos
+            while spec_pos < s_end:
+                offset = spec_pos - self._pos
+                frame = self._buf[offset:]
+                if len(frame) < self.N_FFT:
+                    frame = np.pad(frame, (0, self.N_FFT - len(frame)))
+                enhanced = self._gate_frame(frame, learn=False)
+                lo = spec_pos - self._pos
+                needed = lo + self.N_FFT
+                spec_ola = self._grow(spec_ola, needed)
+                spec_win = self._grow(spec_win, needed)
+                spec_ola[lo : lo + self.N_FFT] += enhanced
+                spec_win[lo : lo + self.N_FFT] += self.window**2
+                spec_pos += self.HOP
+            self._prev_gain = gain_snapshot
+            lo = spec_lo - self._pos
+            coverage = np.clip(spec_win[lo : lo + spec_len], 0.0, 1.0)
+            dry = self._buf[lo : lo + spec_len]
+            spec = (spec_ola[lo : lo + spec_len] * coverage + dry * (1.0 - coverage)).astype(
+                np.float32
+            )
+
+        # Retire emitted samples; keep the tail that overlaps future frames.
+        keep = self._pos - self._ola_start
+        self._ola = self._ola[keep:].copy()
+        self._win = self._win[keep:].copy()
+        self._ola_start = self._pos
+        self._next_out = s_end
+
+        return np.concatenate([exact, spec])
+
+
 # Global cache for MLDenoiser (avoid reloading model every call)
 _ml_denoiser_cache: Optional[MLDenoiser] = None
 
@@ -556,6 +773,7 @@ def denoise(
     reduction_db: float = -24.0,
     strength: float = 1.0,
     device: str = "cpu",
+    streaming_state: Optional[StreamingSpectralGate] = None,
 ) -> NDArray[np.float32]:
     """Denoise audio using the best available method.
 
@@ -572,6 +790,11 @@ def denoise(
         strength: Suppression strength from 0.5 to 2.0. ML uses a blended
             second pass above 1.0; spectral scales its threshold/reduction.
         device: Device for ML denoiser ("cpu", "cuda", "xpu")
+        streaming_state: Persistent ``StreamingSpectralGate`` for the
+            realtime path.  Without it the spectral fallback is stateless
+            and rebuilds per call (fine for whole files, useless per hop:
+            it never finishes learning its noise profile).  ``noise_reference``
+            is ignored when this is given.
 
     Returns:
         Denoised audio
@@ -627,6 +850,15 @@ def denoise(
         denoiser = _get_cached_ml_denoiser(device=device)
         return denoiser.process(audio, sample_rate, strength=strength)
     else:
+        if streaming_state is not None:
+            # Persistent streaming gate: a fresh SpectralGateDenoiser per hop
+            # never finishes auto-learning (10 frames = 416ms) and degenerates
+            # to a windowed passthrough for typical realtime chunks.
+            streaming_state.configure(
+                threshold_db=threshold_db * strength,
+                reduction_db=reduction_db * strength,
+            )
+            return streaming_state.process(audio)
         config = DenoiseConfig(
             threshold_db=threshold_db * strength,
             reduction_db=reduction_db * strength,

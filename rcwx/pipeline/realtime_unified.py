@@ -23,10 +23,11 @@ import torch
 from scipy.signal import resample_poly
 
 from rcwx.audio.buffer import RingOutputBuffer
+from rcwx.audio.denoise import StreamingSpectralGate
 from rcwx.audio.denoise import denoise as denoise_audio
 from rcwx.audio.duplex import AsioDuplexStream
 from rcwx.audio.input import AudioInput
-from rcwx.audio.noise_gate import NoiseGate
+from rcwx.audio.noise_gate import SENSITIVITY_MARGIN_DB, NoiseGate
 from rcwx.audio.output import AudioOutput
 from rcwx.audio.postprocess import PostprocessConfig, Postprocessor
 from rcwx.audio.resample import StatefulResampler, resample
@@ -205,11 +206,23 @@ class RealtimeVoiceChangerUnified:
 
         # Input-side noise gate (post-denoise, pre-inference).  Pure numpy,
         # cheap enough for every latency mode; state is per-sample so it
-        # survives arbitrary hop sizes.
+        # survives arbitrary hop sizes.  Auto threshold by default: the
+        # open level tracks the noise floor plus a sensitivity margin.
         self._noise_gate = NoiseGate(
             sample_rate=16000,
             threshold_db=getattr(self.config, "noise_gate_threshold_db", -40.0),
         )
+        self._noise_gate.auto_threshold = bool(
+            getattr(self.config, "noise_gate_auto", True)
+        )
+        self._noise_gate.set_sensitivity(
+            getattr(self.config, "noise_gate_sensitivity", "mid")
+        )
+
+        # Persistent streaming spectral gate (spectral-fallback denoise).
+        # The stateless path rebuilds per hop and never finishes learning
+        # its noise profile, so it would passthrough instead of denoise.
+        self._spectral_stream = StreamingSpectralGate(sample_rate=16000)
 
         # SOLA state + the synthesis margin its windows require
         self._sola_state = SolaState()
@@ -587,6 +600,7 @@ class RealtimeVoiceChangerUnified:
         self._input_buf = np.array([], dtype=np.float32)
         self._overlap_buf = None
         self._reset_boundary_continuity_state()
+        self._spectral_stream.reset()
         self._chunks_ready = 0
         self._output_started = False
         self._required_prebuffer_chunks = self._prebuffer_chunks
@@ -864,9 +878,8 @@ class RealtimeVoiceChangerUnified:
     ) -> None:
         effective = method
         if self.config.latency_mode == "aggressive" and method != "gtcrn":
-            # Aggressive hops are shorter than the spectral gate's analysis
-            # window (it would emit silence) and per-hop ML calls waste the
-            # hop budget; GTCRN is the streaming-safe choice.  See
+            # GTCRN is the quality choice for Aggressive (learned, streaming,
+            # CPU ~2ms/hop); per-hop ML calls waste the hop budget.  See
             # RealtimeConfig.__post_init__ for the construction-time remap.
             effective = "gtcrn"
         if effective != self.config.denoise_method:
@@ -884,13 +897,25 @@ class RealtimeVoiceChangerUnified:
     def set_energy_threshold(self, value: float) -> None:
         self.config.energy_threshold = value
 
-    def set_noise_gate(self, enabled: bool, threshold_db: float) -> None:
+    def set_noise_gate(
+        self,
+        enabled: bool,
+        auto: bool = True,
+        sensitivity: str = "mid",
+        threshold_db: float = -40.0,
+    ) -> None:
         was_enabled = self.config.noise_gate_enabled
         self.config.noise_gate_enabled = bool(enabled)
+        self.config.noise_gate_auto = bool(auto)
+        self.config.noise_gate_sensitivity = (
+            sensitivity if sensitivity in SENSITIVITY_MARGIN_DB else "mid"
+        )
         self.config.noise_gate_threshold_db = float(threshold_db)
+        self._noise_gate.auto_threshold = bool(auto)
+        self._noise_gate.set_sensitivity(self.config.noise_gate_sensitivity)
         self._noise_gate.threshold_db = float(threshold_db)
         if bool(enabled) != was_enabled:
-            # Toggle starts a fresh envelope/gain state; threshold-only
+            # Toggle starts a fresh envelope/gain state; parameter-only
             # tweaks keep it so the gain doesn't dip mid-stream.
             self._noise_gate.reset()
 
@@ -1178,6 +1203,7 @@ class RealtimeVoiceChangerUnified:
                 method=self.config.denoise_method,
                 strength=self.config.denoise_strength,
                 device=self.pipeline.device,
+                streaming_state=self._spectral_stream,
             )
 
         # --- Stage 3.5: Optional input noise gate ---

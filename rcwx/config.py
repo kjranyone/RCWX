@@ -208,6 +208,12 @@ class InferenceConfig:
     noise_gate_enabled: bool = False
     # Open threshold in dBFS (RMS envelope); closes 3dB lower after 60ms.
     noise_gate_threshold_db: float = -40.0
+    # Auto threshold: the open level follows a minimum-statistics estimate
+    # of the noise floor plus a sensitivity margin.  GUI default; the
+    # threshold above is the manual fallback (config file only).
+    noise_gate_auto: bool = True
+    # "low" (+10dB) / "mid" (+6dB) / "high" (+3dB) above the floor.
+    noise_gate_sensitivity: str = "mid"
 
     # Audio-level overlap for HuBERT continuity
     overlap_sec: float = 0.20

@@ -24,6 +24,17 @@ def _sine(freq: float, seconds: float, amp: float) -> np.ndarray:
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
+def _rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2)))
+
+
+def _auto_gate(sensitivity: str = "mid") -> NoiseGate:
+    gate = NoiseGate(SR, threshold_db=-40.0)
+    gate.auto_threshold = True
+    gate.set_sensitivity(sensitivity)
+    return gate
+
+
 def test_loud_signal_passes_through() -> None:
     gate = NoiseGate(SR, threshold_db=-40.0)
     speech = _sine(220.0, 1.0, 0.3)  # ~-13 dBFS, well above threshold
@@ -87,6 +98,57 @@ def test_threshold_property_updates_levels() -> None:
     )
 
 
+def test_auto_threshold_gates_noise_not_tone() -> None:
+    gate = _auto_gate()
+    rng = np.random.RandomState(3)
+    noise = (rng.randn(SR) * 0.001).astype(np.float32)
+    tone = _sine(220.0, 1.0 / 3, 0.3)
+    signal = np.concatenate([noise, tone, noise])
+    out = gate.process(signal)
+    t0, t1 = SR, SR + len(tone)
+    assert _rms(out[t0:t1]) > 0.9 * _rms(signal[t0:t1])
+    tail = slice(len(signal) - SR // 2, None)
+    assert _rms(out[tail]) < 0.3 * _rms(signal[tail])
+
+
+def test_auto_loud_opening_does_not_lock_open() -> None:
+    # A stream that starts loud must still gate the quiet tail (the floor
+    # is a sliding-window minimum, not "min so far").
+    gate = _auto_gate()
+    rng = np.random.RandomState(4)
+    loud = _sine(220.0, 1.0, 0.3)
+    quiet = (rng.randn(SR) * 0.001).astype(np.float32)
+    out = gate.process(np.concatenate([loud, quiet]))
+    head = slice(0, SR // 2)
+    tail = slice(len(out) - SR // 2, None)
+    assert _rms(out[head]) > 0.9 * _rms(loud[head])
+    assert _rms(out[tail]) < 0.3 * _rms(quiet[len(quiet) - SR // 2 :])
+
+
+def test_auto_sustained_loud_tone_stays_open() -> None:
+    # A tone longer than the 1s floor window contaminates the floor with
+    # its own level; the -30dBFS open guard must keep it passing.
+    gate = _auto_gate()
+    tone = _sine(220.0, 2.5, 0.3)
+    out = gate.process(tone)
+    settled = slice(SR, None)
+    assert _rms(out[settled]) > 0.9 * _rms(tone[settled])
+
+
+def test_auto_sensitivity_margins() -> None:
+    # Tone ~+7dB over the noise floor: "high" (+3dB margin) opens,
+    # "low" (+10dB margin) stays closed.
+    rng = np.random.RandomState(5)
+    noise = (rng.randn(2 * SR) * 0.001).astype(np.float32)
+    tone = _sine(220.0, 1.0, 0.001 * float(np.sqrt(5.0)))
+    ratios = {}
+    for sens in ("low", "high"):
+        gate = _auto_gate(sens)
+        out = gate.process(np.concatenate([noise, tone]))
+        ratios[sens] = _rms(out[2 * SR :]) / _rms(tone)
+    assert ratios["high"] > 3.0 * ratios["low"]
+
+
 class _FakePipeline:
     _loaded = True
     device = "cpu"
@@ -129,5 +191,9 @@ if __name__ == "__main__":
     test_hold_keeps_gate_open_through_short_dip()
     test_release_is_smooth()
     test_threshold_property_updates_levels()
+    test_auto_threshold_gates_noise_not_tone()
+    test_auto_loud_opening_does_not_lock_open()
+    test_auto_sustained_loud_tone_stays_open()
+    test_auto_sensitivity_margins()
     test_preprocess_hop_applies_gate()
     print("OK: all noise gate tests passed")

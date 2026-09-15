@@ -1,14 +1,14 @@
 """Aggressive-mode denoise policy.
 
-Aggressive realtime hops (20-100ms = 320-1600 samples @16k) are shorter than
-the spectral gate's 2048-sample analysis window, so spectral processing used
-to return pure silence and mute the stream.  Two guarantees:
+The Aggressive hop budget leaves no room for per-hop ML denoiser calls,
+and GTCRN (learned, streaming, CPU ~2ms/hop) is the highest-quality
+denoiser that fits that budget.  Two guarantees:
 
-1. In Aggressive mode the denoise method is remapped to the streaming-safe
-   GTCRN denoiser (construction, ``set_denoise``, ``set_latency_mode``).
-2. As a safety net for any other path, ``denoise(method="spectral")`` passes
-   audio shorter than one analysis window through unchanged instead of
-   zeroing it.
+1. In Aggressive mode the denoise method is remapped to GTCRN
+   (construction, ``set_denoise``, ``set_latency_mode``).
+2. As a safety net for stateless callers, ``denoise(method="spectral")``
+   passes audio shorter than one analysis window through unchanged instead
+   of zeroing it (the realtime path uses the streaming gate instead).
 """
 
 from __future__ import annotations
