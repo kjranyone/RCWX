@@ -217,6 +217,7 @@ impl Engine {
         self.compile("rel_attn", &shaders::rel_attn_src(), 3)?;
         self.compile("flip_ch", &shaders::flip_ch_src(), 2)?;
         self.compile("im2col2d", &shaders::im2col2d_src(), 2)?;
+        self.compile("im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
         self.compile("avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
         self.compile("conv_transpose2d", &shaders::conv_transpose2d_src(), 4)?;
         self.compile("concat_ch", &shaders::concat_ch_src(), 3)?;
@@ -588,6 +589,22 @@ impl<'a> Graph<'a> {
             let cols = 512u32;
             let rows = wg.div_ceil(cols);
             self.dispatch("im2col2d", &[x, ic], words, cols, rows, 1);
+        }
+    }
+
+    /// 汎用 im2col2d (kernel k・pad p)。出力 [c*k*k, h*w]。
+    pub fn im2col2d_k(&mut self, x: &GpuTensor, ic: &GpuTensor, c: u32, h: u32, w: u32, k: u32, pad: u32) {
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[c, h, w, k]);
+        words[4] = pad;
+        let total = c * k * k * h * w;
+        let wg = total.div_ceil(256);
+        if wg <= 65535 {
+            self.dispatch("im2col2d_k", &[x, ic], words, wg, 1, 1);
+        } else {
+            let cols = 512u32;
+            let rows = wg.div_ceil(cols);
+            self.dispatch("im2col2d_k", &[x, ic], words, cols, rows, 1);
         }
     }
 

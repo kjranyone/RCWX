@@ -348,6 +348,34 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 }
 
+/// 汎用 im2col2d (kernel k・pad p・stride 1)。出力 [c*k*k, h*w]。
+pub fn im2col2d_k_src() -> String {
+    header(2)
+        + r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let c_dim = P.p0.x; let h = P.p0.y; let w = P.p0.z; let k_dim = P.p0.w;
+  let pad = P.p1.x;
+  let i = gid.x + gid.y * 131072u;
+  let total_out = h * w;
+  let kk = k_dim * k_dim;
+  let total = c_dim * kk * total_out;
+  if (i >= total) { return; }
+  let x = i % w;
+  let y = (i / w) % h;
+  let ck = i / total_out;
+  let c = ck / kk;
+  let rem = ck % kk;
+  let j = rem / k_dim;
+  let ii = rem % k_dim;
+  let sy = i32(y) + i32(j) - i32(pad);
+  let sx = i32(x) + i32(ii) - i32(pad);
+  let v = select(0.0, B1[c * h * w + u32(sy) * w + u32(sx)], sy >= 0 && sy < i32(h) && sx >= 0 && sx < i32(w));
+  B2[i] = v;
+}
+"#
+}
+
 pub fn avg_pool2x2_src() -> String {
     header(2)
         + r#"

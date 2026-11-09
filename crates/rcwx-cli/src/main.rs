@@ -346,10 +346,17 @@ fn main() -> Result<()> {
     }
 
     // ---- F0 ----
-    let mut f0v = if args.f0_method == "rmvpe" {
-        rmvpe.infer(&eng, &wav_pad)
-    } else {
-        vec![0.0f32; t100]
+    let mut f0v = match args.f0_method.as_str() {
+        "rmvpe" => rmvpe.infer(&eng, &wav_pad),
+        "swiftf0" => {
+            let sf0 = rcwx_nn::swiftf0::SwiftF0::load(
+                &eng,
+                &rcwx_nn::swiftf0::default_swiftf0_path(),
+            )
+            .context("SwiftF0 load")?;
+            sf0.detect(&eng, &wav_pad)
+        }
+        _ => vec![0.0f32; t100],
     };
     f0v.resize(t100, 0.0);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {

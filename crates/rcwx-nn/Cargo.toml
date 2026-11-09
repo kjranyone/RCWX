@@ -12,3 +12,6 @@ rustfft = "6.4.1"
 safetensors = "0.8.0"
 serde_json = "1.0.154"
 wgpu = "30.0.1"
+
+[dev-dependencies]
+zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
