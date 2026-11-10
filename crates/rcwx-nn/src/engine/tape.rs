@@ -1178,7 +1178,10 @@ impl<'e> Tape<'e> {
         if std::env::var("MM_DEBUG").is_ok() {
             eprintln!(
                 "[mm] m={m} n={n} k={k} b={batch} a=({a_row},{a_k},{a_base},{a_bs}) w=({w_row},{w_k},{w_base},{w_bs}) c=({c_row},{c_n},0,{c_bs}) alen={} wlen={} clen={} bias={}",
-                a_t.len, w_t.len, out_ref.len, b_t.is_some()
+                a_t.len,
+                w_t.len,
+                out_ref.len,
+                b_t.is_some()
             );
         }
         self.g.matmul_ex(
@@ -2608,7 +2611,6 @@ impl<'e> Tape<'e> {
         });
     }
 
-
     /// masked_fill 相当 (末尾 2 次元 [r2, c2] の 0/1 mask でブロードキャスト)。
     pub fn mask_fill2d(&mut self, x: Var, mask: Var, c2: u32, fill: f32) -> Var {
         let total = self.numel(x);
@@ -2640,7 +2642,14 @@ impl<'e> Tape<'e> {
                 let dx = ctx.alloc(total as usize);
                 let mut w = [0u32; 32];
                 w[0..4].copy_from_slice(&[total, 0, r2, c2]);
-                ctx.dispatch("t_mask_fill_bwd", &[&dy, &m_t, &dx], w, total.div_ceil(256), 1, 1);
+                ctx.dispatch(
+                    "t_mask_fill_bwd",
+                    &[&dy, &m_t, &dx],
+                    w,
+                    total.div_ceil(256),
+                    1,
+                    1,
+                );
                 ctx.accum(x_id, dx);
             }),
         });

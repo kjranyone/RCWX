@@ -116,6 +116,10 @@ pub struct RtEngine {
 impl RtEngine {
     pub fn new(backend: Backend, cfg: RtConfig) -> Result<Self> {
         let dir = rcwx_nn::rmvpe::default_rmvpe_dir();
+        // リアルタイム経路で学習カーネルは不要 (起動時間削減)
+        if std::env::var("RCWX_SKIP_TRAIN_KERNELS").is_err() {
+            unsafe { std::env::set_var("RCWX_SKIP_TRAIN_KERNELS", "1") };
+        }
         let eng = Engine::new(backend)?;
         let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors"))?;
         let synth = match &cfg.model_path {

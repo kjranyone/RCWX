@@ -3,7 +3,9 @@ use rcwx_nn::engine::tape::Tape;
 use rcwx_nn::engine::{Backend, Engine};
 
 fn lcg(state: &mut u64) -> f32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     ((*state >> 33) as f32 / (1u64 << 33) as f32 - 0.5) * 2.0
 }
 
@@ -12,7 +14,9 @@ fn mm_batch2_repro() {
     let eng = Engine::new(Backend::Vulkan).expect("engine");
     let (batch, oc, ic, t) = (2u32, 16u32, 16u32, 13u32);
     let mut st = 9u64;
-    let x_d: Vec<f32> = (0..(batch * ic * t) as usize).map(|_| lcg(&mut st)).collect();
+    let x_d: Vec<f32> = (0..(batch * ic * t) as usize)
+        .map(|_| lcg(&mut st))
+        .collect();
     let w_d: Vec<f32> = (0..(oc * ic) as usize).map(|_| lcg(&mut st)).collect();
     let b_d: Vec<f32> = (0..oc as usize).map(|_| lcg(&mut st)).collect();
 
@@ -25,8 +29,26 @@ fn mm_batch2_repro() {
     let x = tape.const_f32s(&x_d, vec![batch as usize, ic as usize, t as usize]);
     // mm: out[b, o, t] = Σ_c W[o,c]·x[b,c,t]
     let out = tape.mm(
-        pv[0], x, None, (batch * oc * t) as usize, oc, t, ic, batch, ic, 1, 0, 0, 1, t, 0,
-        ic * t, t, 1, oc * t, 1.0,
+        pv[0],
+        x,
+        None,
+        (batch * oc * t) as usize,
+        oc,
+        t,
+        ic,
+        batch,
+        ic,
+        1,
+        0,
+        0,
+        1,
+        t,
+        0,
+        ic * t,
+        t,
+        1,
+        oc * t,
+        1.0,
     );
     let out = tape.add_ch_bias(out, pv[1], oc, t);
     let out_t = tape.var_tensor(out);

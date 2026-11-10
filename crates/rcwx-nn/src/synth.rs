@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::engine::{Engine, GpuTensor, Graph};
+use crate::engine::{Engine, GpuTensor, Graph, Plan};
 
 pub struct SynthConfig {
     pub version: u32,     // 1 (256-dim) / 2 (768-dim)
@@ -1523,8 +1523,7 @@ impl Synth {
             let lo = start - w_start;
             let take = end - start;
             for c in 0..inter {
-                z[c * t + start..c * t + end]
-                    .copy_from_slice(&zw[c * n + lo..c * n + lo + take]);
+                z[c * t + start..c * t + end].copy_from_slice(&zw[c * n + lo..c * n + lo + take]);
             }
             start = end;
         }
@@ -1548,30 +1547,111 @@ impl Synth {
         let chunk = chunk as usize;
         let margin = margin as usize;
 
+        let timing = std::env::var("RCWX_TIMING").is_ok();
+        let t_enc = std::time::Instant::now();
         let z_cpu = self.encode_windowed_cpu(eng, feats, pitch_idx, t as u32); // [inter, T]
+        if timing {
+            eprintln!(
+                "[timing] synth.encode: {:.2}s",
+                t_enc.elapsed().as_secs_f64()
+            );
+        }
+        let t_dec = std::time::Instant::now();
 
         let mut out = vec![0.0f32; t * zc as usize];
+        let mut acc_build = 0.0f64;
+        let mut acc_sub = 0.0f64;
+        let mut acc_rb = 0.0f64;
+        // 固定長 staging 入力で decode プランを一度だけ構築し、chunk ごとに
+        // 入力を書き換えて再生する (毎 chunk のグラフ再構築とテンソル確保を廃止)。
+        // 末尾の小さい chunk もフル長で実行し、出力は有効範囲のみ採る
+        // (margin 外の余白出力は破棄されるため末尾の stale/zero は影響しない)。
+        // K 組の staging/plan を交互に使い **K chunk を 1 submit に束ねる** —
+        // chunk 間の GPU アイドルと fence 待ち回数を 1/K に削減。
+        let n_full = (chunk + 2 * margin) as u32;
+        let inter = cfg.inter_channels as usize;
+        let k_batch: usize = std::env::var("RCWX_DEC_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let mut sets: Vec<(GpuTensor, GpuTensor, GpuTensor, Plan)> = Vec::new();
+        for _ in 0..k_batch {
+            let z_st = eng.tensor_zeros(inter * n_full as usize, vec![]);
+            let har_st = eng.tensor_zeros(n_full as usize * zc as usize, vec![]);
+            let tb = std::time::Instant::now();
+            let mut g = eng.graph();
+            let a = self.decode_graph_inner(eng, &mut g, &z_st, &har_st, n_full);
+            let plan = g.into_plan().expect("decode plan");
+            acc_build += tb.elapsed().as_secs_f64();
+            sets.push((z_st, har_st, a, plan));
+        }
+        // z は [inter, T] チャネル主導 — 窓はチャネルごとに固定幅 n_full の
+        // 連続領域へ詰め直す (余白はゼロ: 旧実装の zero-padding 境界と同一)
+        let nf = n_full as usize;
+        let mut zw = vec![0.0f32; inter * nf];
+        let mut har_full = vec![0.0f32; nf * zc as usize];
         let mut start = 0usize;
         while start < t {
-            let end = (start + chunk).min(t);
-            let w_start = start.saturating_sub(margin);
-            let w_end = (end + margin).min(t);
-            let n = (w_end - w_start) as u32;
-            // z の末尾抽出は GPU 内で (slice_ch) — 全 z を一度アップロード
-            let z_full_t = eng.tensor_from_f32(&z_cpu, vec![]);
-            let har = self.sinegen_range(pitchf, w_start, n as usize);
-            let har_t = eng.tensor_from_f32(&har, vec![]);
-            let mut g = eng.graph();
-            let audio =
-                self.decode_graph_off(eng, &mut g, &z_full_t, &har_t, t as u32, w_start as u32, n);
-            g.submit().expect("submit");
-            let samples = eng.readback_f32(&audio);
-            let s_off = start - w_start;
-            let take = end - start;
-            let row = zc as usize * take;
-            out[start * zc as usize..start * zc as usize + row]
-                .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
-            start = end;
+            let ts = std::time::Instant::now();
+            let mut group: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, w_start)
+            let mut plan_refs: Vec<&Plan> = Vec::new();
+            for (idx, (z_st, har_st, _a, plan)) in sets.iter().enumerate() {
+                let s = start + idx * chunk;
+                if s >= t {
+                    break;
+                }
+                let end = (s + chunk).min(t);
+                let w_start = s.saturating_sub(margin);
+                let w_end = (end + margin).min(t);
+                let n = w_end - w_start;
+                for c in 0..inter {
+                    let base = c * nf;
+                    zw[base..base + n].copy_from_slice(&z_cpu[c * t + w_start..c * t + w_end]);
+                    zw[base + n..base + nf].fill(0.0);
+                }
+                eng.write_f32(z_st, &zw);
+                let har = self.sinegen_range(pitchf, w_start, n);
+                har_full[..har.len()].copy_from_slice(&har);
+                har_full[har.len()..].fill(0.0);
+                eng.write_f32(har_st, &har_full);
+                group.push((s, end, w_start));
+                plan_refs.push(plan);
+            }
+            if plan_refs.is_empty() {
+                break;
+            }
+            eng.replay_plans(&plan_refs);
+            acc_sub += ts.elapsed().as_secs_f64();
+            let tr = std::time::Instant::now();
+            let trace = std::env::var_os("RCWX_DEC_RB_TRACE").is_some();
+            let mut ti = std::time::Instant::now();
+            for (i, set) in sets.iter().enumerate().take(group.len()) {
+                let (s, end, w_start) = group[i];
+                let samples = eng.readback_f32(&set.2);
+                if trace {
+                    eprintln!(
+                        "[dec] chunk {s}: rb {:.1}ms",
+                        ti.elapsed().as_secs_f64() * 1000.0
+                    );
+                    ti = std::time::Instant::now();
+                }
+                let s_off = s - w_start;
+                let take = end - s;
+                let row = zc as usize * take;
+                out[s * zc as usize..s * zc as usize + row]
+                    .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
+            }
+            acc_rb += tr.elapsed().as_secs_f64();
+            start = group.last().unwrap().1;
+        }
+        if timing {
+            eprintln!(
+                "[timing] synth.decode: {:.2}s (build {:.2}s / submit {:.2}s / rb {:.2}s)",
+                t_dec.elapsed().as_secs_f64(),
+                acc_build,
+                acc_sub,
+                acc_rb
+            );
         }
         out
     }

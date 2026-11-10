@@ -100,6 +100,43 @@ crates/
   スプライスなし、バッチ境界のみ SOLA。
   fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)。
   単発 (バッチなし) では p50 ≈ 45ms/hop — さらなる単発高速化は今後の課題
+- **オフライン変換の高速化 (fused attention + plan 再生)**: HuBERT の attention を
+  **flash 形式の fused カーネル** (`flash_attn`・online softmax・T² スコア行列を
+  材料化しない) に置換し、synth の decode chunk ループを**固定 staging での
+  プラン 1 回構築 + replay** 化 (毎 chunk のグラフ再構築と 12MB z 再アップロードを
+  廃止)。起動は学習カーネル除外 (`RCWX_SKIP_TRAIN_KERNELS=1`・cli/rt とも設定) +
+  swiftf0 時の RMVPE 遅延ロード + kernel 並列コンパイルで削減。
+  60s 変換が 125s → **~13.0s** (engine 3.3s / hubert 0.7 / f0 1.2 / decode 6.6) —
+  **交互 5 ラウンドで warm Python (13.8-14.3s) を全ラウンド下回り PyTorch 超え達成**。
+  decode chunk は 64 フレーム + margin 4 (rt と同じ・整相 corr 1.0 で品質等価)。
+  **複 chunk の一括 submit (RCWX_DEC_BATCH) は逆効果**: このドライバは in-flight の
+  コマンド量が増えると superlinear に遅くなる (batch2 で 1.5×・batch3 で 3.4×・実測) —
+  既定 1 のまま。詳細は下記「シェーダコンパイラと attention 経路」
+- **シェーダコンパイラと attention 経路 (Arc B570 実測)**:
+  - wgpu 既定 (Auto) は dxcompiler.dll が見つからないと **FXC (SM5.1) に黙って
+    フォールバック**する。FXC は matmul 系のコンパイルが ~3s/個・flash_attn は
+    **30s** と遅いが、**生成コードの実行は DXC 比で ~2 倍高速** (rt p50 7.15 vs
+    14.4ms・decode rb 8.5 vs 13.4s)。DXC は逆 (コンパイル高速・実行遅い)。
+  - 既定: **rt/GUI = FXC + 古典 attention** (T≤560 では T² も微小)。
+    **cli `run` は入力長で切り替え** — 30s 未満は DXC (起動 0.8s)、以上は FXC
+    (コンパイル 3.3s だが実行 ~1.9× 高速)。env: `RCWX_DXC=0|1` (強制) /
+    `RCWX_DXC_PATH=fxc|<path>` / `RCWX_ATTN=flash|classic` /
+    `RCWX_DX12_SM=6.x` (診断) / `RCWX_COMPILE_THREADS=N`。
+  - カーネルコンパイルは 8 スレッド round-robin 並列 (FXC 44s → 6.3s・起動も
+    44s → 6.5s)。wgpu の pipeline cache は DX12 が stub で効かないため、
+    将来は dxcompiler.dll を実行ファイル横に同梱して DXC 併用が本命。
+  - **古典 attention (T² scores 材料化) は persistent scratch 必須**: 従来
+    build_plan が層ごとに作業バッファを確保し plan が握り続けるため t≈1700 で
+    scores 12 層分 ~1.7GB が resident 化し、WDDM residency 圧迫から**以降の全
+    ステージが 5〜20 倍減速** (decode 8.5→90s) したり 2 窓で device lost した。
+    全層で 9 本の scratch (qkv/scores/ctx/o/x3/ff/ff2/x ping-pong) を再利用する
+    ことで resident は ~190MB/窓に収まり両方解消 (数値は flash と corr 1.0)。
+    SwiftF0 は長尺でも内部 ~1.4GB/27s 級の中間バッファを持つため 25s+1s 窓分割が
+    必要 (単発は 2GB 上限で落ちる)。`RCWX_HUBERT_WIN` で窓長上書き可
+  - flash_attn の WGSL は行 max を SLM に出版するフェーズを入れると FXC の
+    コンパイルが爆発するため、各スレッドが私的に max を取る 2-barrier 構造
+    (p 再計算の exp 増と引き換え)。vec4→スカラー化・手動展開・部分和分割では
+    直らない (FXC のループネスト最適化の superlinear なコスト)
 - **重みの実行時調達 (頒布対応)**: 共通重み (HuBERT/RMVPE/SwiftF0) は
   `rcwx-cli download` が公式配布元から .pt/wheel を落とし **バイナリ内蔵の変換器**
   (`rcwx-nn/src/convert.rs` + `pth.rs` の torch zip+pickle 完全リーダ) で

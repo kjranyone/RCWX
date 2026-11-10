@@ -1,23 +1,29 @@
 //! 微分可能 STFT / mel スペクトログラム (損失計算用)。
 //! rDFT 基底・mel 基底は外部 (golden / 前処理) で生成した同一のものを使う。
 
-use rcwx_nn::engine::tape::{Tape, Var};
 use rcwx_nn::engine::GpuTensor;
+use rcwx_nn::engine::tape::{Tape, Var};
 
 pub struct StftMel {
     pub n_fft: u32,
     pub hop: u32,
-    pub basis_re: GpuTensor, // [bins, n_fft]
-    pub basis_im: GpuTensor, // [bins, n_fft]
+    pub basis_re: GpuTensor,  // [bins, n_fft]
+    pub basis_im: GpuTensor,  // [bins, n_fft]
     pub mel_basis: GpuTensor, // [n_mels, bins]
-    pub hann: GpuTensor,     // [n_fft]
+    pub hann: GpuTensor,      // [n_fft]
     pub n_mels: u32,
 }
 
 impl StftMel {
     /// Rust 側で基底を生成 (n_fft=2048/hop=480/n_mels=128・Slaney mel)。
     /// golden 比較時は Python 側で生成した同一基底を差し込む。
-    pub fn new_rust(eng: &rcwx_nn::engine::Engine, n_fft: u32, hop: u32, n_mels: u32, sr: u32) -> Self {
+    pub fn new_rust(
+        eng: &rcwx_nn::engine::Engine,
+        n_fft: u32,
+        hop: u32,
+        n_mels: u32,
+        sr: u32,
+    ) -> Self {
         let bins = n_fft / 2 + 1;
         let mut re = vec![0.0f32; (bins * n_fft) as usize];
         let mut im = vec![0.0f32; (bins * n_fft) as usize];
@@ -152,7 +158,9 @@ pub fn slaney_mel(n_mels: u32, bins: u32, sr: u32, n_fft: u32) -> Vec<f32> {
         centers_mel.push(min_mel + (max_mel - min_mel) * i as f32 / (n_mels + 1) as f32);
     }
     let centers_hz: Vec<f32> = centers_mel.iter().map(|m| mel_to_hz(*m)).collect();
-    let fft_freqs: Vec<f32> = (0..bins).map(|k| k as f32 * sr as f32 / n_fft as f32).collect();
+    let fft_freqs: Vec<f32> = (0..bins)
+        .map(|k| k as f32 * sr as f32 / n_fft as f32)
+        .collect();
     // Slaney: 三角フィルタ + 面積正規化 (enorm)
     let mut out = vec![0.0f32; (n_mels * bins) as usize];
     for m in 0..n_mels {

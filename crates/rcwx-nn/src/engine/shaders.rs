@@ -40,6 +40,132 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 });
 
+/// fused attention (flash 形式・online softmax)。
+/// B1 = qkv [t, 3H] 行優先、各ヘッドの q/k/v は行内 q_off/k_off/v_off + h*hd 位置。
+/// B2 = ctx 出力 [t, H] 行優先: ctx[m, h*64+d] = Σ_j softmax_j(q_m·k_j·scale)·v_j[d]。
+/// T² スコア行列を材料化しないため長尺入力のメモリとトラフィックが O(T) になる。
+/// head_dim=64 固定 (SLM レイアウトが 64/65 ストライドに依存)。
+///
+/// 実装上の注意 (Arc B570 / DXC 実測): 行 max を SLM に出版する rmax/rsc フェーズを
+/// 入れると (workgroup barrier 4 系統 + 出版→再読み) DXC のコンパイルが ~30s に
+/// 爆発する。各スレッドが自分の 2 行だけ私的に max を取り p = exp(s - nm) を
+/// acc ループ内で直接計算する 2 barrier 構造なら 0.7s でコンパイルできる。
+/// (p 再計算の exp は +30/thread/strip だが attention 全体に占める割れ目は小さい)
+pub fn flash_attn_src() -> String {
+    header(2)
+        + r#"
+var<workgroup> qt: array<f32, 2080>;  // q タイル [32][65] (+1 は bank conflict 回避)
+var<workgroup> kt: array<f32, 1040>;  // k ストリップ [16][65]
+var<workgroup> vt: array<f32, 1040>;  // v ストリップ [16][65]
+var<workgroup> st: array<f32, 512>;   // スコア [32][16]
+@compute @workgroup_size(16, 16)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let t = P.p0.x; let row = P.p0.y; let heads = P.p0.z; let scale = f32_of(P.p0.w);
+  let q_off = P.p1.x; let k_off = P.p1.y; let v_off = P.p1.z; let out_row = P.p1.w;
+  let tile_m = wid.x * 32u;
+  let h = wid.y;
+  let lin = lid.y * 16u + lid.x;
+
+  // q タイル (範囲外行は 0)
+  for (var rep: u32 = 0u; rep < 8u; rep = rep + 1u) {
+    let e = lin + rep * 256u;
+    let m = e / 64u; let d = e % 64u;
+    let gm = tile_m + m;
+    qt[m * 65u + d] = select(0.0, B1[gm * row + q_off + h * 64u + d], gm < t);
+  }
+  // スレッドは 2 行 (2*lid.y, +1) × 4 次元 (4*lid.x..+4) を担当
+  var a0x = 0.0; var a0y = 0.0; var a0z = 0.0; var a0w = 0.0;
+  var a1x = 0.0; var a1y = 0.0; var a1z = 0.0; var a1w = 0.0;
+  var m0 = -3.0e38; var m1 = -3.0e38;
+  var l0 = 0.0; var l1 = 0.0;
+  workgroupBarrier();
+  var j0: u32 = 0u;
+  loop {
+    if (j0 >= t) { break; }
+    // k/v ストリップ (範囲外キーは 0 — スコア側で -inf 化するので値は不問)
+    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
+      let e = lin + rep * 256u;
+      let j = e / 64u; let d = e % 64u;
+      let gj = j0 + j;
+      let inr = gj < t;
+      kt[j * 65u + d] = select(0.0, B1[gj * row + k_off + h * 64u + d], inr);
+      vt[j * 65u + d] = select(0.0, B1[gj * row + v_off + h * 64u + d], inr);
+    }
+    workgroupBarrier();
+    // スコア 512 個を 2 個/スレッド (範囲外 j は -inf)
+    {
+      let e2 = lin * 2u;
+      let ma = e2 / 16u; let ja = e2 % 16u;
+      let mb = (e2 + 1u) / 16u; let jb = (e2 + 1u) % 16u;
+      var sa = -3.0e38; var sb = -3.0e38;
+      if (j0 + ja < t) {
+        sa = 0.0;
+        for (var d: u32 = 0u; d < 64u; d = d + 1u) { sa = sa + qt[ma * 65u + d] * kt[ja * 65u + d]; }
+        sa = sa * scale;
+      }
+      if (j0 + jb < t) {
+        sb = 0.0;
+        for (var d: u32 = 0u; d < 64u; d = d + 1u) { sb = sb + qt[mb * 65u + d] * kt[jb * 65u + d]; }
+        sb = sb * scale;
+      }
+      st[ma * 16u + ja] = sa;
+      st[mb * 16u + jb] = sb;
+    }
+    workgroupBarrier();
+    // 各スレッドは自分の 2 行だけ私的に max 更新し p = exp(s - nm) を直接計算
+    // (行 max の SLM 出版フェーズを入れると DXC コンパイルが ~30s になるため)
+    var nm0 = m0; var nm1 = m1;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      nm0 = max(nm0, st[(lid.y * 2u) * 16u + j]);
+      nm1 = max(nm1, st[(lid.y * 2u + 1u) * 16u + j]);
+    }
+    let sc0 = exp(m0 - nm0);
+    let sc1 = exp(m1 - nm1);
+    a0x = a0x * sc0; a0y = a0y * sc0; a0z = a0z * sc0; a0w = a0w * sc0;
+    a1x = a1x * sc1; a1y = a1y * sc1; a1z = a1z * sc1; a1w = a1w * sc1;
+    var ls0 = 0.0; var ls1 = 0.0;
+    let d0 = lid.x * 4u;
+    for (var j: u32 = 0u; j < 16u; j = j + 1u) {
+      let p0 = exp(st[(lid.y * 2u) * 16u + j] - nm0);
+      let p1 = exp(st[(lid.y * 2u + 1u) * 16u + j] - nm1);
+      ls0 = ls0 + p0; ls1 = ls1 + p1;
+      let vb = j * 65u + d0;
+      a0x = a0x + p0 * vt[vb];
+      a0y = a0y + p0 * vt[vb + 1u];
+      a0z = a0z + p0 * vt[vb + 2u];
+      a0w = a0w + p0 * vt[vb + 3u];
+      a1x = a1x + p1 * vt[vb];
+      a1y = a1y + p1 * vt[vb + 1u];
+      a1z = a1z + p1 * vt[vb + 2u];
+      a1w = a1w + p1 * vt[vb + 3u];
+    }
+    l0 = l0 * sc0 + ls0; l1 = l1 * sc1 + ls1;
+    m0 = nm0; m1 = nm1;
+    workgroupBarrier();
+    j0 = j0 + 16u;
+  }
+  let om0 = tile_m + lid.y * 2u;
+  let om1 = om0 + 1u;
+  let obase = h * 64u + lid.x * 4u;
+  if (om0 < t) {
+    B2[om0 * out_row + obase] = a0x / l0;
+    B2[om0 * out_row + obase + 1u] = a0y / l0;
+    B2[om0 * out_row + obase + 2u] = a0z / l0;
+    B2[om0 * out_row + obase + 3u] = a0w / l0;
+  }
+  if (om1 < t) {
+    B2[om1 * out_row + obase] = a1x / l1;
+    B2[om1 * out_row + obase + 1u] = a1y / l1;
+    B2[om1 * out_row + obase + 2u] = a1z / l1;
+    B2[om1 * out_row + obase + 3u] = a1w / l1;
+  }
+}
+"#
+}
+
 pub fn matmul_tiled_src() -> String {
     header(4)
         + r#"
@@ -93,6 +219,8 @@ fn main(
       tb[bn * 20u + bk] = select(0.0, B2[w_off + gn * w_row + gk2 * w_k], gn < n_dim && gk2 < k_dim);
     }
     workgroupBarrier();
+    // 16 trip を手動展開 (DXC は定数境界ループを展開せず、 rolled loop の SLM
+    // 依存鎖で ~2x 遅くなるため。FXC は自動展開していた)
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
       let a0 = ta[lx * 20u + kk];
       let a1 = ta[(lx + 1u) * 20u + kk];
@@ -705,7 +833,6 @@ fn main(
 "#
 }
 
-
 /// チャネル major 行列の末尾 n_out フレーム抽出: out[c, t] = in[c, off+t]。
 pub fn slice_ch_src() -> String {
     header(2)
@@ -783,10 +910,10 @@ fn main(
     workgroupBarrier();
     var h00 = f16(0.0); var h01 = f16(0.0); var h10 = f16(0.0); var h11 = f16(0.0);
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-      let a0 = ta[lx * 16u + kk];
-      let a1 = ta[(lx + 1u) * 16u + kk];
-      let b0 = tb[ly * 16u + kk];
-      let b1 = tb[(ly + 1u) * 16u + kk];
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
       h00 = h00 + a0 * b0;
       h01 = h01 + a0 * b1;
       h10 = h10 + a1 * b0;

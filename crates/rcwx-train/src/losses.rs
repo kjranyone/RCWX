@@ -39,7 +39,14 @@ pub fn mse_mean(tape: &mut Tape<'_>, x: Var, c: f32) -> Var {
             let dx = ctx.alloc(len as usize);
             let mut words = [0u32; 32];
             words[0..4].copy_from_slice(&[len, c.to_bits(), (1.0f32 / len as f32).to_bits(), 0]);
-            ctx.dispatch("t_mse_bwd", &[&x_t, &dx, &dy], words, len.div_ceil(256), 1, 1);
+            ctx.dispatch(
+                "t_mse_bwd",
+                &[&x_t, &dx, &dy],
+                words,
+                len.div_ceil(256),
+                1,
+                1,
+            );
             ctx.accum(x_id, dx);
         }),
     );
@@ -118,7 +125,14 @@ pub fn l1_mean(tape: &mut Tape<'_>, a: Var, b: Var) -> Var {
             let da = ctx.alloc(len as usize);
             let mut words = [0u32; 32];
             words[0..3].copy_from_slice(&[len, (1.0f32 / len as f32).to_bits(), 0]);
-            ctx.dispatch("t_l1_sign", &[&a_t, &b_t, &da, &dy], words, len.div_ceil(256), 1, 1);
+            ctx.dispatch(
+                "t_l1_sign",
+                &[&a_t, &b_t, &da, &dy],
+                words,
+                len.div_ceil(256),
+                1,
+                1,
+            );
             ctx.accum(a_id, da.clone_handle());
             let db = ctx.alloc(len as usize);
             let mut words = [0u32; 32];
@@ -231,7 +245,14 @@ pub fn kl_loss(
                 1,
                 1,
             );
-            ctx.dispatch("t_kl_bwd_b", &[&m_t, &dy, &dlq], words, len.div_ceil(256), 1, 1);
+            ctx.dispatch(
+                "t_kl_bwd_b",
+                &[&m_t, &dy, &dlq],
+                words,
+                len.div_ceil(256),
+                1,
+                1,
+            );
             ctx.accum(zp_id, dz);
             ctx.accum(mp_id, dm);
             ctx.accum(lp_id, dlp);

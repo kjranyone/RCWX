@@ -347,7 +347,7 @@ impl Hubert {
         g.add(&pos_pre, &pos, &summed, H * t);
 
         // ---- encoder LN → [T, 768] ----
-        let mut x = eng.tensor_uninit((t * H) as usize);
+        let x = eng.tensor_uninit((t * H) as usize);
         g.layer_norm(
             &summed,
             &self.enc_ln_g,
@@ -363,13 +363,32 @@ impl Hubert {
         );
 
         // ---- transformer layers (post-LN) ----
+        // 作業バッファは全層で 1 回確保して再利用する。従来は層ごとに確保し plan が
+        // 握り続けるため t≈1700 で scores 12 層分だけで ~1.7GB が resident 化し、
+        // WDDM の residency 圧迫から以降の全ステージが数分の 1 に減速したり長尺 2 窓で
+        // device lost する (実測)。同一バッファへの再書き込みは常に読み取り dispatch
+        // の後 (キュー内順序) なので層をまたいだ aliasing は安全。x は ping-pong。
+        let x_b = eng.tensor_uninit((t * H) as usize);
+        let qkv_s = eng.tensor_uninit((t * 3 * H) as usize);
+        let ctx_s = eng.tensor_uninit((t * H) as usize);
+        let o_s = eng.tensor_uninit((t * H) as usize);
+        let x3_s = eng.tensor_uninit((t * H) as usize);
+        let ff_s = eng.tensor_uninit((t * FFN) as usize);
+        let ff2_s = eng.tensor_uninit((t * H) as usize);
+        let scores_s = if eng.attn_flash {
+            None
+        } else {
+            Some(eng.tensor_uninit((HEADS * t * t) as usize))
+        };
+        let mut parity = false;
         for l in &self.layers[..n_layers as usize] {
-            let qkv = eng.tensor_uninit((t * 3 * H) as usize);
+            let (x_cur, x_nxt) = if parity { (&x_b, &x) } else { (&x, &x_b) };
+            parity = !parity;
             g.matmul(
-                &x,
+                x_cur,
                 &l.qkv_w,
                 Some(&l.qkv_b),
-                &qkv,
+                &qkv_s,
                 t,
                 3 * H,
                 H,
@@ -388,63 +407,66 @@ impl Hubert {
                 0,
                 1.0,
             );
-            // scores[12, T, T] = q·k^T / 8 (qkv バッファから strided 参照)
-            let scores = eng.tensor_uninit((HEADS * t * t) as usize);
+            if eng.attn_flash {
+                // fused attention (flash 形式): T² スコア行列を材料化せず online softmax
+                // で直接 ctx[T, 768] に書く。q/k/v は qkv バッファ内の strided 参照。
+                g.flash_attn(&qkv_s, &ctx_s, t, 3 * H, HEADS, 0, H, 2 * H, 0.125, H);
+            } else {
+                // 古典 3-kernel 経路 (T² scores 材料化 — scratch 再利用)
+                let scores = scores_s.as_ref().unwrap();
+                g.matmul(
+                    &qkv_s,
+                    &qkv_s,
+                    None,
+                    scores,
+                    t,
+                    t,
+                    HEAD_DIM,
+                    HEADS,
+                    3 * H,
+                    1,
+                    0,
+                    HEAD_DIM,
+                    3 * H,
+                    1,
+                    H,
+                    HEAD_DIM,
+                    t,
+                    1,
+                    0,
+                    t * t,
+                    0.125,
+                );
+                g.softmax(scores, HEADS * t, t);
+                g.matmul(
+                    scores,
+                    &qkv_s,
+                    None,
+                    &ctx_s,
+                    t,
+                    HEAD_DIM,
+                    t,
+                    HEADS,
+                    t,
+                    1,
+                    0,
+                    t * t,
+                    1,
+                    3 * H,
+                    2 * H,
+                    HEAD_DIM,
+                    H,
+                    1,
+                    0,
+                    HEAD_DIM,
+                    1.0,
+                );
+            }
             g.matmul(
-                &qkv,
-                &qkv,
-                None,
-                &scores,
-                t,
-                t,
-                HEAD_DIM,
-                HEADS,
-                3 * H,
-                1,
-                0,
-                HEAD_DIM,
-                3 * H,
-                1,
-                H,
-                HEAD_DIM,
-                t,
-                1,
-                0,
-                t * t,
-                0.125,
-            );
-            g.softmax(&scores, HEADS * t, t);
-            // ctx[T, 768]: 各 head が h*64 位置へ書き込み。v は転置 (n=d が +1)
-            let ctx = eng.tensor_uninit((t * H) as usize);
-            g.matmul(
-                &scores,
-                &qkv,
-                None,
-                &ctx,
-                t,
-                HEAD_DIM,
-                t,
-                HEADS,
-                t,
-                1,
-                0,
-                t * t,
-                1,
-                3 * H,
-                2 * H,
-                HEAD_DIM,
-                H,
-                1,
-                0,
-                HEAD_DIM,
-                1.0,
-            );
-            let o_out = eng.tensor_uninit((t * H) as usize);
-            g.matmul(
-                &ctx,
+                &ctx_s,
                 &l.o_w,
                 Some(&l.o_b),
-                &o_out,
+                &o_s,
                 t,
                 H,
                 H,
@@ -463,17 +485,15 @@ impl Hubert {
                 0,
                 1.0,
             );
-            let x3 = eng.tensor_uninit((t * H) as usize);
             g.add_layer_norm(
-                &x, &o_out, &l.ln_a_g, &l.ln_a_b, &x3, t, H, H, 1, H, 1, LN_EPS,
+                x_cur, &o_s, &l.ln_a_g, &l.ln_a_b, &x3_s, t, H, H, 1, H, 1, LN_EPS,
             );
 
-            let ff = eng.tensor_uninit((t * FFN) as usize);
             g.matmul(
-                &x3,
+                &x3_s,
                 &l.ff1_w,
                 Some(&l.ff1_b),
-                &ff,
+                &ff_s,
                 t,
                 FFN,
                 H,
@@ -492,13 +512,12 @@ impl Hubert {
                 0,
                 1.0,
             );
-            g.gelu(&ff, t * FFN);
-            let ff2 = eng.tensor_uninit((t * H) as usize);
+            g.gelu(&ff_s, t * FFN);
             g.matmul(
-                &ff,
+                &ff_s,
                 &l.ff2_w,
                 Some(&l.ff2_b),
-                &ff2,
+                &ff2_s,
                 t,
                 H,
                 FFN,
@@ -517,12 +536,12 @@ impl Hubert {
                 0,
                 1.0,
             );
-            let x5 = eng.tensor_uninit((t * H) as usize);
             g.add_layer_norm(
-                &x3, &ff2, &l.ln_f_g, &l.ln_f_b, &x5, t, H, H, 1, H, 1, LN_EPS,
+                &x3_s, &ff2_s, &l.ln_f_g, &l.ln_f_b, x_nxt, t, H, H, 1, H, 1, LN_EPS,
             );
-            x = x5;
         }
+        // 偶数層は x_b に・奇数層は x に書く → 最終層の出力側 (n_layers 偶数で x)
+        let x = if parity { x_b } else { x };
 
         // v1: layer<12 → encoder LN → final_proj
         if dim == 256 {
@@ -745,58 +764,62 @@ impl Hubert {
                 0,
                 1.0,
             );
-            let scores = eng.tensor_uninit((HEADS * t * t) as usize);
-            g.matmul(
-                &qkv,
-                &qkv,
-                None,
-                &scores,
-                t,
-                t,
-                HEAD_DIM,
-                HEADS,
-                3 * H,
-                1,
-                0,
-                HEAD_DIM,
-                3 * H,
-                1,
-                H,
-                HEAD_DIM,
-                t,
-                1,
-                0,
-                t * t,
-                0.125,
-            );
-            g.softmax(&scores, HEADS * t, t);
-            if li == 0 {
-                keep.push(("L0.scores_sm", scores.clone_buf()));
-            }
             let ctx = eng.tensor_uninit((t * H) as usize);
-            g.matmul(
-                &scores,
-                &qkv,
-                None,
-                &ctx,
-                t,
-                HEAD_DIM,
-                t,
-                HEADS,
-                t,
-                1,
-                0,
-                t * t,
-                1,
-                3 * H,
-                2 * H,
-                HEAD_DIM,
-                H,
-                1,
-                0,
-                HEAD_DIM,
-                1.0,
-            );
+            if eng.attn_flash {
+                // fused attention (flash 形式) — features_ver と同一 (T² 材料化なし)
+                g.flash_attn(&qkv, &ctx, t, 3 * H, HEADS, 0, H, 2 * H, 0.125, H);
+            } else {
+                // 古典 3-kernel 経路 (FXC 向き: コンパイルが速く実行も十分速い。
+                // T² scores を材料化するため長尺は窓分割が前提)
+                let scores = eng.tensor_uninit((HEADS * t * t) as usize);
+                g.matmul(
+                    &qkv,
+                    &qkv,
+                    None,
+                    &scores,
+                    t,
+                    t,
+                    HEAD_DIM,
+                    HEADS,
+                    3 * H,
+                    1,
+                    0,
+                    HEAD_DIM,
+                    3 * H,
+                    1,
+                    H,
+                    HEAD_DIM,
+                    t,
+                    1,
+                    0,
+                    t * t,
+                    0.125,
+                );
+                g.softmax(&scores, HEADS * t, t);
+                g.matmul(
+                    &scores,
+                    &qkv,
+                    None,
+                    &ctx,
+                    t,
+                    HEAD_DIM,
+                    t,
+                    HEADS,
+                    t,
+                    1,
+                    0,
+                    t * t,
+                    1,
+                    3 * H,
+                    2 * H,
+                    HEAD_DIM,
+                    H,
+                    1,
+                    0,
+                    HEAD_DIM,
+                    1.0,
+                );
+            }
             let o_out = eng.tensor_uninit((t * H) as usize);
             g.matmul(
                 &ctx,

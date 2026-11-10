@@ -33,14 +33,13 @@ impl Adopted {
         self.p.get(&format!("{prefix}.bias")).copied()
     }
     pub fn vec(&self, name: &str) -> Var {
-        self.p
-            .get(name)
-            .copied()
-            .unwrap_or_else(|| panic!("vec key missing: {name} (have: {:?})", {
+        self.p.get(name).copied().unwrap_or_else(|| {
+            panic!("vec key missing: {name} (have: {:?})", {
                 let mut ks: Vec<&String> = self.p.keys().collect();
                 ks.sort();
                 ks
-            }))
+            })
+        })
     }
 }
 
@@ -82,8 +81,26 @@ pub fn conv1x1(
     let w = a.w(prefix);
     let out_len = (batch * out_c * t_len) as usize;
     let out = tape.mm(
-        w, x, None, out_len, out_c, t_len, in_c, batch, in_c, 1, 0, 0, 1, t_len, 0, in_c * t_len,
-        t_len, 1, out_c * t_len, 1.0,
+        w,
+        x,
+        None,
+        out_len,
+        out_c,
+        t_len,
+        in_c,
+        batch,
+        in_c,
+        1,
+        0,
+        0,
+        1,
+        t_len,
+        0,
+        in_c * t_len,
+        t_len,
+        1,
+        out_c * t_len,
+        1.0,
     );
     if let Some(b) = a.bias(prefix) {
         tape.add_ch_bias(out, b, out_c, t_len)
@@ -330,7 +347,16 @@ pub fn attention_layer(
         });
     }
     let attn = attn.expect("attention heads");
-    conv1x1(tape, a, &format!("{prefix}.conv_o"), attn, c, c, batch, t_len)
+    conv1x1(
+        tape,
+        a,
+        &format!("{prefix}.conv_o"),
+        attn,
+        c,
+        c,
+        batch,
+        t_len,
+    )
 }
 
 /// FFN (relu)。x [B, C, T] → [B, C, T]。
@@ -347,9 +373,35 @@ pub fn ffn(
     mask: Option<Var>,
 ) -> Var {
     let pad = (kernel - 1) / 2;
-    let h = conv1d(tape, a, &format!("{prefix}.conv_1"), x, filter, c, kernel, 1, 1, pad, batch, t_len);
+    let h = conv1d(
+        tape,
+        a,
+        &format!("{prefix}.conv_1"),
+        x,
+        filter,
+        c,
+        kernel,
+        1,
+        1,
+        pad,
+        batch,
+        t_len,
+    );
     let h = tape.relu(h);
-    let h = conv1d(tape, a, &format!("{prefix}.conv_2"), h, c, filter, kernel, 1, 1, pad, batch, t_len);
+    let h = conv1d(
+        tape,
+        a,
+        &format!("{prefix}.conv_2"),
+        h,
+        c,
+        filter,
+        kernel,
+        1,
+        1,
+        pad,
+        batch,
+        t_len,
+    );
     if let Some(m) = mask {
         tape.mul_frame_mask(h, m, c, t_len)
     } else {

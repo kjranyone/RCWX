@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use rcwx_nn::engine::tape::{ParamStore, Tape, Var};
 use rcwx_nn::engine::Engine;
+use rcwx_nn::engine::tape::{ParamStore, Tape, Var};
 
-use crate::modules::{attention_layer, conv1d, conv1x1, ffn, wn, Adopted};
+use crate::modules::{Adopted, attention_layer, conv1d, conv1x1, ffn, wn};
 
 #[derive(Clone)]
 pub struct SynthTrainCfg {
@@ -159,16 +159,51 @@ pub fn enc_p(
     let x = {
         let w = a.vec("enc_p.emb_phone.weight");
         tape.mm(
-            phone, w, a.bias("enc_p.emb_phone"), (bt * h) as usize, t_len, h, cfg.in_channels,
-            batch, cfg.in_channels, 1, 0, t_len * cfg.in_channels, cfg.in_channels, 1, 0, 0, h, 1,
-            t_len * h, 1.0,
+            phone,
+            w,
+            a.bias("enc_p.emb_phone"),
+            (bt * h) as usize,
+            t_len,
+            h,
+            cfg.in_channels,
+            batch,
+            cfg.in_channels,
+            1,
+            0,
+            t_len * cfg.in_channels,
+            cfg.in_channels,
+            1,
+            0,
+            0,
+            h,
+            1,
+            t_len * h,
+            1.0,
         )
     };
     let xp = {
         let emb = a.vec("enc_p.emb_pitch.weight");
         tape.mm(
-            pitch_onehot, emb, None, (bt * h) as usize, t_len, h, 256, batch, 256, 1, 0,
-            t_len * 256, 1, h, 0, 0, h, 1, t_len * h, 1.0,
+            pitch_onehot,
+            emb,
+            None,
+            (bt * h) as usize,
+            t_len,
+            h,
+            256,
+            batch,
+            256,
+            1,
+            0,
+            t_len * 256,
+            1,
+            h,
+            0,
+            0,
+            h,
+            1,
+            t_len * h,
+            1.0,
         )
     };
     let x = tape.add(x, xp, false);
@@ -225,9 +260,25 @@ pub fn enc_p(
         );
     }
     x = tape.mul_frame_mask(x, mask, h, t_len);
-    let stats = conv1x1(tape, a, "enc_p.proj", x, 2 * cfg.inter_channels, h, batch, t_len);
+    let stats = conv1x1(
+        tape,
+        a,
+        "enc_p.proj",
+        x,
+        2 * cfg.inter_channels,
+        h,
+        batch,
+        t_len,
+    );
     let stats = tape.mul_frame_mask(stats, mask, 2 * cfg.inter_channels, t_len);
-    let m_p = tape.chslice(stats, 2 * cfg.inter_channels, 0, cfg.inter_channels, batch, t_len);
+    let m_p = tape.chslice(
+        stats,
+        2 * cfg.inter_channels,
+        0,
+        cfg.inter_channels,
+        batch,
+        t_len,
+    );
     let logs_p = tape.chslice(
         stats,
         2 * cfg.inter_channels,
@@ -256,10 +307,38 @@ pub fn enc_q(
     let h = cfg.hidden_channels;
     let x = conv1x1(tape, a, "enc_q.pre", spec, h, spec_bins, batch, t_len);
     let x = tape.mul_frame_mask(x, mask, h, t_len);
-    let x = wn(tape, a, "enc_q.enc", x, h, 5, 16, batch, t_len, Some(g), Some(mask));
-    let stats = conv1x1(tape, a, "enc_q.proj", x, 2 * cfg.inter_channels, h, batch, t_len);
+    let x = wn(
+        tape,
+        a,
+        "enc_q.enc",
+        x,
+        h,
+        5,
+        16,
+        batch,
+        t_len,
+        Some(g),
+        Some(mask),
+    );
+    let stats = conv1x1(
+        tape,
+        a,
+        "enc_q.proj",
+        x,
+        2 * cfg.inter_channels,
+        h,
+        batch,
+        t_len,
+    );
     let stats = tape.mul_frame_mask(stats, mask, 2 * cfg.inter_channels, t_len);
-    let m_q = tape.chslice(stats, 2 * cfg.inter_channels, 0, cfg.inter_channels, batch, t_len);
+    let m_q = tape.chslice(
+        stats,
+        2 * cfg.inter_channels,
+        0,
+        cfg.inter_channels,
+        batch,
+        t_len,
+    );
     let logs_q = tape.chslice(
         stats,
         2 * cfg.inter_channels,
@@ -297,7 +376,19 @@ pub fn flow_forward(
         let x1 = tape.chslice(x, inter, half, half, batch, t_len);
         let hh = conv1x1(tape, a, &format!("{fp}.pre"), x0, h, half, batch, t_len);
         let hh = tape.mul_frame_mask(hh, mask, h, t_len);
-        let hh = wn(tape, a, &format!("{fp}.enc"), hh, h, 5, 3, batch, t_len, Some(g), Some(mask));
+        let hh = wn(
+            tape,
+            a,
+            &format!("{fp}.enc"),
+            hh,
+            h,
+            5,
+            3,
+            batch,
+            t_len,
+            Some(g),
+            Some(mask),
+        );
         let m = conv1x1(tape, a, &format!("{fp}.post"), hh, half, h, batch, t_len);
         let m = tape.mul_frame_mask(m, mask, half, t_len);
         let x1n = tape.add(x1, m, false);
@@ -323,7 +414,18 @@ pub fn decoder(
     let inter = cfg.inter_channels;
     let mut t = seg_t;
     let mut x = conv1d(
-        tape, a, "dec.conv_pre", z, cfg.upsample_initial_channel, inter, 7, 1, 1, 3, batch, t,
+        tape,
+        a,
+        "dec.conv_pre",
+        z,
+        cfg.upsample_initial_channel,
+        inter,
+        7,
+        1,
+        1,
+        3,
+        batch,
+        t,
     );
     {
         let gin = tape.shape(a.w("dec.cond"))[1] as u32;
@@ -371,7 +473,18 @@ pub fn decoder(
             let hw = a.w(&format!("dec.noise_convs.{i}"));
             let hb = a.bias(&format!("dec.noise_convs.{i}"));
             tape.conv1d(
-                har, hw, hb, c_cur, 1, nk, stride_f0, 1, stride_f0 / 2, batch, t_in, t_n,
+                har,
+                hw,
+                hb,
+                c_cur,
+                1,
+                nk,
+                stride_f0,
+                1,
+                stride_f0 / 2,
+                batch,
+                t_in,
+                t_n,
             )
         } else {
             let hw = a.w(&format!("dec.noise_convs.{i}"));

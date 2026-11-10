@@ -287,8 +287,25 @@ impl SwiftF0 {
         if n == 0 || n_target == 0 {
             return Vec::new();
         }
+        let timing = std::env::var("RCWX_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
         let (pitch, conf) = self.infer_raw(eng, audio);
-        self.finish(audio, &pitch, &conf)
+        if timing {
+            eprintln!(
+                "[timing] swiftf0.infer_raw ({}s audio): {:.2}s",
+                n as f64 / 16000.0,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        let t1 = std::time::Instant::now();
+        let out = self.finish(audio, &pitch, &conf);
+        if timing {
+            eprintln!(
+                "[timing] swiftf0.finish: {:.2}s",
+                t1.elapsed().as_secs_f64()
+            );
+        }
+        out
     }
 
     /// GPU 読み戻し済みの (pitch, confidence) から 100fps F0 を作る。

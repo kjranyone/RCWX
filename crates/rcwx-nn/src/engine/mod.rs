@@ -65,6 +65,11 @@ pub struct Engine {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub adapter_info: wgpu::AdapterInfo,
+    /// fused attention (flash_attn) を使うか。FXC 時は古典 3-kernel 経路
+    /// (T² 材料化・窓分割前提) の方が総合的に勝るため既定 false。
+    pub attn_flash: bool,
+    /// DXC が実際に選択されたか (診断表示用)。
+    pub dxc_active: bool,
     uniform_buf: wgpu::Buffer,
     kernels: HashMap<&'static str, Kernel>,
     pub has_f16: bool,
@@ -144,6 +149,56 @@ struct PendingUpload {
     src_off: wgpu::BufferAddress,
     dst: wgpu::Buffer,
     size: wgpu::BufferAddress,
+}
+
+/// dxcompiler.dll の在処を探す (RCWX_DXC_PATH > exe 横 > Windows SDK > System32)。
+/// 見つからなければ None (wgpu は FXC にフォールバックする)。
+/// DXC (dxcompiler.dll) がこの環境で利用可能か (cli のコンパイラ既定選択用)。
+pub fn dxc_available() -> bool {
+    find_dxcompiler_dll().is_some()
+}
+
+fn find_dxcompiler_dll() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("RCWX_DXC_PATH") {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let p = exe.parent()?.join("dxcompiler.dll");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    // Windows Kits: bin/<sdkVer>/x64/dxcompiler.dll のうち最新
+    let kits = std::path::PathBuf::from(
+        std::env::var_os("ProgramFiles(x86)")
+            .unwrap_or_else(|| std::ffi::OsString::from("C:/Program Files (x86)")),
+    )
+    .join("Windows Kits/10/bin");
+    if let Ok(versions) = std::fs::read_dir(&kits) {
+        let mut best: Option<std::path::PathBuf> = None;
+        for v in versions.flatten() {
+            let p = v.path().join("x64/dxcompiler.dll");
+            if p.is_file() {
+                let better = best
+                    .as_ref()
+                    .map(|b| {
+                        v.file_name() > b.parent().unwrap().parent().unwrap().file_name().unwrap()
+                    })
+                    .unwrap_or(true);
+                if better {
+                    best = Some(p);
+                }
+            }
+        }
+        if let Some(p) = best {
+            return Some(p);
+        }
+    }
+    let sys = std::path::PathBuf::from("C:/Windows/System32/dxcompiler.dll");
+    sys.is_file().then_some(sys)
 }
 
 impl Engine {
@@ -381,6 +436,37 @@ impl Engine {
         boost_gpu_scheduling_priority();
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = backend_flag(backend);
+        // wgpu 既定 (Auto) は dxcompiler.dll を標準検索パスから探し、無ければ FXC
+        // (SM5.1) へ黙ってフォールバックする。FXC は複雑なループの最適化が壊滅的に
+        // 遅く (flash_attn ~30s・matmul 系 ~3s/個 — 実測)、生成コードも旧式。
+        // Windows SDK / 実行ファイル横の dxcompiler.dll を明示指定する。
+        // 既定は FXC (wgpu Auto: dxcompiler.dll が見つからない→FXC。この環境では
+        // FXC の生成コードが実行 ~2x 高速なため)。RCWX_DXC=1 で DXC を明示選択
+        // (起動は速いがカーネルが遅い)。RCWX_DX12_SM=6.4 等はシェーダモデル指定 (診断用)。
+        let mut dxc_active = false;
+        let want_dxc = std::env::var("RCWX_DXC").ok().as_deref() == Some("1")
+            || std::env::var("RCWX_DXC_PATH")
+                .ok()
+                .is_some_and(|v| v != "fxc" && !v.is_empty());
+        if !matches!(backend, Backend::Vulkan) && want_dxc {
+            if let Some(path) = find_dxcompiler_dll() {
+                dxc_active = true;
+                desc.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::DynamicDxc {
+                    dxc_path: path.display().to_string(),
+                };
+                if let Some(sm) = std::env::var("RCWX_DX12_SM").ok().and_then(|v| {
+                    let v = v
+                        .trim_start_matches("cs_")
+                        .trim_start_matches("6.")
+                        .to_string();
+                    let minor: u32 = v.parse().ok()?;
+                    Some(wgpu::DxcShaderModel::from_parts(6, minor))
+                }) {
+                    desc.backend_options.dx12.force_shader_model =
+                        unsafe { wgpu::ForceShaderModelToken::with_shader_model(sm) };
+                }
+            }
+        }
         let instance = wgpu::Instance::new(desc);
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -434,10 +520,15 @@ impl Engine {
                 | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+        // flash attention: DXC 時または RCWX_ATTN=flash のときのみ (FXC では
+        // コンパイル 30s + 古典経路が十分速いため)
+        let attn_flash = dxc_active || std::env::var("RCWX_ATTN").ok().as_deref() == Some("flash");
         let mut e = Self {
             device,
             queue,
             adapter_info: info,
+            attn_flash,
+            dxc_active,
             uniform_buf,
             kernels: HashMap::new(),
             has_f16,
@@ -808,14 +899,20 @@ unsafe fn pin_mmcss_thread() {
     }
 }
 
-impl Engine {
-    fn compile(&mut self, name: &'static str, src: &str, n_storage: u32) -> Result<()> {
-        let module = self
-            .device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(name),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
-            });
+impl Engine {}
+
+/// 1 カーネルをコンパイル (スレッド安全: Device は Sync)。
+fn compile_kernel(
+    device: &wgpu::Device,
+    name: &'static str,
+    src: &str,
+    n_storage: u32,
+) -> Result<(wgpu::ComputePipeline, wgpu::BindGroupLayout)> {
+    {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(name),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+        });
         let mut entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -838,116 +935,234 @@ impl Engine {
                 count: None,
             });
         }
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(name),
-                entries: &entries,
-            });
-        let pipeline = self
-            .device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(name),
-                layout: Some(&self.device.create_pipeline_layout(
-                    &wgpu::PipelineLayoutDescriptor {
-                        label: Some(name),
-                        bind_group_layouts: &[Some(&bgl)],
-                        immediate_size: 0,
-                    },
-                )),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-        self.kernels.insert(
-            name,
-            Kernel {
-                pipeline,
-                bgl,
-                n_storage,
-            },
-        );
-        Ok(())
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(name),
+            entries: &entries,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(name),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(name),
+                    bind_group_layouts: &[Some(&bgl)],
+                    immediate_size: 0,
+                }),
+            ),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Ok((pipeline, bgl))
     }
+}
 
+impl Engine {
     fn compile_all(&mut self) -> Result<()> {
-        self.compile("matmul", &shaders::MATMUL, 4)?;
-        self.compile("matmul_tiled", &shaders::matmul_tiled_src(), 4)?;
-        self.compile("conv1d", &shaders::CONV1D, 4)?;
-        self.compile("groupnorm", &shaders::groupnorm_src(), 4)?;
-        self.compile("layernorm", &shaders::layernorm_src(), 4)?;
-        self.compile("gelu", &shaders::GELU, 1)?;
-        self.compile("softmax", &shaders::SOFTMAX, 1)?;
-        self.compile("add", &shaders::ADD, 3)?;
-        self.compile("im2col", &shaders::im2col_src(), 2)?;
-        self.compile("pointwise", &shaders::pointwise_src(), 2)?;
-        self.compile("conv_transpose1d", &shaders::conv_transpose1d_src(), 4)?;
-        self.compile("rel_attn", &shaders::rel_attn_src(), 3)?;
-        self.compile("flip_ch", &shaders::flip_ch_src(), 2)?;
-        self.compile("im2col2d", &shaders::im2col2d_src(), 2)?;
-        self.compile("im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
-        self.compile("matmul_conv", &shaders::matmul_conv_src(), 4)?;
-        self.compile("matmul_tiled_res", &shaders::matmul_tiled_res_src(), 5)?;
-        self.compile("matmul_tiled_x", &shaders::matmul_tiled_x_src(), 5)?;
-        self.compile("add_layernorm", &shaders::add_layernorm_src(), 5)?;
-        self.compile("slice_ch", &shaders::slice_ch_src(), 2)?;
-        self.compile("avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
-        self.compile("conv_transpose2d", &shaders::conv_transpose2d_src(), 4)?;
-        self.compile("concat_ch", &shaders::concat_ch_src(), 3)?;
-        self.compile("transpose_flatten", &shaders::transpose_flatten_src(), 2)?;
-        self.compile("pad2d", &shaders::pad2d_src(), 2)?;
-        // 学習 (Issue #8) 用 kernel 群
-        self.compile("t_fill", &train_shaders::T_FILL, 1)?;
-        self.compile("t_copy", &train_shaders::T_COPY, 2)?;
-        self.compile("t_mul2", &train_shaders::T_MUL2, 3)?;
-        self.compile("t_pw_fwd", &train_shaders::T_PW_FWD, 2)?;
-        self.compile("t_pw_bwd", &train_shaders::T_PW_BWD, 4)?;
-        self.compile("t_softmax_bwd", &train_shaders::T_SOFTMAX_BWD, 3)?;
-        self.compile("t_layernorm_bwd", &train_shaders::T_LAYERNORM_BWD, 5)?;
-        self.compile("t_ln_param_grad", &train_shaders::T_LN_PARAM_GRAD, 4)?;
-        self.compile("t_colsum", &train_shaders::T_COLSUM, 2)?;
-        self.compile("t_reduce_partials", &train_shaders::T_REDUCE_PARTIALS, 3)?;
-        self.compile("t_reduce_final", &train_shaders::T_REDUCE_FINAL, 2)?;
-        self.compile("t_adamw", &train_shaders::T_ADAMW, 4)?;
-        self.compile("t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
-        self.compile("t_wn_bwd", &train_shaders::T_WN_BWD, 7)?;
-        self.compile("t_im2col", &train_shaders::T_IM2COL, 2)?;
-        self.compile("t_col2im", &train_shaders::T_COL2IM, 2)?;
-        self.compile("t_add_ch_bias", &train_shaders::T_ADD_CH_BIAS, 2)?;
-        self.compile("t_l1_sign", &train_shaders::T_L1_SIGN, 4)?;
-        self.compile("t_mse_bwd", &train_shaders::T_MSE_BWD, 3)?;
-        self.compile("t_chslice", &train_shaders::T_CHSLICE, 2)?;
-        self.compile("t_chslice_bwd", &train_shaders::T_CHSLICE_BWD, 2)?;
-        self.compile("t_gating", &train_shaders::T_GATING, 2)?;
-        self.compile("t_gating_bwd", &train_shaders::T_GATING_BWD, 3)?;
-        self.compile("t_skew", &train_shaders::T_SKEW, 2)?;
-        self.compile("t_skew_bwd", &train_shaders::T_SKEW_BWD, 2)?;
-        self.compile("t_add_bias2d", &train_shaders::T_ADD_BIAS2D, 3)?;
-        self.compile("t_mask_fill", &train_shaders::T_MASK_FILL, 3)?;
-        self.compile("t_mask_fill_bwd", &train_shaders::T_MASK_FILL_BWD, 3)?;
-        self.compile("t_reflect_pad", &train_shaders::T_REFLECT_PAD, 2)?;
-        self.compile("t_mul_window", &train_shaders::T_MUL_WINDOW, 3)?;
-        self.compile("t_mag", &train_shaders::T_MAG, 3)?;
-        self.compile("t_mag_bwd", &train_shaders::T_MAG_BWD, 6)?;
-        self.compile("t_log_clamp", &train_shaders::T_LOG_CLAMP, 2)?;
-        self.compile("t_log_clamp_bwd", &train_shaders::T_LOG_CLAMP_BWD, 3)?;
-        self.compile("t_kl_elem", &train_shaders::T_KL_ELEM, 6)?;
-        self.compile("t_kl_bwd_a", &train_shaders::T_KL_BWD_A, 8)?;
-        self.compile("t_kl_bwd_b", &train_shaders::T_KL_BWD_B, 3)?;
-        self.compile("t_gather_frames", &train_shaders::T_GATHER_FRAMES, 3)?;
-        self.compile(
-            "t_gather_frames_bwd",
-            &train_shaders::T_GATHER_FRAMES_BWD,
-            3,
+        // RCWX_KERNELS=a,b — 指定カーネルのみコンパイル (コンパイル時間の研究用)
+        let only: Option<Vec<String>> = std::env::var("RCWX_KERNELS")
+            .ok()
+            .map(|s| s.split(',').map(|k| k.trim().to_string()).collect());
+        let mut jobs: Vec<(&'static str, String, u32)> = Vec::new();
+        let mut try_compile =
+            |_this: &mut Self, name: &'static str, src: &str, n: u32| -> Result<()> {
+                if let Some(list) = &only {
+                    if !list.iter().any(|k| k == name) {
+                        return Ok(());
+                    }
+                }
+                jobs.push((name, src.to_string(), n));
+                Ok(())
+            };
+        try_compile(self, "matmul", &shaders::MATMUL, 4)?;
+        if self.attn_flash {
+            try_compile(self, "flash_attn", &shaders::flash_attn_src(), 2)?;
+        }
+        try_compile(self, "matmul_tiled", &shaders::matmul_tiled_src(), 4)?;
+        try_compile(self, "conv1d", &shaders::CONV1D, 4)?;
+        try_compile(self, "groupnorm", &shaders::groupnorm_src(), 4)?;
+        try_compile(self, "layernorm", &shaders::layernorm_src(), 4)?;
+        try_compile(self, "gelu", &shaders::GELU, 1)?;
+        try_compile(self, "softmax", &shaders::SOFTMAX, 1)?;
+        try_compile(self, "add", &shaders::ADD, 3)?;
+        try_compile(self, "im2col", &shaders::im2col_src(), 2)?;
+        try_compile(self, "pointwise", &shaders::pointwise_src(), 2)?;
+        try_compile(
+            self,
+            "conv_transpose1d",
+            &shaders::conv_transpose1d_src(),
+            4,
         )?;
-        self.compile("t_transpose", &train_shaders::T_TRANSPOSE, 2)?;
-        self.compile("t_mul_frame_mask", &train_shaders::T_MUL_FRAME_MASK, 3)?;
-        self.compile("t_im2col2d", &train_shaders::T_IM2COL2D, 2)?;
-        self.compile("t_col2im2d", &train_shaders::T_COL2IM2D, 2)?;
-        self.compile("t_reflect_pad_bwd", &train_shaders::T_REFLECT_PAD_BWD, 2)?;
-        self.compile("t_add_bcast_t", &train_shaders::T_ADD_BCAST_T, 3)?;
-        self.compile("t_chcat", &train_shaders::T_CHCAT, 3)?;
+        try_compile(self, "rel_attn", &shaders::rel_attn_src(), 3)?;
+        try_compile(self, "flip_ch", &shaders::flip_ch_src(), 2)?;
+        try_compile(self, "im2col2d", &shaders::im2col2d_src(), 2)?;
+        try_compile(self, "im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
+        try_compile(self, "matmul_conv", &shaders::matmul_conv_src(), 4)?;
+        try_compile(
+            self,
+            "matmul_tiled_res",
+            &shaders::matmul_tiled_res_src(),
+            5,
+        )?;
+        try_compile(self, "matmul_tiled_x", &shaders::matmul_tiled_x_src(), 5)?;
+        try_compile(self, "add_layernorm", &shaders::add_layernorm_src(), 5)?;
+        try_compile(self, "slice_ch", &shaders::slice_ch_src(), 2)?;
+        try_compile(self, "avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
+        try_compile(
+            self,
+            "conv_transpose2d",
+            &shaders::conv_transpose2d_src(),
+            4,
+        )?;
+        try_compile(self, "concat_ch", &shaders::concat_ch_src(), 3)?;
+        try_compile(
+            self,
+            "transpose_flatten",
+            &shaders::transpose_flatten_src(),
+            2,
+        )?;
+        try_compile(self, "pad2d", &shaders::pad2d_src(), 2)?;
+        // 学習 (Issue #8) 用 kernel 群 (推論バイナリは RCWX_SKIP_TRAIN_KERNELS=1
+        // で省略 — FXC で ~1s・DXC でも数十 ms × 46 個の起動時間を削減)
+        if std::env::var("RCWX_SKIP_TRAIN_KERNELS").ok().as_deref() != Some("1") {
+            try_compile(self, "t_fill", &train_shaders::T_FILL, 1)?;
+            try_compile(self, "t_copy", &train_shaders::T_COPY, 2)?;
+            try_compile(self, "t_mul2", &train_shaders::T_MUL2, 3)?;
+            try_compile(self, "t_pw_fwd", &train_shaders::T_PW_FWD, 2)?;
+            try_compile(self, "t_pw_bwd", &train_shaders::T_PW_BWD, 4)?;
+            try_compile(self, "t_softmax_bwd", &train_shaders::T_SOFTMAX_BWD, 3)?;
+            try_compile(self, "t_layernorm_bwd", &train_shaders::T_LAYERNORM_BWD, 5)?;
+            try_compile(self, "t_ln_param_grad", &train_shaders::T_LN_PARAM_GRAD, 4)?;
+            try_compile(self, "t_colsum", &train_shaders::T_COLSUM, 2)?;
+            try_compile(
+                self,
+                "t_reduce_partials",
+                &train_shaders::T_REDUCE_PARTIALS,
+                3,
+            )?;
+            try_compile(self, "t_reduce_final", &train_shaders::T_REDUCE_FINAL, 2)?;
+            try_compile(self, "t_adamw", &train_shaders::T_ADAMW, 4)?;
+            try_compile(self, "t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
+            try_compile(self, "t_wn_bwd", &train_shaders::T_WN_BWD, 7)?;
+            try_compile(self, "t_im2col", &train_shaders::T_IM2COL, 2)?;
+            try_compile(self, "t_col2im", &train_shaders::T_COL2IM, 2)?;
+            try_compile(self, "t_add_ch_bias", &train_shaders::T_ADD_CH_BIAS, 2)?;
+            try_compile(self, "t_l1_sign", &train_shaders::T_L1_SIGN, 4)?;
+            try_compile(self, "t_mse_bwd", &train_shaders::T_MSE_BWD, 3)?;
+            try_compile(self, "t_chslice", &train_shaders::T_CHSLICE, 2)?;
+            try_compile(self, "t_chslice_bwd", &train_shaders::T_CHSLICE_BWD, 2)?;
+            try_compile(self, "t_gating", &train_shaders::T_GATING, 2)?;
+            try_compile(self, "t_gating_bwd", &train_shaders::T_GATING_BWD, 3)?;
+            try_compile(self, "t_skew", &train_shaders::T_SKEW, 2)?;
+            try_compile(self, "t_skew_bwd", &train_shaders::T_SKEW_BWD, 2)?;
+            try_compile(self, "t_add_bias2d", &train_shaders::T_ADD_BIAS2D, 3)?;
+            try_compile(self, "t_mask_fill", &train_shaders::T_MASK_FILL, 3)?;
+            try_compile(self, "t_mask_fill_bwd", &train_shaders::T_MASK_FILL_BWD, 3)?;
+            try_compile(self, "t_reflect_pad", &train_shaders::T_REFLECT_PAD, 2)?;
+            try_compile(self, "t_mul_window", &train_shaders::T_MUL_WINDOW, 3)?;
+            try_compile(self, "t_mag", &train_shaders::T_MAG, 3)?;
+            try_compile(self, "t_mag_bwd", &train_shaders::T_MAG_BWD, 6)?;
+            try_compile(self, "t_log_clamp", &train_shaders::T_LOG_CLAMP, 2)?;
+            try_compile(self, "t_log_clamp_bwd", &train_shaders::T_LOG_CLAMP_BWD, 3)?;
+            try_compile(self, "t_kl_elem", &train_shaders::T_KL_ELEM, 6)?;
+            try_compile(self, "t_kl_bwd_a", &train_shaders::T_KL_BWD_A, 8)?;
+            try_compile(self, "t_kl_bwd_b", &train_shaders::T_KL_BWD_B, 3)?;
+            try_compile(self, "t_gather_frames", &train_shaders::T_GATHER_FRAMES, 3)?;
+            try_compile(
+                self,
+                "t_gather_frames_bwd",
+                &train_shaders::T_GATHER_FRAMES_BWD,
+                3,
+            )?;
+            try_compile(self, "t_transpose", &train_shaders::T_TRANSPOSE, 2)?;
+            try_compile(
+                self,
+                "t_mul_frame_mask",
+                &train_shaders::T_MUL_FRAME_MASK,
+                3,
+            )?;
+            try_compile(self, "t_im2col2d", &train_shaders::T_IM2COL2D, 2)?;
+            try_compile(self, "t_col2im2d", &train_shaders::T_COL2IM2D, 2)?;
+            try_compile(
+                self,
+                "t_reflect_pad_bwd",
+                &train_shaders::T_REFLECT_PAD_BWD,
+                2,
+            )?;
+            try_compile(self, "t_add_bcast_t", &train_shaders::T_ADD_BCAST_T, 3)?;
+            try_compile(self, "t_chcat", &train_shaders::T_CHCAT, 3)?;
+        }
+
+        // 並列コンパイル (FXC は matmul 系が ~3s/個と重いため効果大。
+        // wgpu Device は Sync・パイプライン生成はスレッド安全)
+        let t0 = std::time::Instant::now();
+        let n_threads = std::env::var("RCWX_COMPILE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(8))
+                    .unwrap_or(4)
+            });
+        let results: std::sync::Mutex<
+            Vec<(
+                &'static str,
+                wgpu::ComputePipeline,
+                wgpu::BindGroupLayout,
+                u32,
+            )>,
+        > = std::sync::Mutex::new(Vec::new());
+        let errs: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        // 重いカーネル (FXC で ~3s/個の matmul 系) を先頭に置いてから round-robin。
+        // 呼び出し順のままだと matmul_tiled と matmul_conv が同一レーンに束なり
+        // wall が ~6.3s になる (実測)。並べ替え後は各レーンに高々 1 個 → ~3.3s。
+        jobs.sort_by_key(|(name, _, _)| !name.contains("matmul"));
+        let lanes: Vec<Vec<&(&'static str, String, u32)>> = (0..n_threads)
+            .map(|i| jobs.iter().skip(i).step_by(n_threads).collect())
+            .collect();
+        std::thread::scope(|sc| {
+            for thr_jobs in lanes {
+                let results = &results;
+                let errs = &errs;
+                let device = &self.device;
+                sc.spawn(move || {
+                    for (name, src, n) in thr_jobs {
+                        let kt = std::time::Instant::now();
+                        match compile_kernel(device, name, src, *n) {
+                            Ok((pipeline, bgl)) => {
+                                if std::env::var_os("RCWX_KERNEL_TIMING").is_some() {
+                                    eprintln!("[kernel] {name}: {:.0}ms", kt.elapsed().as_millis());
+                                }
+                                results.lock().unwrap().push((name, pipeline, bgl, *n));
+                            }
+                            Err(e) => errs.lock().unwrap().push(format!("{name}: {e:#}")),
+                        }
+                    }
+                });
+            }
+        });
+        let errs = errs.into_inner().unwrap();
+        if !errs.is_empty() {
+            anyhow::bail!("kernel compile failed:\n{}", errs.join("\n"));
+        }
+        for (name, pipeline, bgl, n) in results.into_inner().unwrap() {
+            self.kernels.insert(
+                name,
+                Kernel {
+                    pipeline,
+                    bgl,
+                    n_storage: n,
+                },
+            );
+        }
+        if std::env::var_os("RCWX_KERNEL_TIMING").is_some() {
+            eprintln!(
+                "[kernel] total {} kernels in {:.2}s ({} threads)",
+                self.kernels.len(),
+                t0.elapsed().as_secs_f64(),
+                n_threads
+            );
+        }
         Ok(())
     }
 
@@ -1075,13 +1290,28 @@ impl Engine {
     pub fn readback_f32(&self, t: &GpuTensor) -> Vec<f32> {
         let size = t.bytes();
         let staging = self.take_staging(size);
+
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         enc.copy_buffer_to_buffer(&t.buffer, 0, &staging, 0, size);
         let (idx, epoch) = self.submit_flushed2(enc.finish());
-        staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = mapped.clone();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |res| {
+                if let Err(e) = res {
+                    eprintln!("[rb] map_async error: {e:?}");
+                }
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            });
         self.wait_gpu(idx);
+        // wait_gpu は submit 完了で返るが map コールバックは次の poll で処理される
+        // 場合がある (深いキューで発生) のでここで追いポンプする
+        while !mapped.load(std::sync::atomic::Ordering::Acquire) {
+            self.device.poll(wgpu::PollType::Poll).expect("poll map");
+        }
         self.mark_drained(epoch);
         let data = Self::mapped_f32(&staging);
         staging.unmap();
@@ -2159,6 +2389,30 @@ impl<'a> Graph<'a> {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[rows, cols, 0, 0]);
         self.dispatch("softmax", &[x], words, rows, 1, 1);
+    }
+
+    /// fused attention (flash 形式)。qkv は [t, 3H] 行優先で q/k/v が行内
+    /// q_off/k_off/v_off (+ヘッドオフセット h*64) に載るレイアウト。
+    /// ctx[m, h*64+d] = softmax(q·k^T·scale)·v を T² 材料化なしで直接書く。
+    /// head_dim は 64 固定 (カーネルの SLM レイアウト依存)。
+    pub fn flash_attn(
+        &mut self,
+        qkv: &GpuTensor,
+        ctx: &GpuTensor,
+        t: u32,
+        row: u32,
+        heads: u32,
+        q_off: u32,
+        k_off: u32,
+        v_off: u32,
+        scale: f32,
+        out_row: u32,
+    ) {
+        debug_assert!(row % (heads * 64) == 0);
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[t, row, heads, scale.to_bits()]);
+        words[4..8].copy_from_slice(&[q_off, k_off, v_off, out_row]);
+        self.dispatch("flash_attn", &[qkv, ctx], words, t.div_ceil(32), heads, 1);
     }
 
     pub fn add(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor, len: u32) {

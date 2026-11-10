@@ -133,7 +133,12 @@ fn condition_f0(f0v: &mut [f32], shift_st: f64) {
 /// stabilize_f0_boundaries (f0_processing.py と同一): 端の有声フレームを中央値へ ramp blend。
 /// 長尺入力の F0 抽出を窓分割する (RMVPE の dispatch グリッド上限対策)。
 /// 25s 窓 + 1s 文脈で中央のフレームのみ採録。100fps (160 samples/frame)。
-fn windowed_f0(wav: &[f32], n_total: usize, want_frames: usize, infer: impl Fn(&[f32]) -> Vec<f32>) -> Vec<f32> {
+fn windowed_f0(
+    wav: &[f32],
+    n_total: usize,
+    want_frames: usize,
+    infer: impl Fn(&[f32]) -> Vec<f32>,
+) -> Vec<f32> {
     let win = 400_000usize;
     let ctx = 16_000usize;
     if n_total <= win + ctx {
@@ -419,18 +424,50 @@ fn main() -> Result<()> {
         "vulkan" => Backend::Vulkan,
         _ => Backend::Dx12,
     };
+    // コンパイラ選択 (DX12): FXC はカーネル実行が ~1.9x 高速だがコンパイルに
+    // ~3.3s (重い kernel の並列レーン律速)。DXC は起動 ~1s だが実行が遅い。
+    // 入力 30s 未満は起動が支配 → DXC、それ以上は実行が支配 → FXC (古典 attention
+    // は persistent scratch 化済みで長尺も安全)。dxcompiler.dll が無い環境は
+    // 常に FXC。RCWX_DXC で明示指定があれば従う。
+    if matches!(backend, Backend::Dx12) && std::env::var("RCWX_DXC").is_err() {
+        let long = audio.len() >= 16000 * 30;
+        let have_dxc = rcwx_nn::engine::dxc_available();
+        unsafe { std::env::set_var("RCWX_DXC", if !long && have_dxc { "1" } else { "0" }) };
+    }
+    // 推論には学習カーネル不要 (起動時間削減)
+    unsafe { std::env::set_var("RCWX_SKIP_TRAIN_KERNELS", "1") };
+    let t_app = std::time::Instant::now();
     let eng = Engine::new(backend).context("engine init")?;
+    let t_eng = t_app.elapsed();
+    if std::env::var("RCWX_TIMING").is_ok() {
+        eprintln!("[timing] engine init: {:.2}s", t_eng.as_secs_f64());
+    }
     println!(
         "adapter: {} ({:?})",
         eng.adapter_info.name, eng.adapter_info.backend
     );
     let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors")).context("HuBERT load")?;
-    let rmvpe = Rmvpe::load(&eng, &dir).context("RMVPE load")?;
+    let t_hb = t_app.elapsed();
+    // swiftf0 のとき RMVPE は不要 (ロード ~0.3s 削減)
+    let rmvpe = if args.f0_method == "rmvpe" {
+        Some(Rmvpe::load(&eng, &dir).context("RMVPE load")?)
+    } else {
+        None
+    };
+    let t_rm = t_app.elapsed();
     let synth = match &args.model {
         Some(m) => Synth::load_from_pth(&eng, std::path::Path::new(m))
             .with_context(|| format!("モデル {m} の読み込み"))?,
         None => Synth::load(&eng, &dir).context("Synth load")?,
     };
+    if std::env::var("RCWX_TIMING").is_ok() {
+        eprintln!(
+            "[timing] startup: hubert {:.2}s / rmvpe +{:.2}s / synth +{:.2}s",
+            t_hb.as_secs_f64(),
+            (t_rm - t_hb).as_secs_f64(),
+            t_app.elapsed().saturating_sub(t_rm).as_secs_f64()
+        );
+    }
     let model_version = synth.cfg.version;
     let fd = synth.cfg.in_channels as usize;
     println!(
@@ -439,13 +476,28 @@ fn main() -> Result<()> {
     );
 
     // ---- HuBERT → [T50, fd] (v1=256-dim/layer9, v2=768-dim/layer12) ----
+    let timing = std::env::var("RCWX_TIMING").is_ok();
+    let mut t_mark = std::time::Instant::now();
+    let mut mark = |label: &str, timing: bool| {
+        if timing {
+            eprintln!("[timing] {label}: {:.2}s", t_mark.elapsed().as_secs_f64());
+        }
+        t_mark = std::time::Instant::now();
+    };
     // full-context の attention は T² のスコア行列をレイヤー分保持するため
     // 約束 40s (T50=2000) を超える入力は窓分割する (両側 2s コンテキスト付き、
     // 中央のみ採録)。窓内は完全 full-context 相当。
     // RCWX_HUBERT_CHUNK=1 で短尺でも分割パスを強制 (品質比較用)。
     let force_hubert_chunk = std::env::var("RCWX_HUBERT_CHUNK").ok().as_deref() == Some("1");
     let ctx_samples = 64_000usize; // 2s @16k
-    let win_samples = 480_000usize; // 30s @16k
+    // 窓長 30s (480k・60s で 2 窓)。古典 attention は T² scores を材料化するが、
+    // build_plan の作業バッファは全層で再利用 (persistent scratch) されるため
+    // resident は scores 1 本分 (~140MB/窓) に収まり、かつての 2 窓 device lost /
+    // 全体減速は起こらない。RCWX_HUBERT_WIN で上書き可。
+    let win_samples = std::env::var("RCWX_HUBERT_WIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(480_000);
     let mut feats_data: Vec<f32> = if t50 <= 2000 && !force_hubert_chunk {
         let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
         let feats = hubert.features_ver(&eng, &wav_t, n_total as u32, model_version);
@@ -493,6 +545,7 @@ fn main() -> Result<()> {
         );
     }
     // ---- IVF index ブレンド (補間前・Python と同じ位置) ----
+    mark("hubert", timing);
     if args.index_rate > 0.0 {
         match rcwx_nn::ivf::IvfIndex::load(&dir) {
             Ok(ivf) if ivf.dim == fd => {
@@ -514,11 +567,15 @@ fn main() -> Result<()> {
     let mut f0v = match args.f0_method.as_str() {
         // RMVPE は conv の dispatch グリッド上限 (x≤65535) に当たるため長尺は
         // 窓分割 (25s 窓 + 1s 文脈、中央のみ採録)。SwiftF0 も同条件で統一。
-        "rmvpe" => windowed_f0(&wav_pad, n_total, t100, |w| rmvpe.infer(&eng, w)),
+        "rmvpe" => windowed_f0(&wav_pad, n_total, t100, |w| {
+            rmvpe.as_ref().unwrap().infer(&eng, w)
+        }),
         "swiftf0" => {
             let sf0 =
                 rcwx_nn::swiftf0::SwiftF0::load(&eng, &rcwx_nn::swiftf0::default_swiftf0_path())
                     .context("SwiftF0 load")?;
+            // SwiftF0 も内部で ~1.4GB/27s 級の STFT/im2col 中間を持つため 2GB 上限に
+            // 当たる。25s+1s 窓で分割 (RMVPE と同条件)。
             windowed_f0(&wav_pad, n_total, t100, |w| sf0.detect(&eng, w))
         }
         _ => vec![0.0f32; t100],
@@ -559,6 +616,7 @@ fn main() -> Result<()> {
     }
 
     // ---- 100fps 補間 (上の HuBERT FIRST で抽出・IVF ブレンド済みの feats_data から) ----
+    mark("f0", timing);
     // (かつてここで再抽出していたため IVF ブレンドが破棄されていた — M4 以降の不具合を修正)
     let mut feats100 = vec![0.0f32; t100 * fd];
     for r in 0..t100 {
@@ -575,18 +633,41 @@ fn main() -> Result<()> {
     }
 
     // ---- Synth (noise_scale=0 決定論) ----
+    mark("interp+cpu", timing);
     let feats_t = eng.tensor_from_f32(&feats100, vec![]);
     // T が大きいとデコーダ中間バッファが 128MB バインド上限を超えるため、
     // 96 フレーム窓 + 8 フレーム受容野マージンで分割生成
     // (RCWX_CHUNK=1 で短尺でもチャンクパスを強制して検証できる)
     let force_chunk = std::env::var("RCWX_CHUNK").ok().as_deref() == Some("1");
+    // decode chunk の受容野マージン。rt と同じ 4 フレームで品質等価 (整相 corr 1.0・
+    // 実測)。8 からの削減は chunk あたり ~8% の無駄計算を省く。
+    let dec_margin: u32 = std::env::var("RCWX_DEC_MARGIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    // デコーダ chunk 長 (100fps フレーム)。実測 (60s・DXC): 64 が最適
+    // (chunk あたりの実行が小さい長さの方が局所性が良く 1.7ms/fr 級 — 96 は 1.9ms/fr)。
+    // RCWX_DEC_CHUNK で実験的に変更可。
+    let dec_chunk: u32 = std::env::var("RCWX_DEC_CHUNK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let mut out: Vec<f32> = if t100 > 96 || force_chunk {
-        synth.infer_chunked(&eng, &feats_t, &pitch, &f0v, t100 as u32, 96, 8)
+        synth.infer_chunked(
+            &eng,
+            &feats_t,
+            &pitch,
+            &f0v,
+            t100 as u32,
+            dec_chunk,
+            dec_margin,
+        )
     } else {
         let audio_out = synth.infer(&eng, &feats_t, &pitch, &f0v, t100 as u32);
         eng.readback_f32(&audio_out)
     };
     println!("synth out: {} samples", out.len());
+    mark("synth", timing);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write(
             "target/golden/cli_rust_synthout.bin",

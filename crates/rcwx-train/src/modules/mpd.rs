@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use rcwx_nn::engine::tape::{ParamStore, Tape, Var};
 use rcwx_nn::engine::Engine;
+use rcwx_nn::engine::tape::{ParamStore, Tape, Var};
 
 use crate::modules::Adopted;
 
@@ -43,10 +43,14 @@ impl Mpd {
         let keys: Vec<&String> = w.keys().collect();
         for k in keys {
             if k.ends_with(".weight_v") || k.ends_with(".weight_g") {
-                let prefix = k.trim_end_matches(".weight_v").trim_end_matches(".weight_g");
-                if store.wns.iter().any(|wn| {
-                    store.entries[wn.v_idx].name == format!("{prefix}.weight_v")
-                }) {
+                let prefix = k
+                    .trim_end_matches(".weight_v")
+                    .trim_end_matches(".weight_g");
+                if store
+                    .wns
+                    .iter()
+                    .any(|wn| store.entries[wn.v_idx].name == format!("{prefix}.weight_v"))
+                {
                     continue;
                 }
                 if let Some((v, vs)) = w.get(&format!("{prefix}.weight_v")) {
@@ -114,9 +118,12 @@ impl Mpd {
             }
             if e.name.ends_with(".weight") {
                 let prefix = e.name.trim_end_matches(".weight");
-                if self.store.wns.iter().any(|wn| {
-                    self.store.entries[wn.v_idx].name == format!("{prefix}.weight_v")
-                }) {
+                if self
+                    .store
+                    .wns
+                    .iter()
+                    .any(|wn| self.store.entries[wn.v_idx].name == format!("{prefix}.weight_v"))
+                {
                     continue;
                 }
                 let v = a.adopt_entry(tape, &self.store, i);
@@ -132,7 +139,14 @@ impl Mpd {
 
 /// DiscriminatorS (grouped conv 列 + post)。
 pub fn disc_s(tape: &mut Tape<'_>, a: &Adopted, x: Var, batch: u32, t_len: u32) -> (Var, Vec<Var>) {
-    let chans = [(1u32, 16u32), (16, 64), (64, 256), (256, 1024), (1024, 1024), (1024, 1024)];
+    let chans = [
+        (1u32, 16u32),
+        (16, 64),
+        (64, 256),
+        (256, 1024),
+        (1024, 1024),
+        (1024, 1024),
+    ];
     let ks = [15u32, 41, 41, 41, 41, 5];
     let strides = [1u32, 4, 4, 4, 4, 1];
     let groups = [1u32, 4, 16, 64, 256, 1];
@@ -186,9 +200,7 @@ pub fn disc_p(
         let w = a.w(&format!("{prefix}.convs.{i}"));
         let b = a.bias(&format!("{prefix}.convs.{i}"));
         let oh = (hh + 2 - 5) / 3 + 1; // pad=2, k=5, s=3
-        cur = tape.conv2d(
-            cur, w, b, chans[i], c_in, 5, 1, 3, 1, 2, batch, hh, ww,
-        );
+        cur = tape.conv2d(cur, w, b, chans[i], c_in, 5, 1, 3, 1, 2, batch, hh, ww);
         cur = tape.lrelu(cur, 0.1);
         fmaps.push(cur);
         c_in = chans[i];
@@ -198,9 +210,7 @@ pub fn disc_p(
     let w = a.w(&format!("{prefix}.post"));
     let b = a.bias(&format!("{prefix}.post"));
     let oh = (hh + 2 - 3) / 1 + 1;
-    let logits = tape.conv2d(
-        cur, w, b, 1, c_in, 3, 1, 1, 1, 1, batch, hh, ww,
-    );
+    let logits = tape.conv2d(cur, w, b, 1, c_in, 3, 1, 1, 1, 1, batch, hh, ww);
     (logits, fmaps)
 }
 

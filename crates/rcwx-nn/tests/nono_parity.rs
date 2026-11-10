@@ -36,6 +36,10 @@ fn nono_pth_direct_load() {
         .collect();
     let n = expect.len().min(out.len());
     let corr = rcwx_nn::cosine(&out[..n], &expect[..n]);
-    println!("nono audio len {} vs ref {}, corr = {corr:.6}", out.len(), expect.len());
+    println!(
+        "nono audio len {} vs ref {}, corr = {corr:.6}",
+        out.len(),
+        expect.len()
+    );
     assert!(corr > 0.999, "nono corr too low: {corr}");
 }

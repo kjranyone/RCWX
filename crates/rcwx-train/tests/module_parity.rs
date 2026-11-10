@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use rcwx_nn::engine::tape::Tape;
 use rcwx_nn::engine::{Backend, Engine};
-use rcwx_train::modules::synth_train::{enc_p, SynthTrain, SynthTrainCfg};
+use rcwx_train::modules::synth_train::{SynthTrain, SynthTrainCfg, enc_p};
 
 fn golden_path() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap())
@@ -94,7 +94,10 @@ fn fixture(
 
 /// x0 パイプライン + conv_q の検証 (STAGE 環境変数で段階有効化)。
 fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
-    let stage: u32 = std::env::var("STAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let stage: u32 = std::env::var("STAGE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
     let mut tape = Tape::new(eng);
     let a = st.adopt(&mut tape);
     let h = f.cfg.hidden_channels;
@@ -105,8 +108,26 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let bt = f.batch * f.t_len;
     let w = a.vec("enc_p.emb_phone.weight");
     let xp = tape.mm(
-        phone, w, a.bias("enc_p.emb_phone"), (bt * h) as usize, f.t_len, h, 8, f.batch, 8, 1, 0,
-        f.t_len * 8, 8, 1, 0, 0, h, 1, f.t_len * h, 1.0,
+        phone,
+        w,
+        a.bias("enc_p.emb_phone"),
+        (bt * h) as usize,
+        f.t_len,
+        h,
+        8,
+        f.batch,
+        8,
+        1,
+        0,
+        f.t_len * 8,
+        8,
+        1,
+        0,
+        0,
+        h,
+        1,
+        f.t_len * h,
+        1.0,
     );
     let xp_t = tape.var_tensor(xp);
     let xp_lin = tape.linear(
@@ -121,8 +142,26 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     if stage >= 2 {
         let emb = a.vec("enc_p.emb_pitch.weight");
         let xq = tape.mm(
-            onehot, emb, None, (bt * h) as usize, f.t_len, h, 256, f.batch, 256, 1, 0,
-            f.t_len * 256, 1, h, 0, 0, h, 1, f.t_len * h, 1.0,
+            onehot,
+            emb,
+            None,
+            (bt * h) as usize,
+            f.t_len,
+            h,
+            256,
+            f.batch,
+            256,
+            1,
+            0,
+            f.t_len * 256,
+            1,
+            h,
+            0,
+            0,
+            h,
+            1,
+            f.t_len * h,
+            1.0,
         );
         last = xq;
         if stage >= 3 {
@@ -153,7 +192,14 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let xm = last;
     let q0 = if stage >= 4 || stage == 10 || stage == 11 || stage == 13 {
         let v = rcwx_train::modules::conv1x1(
-            &mut tape, &a, "enc_p.encoder.attn_layers.0.conv_q", xm, h, h, f.batch, f.t_len,
+            &mut tape,
+            &a,
+            "enc_p.encoder.attn_layers.0.conv_q",
+            xm,
+            h,
+            h,
+            f.batch,
+            f.t_len,
         );
         Some(tape.var_tensor(v))
     } else {
@@ -163,22 +209,71 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let dk = h / f.cfg.n_heads;
     let ws = f.cfg.window_size;
     let q0v = rcwx_train::modules::conv1x1(
-        &mut tape, &a, "enc_p.encoder.attn_layers.0.conv_q", xm, h, h, f.batch, f.t_len,
+        &mut tape,
+        &a,
+        "enc_p.encoder.attn_layers.0.conv_q",
+        xm,
+        h,
+        h,
+        f.batch,
+        f.t_len,
     );
     let k0v = rcwx_train::modules::conv1x1(
-        &mut tape, &a, "enc_p.encoder.attn_layers.0.conv_k", xm, h, h, f.batch, f.t_len,
+        &mut tape,
+        &a,
+        "enc_p.encoder.attn_layers.0.conv_k",
+        xm,
+        h,
+        h,
+        f.batch,
+        f.t_len,
     );
     let scale = 1.0f32 / (dk as f32).sqrt();
     let qk_h0 = tape.mm(
-        q0v, k0v, None, (f.batch * f.t_len * f.t_len) as usize, f.t_len, f.t_len, dk, f.batch, 1,
-        f.t_len, 0, h * f.t_len, 1, f.t_len, 0, h * f.t_len, f.t_len, 1, f.t_len * f.t_len, scale,
+        q0v,
+        k0v,
+        None,
+        (f.batch * f.t_len * f.t_len) as usize,
+        f.t_len,
+        f.t_len,
+        dk,
+        f.batch,
+        1,
+        f.t_len,
+        0,
+        h * f.t_len,
+        1,
+        f.t_len,
+        0,
+        h * f.t_len,
+        f.t_len,
+        1,
+        f.t_len * f.t_len,
+        scale,
     );
     let qk_t = tape.var_tensor(qk_h0);
     let relk = a.vec("enc_p.encoder.attn_layers.0.emb_rel_k");
     let m_rel = tape.mm(
-        q0v, relk, None, (f.batch * f.t_len * (2 * ws + 1)) as usize, f.t_len, 2 * ws + 1, dk,
-        f.batch, 1, f.t_len, 0, h * f.t_len, dk, 1, 0, 0, 2 * ws + 1, 1,
-        f.t_len * (2 * ws + 1), scale,
+        q0v,
+        relk,
+        None,
+        (f.batch * f.t_len * (2 * ws + 1)) as usize,
+        f.t_len,
+        2 * ws + 1,
+        dk,
+        f.batch,
+        1,
+        f.t_len,
+        0,
+        h * f.t_len,
+        dk,
+        1,
+        0,
+        0,
+        2 * ws + 1,
+        1,
+        f.t_len * (2 * ws + 1),
+        scale,
     );
     let rel_bias0 = tape.skew(m_rel, 0, f.batch, f.t_len, ws);
     let rel_t = tape.var_tensor(rel_bias0);
@@ -189,8 +284,16 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let p_t = tape.var_tensor(p_h0);
     let att = if std::env::var("SKIP_ATTN").is_err() {
         let v = rcwx_train::modules::attention_layer(
-            &mut tape, &a, "enc_p.encoder.attn_layers.0", xm, h, f.cfg.n_heads,
-            f.cfg.window_size, f.batch, f.t_len, Some(bias),
+            &mut tape,
+            &a,
+            "enc_p.encoder.attn_layers.0",
+            xm,
+            h,
+            f.cfg.n_heads,
+            f.cfg.window_size,
+            f.batch,
+            f.t_len,
+            Some(bias),
         );
         Some(tape.var_tensor(v))
     } else {
@@ -199,7 +302,10 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     tape.submit().expect("submit");
     let got = eng.readback_f32(&xp_t);
     let (want, _) = &f.want_out["xp"];
-    println!("dbg xp (stage {stage}): cos={:.6}", rcwx_train::cosine_pub(&got, want));
+    println!(
+        "dbg xp (stage {stage}): cos={:.6}",
+        rcwx_train::cosine_pub(&got, want)
+    );
     if let Some(q0_t) = &q0 {
         let got = eng.readback_f32(q0_t);
         let (want_gold, _) = &f.want_out["q0"];
@@ -207,8 +313,18 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
         if stage == 10 || stage == 11 || stage == 13 {
             // 期待値: conv_q(transpose(xp_golden))
             let (xpw, _) = &f.want_out["xp"];
-            let we = st.store.entries.iter().find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.weight").unwrap();
-            let be = st.store.entries.iter().find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.bias").unwrap();
+            let we = st
+                .store
+                .entries
+                .iter()
+                .find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.weight")
+                .unwrap();
+            let be = st
+                .store
+                .entries
+                .iter()
+                .find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.bias")
+                .unwrap();
             let wbuf = eng.readback_f32(&we.value);
             let bbuf = eng.readback_f32(&be.value);
             let bt = (f.batch * f.t_len) as usize;
@@ -219,7 +335,8 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
                         let mut acc = bbuf[o];
                         for c in 0..h as usize {
                             // transpose(xp): xm[b, c, t] = xp[b, t, c]
-                            acc += wbuf[o * h as usize + c] * xpw[(b * f.t_len as usize + t) * h as usize + c];
+                            acc += wbuf[o * h as usize + c]
+                                * xpw[(b * f.t_len as usize + t) * h as usize + c];
                         }
                         want[(b * h as usize + o) * f.t_len as usize + t] = acc;
                     }
@@ -227,11 +344,17 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
             }
             let _ = bt;
         }
-        println!("dbg q0 (stage {stage}): cos={:.6}", rcwx_train::cosine_pub(&got, &want));
+        println!(
+            "dbg q0 (stage {stage}): cos={:.6}",
+            rcwx_train::cosine_pub(&got, &want)
+        );
         if let Some(att_t) = &att {
             let got = eng.readback_f32(att_t);
             let (want, _) = &f.want_out["att0"];
-            println!("dbg att0 (stage {stage}): cos={:.6}", rcwx_train::cosine_pub(&got, want));
+            println!(
+                "dbg att0 (stage {stage}): cos={:.6}",
+                rcwx_train::cosine_pub(&got, want)
+            );
         }
         {
             // golden [b, heads, t, t] から head0 を抽出して比較
@@ -259,10 +382,25 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
                 println!("  p0[{i},{j}] got={:.6} want={:.6}", got[base], want[base]);
             }
         }
-        let bad_b0 = got.iter().zip(want.iter()).take(208).filter(|(g, w)| (**g - **w).abs() > 0.01).count();
-        let bad_b1 = got.iter().zip(want.iter()).skip(208).filter(|(g, w)| (**g - **w).abs() > 0.01).count();
+        let bad_b0 = got
+            .iter()
+            .zip(want.iter())
+            .take(208)
+            .filter(|(g, w)| (**g - **w).abs() > 0.01)
+            .count();
+        let bad_b1 = got
+            .iter()
+            .zip(want.iter())
+            .skip(208)
+            .filter(|(g, w)| (**g - **w).abs() > 0.01)
+            .count();
         println!("  bad: b0={bad_b0}/208 b1={bad_b1}/208");
-        let be = st.store.entries.iter().find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.bias").unwrap();
+        let be = st
+            .store
+            .entries
+            .iter()
+            .find(|e| e.name == "enc_p.encoder.attn_layers.0.conv_q.bias")
+            .unwrap();
         let bbuf = eng.readback_f32(&be.value);
         println!("  bias[3]={:.5} got(1,3,5)={:.5}", bbuf[3], got[252]);
     }
@@ -301,10 +439,19 @@ fn encp_parity() {
         let mut tape = Tape::new(&eng);
         let a = st.adopt(&mut tape);
         let (x0w, _) = &f.want_out["x0"];
-        let x0 = tape.const_f32s(x0w, vec![f.batch as usize, h_probe() as usize, f.t_len as usize]);
+        let x0 = tape.const_f32s(
+            x0w,
+            vec![f.batch as usize, h_probe() as usize, f.t_len as usize],
+        );
         let q0 = rcwx_train::modules::conv1x1(
-            &mut tape, &a, "enc_p.encoder.attn_layers.0.conv_q", x0, h_probe(), h_probe(),
-            f.batch, f.t_len,
+            &mut tape,
+            &a,
+            "enc_p.encoder.attn_layers.0.conv_q",
+            x0,
+            h_probe(),
+            h_probe(),
+            f.batch,
+            f.t_len,
         );
         let q0_t = tape.var_tensor(q0);
         tape.submit().expect("submit");

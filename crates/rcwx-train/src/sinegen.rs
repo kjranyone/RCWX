@@ -97,11 +97,19 @@ pub fn sinegen_train(
         let mut acc2 = 0.0f32;
         for j in 0..n_out {
             let t = (j / upp).min(t_frames - 1);
-            let s = if j > 0 && tmp[j] < tmp[j - 1] { -1.0 } else { 0.0 };
+            let s = if j > 0 && tmp[j] < tmp[j - 1] {
+                -1.0
+            } else {
+                0.0
+            };
             acc2 += rad[t] + s;
             let uv = f0[b * t_frames + t] > 0.0;
             let sine = (2.0 * std::f32::consts::PI * acc2).sin() * cfg.sine_amp;
-            let noise_amp = if uv { cfg.noise_std } else { cfg.sine_amp / 3.0 };
+            let noise_amp = if uv {
+                cfg.noise_std
+            } else {
+                cfg.sine_amp / 3.0
+            };
             let noise = normal(rng) * noise_amp;
             out[b * n_out + j] = if uv { sine + noise } else { noise };
         }
