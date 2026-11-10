@@ -185,11 +185,56 @@ struct Orb {
 
 /// オーロラの光源。同心円を重ねてガウス的なぼけを擬似している。
 const ORBS: &[Orb] = &[
-    Orb { x: -220., y: -240., size: 760., color: sakura, strength: 1.0, period: 11.0, phase: 0.00, id: "orb-sakura" },
-    Orb { x: 420., y: -160., size: 620., color: lavender, strength: 0.9, period: 13.0, phase: 0.35, id: "orb-lavender" },
-    Orb { x: -160., y: 380., size: 560., color: mint, strength: 0.55, period: 15.0, phase: 0.60, id: "orb-mint" },
-    Orb { x: 560., y: 300., size: 640., color: sky, strength: 0.7, period: 12.0, phase: 0.80, id: "orb-sky" },
-    Orb { x: 170., y: 60., size: 430., color: peach, strength: 0.45, period: 17.0, phase: 0.50, id: "orb-peach" },
+    Orb {
+        x: -220.,
+        y: -240.,
+        size: 760.,
+        color: sakura,
+        strength: 1.0,
+        period: 11.0,
+        phase: 0.00,
+        id: "orb-sakura",
+    },
+    Orb {
+        x: 420.,
+        y: -160.,
+        size: 620.,
+        color: lavender,
+        strength: 0.9,
+        period: 13.0,
+        phase: 0.35,
+        id: "orb-lavender",
+    },
+    Orb {
+        x: -160.,
+        y: 380.,
+        size: 560.,
+        color: mint,
+        strength: 0.55,
+        period: 15.0,
+        phase: 0.60,
+        id: "orb-mint",
+    },
+    Orb {
+        x: 560.,
+        y: 300.,
+        size: 640.,
+        color: sky,
+        strength: 0.7,
+        period: 12.0,
+        phase: 0.80,
+        id: "orb-sky",
+    },
+    Orb {
+        x: 170.,
+        y: 60.,
+        size: 430.,
+        color: peach,
+        strength: 0.45,
+        period: 17.0,
+        phase: 0.50,
+        id: "orb-peach",
+    },
 ];
 
 fn orb_layer(size: f32, alpha: f32, color: Hsla) -> AnyElement {
@@ -314,7 +359,9 @@ pub fn card_head(icon: IconName, tint: Hsla, title: &'static str) -> AnyElement 
                 .flex()
                 .items_center()
                 .justify_center()
-                .shadow(vec![BoxShadow::new(px(0.), px(0.), tint.opacity(0.25)).blur_radius(px(10.))])
+                .shadow(vec![
+                    BoxShadow::new(px(0.), px(0.), tint.opacity(0.25)).blur_radius(px(10.)),
+                ])
                 .child(Icon::new(icon).text_color(tint).with_size(px(14.))),
         )
         .child(
@@ -324,17 +371,11 @@ pub fn card_head(icon: IconName, tint: Hsla, title: &'static str) -> AnyElement 
                 .text_color(porcelain().opacity(0.92))
                 .child(title),
         )
-        .child(
-            div()
-                .flex_1()
-                .h(px(1.))
-                .ml_1()
-                .bg(linear_gradient(
-                    90.,
-                    linear_color_stop(white(0.14), 0.),
-                    linear_color_stop(clear(), 1.),
-                )),
-        )
+        .child(div().flex_1().h(px(1.)).ml_1().bg(linear_gradient(
+            90.,
+            linear_color_stop(white(0.14), 0.),
+            linear_color_stop(clear(), 1.),
+        )))
         .into_any_element()
 }
 
@@ -390,47 +431,49 @@ pub fn hero_button(
 ) -> AnyElement {
     let (bg, border, text, glows, glows_hover): (Fill, Hsla, Hsla, Vec<BoxShadow>, Vec<BoxShadow>) =
         match kind {
-        HeroKind::Primary => {
-            let idle = vec![
-                BoxShadow::new(px(0.), px(4.), sakura().opacity(0.42)).blur_radius(px(22.)),
-                BoxShadow::new(px(0.), px(1.), lavender().opacity(0.40)).blur_radius(px(14.)),
-            ];
-            let hover = vec![
-                BoxShadow::new(px(0.), px(6.), sakura().opacity(0.60)).blur_radius(px(26.)),
-                BoxShadow::new(px(0.), px(2.), lavender().opacity(0.55)).blur_radius(px(18.)),
-            ];
-            (
-                linear_gradient(
-                    100.,
-                    linear_color_stop(sakura(), 0.),
-                    linear_color_stop(lavender(), 1.),
+            HeroKind::Primary => {
+                let idle = vec![
+                    BoxShadow::new(px(0.), px(4.), sakura().opacity(0.42)).blur_radius(px(22.)),
+                    BoxShadow::new(px(0.), px(1.), lavender().opacity(0.40)).blur_radius(px(14.)),
+                ];
+                let hover = vec![
+                    BoxShadow::new(px(0.), px(6.), sakura().opacity(0.60)).blur_radius(px(26.)),
+                    BoxShadow::new(px(0.), px(2.), lavender().opacity(0.55)).blur_radius(px(18.)),
+                ];
+                (
+                    linear_gradient(
+                        100.,
+                        linear_color_stop(sakura(), 0.),
+                        linear_color_stop(lavender(), 1.),
+                    )
+                    .into(),
+                    clear(),
+                    plum(),
+                    idle,
+                    hover,
                 )
-                .into(),
-                clear(),
-                plum(),
-                idle,
-                hover,
-            )
-        }
-        HeroKind::Danger => {
-            let idle = vec![BoxShadow::new(px(0.), px(3.), rose().opacity(0.30)).blur_radius(px(16.))];
-            let hover = vec![BoxShadow::new(px(0.), px(4.), rose().opacity(0.45)).blur_radius(px(20.))];
-            (
-                rose().opacity(0.20).into(),
-                rose().opacity(0.38),
-                rose_light(),
-                idle,
-                hover,
-            )
-        }
-        HeroKind::Ghost => (
-            white(0.05).into(),
-            white(0.10),
-            muted_lilac(),
-            vec![],
-            vec![BoxShadow::new(px(0.), px(2.), white(0.08)).blur_radius(px(10.))],
-        ),
-    };
+            }
+            HeroKind::Danger => {
+                let idle =
+                    vec![BoxShadow::new(px(0.), px(3.), rose().opacity(0.30)).blur_radius(px(16.))];
+                let hover =
+                    vec![BoxShadow::new(px(0.), px(4.), rose().opacity(0.45)).blur_radius(px(20.))];
+                (
+                    rose().opacity(0.20).into(),
+                    rose().opacity(0.38),
+                    rose_light(),
+                    idle,
+                    hover,
+                )
+            }
+            HeroKind::Ghost => (
+                white(0.05).into(),
+                white(0.10),
+                muted_lilac(),
+                vec![],
+                vec![BoxShadow::new(px(0.), px(2.), white(0.08)).blur_radius(px(10.))],
+            ),
+        };
     div()
         .id(SharedString::from(id))
         .cursor_pointer()
@@ -452,11 +495,9 @@ pub fn hero_button(
 
 /// 脈打つステータスドット。
 pub fn pulse_dot(color: Hsla, id: &'static str, live: bool) -> AnyElement {
-    let dot = div()
-        .size(px(9.))
-        .rounded_full()
-        .bg(color)
-        .shadow(vec![BoxShadow::new(px(0.), px(0.), color.opacity(0.8)).blur_radius(px(6.))]);
+    let dot = div().size(px(9.)).rounded_full().bg(color).shadow(vec![
+        BoxShadow::new(px(0.), px(0.), color.opacity(0.8)).blur_radius(px(6.)),
+    ]);
     if live {
         let breath = Animation::new(Duration::from_millis(1600))
             .repeat_synced()
@@ -512,15 +553,11 @@ pub fn vu_meter(level: f32) -> AnyElement {
                     let bars: Vec<AnyElement> = (0..SEGMENTS)
                         .map(|i| {
                             let hot = i >= SEGMENTS - 3;
-                            let mut bar = div()
-                                .flex_1()
-                                .h(px(8.))
-                                .rounded_full()
-                                .bg(if i < lit {
-                                    color_at(i)
-                                } else {
-                                    white(0.07)
-                                });
+                            let mut bar = div().flex_1().h(px(8.)).rounded_full().bg(if i < lit {
+                                color_at(i)
+                            } else {
+                                white(0.07)
+                            });
                             if i < lit && hot {
                                 bar = bar.shadow(vec![
                                     BoxShadow::new(px(0.), px(0.), color_at(i).opacity(0.7))
@@ -538,11 +575,7 @@ pub fn vu_meter(level: f32) -> AnyElement {
 }
 
 /// 通知バナー: 色つきガラス + アイコン。
-pub fn glass_banner(
-    icon: IconName,
-    tint: Hsla,
-    text: impl Into<SharedString>,
-) -> AnyElement {
+pub fn glass_banner(icon: IconName, tint: Hsla, text: impl Into<SharedString>) -> AnyElement {
     h_flex()
         .w_full()
         .items_start()
@@ -553,7 +586,12 @@ pub fn glass_banner(
         .bg(tint.opacity(0.13))
         .border_1()
         .border_color(tint.opacity(0.28))
-        .child(Icon::new(icon).text_color(tint).with_size(px(15.)).mt(px(1.)))
+        .child(
+            Icon::new(icon)
+                .text_color(tint)
+                .with_size(px(15.))
+                .mt(px(1.)),
+        )
         .child(
             div()
                 .flex_1()
@@ -588,9 +626,11 @@ pub fn pill_tabs(
                 (
                     sakura_light(),
                     sakura_light(),
-                    vec![BoxShadow::new(px(0.), px(1.), white(0.18))
-                        .blur_radius(px(4.))
-                        .inset()],
+                    vec![
+                        BoxShadow::new(px(0.), px(1.), white(0.18))
+                            .blur_radius(px(4.))
+                            .inset(),
+                    ],
                 )
             } else {
                 (muted_lilac(), muted_lilac().opacity(0.8), vec![])
@@ -609,7 +649,11 @@ pub fn pill_tabs(
                     h_flex()
                         .items_center()
                         .gap_1p5()
-                        .child(Icon::new(tab.icon).text_color(icon_color).with_size(px(13.)))
+                        .child(
+                            Icon::new(tab.icon)
+                                .text_color(icon_color)
+                                .with_size(px(13.)),
+                        )
                         .child(div().text_sm().text_color(fg).child(tab.label)),
                 )
                 .into_any_element()

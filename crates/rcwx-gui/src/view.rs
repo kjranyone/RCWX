@@ -9,9 +9,9 @@ use crate::settings::{
 use crate::theme::{self, HeroKind, PillTab};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::Disableable as _;
+use gpui_kit::component::Icon;
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::Icon;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
@@ -143,7 +143,10 @@ where
     V: Into<SharedString>,
     I: IntoIterator<Item = (L, V)>,
 {
-    pairs.into_iter().map(|(label, value)| choice(label, value)).collect()
+    pairs
+        .into_iter()
+        .map(|(label, value)| choice(label, value))
+        .collect()
 }
 
 fn model_choices(models: &[ModelEntry]) -> Vec<Choice> {
@@ -183,8 +186,20 @@ fn open_select(
     cx.new(|cx| SelectState::new(SearchableVec::new(items), row, window, cx).searchable(searchable))
 }
 
-fn new_slider(cx: &mut Context<RcwxApp>, min: f32, max: f32, value: f32, step: f32) -> Entity<SliderState> {
-    cx.new(|_| SliderState::new().min(min).max(max).step(step).default_value(value))
+fn new_slider(
+    cx: &mut Context<RcwxApp>,
+    min: f32,
+    max: f32,
+    value: f32,
+    step: f32,
+) -> Entity<SliderState> {
+    cx.new(|_| {
+        SliderState::new()
+            .min(min)
+            .max(max)
+            .step(step)
+            .default_value(value)
+    })
 }
 
 fn opt_name(name: &str) -> Option<&str> {
@@ -217,7 +232,8 @@ impl RcwxApp {
         let model_select = open_select(model_choices(&models), &s.model, true, window, cx);
         let host_select = open_select(host_choices(&hosts), &s.host, false, window, cx);
         let input_select = open_select(device_choices(&inputs), &s.input_device, true, window, cx);
-        let output_select = open_select(device_choices(&outputs), &s.output_device, true, window, cx);
+        let output_select =
+            open_select(device_choices(&outputs), &s.output_device, true, window, cx);
         let channel_select = open_select(
             choices_from_pairs([("自動 (平均)", "auto"), ("Ch 1", "0"), ("Ch 2", "1")]),
             &s.input_channel,
@@ -306,7 +322,11 @@ impl RcwxApp {
             index_beside,
             input_rate,
             output_rate,
-            tab: 0,
+            // 実機確認用: RCWX_START_TAB=1/2 で初期タブを指定
+            tab: std::env::var("RCWX_START_TAB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             model_select,
             host_select,
             input_select,
@@ -366,10 +386,11 @@ impl RcwxApp {
         let voice = self.voice_select.clone();
         let backend = self.backend_select.clone();
 
-        self._subs.push(Self::bind_select(window, cx, &model, |this, value| {
-            this.s.model = value.to_string();
-            this.index_beside = sidecar_index(&this.s.model);
-        }));
+        self._subs
+            .push(Self::bind_select(window, cx, &model, |this, value| {
+                this.s.model = value.to_string();
+                this.index_beside = sidecar_index(&this.s.model);
+            }));
         self._subs.push(cx.subscribe_in(
             &host,
             window,
@@ -405,12 +426,18 @@ impl RcwxApp {
                 }
             },
         ));
-        self._subs.push(Self::bind_select(window, cx, &channel, |this, value| {
-            this.s.input_channel = value.to_string();
-        }));
-        self._subs.push(Self::bind_select(window, cx, &output_channel, |this, value| {
-            this.s.output_channel = value.to_string();
-        }));
+        self._subs
+            .push(Self::bind_select(window, cx, &channel, |this, value| {
+                this.s.input_channel = value.to_string();
+            }));
+        self._subs.push(Self::bind_select(
+            window,
+            cx,
+            &output_channel,
+            |this, value| {
+                this.s.output_channel = value.to_string();
+            },
+        ));
         self._subs.push(cx.subscribe_in(
             &f0,
             window,
@@ -427,52 +454,99 @@ impl RcwxApp {
                 }
             },
         ));
-        self._subs.push(Self::bind_select(window, cx, &denoise, |this, value| {
-            this.s.denoise = value.to_string();
-        }));
-        self._subs.push(Self::bind_select(window, cx, &gate, |this, value| {
-            this.s.noise_gate_sensitivity = match value {
-                "0" => 0,
-                "2" => 2,
-                _ => 1,
-            };
-        }));
-        self._subs.push(Self::bind_select(window, cx, &voice, |this, value| {
-            this.s.voice_gate_mode = value.to_string();
-        }));
-        self._subs.push(Self::bind_select(window, cx, &backend, |this, value| {
-            this.s.backend = value.to_string();
-            this.s.preserve_device = None;
-        }));
+        self._subs
+            .push(Self::bind_select(window, cx, &denoise, |this, value| {
+                this.s.denoise = value.to_string();
+            }));
+        self._subs
+            .push(Self::bind_select(window, cx, &gate, |this, value| {
+                this.s.noise_gate_sensitivity = match value {
+                    "0" => 0,
+                    "2" => 2,
+                    _ => 1,
+                };
+            }));
+        self._subs
+            .push(Self::bind_select(window, cx, &voice, |this, value| {
+                this.s.voice_gate_mode = value.to_string();
+            }));
+        self._subs
+            .push(Self::bind_select(window, cx, &backend, |this, value| {
+                this.s.backend = value.to_string();
+                this.s.preserve_device = None;
+            }));
 
-        self.watch_slider(window, cx, &self.sliders.input_gain.clone(), |this, v| this.s.input_gain_db = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.output_gain.clone(), |this, v| this.s.output_gain_db = f64::from(v));
+        self.watch_slider(window, cx, &self.sliders.input_gain.clone(), |this, v| {
+            this.s.input_gain_db = f64::from(v)
+        });
+        self.watch_slider(window, cx, &self.sliders.output_gain.clone(), |this, v| {
+            this.s.output_gain_db = f64::from(v)
+        });
         self.watch_slider(window, cx, &self.sliders.chunk.clone(), |this, v| {
             this.s.chunk_sec = f64::from(v) / 1000.0;
             this.s.chunk_sec = this.s.snapped_chunk_sec();
         });
-        self.watch_slider(window, cx, &self.sliders.pitch.clone(), |this, v| this.s.pitch = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.moe.clone(), |this, v| this.s.moe = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.index_rate.clone(), |this, v| this.s.index_rate = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.index_k.clone(), |this, v| this.s.index_k = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.denoise_strength.clone(), |this, v| {
-            this.s.denoise_strength = f64::from(v);
+        self.watch_slider(window, cx, &self.sliders.pitch.clone(), |this, v| {
+            this.s.pitch = f64::from(v)
         });
-        self.watch_slider(window, cx, &self.sliders.treble_boost.clone(), |this, v| this.s.treble_boost_db = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.treble_cutoff.clone(), |this, v| {
-            this.s.treble_cutoff_hz = f64::from(v);
+        self.watch_slider(window, cx, &self.sliders.moe.clone(), |this, v| {
+            this.s.moe = f64::from(v)
         });
-        self.watch_slider(window, cx, &self.sliders.limiter_threshold.clone(), |this, v| {
-            this.s.limiter_threshold_db = f64::from(v);
+        self.watch_slider(window, cx, &self.sliders.index_rate.clone(), |this, v| {
+            this.s.index_rate = f64::from(v)
         });
-        self.watch_slider(window, cx, &self.sliders.limiter_release.clone(), |this, v| {
-            this.s.limiter_release_ms = f64::from(v);
+        self.watch_slider(window, cx, &self.sliders.index_k.clone(), |this, v| {
+            this.s.index_k = f64::from(v)
         });
-        self.watch_slider(window, cx, &self.sliders.normalizer_rms.clone(), |this, v| {
-            this.s.normalizer_target_rms = f64::from(v);
+        self.watch_slider(
+            window,
+            cx,
+            &self.sliders.denoise_strength.clone(),
+            |this, v| {
+                this.s.denoise_strength = f64::from(v);
+            },
+        );
+        self.watch_slider(window, cx, &self.sliders.treble_boost.clone(), |this, v| {
+            this.s.treble_boost_db = f64::from(v)
         });
-        self.watch_slider(window, cx, &self.sliders.energy.clone(), |this, v| this.s.energy_threshold = f64::from(v));
-        self.watch_slider(window, cx, &self.sliders.slew.clone(), |this, v| this.s.f0_slew_max_step = f64::from(v));
+        self.watch_slider(
+            window,
+            cx,
+            &self.sliders.treble_cutoff.clone(),
+            |this, v| {
+                this.s.treble_cutoff_hz = f64::from(v);
+            },
+        );
+        self.watch_slider(
+            window,
+            cx,
+            &self.sliders.limiter_threshold.clone(),
+            |this, v| {
+                this.s.limiter_threshold_db = f64::from(v);
+            },
+        );
+        self.watch_slider(
+            window,
+            cx,
+            &self.sliders.limiter_release.clone(),
+            |this, v| {
+                this.s.limiter_release_ms = f64::from(v);
+            },
+        );
+        self.watch_slider(
+            window,
+            cx,
+            &self.sliders.normalizer_rms.clone(),
+            |this, v| {
+                this.s.normalizer_target_rms = f64::from(v);
+            },
+        );
+        self.watch_slider(window, cx, &self.sliders.energy.clone(), |this, v| {
+            this.s.energy_threshold = f64::from(v)
+        });
+        self.watch_slider(window, cx, &self.sliders.slew.clone(), |this, v| {
+            this.s.f0_slew_max_step = f64::from(v)
+        });
     }
 
     fn bind_select(
@@ -501,13 +575,17 @@ impl RcwxApp {
         slider: &Entity<SliderState>,
         apply: fn(&mut Self, f32),
     ) {
-        let sub = cx.subscribe_in(slider, window, move |this, _, event: &SliderEvent, _, cx| {
-            if let SliderEvent::Change(value) = event {
-                apply(this, value.start());
-                this.push_live();
-                cx.notify();
-            }
-        });
+        let sub = cx.subscribe_in(
+            slider,
+            window,
+            move |this, _, event: &SliderEvent, _, cx| {
+                if let SliderEvent::Change(value) = event {
+                    apply(this, value.start());
+                    this.push_live();
+                    cx.notify();
+                }
+            },
+        );
         self._subs.push(sub);
     }
 
@@ -544,7 +622,13 @@ impl RcwxApp {
         self.s.output_device = resolve_device(&self.s.output_device, &outputs);
         self.inputs = inputs;
         self.outputs = outputs;
-        Self::replace_choices(&self.input_select, device_choices(&self.inputs), &self.s.input_device, window, cx);
+        Self::replace_choices(
+            &self.input_select,
+            device_choices(&self.inputs),
+            &self.s.input_device,
+            window,
+            cx,
+        );
         Self::replace_choices(
             &self.output_select,
             device_choices(&self.outputs),
@@ -560,8 +644,20 @@ impl RcwxApp {
         self.models = scan_models(&models_root(&self.s.rvc_models_dir), &self.s.model);
         self.bundle = bundle_info();
         self.index_beside = sidecar_index(&self.s.model);
-        Self::replace_choices(&self.model_select, model_choices(&self.models), &self.s.model, window, cx);
-        Self::replace_choices(&self.host_select, host_choices(&self.hosts), &self.s.host, window, cx);
+        Self::replace_choices(
+            &self.model_select,
+            model_choices(&self.models),
+            &self.s.model,
+            window,
+            cx,
+        );
+        Self::replace_choices(
+            &self.host_select,
+            host_choices(&self.hosts),
+            &self.s.host,
+            window,
+            cx,
+        );
         self.reload_devices(window, cx);
         cx.notify();
     }
@@ -570,7 +666,13 @@ impl RcwxApp {
         self.s.model = path;
         self.models = scan_models(&models_root(&self.s.rvc_models_dir), &self.s.model);
         self.index_beside = sidecar_index(&self.s.model);
-        Self::replace_choices(&self.model_select, model_choices(&self.models), &self.s.model, window, cx);
+        Self::replace_choices(
+            &self.model_select,
+            model_choices(&self.models),
+            &self.s.model,
+            window,
+            cx,
+        );
         cx.notify();
     }
 
@@ -584,7 +686,9 @@ impl RcwxApp {
 
     fn set_pitch(&mut self, pitch: f32, window: &mut Window, cx: &mut Context<Self>) {
         self.s.pitch = f64::from(pitch);
-        self.sliders.pitch.update(cx, |state, cx| state.set_value(pitch, window, cx));
+        self.sliders
+            .pitch
+            .update(cx, |state, cx| state.set_value(pitch, window, cx));
         self.push_live();
     }
 
@@ -595,7 +699,9 @@ impl RcwxApp {
         self.polling = true;
         self._poll = cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_millis(200)).await;
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
                 let keep = this
                     .update(cx, |view, cx| {
                         view.poll();
@@ -627,7 +733,12 @@ impl RcwxApp {
         self.note_counts();
         if self.done_flag.swap(false, Ordering::AcqRel) {
             self.running = false;
-            if let Some(err) = self.thread_err.lock().ok().and_then(|mut guard| guard.take()) {
+            if let Some(err) = self
+                .thread_err
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.take())
+            {
                 self.error = Some(err);
             }
         }
@@ -638,10 +749,16 @@ impl RcwxApp {
         if self.running || self.session_live.load(Ordering::Acquire) {
             let mut parts = Vec::new();
             if self.stats.underruns > self.seen_underruns {
-                parts.push(format!("underrun +{}", self.stats.underruns - self.seen_underruns));
+                parts.push(format!(
+                    "underrun +{}",
+                    self.stats.underruns - self.seen_underruns
+                ));
             }
             if self.stats.queue_full > self.seen_queue {
-                parts.push(format!("queue full +{}", self.stats.queue_full - self.seen_queue));
+                parts.push(format!(
+                    "queue full +{}",
+                    self.stats.queue_full - self.seen_queue
+                ));
             }
             if self.stats.trims > self.seen_trims {
                 parts.push(format!("trim +{}", self.stats.trims - self.seen_trims));
@@ -797,13 +914,15 @@ impl RcwxApp {
             this.update_in(cx, |view, window, cx| {
                 match kind {
                     "wav" => {
-                        view.wav.update(cx, |state, cx| state.set_value(path, window, cx));
+                        view.wav
+                            .update(cx, |state, cx| state.set_value(path, window, cx));
                         view.test_label.clear();
                     }
                     "loop" => {
                         view.s.wav_input = path.clone();
                         view.s.use_wav_input = true;
-                        view.wav_in.update(cx, |state, cx| state.set_value(path, window, cx));
+                        view.wav_in
+                            .update(cx, |state, cx| state.set_value(path, window, cx));
                     }
                     "dir" => {
                         view.s.rvc_models_dir = path;
@@ -854,7 +973,9 @@ impl RcwxApp {
     }
 
     fn play_converted(&mut self, cx: &mut Context<Self>) {
-        if self.converted.is_empty() || self.test_busy.load(Ordering::Acquire) || self.session_live.load(Ordering::Acquire)
+        if self.converted.is_empty()
+            || self.test_busy.load(Ordering::Acquire)
+            || self.session_live.load(Ordering::Acquire)
         {
             self.test_label = "再生できる変換結果がありません".into();
             cx.notify();
@@ -871,7 +992,9 @@ impl RcwxApp {
         self.ensure_poll(cx);
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { play_wav(&host, opt_name(&device), std::path::Path::new(&path), &stop) })
+                .background_spawn(async move {
+                    play_wav(&host, opt_name(&device), std::path::Path::new(&path), &stop)
+                })
                 .await;
             this.update(cx, |view, cx| {
                 view.test_label = match result {
@@ -944,7 +1067,14 @@ impl RcwxApp {
             let stop_rec = Arc::clone(&stop);
             let recorded = cx
                 .background_spawn(async move {
-                    record_seconds(&host, opt_name(&input), channel, 3.0, &rec_for_task, &stop_rec)
+                    record_seconds(
+                        &host,
+                        opt_name(&input),
+                        channel,
+                        3.0,
+                        &rec_for_task,
+                        &stop_rec,
+                    )
                 })
                 .await;
             if recorded.is_err() || stop.load(Ordering::Acquire) {
@@ -984,7 +1114,9 @@ impl RcwxApp {
                 cx.notify();
             })
             .ok();
-            let host = this.update(cx, |view, _| view.s.host.clone()).unwrap_or_default();
+            let host = this
+                .update(cx, |view, _| view.s.host.clone())
+                .unwrap_or_default();
             let label = out.clone();
             let play_result = cx
                 .background_spawn(async move {
@@ -1152,7 +1284,12 @@ impl RcwxApp {
 
     fn header(&mut self, session: bool, cx: &mut Context<Self>) -> AnyElement {
         let hero = if self.running {
-            theme::hero_button("stop", "停止", HeroKind::Danger, cx.listener(|this, _, _, cx| this.stop(cx)))
+            theme::hero_button(
+                "stop",
+                "停止",
+                HeroKind::Danger,
+                cx.listener(|this, _, _, cx| this.stop(cx)),
+            )
         } else if session {
             theme::hero_button("stopping", "停止中", HeroKind::Ghost, |_, _, _| {})
         } else {
@@ -1232,9 +1369,21 @@ impl RcwxApp {
             .pb_1()
             .child(theme::pill_tabs(
                 &[
-                    PillTab { id: "tab-main", icon: IconName::AudioWaveform, label: "メイン" },
-                    PillTab { id: "tab-audio", icon: IconName::WavesHorizontal, label: "オーディオ" },
-                    PillTab { id: "tab-settings", icon: IconName::SlidersHorizontal, label: "詳細設定" },
+                    PillTab {
+                        id: "tab-main",
+                        icon: IconName::AudioWaveform,
+                        label: "メイン",
+                    },
+                    PillTab {
+                        id: "tab-audio",
+                        icon: IconName::WavesHorizontal,
+                        label: "オーディオ",
+                    },
+                    PillTab {
+                        id: "tab-settings",
+                        icon: IconName::SlidersHorizontal,
+                        label: "詳細設定",
+                    },
                 ],
                 self.tab,
                 cx.listener(|this, index: &usize, _, cx| {
@@ -1304,12 +1453,10 @@ impl RcwxApp {
             .gap_3()
             .child(
                 v_flex()
-                    .flex_grow(1.)
-                    .flex_shrink(1.)
+                    .flex_1()
                     .min_w_0()
                     .gap_3()
-                    .bg(hsla(120., 0.9, 0.35, 0.85))
-                            .child(self.section_model(cx))
+                    .child(self.section_model(cx))
                     .child(self.section_pitch(cx))
                     .child(self.section_index(cx))
                     .child(self.section_denoise(cx))
@@ -1320,8 +1467,7 @@ impl RcwxApp {
                     .w(px(420.))
                     .flex_shrink_0()
                     .gap_3()
-                    .bg(hsla(0., 0.9, 0.45, 0.85))
-                            .child(self.section_latency(cx))
+                    .child(self.section_latency(cx))
                     .child(self.section_device_summary(cx))
                     .child(self.section_test(cx)),
             )
@@ -1482,8 +1628,16 @@ impl RcwxApp {
     }
 
     fn section_model(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let beside = if self.index_beside { "あり" } else { "なし" };
-        let runtime = if self.bundle.ivf { "読込可" } else { "バンドルに無い" };
+        let beside = if self.index_beside {
+            "あり"
+        } else {
+            "なし"
+        };
+        let runtime = if self.bundle.ivf {
+            "読込可"
+        } else {
+            "バンドルに無い"
+        };
         card(
             IconName::Disc3,
             theme::sakura(),
@@ -1504,20 +1658,18 @@ impl RcwxApp {
                                 .min_w_0()
                                 .child(Select::new(&self.model_select).placeholder("モデルを選択")),
                         )
+                        .child(Button::new("browse-model").label("開く").on_click(
+                            cx.listener(|this, _, window, cx| this.browse(window, cx, "model")),
+                        ))
                         .child(
-                            Button::new("browse-model")
-                                .label("開く")
-                                .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx, "model"))),
-                        )
-                        .child(
-                            Button::new("rescan")
-                                .label("再読込")
-                                .on_click(cx.listener(|this, _, window, cx| this.rescan(window, cx))),
+                            Button::new("rescan").label("再読込").on_click(
+                                cx.listener(|this, _, window, cx| this.rescan(window, cx)),
+                            ),
                         ),
                 )
-                .child(note(
-                    format!("モデル隣の .index: {beside} / 実行 Index: {runtime}"),
-                ))
+                .child(note(format!(
+                    "モデル隣の .index: {beside} / 実行 Index: {runtime}"
+                )))
                 .child(note(
                     "一覧の .pth は記録です。変換に使う声は実行バンドルです。",
                 )),
@@ -1556,7 +1708,12 @@ impl RcwxApp {
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(div().text_sm().text_color(theme::muted_lilac()).child("推定レイテンシ"))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::muted_lilac())
+                                .child("推定レイテンシ"),
+                        )
                         .child(value_text(format!("~{:.0} ms", self.s.estimate_ms()))),
                 ),
         )
@@ -1620,7 +1777,12 @@ impl RcwxApp {
         )
     }
 
-    fn pitch_preset(&mut self, label: &'static str, pitch: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn pitch_preset(
+        &mut self,
+        label: &'static str,
+        pitch: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         Button::new(SharedString::from(format!("pitch-{label}")))
             .label(label)
             .on_click(cx.listener(move |this, _, window, cx| {
@@ -1681,7 +1843,11 @@ impl RcwxApp {
                                 .label("有効化")
                                 .checked(denoise_on)
                                 .on_change(cx.listener(|this, checked, window, cx| {
-                                    this.s.denoise = if *checked { "spectral".into() } else { "none".into() };
+                                    this.s.denoise = if *checked {
+                                        "spectral".into()
+                                    } else {
+                                        "none".into()
+                                    };
                                     let value: SharedString = this.s.denoise.clone().into();
                                     this.denoise_select.update(cx, |state, cx| {
                                         state.set_selected_value(&value, window, cx);
@@ -1712,9 +1878,16 @@ impl RcwxApp {
                                     cx.notify();
                                 })),
                         )
-                        .child(div().text_sm().text_color(theme::muted_lilac()).child("感度"))
                         .child(
-                            div().w(px(150.)).child(Select::new(&self.gate_select).disabled(!self.s.noise_gate)),
+                            div()
+                                .text_sm()
+                                .text_color(theme::muted_lilac())
+                                .child("感度"),
+                        )
+                        .child(
+                            div()
+                                .w(px(150.))
+                                .child(Select::new(&self.gate_select).disabled(!self.s.noise_gate)),
                         ),
                 ),
         )
@@ -1772,23 +1945,41 @@ impl RcwxApp {
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(div().text_xs().text_color(theme::muted_lilac()).child("入力"))
-                        .child(div().text_sm().text_color(theme::porcelain().opacity(0.88)).child(input)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted_lilac())
+                                .child("入力"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::porcelain().opacity(0.88))
+                                .child(input),
+                        ),
                 )
                 .child(
                     h_flex()
                         .items_center()
                         .gap_2()
-                        .child(div().text_xs().text_color(theme::muted_lilac()).child("出力"))
-                        .child(div().text_sm().text_color(theme::porcelain().opacity(0.88)).child(output)),
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::muted_lilac())
+                                .child("出力"),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::porcelain().opacity(0.88))
+                                .child(output),
+                        ),
                 )
-                .child(note(
-                    format!(
-                        "{} / {}",
-                        rate_text(self.input_rate),
-                        rate_text(self.output_rate)
-                    ),
-                ))
+                .child(note(format!(
+                    "{} / {}",
+                    rate_text(self.input_rate),
+                    rate_text(self.output_rate)
+                )))
                 .child(note(format!("推論デバイス: {gpu}"))),
         )
     }
@@ -1806,7 +1997,11 @@ impl RcwxApp {
                 .w_full()
                 .child(
                     Button::new("audio-test")
-                        .label(if busy { "停止" } else { "テスト (3秒録音→再生)" })
+                        .label(if busy {
+                            "停止"
+                        } else {
+                            "テスト (3秒録音→再生)"
+                        })
                         .disabled(session)
                         .on_click(cx.listener(|this, _, _, cx| this.audio_test(cx))),
                 )
@@ -1825,11 +2020,9 @@ impl RcwxApp {
                             .w_full()
                             .gap_2()
                             .child(div().flex_1().min_w_0().child(Input::new(&self.wav_in)))
-                            .child(
-                                Button::new("browse-loop")
-                                    .label("参照")
-                                    .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx, "loop"))),
-                            ),
+                            .child(Button::new("browse-loop").label("参照").on_click(
+                                cx.listener(|this, _, window, cx| this.browse(window, cx, "loop")),
+                            )),
                     )
                 })
                 .when(!self.test_label.is_empty(), |this| {
@@ -1837,7 +2030,9 @@ impl RcwxApp {
                     this.child(banner(IconName::Info, theme::lavender(), label))
                 })
                 .when(self.test_label.is_empty(), |this| {
-                    this.child(note("マイクを 3 秒録って、今の設定で変換し、出力へ再生します。"))
+                    this.child(note(
+                        "マイクを 3 秒録って、今の設定で変換し、出力へ再生します。",
+                    ))
                 }),
         )
     }
@@ -1896,7 +2091,8 @@ impl RcwxApp {
                 .child(slider_row(
                     "目標RMS",
                     format!("{:.2}", self.s.normalizer_target_rms),
-                    Slider::new(&self.sliders.normalizer_rms).disabled(!enabled || !self.s.normalizer_enabled),
+                    Slider::new(&self.sliders.normalizer_rms)
+                        .disabled(!enabled || !self.s.normalizer_enabled),
                 )),
         )
     }
@@ -1919,11 +2115,9 @@ impl RcwxApp {
                         .gap_2()
                         .child(field_label("入力"))
                         .child(div().flex_1().min_w_0().child(Input::new(&self.wav)))
-                        .child(
-                            Button::new("browse-wav")
-                                .label("参照")
-                                .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx, "wav"))),
-                        ),
+                        .child(Button::new("browse-wav").label("参照").on_click(
+                            cx.listener(|this, _, window, cx| this.browse(window, cx, "wav")),
+                        )),
                 )
                 .child(
                     h_flex()
@@ -1941,19 +2135,19 @@ impl RcwxApp {
                                 .disabled(busy || session || self.converted.is_empty())
                                 .on_click(cx.listener(|this, _, _, cx| this.play_converted(cx))),
                         )
-                        .child(
-                            Button::new("stop-play")
-                                .label("停止")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.play_stop.store(true, Ordering::Release);
-                                    cx.notify();
-                                })),
-                        )
+                        .child(Button::new("stop-play").label("停止").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.play_stop.store(true, Ordering::Release);
+                                cx.notify();
+                            },
+                        )))
                         .child(
                             Button::new("save-wav")
                                 .label("保存")
                                 .disabled(self.converted.is_empty())
-                                .on_click(cx.listener(|this, _, window, cx| this.save_converted(window, cx))),
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.save_converted(window, cx)
+                                })),
                         ),
                 )
                 .when(!self.test_label.is_empty(), |this| {
@@ -1961,7 +2155,9 @@ impl RcwxApp {
                     this.child(banner(IconName::Info, theme::lavender(), label))
                 })
                 .when(self.test_label.is_empty(), |this| {
-                    this.child(note("現在の Pitch / F0 / Index / Moe でオフライン変換します。"))
+                    this.child(note(
+                        "現在の Pitch / F0 / Index / Moe でオフライン変換します。",
+                    ))
                 }),
         )
     }
@@ -2050,7 +2246,12 @@ impl RcwxApp {
                     .w_full()
                     .gap_2()
                     .items_center()
-                    .child(div().text_xs().text_color(theme::muted_lilac()).child(index_text))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::muted_lilac())
+                            .child(index_text),
+                    )
                     .child(theme::stat_chip(
                         format!(
                             "underrun {window_under} / queue {window_queue} / trim {window_trim}"

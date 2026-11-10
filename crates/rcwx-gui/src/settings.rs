@@ -345,7 +345,8 @@ pub fn save_settings(s: &GuiSettings) {
         _ => "auto",
     });
     v["audio"]["chunk_sec"] = serde_json::json!(s.chunk_sec);
-    v["audio"]["latency_mode"] = serde_json::json!(if s.aggressive { "aggressive" } else { "normal" });
+    v["audio"]["latency_mode"] =
+        serde_json::json!(if s.aggressive { "aggressive" } else { "normal" });
     v["audio"]["input_gain_db"] = serde_json::json!(s.input_gain_db);
     v["audio"]["output_gain_db"] = serde_json::json!(s.output_gain_db);
     v["inference"]["use_f0"] = serde_json::json!(s.use_f0);
@@ -371,10 +372,12 @@ pub fn save_settings(s: &GuiSettings) {
     v["inference"]["postprocess"]["enabled"] = serde_json::json!(s.postprocess);
     v["inference"]["postprocess"]["treble_boost_db"] = serde_json::json!(s.treble_boost_db);
     v["inference"]["postprocess"]["treble_cutoff_hz"] = serde_json::json!(s.treble_cutoff_hz);
-    v["inference"]["postprocess"]["limiter_threshold_db"] = serde_json::json!(s.limiter_threshold_db);
+    v["inference"]["postprocess"]["limiter_threshold_db"] =
+        serde_json::json!(s.limiter_threshold_db);
     v["inference"]["postprocess"]["limiter_release_ms"] = serde_json::json!(s.limiter_release_ms);
     v["inference"]["postprocess"]["normalizer_enabled"] = serde_json::json!(s.normalizer_enabled);
-    v["inference"]["postprocess"]["normalizer_target_rms"] = serde_json::json!(s.normalizer_target_rms);
+    v["inference"]["postprocess"]["normalizer_target_rms"] =
+        serde_json::json!(s.normalizer_target_rms);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -571,7 +574,8 @@ pub fn device_rate(host_name: &str, device: &str, input: bool) -> Option<u32> {
         } else {
             host.output_devices().ok()?
         };
-        list.into_iter().find(|item| item.to_string().contains(device))
+        list.into_iter()
+            .find(|item| item.to_string().contains(device))
     }?;
     let config = if input {
         found.default_input_config().ok()?
@@ -605,7 +609,11 @@ impl GuiSettings {
     }
 
     pub fn f0_choice(&self) -> &str {
-        if self.use_f0 { self.f0_method.as_str() } else { "none" }
+        if self.use_f0 {
+            self.f0_method.as_str()
+        } else {
+            "none"
+        }
     }
 
     pub fn to_rt_config(&self) -> RtConfig {
@@ -622,7 +630,11 @@ impl GuiSettings {
             denoise_strength: self.denoise_strength,
             noise_gate: self.noise_gate,
             noise_gate_sensitivity: self.noise_gate_sensitivity,
-            index_rate: if self.use_index { self.index_rate as f32 } else { 0.0 },
+            index_rate: if self.use_index {
+                self.index_rate as f32
+            } else {
+                0.0
+            },
             index_k: self.index_k.max(1.0) as usize,
             moe_boost: self.moe,
             input_gain_db: self.input_gain_db,
@@ -781,7 +793,10 @@ pub fn convert_wav(input: &str, cfg: &RtConfig) -> Result<String, String> {
         Ok(o) if o.status.success() => Ok(out),
         Ok(o) => {
             let msg = String::from_utf8_lossy(&o.stderr);
-            Err(format!("失敗: {}", msg.chars().take(160).collect::<String>()))
+            Err(format!(
+                "失敗: {}",
+                msg.chars().take(160).collect::<String>()
+            ))
         }
         Err(e) => Err(format!("起動失敗: {e} (rcwx-cli.exe を確認)")),
     }

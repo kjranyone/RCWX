@@ -36,6 +36,16 @@ Issue #6 として **完全 Rust シングルバイナリ化** を計画 (M0〜M
 - **GUI フレームワーク**: 現行 **egui**。**GPUI (Zed) 移行が方針として確定**
   (ユーザー指定) — egui 実装は機能 Parity 済みのため、GPUI 化は描画層置換として
   次期作業。エンジン層 (rcwx-nn/rcwx-rt) への影響なし
+- **GUI デザイン (gpui-kit 版)**: グラスモーフィズム「トワイライト・オーロラ」。
+  `crates/rcwx-gui/src/theme.rs` に集約 — (1) `apply()` で `Theme::global` を桜/ラベンダー
+  配色に塗り替え (gpui-kit コンポーネントは自動追従)、(2) 窓は
+  `WindowBackgroundAppearance::Blurred` (DWM アクリル) + 半透明グラデーション + 
+  呼吸するオーロラオーブ (`with_animation`)、(3) カードはグラデーション縁 + 
+  半透明ガラス + ソフトシャドウ (`glass_panel`)、(4) ピル型タブ・VU メーター・
+  チップ等の部品も theme.rs。view.rs はロジックのみ持ち、描画は theme.rs の部品を
+  組むだけ。アイコンは `gpui_kit::assets::AllAssets` (Lucide 全カタログ)。
+  GPUI は backdrop-blur 非対応のためガラスは半透明 + リムライトで表現。
+  実機確認は `RCWX_START_TAB=1/2` で初期タブを変えられる
 
 ## Rust 単一バイナリ (Issue #6 — M0〜M7 実装済み)
 
@@ -52,6 +62,7 @@ crates/
 │   #            # ブレンド・decode 受容野マージン・SOLA hold-back) + cpal + SPSC ring
 ├── rcwx-cli/    # run / info (自前 .pth pickle リーダ) / devices / download / logs / rt
 └── rcwx-gui/    # GPUI GUI (モデル/デバイス/レイテンシ/pitch/denoise/統計)
+                  # 見た目は theme.rs のグラスモーフィズム (下記参照)
 ```
 
 - 開発ランチャー `dev.ps1` (rcwx.ps1 の Rust 版・同じ流儀):
