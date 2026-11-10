@@ -10,6 +10,33 @@ RVC v2モデルを使ったリアルタイムボイスチェンジャー。**製
 
 対象環境は **Windows + Intel Arc (XPU)**。CUDA / NVIDIA は未検証（コード上に分岐は残るがサポート対象外）。
 
+## これまでの経緯 (pure Rust 化の記録)
+
+Issue #6 として **完全 Rust シングルバイナリ化** を計画 (M0〜M7) し、完遂した。
+
+| マイルストーン | 内容 | 検証 |
+|---|---|---|
+| M0 | burn/wgpu 検証 → **burn 不採用、独自 wgpu+WGSL エンジンを採用** | burn は transformer が約 4 倍遅い + SPIR-V に数値バグ。ort+DirectML も ONNX エクスポート要件で不採用 |
+| M1 | HuBERT WGSL 移植 (fairseq 重みの weight_norm fold・QKV fusion) | golden と cosine 1.0 (v1/v2) |
+| M2 | Synthesizer (TextEncoder/Flow/GeneratorNSF/SineGen) | cosine 0.9996 |
+| M3 | F0: RMVPE (BN fold) + SwiftF0 (ONNX 図を自力解析し WGSL 移植) + f0 後処理鎖 | RMVPE 0.9999 / SwiftF0 0.999 |
+| M4 | ホスト DSP 全般 (scipy 厳密一致の resample/SOLA/spectral/noise gate/postprocess/drift/feedback) + IVF + moe | DSP 全 golden 一致・IVF maxdiff 1e-3 |
+| M5 | CLI (`run` E2E corr 0.983 > gate 0.95 / info・devices・download・logs) | info 出力が Python と同一 |
+| M6 | リアルタイムエンジン (cpal・SPSC ring・drift 制御・hop バッチング) | 20ms hop p50 16.7/p99 18.2ms・全 hop 予算内・実機 MiniFuse で定常 underrun 0 |
+| M7 | GUI (egui) + 純 Rust ランチャー化 | 旧 GUI の全セクション機能復元 |
+
+主要な設計判断の記録:
+
+- **ランチャー分離** — `rcwx.ps1` = 製品 (純 Rust・Python 非依存)、`dev.ps1` = 開発検証
+  (golden 生成・E2E 比較のみ uv/Python を使用)。旧 Python ランチャーは git 履歴
+  (`git show 84a75fe:rcwx.ps1`) に保存
+- **重み形式** — 実行時は `~/.cache/rcwx/models/rust/*.safetensors` (変換済み)。
+  変換は `tools/convert_*.py` で開発時に一回実行
+- **カーネル研究の知見** (30 秒 1500 hop 持続 A/B) は後述のセクションに集約
+- **GUI フレームワーク**: 現行 **egui**。**GPUI (Zed) 移行が方針として確定**
+  (ユーザー指定) — egui 実装は機能 Parity 済みのため、GPUI 化は描画層置換として
+  次期作業。エンジン層 (rcwx-nn/rcwx-rt) への影響なし
+
 ## Rust 単一バイナリ (Issue #6 — M0〜M7 実装済み)
 
 Python/torch 依存ゼロの完全 Rust 実装。`crates/` ワークスペース:
@@ -24,7 +51,7 @@ crates/
 ├── rcwx-rt/     # リアルタイムエンジン: ストリーミング推論 (特徴/F0 sigmoid
 │   #            # ブレンド・decode 受容野マージン・SOLA hold-back) + cpal + SPSC ring
 ├── rcwx-cli/    # run / info (自前 .pth pickle リーダ) / devices / download / logs / rt
-└── rcwx-gui/    # egui GUI (モデル/デバイス/レイテンシ/pitch/denoise/統計)
+└── rcwx-gui/    # egui GUI (旧GUIの全セクション復元・GPUI 移行は次期方針)
 ```
 
 - 開発ランチャー `dev.ps1` (rcwx.ps1 の Rust 版・同じ流儀):

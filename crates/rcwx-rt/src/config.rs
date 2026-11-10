@@ -13,7 +13,7 @@ pub struct RtConfig {
     pub output_gain_db: f64,
     /// pitch shift (半音)
     pub pitch: f64,
-    /// f0 手法: swiftf0 / rmvpe
+    /// f0 手法: swiftf0 / rmvpe / none (F0なし)
     pub f0_method: String,
     /// denoise: none / spectral
     pub denoise: String,
@@ -43,6 +43,15 @@ pub struct RtConfig {
     pub input_channel: Option<usize>,
     /// 出力チャンネル (None = 両ch)
     pub output_channel: Option<usize>,
+    /// 入力ノイズゲート感度 0=低 / 1=中 / 2=高
+    pub noise_gate_sensitivity: u8,
+    /// ポスト処理詳細 (旧 GUI のポスト処理セクション相当)
+    pub treble_boost_db: f64,
+    pub treble_cutoff_hz: f64,
+    pub limiter_threshold_db: f64,
+    pub limiter_release_ms: f64,
+    pub normalizer_enabled: bool,
+    pub normalizer_target_rms: f64,
     /// 1 推論あたりにまとめる hop 数 (入力 hop 粒度は変わらず推論をバッチ。
     /// decoder マージンを償却し GPU 形状を大きくして持続レートを稼ぐ)
     pub batch_hops: u32,
@@ -74,6 +83,13 @@ impl Default for RtConfig {
             feedback_detect: true,
             input_channel: None,
             output_channel: None,
+            noise_gate_sensitivity: 1,
+            treble_boost_db: 4.0,
+            treble_cutoff_hz: 2800.0,
+            limiter_threshold_db: -1.0,
+            limiter_release_ms: 80.0,
+            normalizer_enabled: true,
+            normalizer_target_rms: 0.1,
             batch_hops: 1,
         }
     }

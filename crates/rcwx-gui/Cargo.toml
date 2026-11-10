@@ -7,10 +7,9 @@ license.workspace = true
 [dependencies]
 rcwx-rt = { path = "../rcwx-rt" }
 rcwx-nn = { path = "../rcwx-nn" }
-anyhow = "1.0"
 cpal = "0.18.2"
 serde_json = "1.0"
-eframe = "0.37.0"
+gpui-kit = "0.9.1"
 
 [[bin]]
 name = "rcwx-gui"

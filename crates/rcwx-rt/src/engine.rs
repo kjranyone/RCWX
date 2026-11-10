@@ -96,16 +96,16 @@ impl RtEngine {
         let eng = Engine::new(backend)?;
         let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors"))?;
         let synth = Synth::load(&eng, &dir)?;
-        let (rmvpe, swiftf0) = if cfg.f0_method == "rmvpe" {
-            (Some(Rmvpe::load(&eng, &dir)?), None)
-        } else {
-            (
+        let (rmvpe, swiftf0) = match cfg.f0_method.as_str() {
+            "rmvpe" => (Some(Rmvpe::load(&eng, &dir)?), None),
+            "none" => (None, None), // F0なしモード (f0 = 0)
+            _ => (
                 None,
                 Some(SwiftF0::load(
                     &eng,
                     &rcwx_nn::swiftf0::default_swiftf0_path(),
                 )?),
-            )
+            ),
         };
         let ivf = if cfg.index_rate > 0.0 {
             IvfIndex::load(&dir).ok()
@@ -122,7 +122,11 @@ impl RtEngine {
         let gate = if cfg.noise_gate {
             let mut g = NoiseGate::new(16000, -40.0);
             g.auto_threshold = true;
-            g.set_sensitivity(Sensitivity::Mid);
+            g.set_sensitivity(match cfg.noise_gate_sensitivity {
+                0 => Sensitivity::Low,
+                2 => Sensitivity::High,
+                _ => Sensitivity::Mid,
+            });
             Some(g)
         } else {
             None
@@ -142,7 +146,18 @@ impl RtEngine {
                 (cfg.crossfade_sec * MODEL_SR as f64).round() as usize,
                 (cfg.sola_search_sec * MODEL_SR as f64).round() as usize,
             ),
-            post: Postprocessor::new(MODEL_SR, PostprocessConfig::default()),
+            post: Postprocessor::new(
+                MODEL_SR,
+                PostprocessConfig {
+                    treble_boost_db: cfg.treble_boost_db,
+                    treble_cutoff_hz: cfg.treble_cutoff_hz,
+                    limiter_threshold_db: cfg.limiter_threshold_db,
+                    limiter_release_ms: cfg.limiter_release_ms,
+                    normalizer_enabled: cfg.normalizer_enabled,
+                    normalizer_target_rms: cfg.normalizer_target_rms,
+                    ..PostprocessConfig::default()
+                },
+            ),
             out_hist: Vec::new(),
             plans: None,
             batch_pending: Vec::new(),

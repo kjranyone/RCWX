@@ -108,6 +108,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
         dev_out.as_deref(),
         stop,
         None,
+        None,
     )
 }
 

@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use rcwx_dsp::drift::{compute_shed_policy, FloorTracker};
@@ -114,6 +114,7 @@ struct Shared {
 }
 
 /// 実デバイス実行。stop_flag が立つまで実行。
+#[allow(clippy::too_many_arguments)]
 pub fn run_realtime(
     backend: rcwx_nn::engine::Backend,
     cfg: RtConfig,
@@ -121,6 +122,7 @@ pub fn run_realtime(
     output_name: Option<&str>,
     stop_flag: Arc<AtomicBool>,
     on_stats: Option<Box<dyn Fn(&RtConfig, u64, u64, u64, f64, f64, f64) + Send>>,
+    input_level: Option<Arc<AtomicU32>>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let in_device = pick_device(&host, input_name, true)?;
@@ -174,6 +176,13 @@ pub fn run_realtime(
                 .map(|i| (0..in_ch).map(|k| data[i * in_ch + k]).sum::<f32>() / in_ch as f32)
                 .collect(),
         };
+        // 入力レベルメーター (RMS → dB 相当の f32 を bits で共有)
+        if let Some(lvl) = input_level.as_ref() {
+            let sum: f32 = mono.iter().map(|v| v * v).sum();
+            let rms = (sum / mono.len().max(1) as f32).sqrt();
+            let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            lvl.store((rms.max(peak * 0.5)).to_bits(), Ordering::Relaxed);
+        }
         let mut acc = acc_cb.lock().unwrap();
         acc.extend_from_slice(&mono);
         while acc.len() >= hop_mic {
