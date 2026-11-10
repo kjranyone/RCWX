@@ -1,0 +1,32 @@
+# cargo-about 設定 — 配布バイナリ同梱用 THIRD_PARTY_NOTICES 生成に使用
+#   cargo about generate --workspace --locked templates/about.hbs -o THIRD_PARTY_NOTICES.md
+# CI (.github/workflows/release.yml) がタグビルド時に実行する。
+
+accepted = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    # 以下は OR 選択枝の一部として現れるもの。デュアル/トリライセンスの
+    # permissive 側を選んで配布するため受理する (copyleft 単体は含まれない):
+    "LGPL-2.1-or-later",  # r-efi: MIT OR Apache-2.0 OR LGPL-2.1-or-later
+    "GPL-2.0-only",       # self_cell: Apache-2.0 OR GPL-2.0-only
+    "NCSA",               # (MIT OR Apache-2.0) AND NCSA の構成要素
+]
+
+workarounds = ["ring"]
+
+# 自身のワークスペースクレート (path 依存・非 publish) は通知対象外
+private = { ignore = true }

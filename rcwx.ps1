@@ -46,8 +46,13 @@ Set-Location -Path $PSScriptRoot
 # パス
 # ---------------------------------------------------------------------------
 $ModelsRust = Join-Path $HOME '.cache\rcwx\models\rust'
-$CliExe     = Join-Path $PSScriptRoot 'target\release\rcwx-cli.exe'
-$GuiExe     = Join-Path $PSScriptRoot 'target\release\rcwx-gui.exe'
+
+# 配布アーカイブ (exe がスクリプト横) か開発ワークスペース (target\release) か
+$DistLayout = Test-Path (Join-Path $PSScriptRoot 'rcwx-cli.exe')
+$CliExe     = if ($DistLayout) { Join-Path $PSScriptRoot 'rcwx-cli.exe' }
+              else { Join-Path $PSScriptRoot 'target\release\rcwx-cli.exe' }
+$GuiExe     = if ($DistLayout) { Join-Path $PSScriptRoot 'rcwx-gui.exe' }
+              else { Join-Path $PSScriptRoot 'target\release\rcwx-gui.exe' }
 
 # ---------------------------------------------------------------------------
 # ヘルパー
@@ -57,6 +62,10 @@ function Test-Cargo {
 }
 
 function Invoke-RustBuild {
+    if ($DistLayout) {
+        # 配布アーカイブ: ビルド不要 (Cargo.toml も無いので cargo build は不可)
+        return $true
+    }
     if (Test-Cargo) {
         # --quiet だと初回の GPUI release 最適化が無言のまま数分続く。
         # 製品バイナリだけを対象にし、進捗は cargo の表示に任せる。

@@ -13,6 +13,8 @@ __pycache__/
 # Build
 dist/
 build/
+target/about.json
+THIRD_PARTY_NOTICES.md
 
 sample_data/
 rvc_models/

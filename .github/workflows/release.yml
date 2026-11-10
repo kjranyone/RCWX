@@ -1,0 +1,55 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 配布版はローカル開発用の debug 情報を落とす (Cargo.toml は変更しない)
+      - name: Build release binaries
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: '0'
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release -p rcwx-cli -p rcwx-gui
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Generate THIRD_PARTY_NOTICES.md
+        run: cargo about generate --workspace --locked templates/about.hbs -o THIRD_PARTY_NOTICES.md
+
+      - name: Assemble archive
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $name = "rcwx-$tag-windows-x64"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item target/release/rcwx-cli.exe $stage/
+          Copy-Item target/release/rcwx-gui.exe $stage/
+          Copy-Item rcwx.ps1 $stage/
+          Copy-Item README.md $stage/
+          Copy-Item docs/SETUP.md $stage/ -ErrorAction SilentlyContinue
+          Copy-Item LICENSE $stage/
+          Copy-Item THIRD_PARTY_NOTICES.md $stage/
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
+          Get-Item "dist/$name.zip" | Select-Object Name, Length
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

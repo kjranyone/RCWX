@@ -108,6 +108,21 @@ crates/
 .\dev.ps1 golden              # 重み変換 + golden 生成 → ~/.cache/rcwx/models/rust/
 ```
 
+### リリース (タグ → 配布アーカイブ自動生成)
+
+`v*` タグを push すると `.github/workflows/release.yml` が Windows x64 向けに:
+
+1. `rcwx-cli` / `rcwx-gui` を release ビルド (CI のみ env で `debug=0` + `strip=symbols`。
+   ローカル開発用の `debug = true` は Cargo.toml から変更しない)
+2. `cargo about` (`about.toml` + `templates/about.hbs`) で `THIRD_PARTY_NOTICES.md` を生成
+   (リポジトリにはコミットしない・`.gitignore` 済み)
+3. zip を組み立てて GitHub Release に添付: `rcwx-<tag>-windows-x64.zip`
+   (中身: rcwx-cli.exe / rcwx-gui.exe / rcwx.ps1 / README.md / SETUP.md / LICENSE /
+   THIRD_PARTY_NOTICES.md)
+
+`rcwx.ps1` はスクリプト横に `rcwx-cli.exe` があると配布レイアウトとして扱い
+(cargo ビルドをスキップ)、`target\release\` があれば開発レイアウトで従来どおり。
+
 ## 開発・検証 (Python 参照実装)
 
 Python (`.venv` / `rcwx/`) は **パリティ検証のリファレンス専用**。製品経路からは

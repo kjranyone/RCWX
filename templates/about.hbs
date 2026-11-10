@@ -1,0 +1,36 @@
+# Third-Party Notices
+
+This product (RCWX) includes software developed by third parties under the
+license terms below. Each section lists the crates that use the license and
+reproduces the applicable notice and license text, as required by the
+MIT / Apache-2.0 / BSD / ISC / MPL-2.0 / Zlib / CC0 licenses.
+
+All third-party crates are used unmodified as published on crates.io; their
+source is available from crates.io and the repository recorded in each
+crate's manifest. This applies in particular to the MPL-2.0 licensed crates,
+whose source availability is required by the MPL.
+
+## Overview
+
+{{#each overview}}
+- {{{this.name}}} ({{this.id}}): {{this.count}} crate(s)
+{{/each}}
+
+## License Texts
+
+{{#each licenses}}
+{{#if this.first_of_kind}}
+### {{{this.name}}} ({{this.id}})
+
+{{/if}}
+Used by:
+
+{{#each this.used_by}}
+- {{this.crate.name}} {{this.crate.version}}
+{{/each}}
+
+```text
+{{{this.text}}}
+```
+
+{{/each}}
