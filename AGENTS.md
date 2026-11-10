@@ -4,7 +4,7 @@
 
 **RCWX** = RVC Real-time Voice Changer on Intel Arc (XPU)
 
-RVC v2モデルを使ったリアルタイムボイスチェンジャー。**製品は Rust 単一バイナリ**
+RVC v1/v2モデルを使ったリアルタイムボイスチェンジャー。**製品は Rust 単一バイナリ**
 (`crates/` ワークスペース) で、Python 実装 (`rcwx/`) はパリティ検証の
 リファレンスとして残している。
 
@@ -72,8 +72,20 @@ crates/
   例: `.\dev.ps1 bench` / `.\dev.ps1 e2e` / `.\dev.ps1 rt --seconds 10` (UTF-8 BOM 必須・
   引数は `$args` で生受取し、`-o` 等の共通パラメータ衝突を回避)
 - 重み変換は dev ツール (`tools/convert_*.py`) で `~/.cache/rcwx/models/rust/` へ
+  (`RCWX_MODELS_DIR` で重みディレクトリを切替可能)
 - パリティ: HuBERT cosine 1.0 / synth 0.9996 / RMVPE 0.9999 / swift-f0 0.999 /
   DSP 全モジュール golden 一致 / オフライン E2E corr 0.983 (>0.95)
+- **モデルは RVC v1 (256-dim) / v2 (768-dim) 両対応**。synth.json の `version` から
+  HuBERT 抽出 (v1: layer 9 + final_proj / v2: layer 12) と TextEncoder 形状
+  (n_layers 3/6・kernel 5/3・emb_phone 入力次元) を切替。モデル SR (40k/48k 等) も
+  synth.json から反映 (rt/cli とも従来 48k 決め打ちだった)。IVF index は次元が
+  モデルと不一致なら blend を無効化して警告。実モデルが無い環境での検証は
+  `uv run python tools/make_test_model.py` (ランダム重みの v1/v2 .pth 生成) →
+  `tools/convert_synth.py <pth> --out ~/.cache/rcwx/models/rust-v1` →
+  `cargo test -p rcwx-nn --test synth_parity` (synth_parity_v1 は rust-v1 ディレクトリ
+  または `RCWX_MODELS_DIR_V1` があるときのみ実行)。ランダム重みモデルの parity は
+  分布の関係で v1 0.9998 / v2 0.996 程度に落ちるため gate を 0.995 に緩和
+  (synth.json の `random_test` フラグで判定・実モデルは従来どおり 0.999)
 - 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15]`、
   `... rt --virtual in.wav -o out.wav --chunk 0.06` (デバイスなし検証)、`... rt` (実デバイス)、
   `cargo run -p rcwx-gui --release`
@@ -86,6 +98,10 @@ crates/
   スプライスなし、バッチ境界のみ SOLA。
   fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)。
   単発 (バッチなし) では p50 ≈ 45ms/hop — さらなる単発高速化は今後の課題
+- 既知の制限: `rmvpe_folded.safetensors` を生成するスクリプトが現行ツリーに無い
+  (`convert_rmvpe.py` は未 fold の `rmvpe.safetensors` のみ出力・旧開発機の残存
+  ファイルに依存)。SwiftF0 のオフライン `run` は長尺入力で GPU のバッファバインド
+  上限 (アダプタにより 128MB) を超える場合あり (rt の hop 窓経路では問題なし)。
 
 
 ## Quick Start

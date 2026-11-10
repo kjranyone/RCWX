@@ -16,12 +16,8 @@ use rcwx_nn::hubert::Hubert;
 use rcwx_nn::rmvpe::Rmvpe;
 use rcwx_nn::synth::Synth;
 
-fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"))
-}
-
 fn weights_dir() -> std::path::PathBuf {
-    home_dir().join(".cache/rcwx/models/rust")
+    rcwx_nn::rust_models_dir()
 }
 
 /// 線形伸縮 (出力長厳密一致)。Python `resample(len→len)` 相当。
@@ -386,10 +382,16 @@ fn main() -> Result<()> {
     let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors")).context("HuBERT load")?;
     let rmvpe = Rmvpe::load(&eng, &dir).context("RMVPE load")?;
     let synth = Synth::load(&eng, &dir).context("Synth load")?;
+    let model_version = synth.cfg.version;
+    let fd = synth.cfg.in_channels as usize;
+    println!(
+        "model: RVC v{model_version} ({fd}-dim features, sr={})",
+        synth.cfg.sr
+    );
 
     // ---- HuBERT FIRST (RMVPE が uniform slot を上書きする問題の切り分け) ----
     let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
-    let feats = hubert.features(&eng, &wav_t, n_total as u32);
+    let feats = hubert.features_ver(&eng, &wav_t, n_total as u32, model_version);
     let mut feats_data = eng.readback_f32(&feats);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write(
@@ -400,13 +402,17 @@ fn main() -> Result<()> {
     // ---- IVF index ブレンド (補間前・Python と同じ位置) ----
     if args.index_rate > 0.0 {
         match rcwx_nn::ivf::IvfIndex::load(&dir) {
-            Ok(ivf) => {
+            Ok(ivf) if ivf.dim == fd => {
                 ivf.blend(&mut feats_data, t50, args.index_rate as f32, args.index_k);
                 println!(
                     "index: rate={} k={} lists={}",
                     args.index_rate, args.index_k, ivf.nlist
                 );
             }
+            Ok(ivf) => eprintln!(
+                "index: ivf dim {} != model feat dim {fd} — skipping blend",
+                ivf.dim
+            ),
             Err(e) => eprintln!("index: ivf.safetensors not found ({e}); skipping blend"),
         }
     }
@@ -457,27 +463,19 @@ fn main() -> Result<()> {
         );
     }
 
-    // ---- HuBERT (v2: layer 12) → [T50, 768] → 100fps ----
-    let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
-    let feats = hubert.features(&eng, &wav_t, n_total as u32);
-    let feats_data = eng.readback_f32(&feats);
-    if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write(
-            "target/golden/cli_rust_feats.bin",
-            bytemuck::cast_slice(&feats_data),
-        );
-    }
-    let mut feats100 = vec![0.0f32; t100 * 768];
+    // ---- 100fps 補間 (上の HuBERT FIRST で抽出・IVF ブレンド済みの feats_data から) ----
+    // (かつてここで再抽出していたため IVF ブレンドが破棄されていた — M4 以降の不具合を修正)
+    let mut feats100 = vec![0.0f32; t100 * fd];
     for r in 0..t100 {
         // PyTorch align_corners=False: src = (r + 0.5) * (in/out) - 0.5 = r*0.5 - 0.25
         let pos = (r as f32) * 0.5 - 0.25;
         let i0 = (pos.floor() as i32).clamp(0, t50 as i32 - 1) as usize;
         let i1 = (i0 + 1).min(t50.saturating_sub(1));
         let fr = (pos - i0 as f32).clamp(0.0, 1.0);
-        for c in 0..768 {
-            let a = feats_data[i0 * 768 + c];
-            let b = feats_data[i1 * 768 + c];
-            feats100[r * 768 + c] = a + (b - a) * fr;
+        for c in 0..fd {
+            let a = feats_data[i0 * fd + c];
+            let b = feats_data[i1 * fd + c];
+            feats100[r * fd + c] = a + (b - a) * fr;
         }
     }
 
@@ -502,7 +500,11 @@ fn main() -> Result<()> {
     }
 
     // ---- trim & 長さ補正 ----
-    let model_sr = 48000u32;
+    let model_sr = if synth.cfg.sr > 0 {
+        synth.cfg.sr
+    } else {
+        48000
+    };
     let zc = (model_sr / 100) as usize;
     let t_pad_tgt = t_pad * model_sr as usize / 16000;
     let extra_pad_tgt = extra_pad * model_sr as usize / 16000;

@@ -8,6 +8,19 @@ pub mod rmvpe;
 pub mod swiftf0;
 pub mod synth;
 
+/// 変換済み重みディレクトリ (~/.cache/rcwx/models/rust)。
+/// `RCWX_MODELS_DIR` で上書き可能 (v1/v2 など複数モデルセットの切り替え検証用)。
+pub fn rust_models_dir() -> std::path::PathBuf {
+    std::env::var("RCWX_MODELS_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
+                .join(".cache/rcwx/models/rust")
+        })
+}
+
 /// safetensors から名前付きテンソルを f32 の平坦配列 + shape で読むヘルパ。
 pub fn read_safetensor_f32(
     path: &std::path::Path,

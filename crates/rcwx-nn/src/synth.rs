@@ -1,4 +1,5 @@
-//! RVC Synthesizer (TextEncoder768 + Flow + GeneratorNSF) の独自 wgpu エンジン実装。
+//! RVC Synthesizer (TextEncoder + Flow + GeneratorNSF) の独自 wgpu エンジン実装。
+//! RVC v1 (256-dim 特徴・n_layers=3・kernel 5) / v2 (768-dim・n_layers=6・kernel 3) 両対応。
 //!
 //! 重み: tools/convert_synth.py 出力の synth.safetensors (weight_norm 解決済み・enc_q 除外)
 //! と synth.json。レイアウトは [C, T] 中心。SineGen legacy は純 Rust (CPU, fp32, 励振ノイズ 0)。
@@ -8,12 +9,16 @@ use anyhow::{Context, Result};
 use crate::engine::{Engine, GpuTensor, Graph};
 
 pub struct SynthConfig {
+    pub version: u32,     // 1 (256-dim) / 2 (768-dim)
+    pub in_channels: u32, // emb_phone 入力次元: 256 (v1) / 768 (v2) = HuBERT 特徴次元
+    /// make_test_model.py 由来のランダム重みモデル (パリティ gate が 0.995 に緩和される)
+    pub random_test: bool,
     pub inter_channels: u32,  // 192
     pub hidden_channels: u32, // 192
     pub filter_channels: u32, // 768
     pub n_heads: u32,         // 2
-    pub n_layers: u32,        // 6
-    pub kernel_size: u32,     // 3
+    pub n_layers: u32,        // v2: 6 / v1: 3
+    pub kernel_size: u32,     // v2: 3 / v1: 5
     pub upsample_rates: Vec<u32>,
     pub upsample_initial_channel: u32, // 512
     pub upsample_kernel_sizes: Vec<u32>,
@@ -43,8 +48,7 @@ pub struct Synth {
 }
 
 pub fn default_synth_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"))
-        .join(".cache/rcwx/models/rust")
+    crate::rust_models_dir()
 }
 
 impl Synth {
@@ -73,10 +77,41 @@ impl Synth {
             }
             w.insert(name.to_string(), eng.tensor_from_f32(&out, shape));
         }
-        // TextEncoder QKV fusion: conv_q/k/v (192x192) を連結して 1 matmul 化
+        // 先に synth.json を解釈 (QKV fusion の層数・次元が version 依存のため)
+        let cfg_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("synth.json"))?)?;
+        let gu = |k: &str, d: u64| cfg_json[k].as_u64().unwrap_or(d) as u32;
+        let gvec = |k: &str| -> Vec<u32> {
+            cfg_json[k]
+                .as_array()
+                .and_then(|a| Some(a.iter().map(|v| v.as_u64().unwrap() as u32).collect()))
+                .unwrap_or_default()
+        };
+        let version = gu("version", 2);
+        let cfg = SynthConfig {
+            version,
+            in_channels: if version == 1 { 256 } else { 768 },
+            random_test: cfg_json["random_test"].as_bool().unwrap_or(false),
+            inter_channels: gu("inter_channels", 192),
+            hidden_channels: gu("hidden_channels", 192),
+            filter_channels: gu("filter_channels", 768),
+            n_heads: gu("n_heads", 2),
+            n_layers: gu("n_layers", 6),
+            kernel_size: gu("kernel_size", 3),
+            upsample_rates: gvec("upsample_rates"),
+            upsample_initial_channel: gu("upsample_initial_channel", 512),
+            upsample_kernel_sizes: gvec("upsample_kernel_sizes"),
+            resblock_kernel_sizes: gvec("resblock_kernel_sizes"),
+            gin_channels: gu("gin_channels", 256),
+            sr: gu("sr", 40000),
+            n_speakers: gu("n_speakers", 1),
+        };
+        // TextEncoder QKV fusion: conv_q/k/v (hidden x hidden) を連結して 1 matmul 化
+        // (層数は v1 で 3・v2 で 6)
         {
-            let hd = 192usize;
-            let names: Vec<String> = (0..6u32)
+            let hd = cfg.hidden_channels as usize;
+            let nl = cfg.n_layers;
+            let names: Vec<String> = (0..nl)
                 .flat_map(|l| {
                     [
                         format!("enc_p.encoder.attn_layers.{l}.conv_q.weight"),
@@ -91,11 +126,11 @@ impl Synth {
             let data: std::collections::HashMap<String, Vec<f32>> = names
                 .iter()
                 .map(|n| {
-                    let t = w.get(n).expect(n);
+                    let t = w.get(n).unwrap_or_else(|| panic!("weight {n} (synth.json の n_layers/version と重みの層数が不一致の可能性)"));
                     (n.clone(), eng.readback_f32(t))
                 })
                 .collect();
-            for l in 0..6u32 {
+            for l in 0..nl {
                 let get = |k: &str| -> Vec<f32> { data.get(k).expect(k).clone() };
                 let qw = get(&format!("enc_p.encoder.attn_layers.{l}.conv_q.weight"));
                 let kw = get(&format!("enc_p.encoder.attn_layers.{l}.conv_k.weight"));
@@ -121,30 +156,6 @@ impl Synth {
                 );
             }
         }
-        let cfg_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("synth.json"))?)?;
-        let gu = |k: &str, d: u64| cfg_json[k].as_u64().unwrap_or(d) as u32;
-        let gvec = |k: &str| -> Vec<u32> {
-            cfg_json[k]
-                .as_array()
-                .and_then(|a| Some(a.iter().map(|v| v.as_u64().unwrap() as u32).collect()))
-                .unwrap_or_default()
-        };
-        let cfg = SynthConfig {
-            inter_channels: gu("inter_channels", 192),
-            hidden_channels: gu("hidden_channels", 192),
-            filter_channels: gu("filter_channels", 768),
-            n_heads: gu("n_heads", 2),
-            n_layers: gu("n_layers", 6),
-            kernel_size: gu("kernel_size", 3),
-            upsample_rates: gvec("upsample_rates"),
-            upsample_initial_channel: gu("upsample_initial_channel", 512),
-            upsample_kernel_sizes: gvec("upsample_kernel_sizes"),
-            resblock_kernel_sizes: gvec("resblock_kernel_sizes"),
-            gin_channels: gu("gin_channels", 256),
-            sr: gu("sr", 40000),
-            n_speakers: gu("n_speakers", 1),
-        };
         let emb_g = cpu.get("emb_g.weight").context("emb_g")?;
         let gin = cfg.gin_channels as usize;
         Ok(Self {
@@ -583,7 +594,7 @@ impl Synth {
         out
     }
 
-    /// feats [T, 768] (GPU) + pitch idx (CPU) + pitchf Hz (CPU) → 音声 [T * zc]。
+    /// feats [T, in_channels] (GPU) + pitch idx (CPU) + pitchf Hz (CPU) → 音声 [T * zc]。
     /// noise_scale=0 決定論 (z = m)。
     pub fn infer(
         &self,
@@ -645,6 +656,8 @@ impl Synth {
 
         // ---- TextEncoder ----
         // x[ch, t] = (Σ_k feats[t,k]·W_phone[ch,k])·√h + emb_pitch[pitch[t]][ch]
+        // (feats 次元は v1=256 / v2=768)
+        let in_ch = cfg.in_channels;
         let x0 = eng.tensor_uninit((h * t) as usize);
         g.matmul_ex(
             self.g("enc_p.emb_phone.weight"),
@@ -653,13 +666,13 @@ impl Synth {
             &x0,
             h,
             t,
-            768,
+            in_ch,
             1,
-            768,
+            in_ch,
             1,
             0,
             0,
-            768,
+            in_ch,
             1,
             0,
             0,
@@ -677,7 +690,7 @@ impl Synth {
             k.push(("x_in", x.clone_handle()));
         }
 
-        // Encoder 6 層 (QKV は fusion 済み重みで 1 matmul、q/k/v は base offset 参照)
+        // Encoder (v1: 3 層 / v2: 6 層。QKV は fusion 済み重みで 1 matmul、q/k/v は base offset 参照)
         for l in 0..nl {
             let p = format!("enc_p.encoder.attn_layers.{l}");
             let qkv = eng.tensor_uninit((3 * h * t) as usize);

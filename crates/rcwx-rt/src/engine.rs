@@ -32,8 +32,7 @@ use rcwx_nn::rmvpe::Rmvpe;
 use rcwx_nn::swiftf0::SwiftF0;
 use rcwx_nn::synth::Synth;
 
-const MODEL_SR: u32 = 48000; // kurumi (synth.json の sr)
-const ZC: usize = MODEL_SR as usize / 100; // 480 samples/frame @100fps
+const MODEL_SR: u32 = 48000; // フォールバック (通常は synth.json の sr を使用)
 const DECODER_OVERLAP_FRAMES: usize = 3;
 /// decoder 窓の左マージン (受容野ウォームアップ分)。出力は末尾 new100+overlap
 /// のみなので左端は捨て枠。4→2 を実測したら整相 corr 0.19 / スペクトル差
@@ -70,6 +69,14 @@ pub struct RtEngine {
     swiftf0: Option<SwiftF0>,
     synth: Synth,
     ivf: Option<IvfIndex>,
+    /// モデルの RVC バージョン (v1: 256-dim 特徴 / v2: 768-dim)
+    model_version: u32,
+    /// 特徴次元 (= synth.cfg.in_channels。v1: 256 / v2: 768)
+    feat_dim: usize,
+    /// モデル出力サンプルレート (synth.json の sr。40k/48k 等)
+    model_sr: u32,
+    /// 1 フレーム分のサンプル数 = model_sr / 100 (100fps)
+    zc: usize,
     pub cfg: RtConfig,
     /// 実行中のスライダー。毎 hop の先頭で `cfg` へ写す。
     pub live: Option<Arc<Mutex<LiveParams>>>,
@@ -82,7 +89,7 @@ pub struct RtEngine {
     hist: Vec<f32>,
     /// HuBERT 入力。長さが同じ間は作り直さない。
     hubert_wav: Option<GpuTensor>,
-    // 特徴キャッシュ (blended, 50fps, flat [T,768])
+    // 特徴キャッシュ (blended, 50fps, flat [T,feat_dim])
     feat_cache: Vec<f32>,
     // F0 (条件付け済み・フィルタ前) 100fps
     f0_cond: Vec<f32>,
@@ -112,6 +119,14 @@ impl RtEngine {
         let eng = Engine::new(backend)?;
         let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors"))?;
         let synth = Synth::load(&eng, &dir)?;
+        let model_version = synth.cfg.version;
+        let feat_dim = synth.cfg.in_channels as usize;
+        let model_sr = if synth.cfg.sr > 0 {
+            synth.cfg.sr
+        } else {
+            MODEL_SR
+        };
+        let zc = model_sr as usize / 100;
         let (rmvpe, swiftf0) = match cfg.f0_method.as_str() {
             "rmvpe" => (Some(Rmvpe::load(&eng, &dir)?), None),
             "none" => (None, None), // F0なしモード (f0 = 0)
@@ -124,7 +139,18 @@ impl RtEngine {
             ),
         };
         // 実行中のオンオフに備えて、ファイルがあるときは最初から載せる。
-        let ivf = IvfIndex::load(&dir).ok();
+        // (次元がモデルと不一致の index は誤ブレンド防止のため除外)
+        let ivf = match IvfIndex::load(&dir) {
+            Ok(i) if i.dim == feat_dim => Some(i),
+            Ok(i) => {
+                eprintln!(
+                    "[RT] ivf index dim {} != model feat dim {feat_dim} (v{model_version}) — index blend disabled",
+                    i.dim
+                );
+                None
+            }
+            Err(_) => None,
+        };
 
         let (fb_jobs, fb_results) = if cfg.feedback_detect {
             let (job_tx, job_rx) = mpsc::sync_channel::<(Vec<f32>, Vec<f32>)>(1);
@@ -159,8 +185,8 @@ impl RtEngine {
 
         let mut engine = Self {
             resampler_in: StatefulResampler::new(cfg.mic_sample_rate, 16000),
-            resampler_out: (cfg.output_sample_rate != MODEL_SR)
-                .then(|| StatefulResampler::new(MODEL_SR, cfg.output_sample_rate)),
+            resampler_out: (cfg.output_sample_rate != model_sr)
+                .then(|| StatefulResampler::new(model_sr, cfg.output_sample_rate)),
             spectral,
             gate: Some(gate),
             hist: vec![0.0; ctx], // ゼロ充填履歴 (prime 相当)
@@ -169,11 +195,11 @@ impl RtEngine {
             f0_cond: Vec::new(),
             f0_filt: Vec::new(),
             sola: SolaState::new(
-                (cfg.crossfade_sec * MODEL_SR as f64).round() as usize,
-                (cfg.sola_search_sec * MODEL_SR as f64).round() as usize,
+                (cfg.crossfade_sec * model_sr as f64).round() as usize,
+                (cfg.sola_search_sec * model_sr as f64).round() as usize,
             ),
             post: Postprocessor::new(
-                MODEL_SR,
+                model_sr,
                 PostprocessConfig {
                     treble_boost_db: cfg.treble_boost_db,
                     treble_cutoff_hz: cfg.treble_cutoff_hz,
@@ -196,6 +222,10 @@ impl RtEngine {
             swiftf0,
             synth,
             ivf,
+            model_version,
+            feat_dim,
+            model_sr,
+            zc,
             cfg,
             live: None,
             stats: RtStats::default(),
@@ -249,8 +279,8 @@ impl RtEngine {
         }
         self.post.reset();
         self.sola = SolaState::new(
-            (self.cfg.crossfade_sec * MODEL_SR as f64).round() as usize,
-            (self.cfg.sola_search_sec * MODEL_SR as f64).round() as usize,
+            (self.cfg.crossfade_sec * self.model_sr as f64).round() as usize,
+            (self.cfg.sola_search_sec * self.model_sr as f64).round() as usize,
         );
         self.out_hist.clear();
         self.batch_pending.clear();
@@ -372,8 +402,11 @@ impl RtEngine {
             match sf.prepare_gpu(&self.eng, &f0_audio) {
                 Some(t) => {
                     let (proj, swift_plan) = sf.plan_and_proj_clone(t);
-                    let (hb_in, hb_out, hb_plan) =
-                        self.hubert.features_plan_clone(&self.eng, win_len as u32);
+                    let (hb_in, hb_out, hb_plan) = self.hubert.features_plan_clone(
+                        &self.eng,
+                        win_len as u32,
+                        self.model_version,
+                    );
                     let (feats_data, probs) = self.eng.run_inputs_plans_readback_two(
                         &[(wav_t, &hb_in)],
                         &[&hb_plan, &swift_plan],
@@ -384,47 +417,55 @@ impl RtEngine {
                 }
                 None => {
                     // 無音など SwiftF0 不要: HuBERT のみ従来経路
-                    let feats = self.hubert.features(&self.eng, wav_t, win_len as u32);
+                    let feats = self.hubert.features_ver(
+                        &self.eng,
+                        wav_t,
+                        win_len as u32,
+                        self.model_version,
+                    );
                     (self.eng.readback_f32(&feats), None)
                 }
             }
         } else {
-            let feats = self.hubert.features(&self.eng, wav_t, win_len as u32);
+            let feats =
+                self.hubert
+                    .features_ver(&self.eng, wav_t, win_len as u32, self.model_version);
             (self.eng.readback_f32(&feats), None)
         };
-        let t50_win = feats_data.len() / 768;
+        let fd = self.feat_dim;
+        let t50_win = feats_data.len() / fd;
 
         // 新規フレーム → キャッシュ (sigmoid ブレンド)
         if t50_win > new50 {
-            let (feat_win, _) = feats_data.split_at(t50_win * 768);
+            let (feat_win, _) = feats_data.split_at(t50_win * fd);
             stage("hubert+blend", &mut stage_t);
-            let cache_t50 = self.feat_cache.len() / 768;
+            let cache_t50 = self.feat_cache.len() / fd;
             // 窓先頭の (t50_win - new50) フレームがキャッシュ末尾と同一時刻
             let overlap = (t50_win - new50).min(cache_t50);
             let blend = sigmoid_blend(overlap);
             for r in 0..overlap {
-                let cache_off = self.feat_cache.len() - overlap * 768;
-                for c in 0..768 {
-                    let ci = cache_off + r * 768 + c;
-                    let ni = r * 768 + c;
+                let cache_off = self.feat_cache.len() - overlap * fd;
+                for c in 0..fd {
+                    let ci = cache_off + r * fd + c;
+                    let ni = r * fd + c;
                     let a = blend[r];
                     self.feat_cache[ci] = a * self.feat_cache[ci] + (1.0 - a) * feat_win[ni];
                 }
             }
-            let new_off = (t50_win - new50) * 768;
+            let new_off = (t50_win - new50) * fd;
             self.feat_cache
-                .extend_from_slice(&feat_win[new_off..t50_win * 768]);
+                .extend_from_slice(&feat_win[new_off..t50_win * fd]);
         } else {
             self.warn
                 .push(format!("HuBERT window too short: {t50_win} <= {new50}"));
         }
-        let cache_cap50 = (CACHE_SEC * 50.0) as usize * 768;
+        let cache_cap50 = (CACHE_SEC * 50.0) as usize * fd;
         if self.feat_cache.len() > cache_cap50 {
             let drop = self.feat_cache.len() - cache_cap50;
-            self.feat_cache.drain(..drop / 768 * 768);
+            self.feat_cache.drain(..drop / fd * fd);
         }
         stage("hubert+blend", &mut stage_t);
-        let cache_t50 = self.feat_cache.len() / 768;
+        let cache_t50 = self.feat_cache.len() / fd;
 
         // 4) F0。Swift は上で GPU 済み。無音はゼロ、RMVPE / none は従来どおり。
         let mut f0_win = if let Some((t, probs)) = swift_probs {
@@ -499,9 +540,9 @@ impl RtEngine {
         // 特徴窓 (50fps): n100/2 相当
         let win50 = n100.div_ceil(2);
         let win50_start = cache_t50.saturating_sub(win50);
-        let mut feats_win = self.feat_cache[win50_start * 768..].to_vec();
-        let feats_win_frames = feats_win.len() / 768;
-        feats_win.truncate(feats_win_frames * 768);
+        let mut feats_win = self.feat_cache[win50_start * fd..].to_vec();
+        let feats_win_frames = feats_win.len() / fd;
+        feats_win.truncate(feats_win_frames * fd);
         if self.cfg.index_rate > 0.0
             && let Some(ivf) = self.ivf.as_ref()
             && feats_win_frames > 0
@@ -516,16 +557,16 @@ impl RtEngine {
 
         // 100fps 補間 (align_corners=False 相当)
         let t50 = feats_win_frames;
-        let mut feats100 = vec![0.0f32; n100 * 768];
+        let mut feats100 = vec![0.0f32; n100 * fd];
         for r in 0..n100 {
             let pos = r as f32 * 0.5 - 0.25;
             let i0 = (pos.floor() as i32).clamp(0, t50 as i32 - 1) as usize;
             let i1 = (i0 + 1).min(t50.saturating_sub(1));
             let fr = (pos - i0 as f32).clamp(0.0, 1.0);
-            for c in 0..768 {
-                let a = feats_win[i0 * 768 + c];
-                let b = feats_win[i1 * 768 + c];
-                feats100[r * 768 + c] = a + (b - a) * fr;
+            for c in 0..fd {
+                let a = feats_win[i0 * fd + c];
+                let b = feats_win[i1 * fd + c];
+                feats100[r * fd + c] = a + (b - a) * fr;
             }
         }
         let pitch: Vec<u32> = f0::quantize_f0_to_pitch(&f0_synth_win);
@@ -546,7 +587,7 @@ impl RtEngine {
             } = self;
             // 形状が変わったらプラン再構築 (ウォームアップ中のみ)
             if plans.as_ref().map(|p| (p.n100, p.n_dec)) != Some((n100, n_dec)) {
-                let feats_in = eng.tensor_uninit(n100 * 768);
+                let feats_in = eng.tensor_uninit(n100 * fd);
                 let pitch_emb_in = eng.tensor_uninit(synth.cfg.hidden_channels as usize * n100);
                 // encode plan
                 let mut g = eng.graph();
@@ -603,13 +644,13 @@ impl RtEngine {
         // 各 hop の確定出力 = 末尾 (new100 + overlap) フレーム分の音声から
         // SOLA で target_len = new100*zc を取り出す。
         let tail_frames = (new100 + DECODER_OVERLAP_FRAMES).min(n100);
-        let take_from = audio48.len() - tail_frames * ZC;
+        let take_from = audio48.len() - tail_frames * self.zc;
         let raw: Vec<f32> = audio48[take_from..].to_vec();
         audio48.clear();
 
         // soft clip
         let clipped: Vec<f32> = raw.iter().map(|v| soft_clip(*v)).collect();
-        let target = new100 * ZC;
+        let target = new100 * self.zc;
         let mut out = sola_crossfade(&clipped, &mut self.sola, target);
         self.stats.solo_offset = self.sola.last_offset;
 
@@ -624,7 +665,7 @@ impl RtEngine {
                 &mask,
                 &self.cfg.voice_gate_mode,
                 self.cfg.energy_threshold as f32,
-                MODEL_SR,
+                self.model_sr,
             );
         }
 
@@ -646,7 +687,7 @@ impl RtEngine {
         // 非同期実行し、推論タイマー・出力レイテンシのどちらにも載せない。
         if self.cfg.feedback_detect {
             self.out_hist.extend_from_slice(&out);
-            let keep = MODEL_SR as usize; // 1s
+            let keep = self.model_sr as usize; // 1s
             if self.out_hist.len() > keep * 2 {
                 let drop = self.out_hist.len() - keep * 2;
                 self.out_hist.drain(..drop);

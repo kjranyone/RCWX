@@ -62,12 +62,14 @@ pub struct Hubert {
     pub final_proj: Option<(GpuTensor, GpuTensor)>,
 }
 
-fn home_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"))
+pub fn default_weights_path() -> std::path::PathBuf {
+    crate::rust_models_dir().join("hubert.safetensors")
 }
 
-pub fn default_weights_path() -> std::path::PathBuf {
-    home_dir().join(".cache/rcwx/models/rust/hubert.safetensors")
+/// RVC モデルバージョン → HuBERT 抽出 (layer, dim)。
+/// v1: layer 9 + encoder LN + final_proj → 256-dim / v2: layer 12 (last_hidden) → 768-dim。
+pub fn layer_dim_for_version(version: u32) -> (u32, u32) {
+    if version == 1 { (9, 256) } else { (12, 768) }
 }
 
 impl Hubert {
@@ -143,18 +145,32 @@ impl Hubert {
         self.extract(eng, wav, n_samples, 12, 768)
     }
 
-    /// キャッシュ済み v2 プランのクローン (input への wav copy と out 読み戻しは
+    /// モデルバージョンに対応する抽出 (v1: layer 9 + final_proj → 256 / v2: layer 12 → 768)。
+    pub fn features_ver(
+        &self,
+        eng: &Engine,
+        wav: &GpuTensor,
+        n_samples: u32,
+        version: u32,
+    ) -> GpuTensor {
+        let (layer, dim) = layer_dim_for_version(version);
+        self.extract(eng, wav, n_samples, layer, dim)
+    }
+
+    /// キャッシュ済みプランのクローン (input への wav copy と out 読み戻しは
     /// 呼び出し側の統合 submit に載せる)。実行は extract 相当を自前で組み立てる
     /// リアルタイム経路のみが使う。
     pub fn features_plan_clone(
         &self,
         eng: &Engine,
         n_samples: u32,
+        version: u32,
     ) -> (GpuTensor, GpuTensor, crate::engine::Plan) {
+        let (layer, dim) = layer_dim_for_version(version);
         let mut plans = self.plans.borrow_mut();
         let entry = plans
-            .entry((n_samples, 12, 768))
-            .or_insert_with(|| self.build_plan(eng, n_samples, 12, 768));
+            .entry((n_samples, layer, dim))
+            .or_insert_with(|| self.build_plan(eng, n_samples, layer, dim));
         (
             entry.input.clone_handle(),
             entry.out.clone_handle(),

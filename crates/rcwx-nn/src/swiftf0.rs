@@ -46,8 +46,7 @@ pub struct SwiftF0 {
 }
 
 pub fn default_swiftf0_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
-        .join(".cache/rcwx/models/rust/swiftf0.safetensors")
+    crate::rust_models_dir().join("swiftf0.safetensors")
 }
 
 impl SwiftF0 {

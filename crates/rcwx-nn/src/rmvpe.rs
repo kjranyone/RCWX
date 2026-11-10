@@ -25,8 +25,7 @@ pub struct Rmvpe {
 }
 
 pub fn default_rmvpe_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"))
-        .join(".cache/rcwx/models/rust")
+    crate::rust_models_dir()
 }
 
 impl Rmvpe {

@@ -52,6 +52,8 @@ def convert_synth(model_path: Path, out_dir: Path) -> None:
         "has_f0": bool(getattr(loader, "has_f0", True)),
         "sr": int(getattr(loader, "sample_rate", 40000)),
         "n_speakers": int(sd["emb_g.weight"].shape[0]),
+        # make_test_model.py 由来のランダム重みモデル (パリティ gate 緩和の判定用)
+        "random_test": "RCWX random test" in str(ckpt.get("info", "")),
         **parsed,
     }
     cfg_path = out_dir / "synth.json"
@@ -78,7 +80,9 @@ def convert_synth(model_path: Path, out_dir: Path) -> None:
     model.dec.m_source.l_sin_gen.forward = _det_sinegen_forward
     torch.manual_seed(0)
     frames = 33
-    feats = torch.randn(1, frames, 768) * 0.5
+    # v1 は 256-dim / v2 は 768-dim 特徴
+    in_ch = 256 if getattr(loader, "version", 2) == 1 else 768
+    feats = torch.randn(1, frames, in_ch) * 0.5
     pitch_hz = torch.where(
         torch.rand(1, frames) > 0.2,
         100.0 + 180.0 * torch.rand(1, frames),
@@ -121,11 +125,17 @@ def convert_synth(model_path: Path, out_dir: Path) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("usage: convert_synth_direct <model.pth>", file=sys.stderr)
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("model", nargs="?", default="model/kurumi/kurumi.pth", help="RVC .pth モデル")
+    ap.add_argument("--out", default=None, help="出力ディレクトリ (既定 ~/.cache/rcwx/models/rust)")
+    args = ap.parse_args()
+    model_path = Path(args.model)
+    if not model_path.exists():
+        print(f"model not found: {model_path}", file=sys.stderr)
         sys.exit(1)
-    model_path = Path(sys.argv[1])
-    out_dir = Path.home() / ".cache/rcwx/models/rust"
+    out_dir = Path(args.out) if args.out else Path.home() / ".cache/rcwx/models/rust"
     convert_synth(model_path, out_dir)
 
 
