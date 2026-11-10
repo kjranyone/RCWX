@@ -164,6 +164,38 @@ fn main(
   }
 }
 "#
+
+/// 学習経路用 Kahan 補償付き tiled matmul (matmul_tiled と同一レイアウト)。
+/// f32 累積誤差 (~1e-3 相対) を ~100x 抑える。使い方: Graph::matmul_ex_kahan。
+pub fn matmul_tiled_kahan_src() -> String {
+    let base = matmul_tiled_src();
+    // accXX への加算を Kahan 補償に置換 + 最終的に補償項を加算戻す。
+    // (加算戻しがないと数学的にプレーン加算と恒等 — bit 一致になる)
+    base.replace(
+        "      acc00 = acc00 + a0 * b0;
+      acc01 = acc01 + a0 * b1;
+      acc10 = acc10 + a1 * b0;
+      acc11 = acc11 + a1 * b1;",
+        "      var y = a0 * b0; var t = acc00 + y;
+      cc00 = cc00 + select((acc00 - t) + y, (y - t) + acc00, abs(acc00) >= abs(y)); acc00 = t;
+      y = a0 * b1; t = acc01 + y;
+      cc01 = cc01 + select((acc01 - t) + y, (y - t) + acc01, abs(acc01) >= abs(y)); acc01 = t;
+      y = a1 * b0; t = acc10 + y;
+      cc10 = cc10 + select((acc10 - t) + y, (y - t) + acc10, abs(acc10) >= abs(y)); acc10 = t;
+      y = a1 * b1; t = acc11 + y;
+      cc11 = cc11 + select((acc11 - t) + y, (y - t) + acc11, abs(acc11) >= abs(y)); acc11 = t;",
+    )
+    .replace(
+        "  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;",
+        "  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  var cc00 = 0.0; var cc01 = 0.0; var cc10 = 0.0; var cc11 = 0.0;",
+    )
+    .replace(
+        "  if (has_bias == 1u) {",
+        "  acc00 = acc00 + cc00; acc01 = acc01 + cc01;
+  acc10 = acc10 + cc10; acc11 = acc11 + cc11;
+  if (has_bias == 1u) {",
+    )
 }
 
 pub fn matmul_tiled_src() -> String {
@@ -849,6 +881,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 }
 
+
 /// matmul_conv の fp16 版: SLM タイルと内積を f16 で計算 (16 項ごとに f32 昇格)。
 /// 入力バッファは f32 のまま (ロード時に変換)。
 pub fn matmul_conv_f16_src() -> String {
@@ -1189,4 +1222,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   }
 }
 "#
+}
+
+#[cfg(test)]
+mod kahan_tests {
+    #[test]
+    fn kahan_source_applies() {
+        let base = super::matmul_tiled_src();
+        let k = super::matmul_tiled_kahan_src();
+        assert!(k.contains("cc00"), "Kahan 補償が適用されていない");
+        assert_ne!(base, k);
+    }
 }

@@ -10,42 +10,49 @@ use crate::modules::Adopted;
 
 pub const PERIODS_V2: [u32; 8] = [2, 3, 5, 7, 11, 17, 23, 37];
 
+/// 重みキー (disc_p.N.*) から実際に存在する disc_p 数を数え、対応する
+/// 先頭 periods を返す (テスト用 tiny D は 2 個など)。
+pub fn infer_periods(w: &MpdWeights) -> Vec<u32> {
+    let mut n = 0usize;
+    for k in w.keys() {
+        if let Some(rest) = k.strip_prefix("disc_p.") {
+            if let Some(idx) = rest.split('.').next().and_then(|s| s.parse::<usize>().ok()) {
+                if idx + 1 > n {
+                    n = idx + 1;
+                }
+            }
+        }
+    }
+    let n = n.min(PERIODS_V2.len());
+    PERIODS_V2[..n].to_vec()
+}
+
 pub struct Mpd {
     pub store: ParamStore,
     pub periods: Vec<u32>,
     pub has_s: bool,
-    /// "discriminators.0.convs.0" 等のプレフィックス集合
-    pub prefixes: Vec<String>,
 }
 
 pub type MpdWeights = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
 impl Mpd {
-    /// w は state_dict 風 ("disc_s.convs.0.weight_v" 等)。
+    /// w は state_dict 風 ("disc_s.convs.0.weight_v" 等)。空なら判別器なし
+    /// (periods も空扱い — smoke 用)。
     pub fn new(eng: &Engine, w: &MpdWeights, periods: &[u32]) -> anyhow::Result<Self> {
+        if w.is_empty() {
+            return Ok(Self {
+                store: ParamStore::new(),
+                periods: vec![],
+                has_s: false,
+            });
+        }
         let mut store = ParamStore::new();
-        // S 判別器の存在判定
-        let has_s = w.contains_key("disc_s.convs.0.weight");
-        let mut register = |store: &mut ParamStore, prefix: &str, w: &MpdWeights| {
-            let wkey = format!("{prefix}.weight");
-            if let Some((v, vs)) = w.get(&format!("{prefix}.weight_v")) {
-                let g = w
-                    .get(&format!("{prefix}.weight_g"))
-                    .map(|(gv, _)| gv[0])
-                    .unwrap_or(1.0);
-                return store.add_weight_norm(eng, prefix, v, g, vs.clone());
-            }
-            let (d, s) = &w[&wkey];
-            store.add(eng, prefix, d, s.clone())
-        };
-        // WN/param 登録 (名前 → entry idx は Adopted 経由で解決するため
-        // ここでは store に全部積むだけ)
-        let keys: Vec<&String> = w.keys().collect();
+        let has_s =
+            w.contains_key("disc_s.convs.0.weight") || w.contains_key("disc_s.convs.0.weight_v");
+        let keys: Vec<String> = w.keys().cloned().collect();
         for k in keys {
-            if k.ends_with(".weight_v") || k.ends_with(".weight_g") {
-                let prefix = k
-                    .trim_end_matches(".weight_v")
-                    .trim_end_matches(".weight_g");
+            if k.ends_with(".weight_v") {
+                let prefix = k.trim_end_matches(".weight_v").to_string();
                 if store
                     .wns
                     .iter()
@@ -56,36 +63,28 @@ impl Mpd {
                 if let Some((v, vs)) = w.get(&format!("{prefix}.weight_v")) {
                     let g = w
                         .get(&format!("{prefix}.weight_g"))
-                        .map(|(gv, _)| gv[0])
-                        .unwrap_or(1.0);
-                    store.add_weight_norm(eng, prefix, v, g, vs.clone());
+                        .map(|(gv, _)| gv.as_slice())
+                        .unwrap_or(&[1.0]);
+                    store.add_weight_norm(eng, &prefix, v, g, vs.clone());
                 }
-            } else if k.ends_with(".weight") || k.ends_with(".bias") {
-                // WN 畳み込みの weight は fold 済みなので登録しない
-                let prefix = k
-                    .trim_end_matches(".weight")
-                    .trim_end_matches(".bias")
-                    .to_string();
-                let is_wn = w.contains_key(&format!("{prefix}.weight_v"));
-                if is_wn && k.ends_with(".weight") {
+            } else if k.ends_with(".weight_g") {
+                continue;
+            } else if k.ends_with(".weight") {
+                let prefix = k.trim_end_matches(".weight").to_string();
+                if w.contains_key(&format!("{prefix}.weight_v")) {
                     continue;
                 }
-                let (d, s) = &w[k];
-                store.add(eng, k, d, s.clone());
+                let (d, s) = &w[&k];
+                store.add(eng, &k, d, s.clone());
+            } else if k.ends_with(".bias") {
+                let (d, s) = &w[&k];
+                store.add(eng, &k, d, s.clone());
             }
-        }
-        let mut prefixes = Vec::new();
-        if has_s {
-            prefixes.push("disc_s".to_string());
-        }
-        for (i, _) in periods.iter().enumerate() {
-            prefixes.push(format!("disc_p.{i}"));
         }
         Ok(Self {
             store,
             periods: periods.to_vec(),
             has_s,
-            prefixes,
         })
     }
 
@@ -128,7 +127,7 @@ impl Mpd {
                 }
                 let v = a.adopt_entry(tape, &self.store, i);
                 a.p.insert(format!("{prefix}.w"), v);
-            } else {
+            } else if e.name.ends_with(".bias") {
                 let v = a.adopt_entry(tape, &self.store, i);
                 a.p.insert(e.name.clone(), v);
             }
@@ -156,7 +155,7 @@ pub fn disc_s(tape: &mut Tape<'_>, a: &Adopted, x: Var, batch: u32, t_len: u32) 
     let mut t = t_len;
     for i in 0..chans.len() {
         let (oc, k, s, g) = (chans[i].1, ks[i], strides[i], groups[i]);
-        let out_len = (t + 2 * 0).saturating_sub(k) / s + 1; // pad なし
+        let out_len = t.saturating_sub(k) / s + 1;
         let w = a.w(&format!("disc_s.convs.{i}"));
         let b = a.bias(&format!("disc_s.convs.{i}"));
         x = tape.conv1d_grouped(x, w, b, oc, in_c, k, s, 0, g, batch, t, out_len);
@@ -166,8 +165,8 @@ pub fn disc_s(tape: &mut Tape<'_>, a: &Adopted, x: Var, batch: u32, t_len: u32) 
         t = out_len;
     }
     let out_len = t.saturating_sub(3) + 1;
-    let w = a.w("disc_s.post");
-    let b = a.bias("disc_s.post");
+    let w = a.w("disc_s.conv_post");
+    let b = a.bias("disc_s.conv_post");
     let logits = tape.conv1d(x, w, b, 1, in_c, 3, 1, 1, 0, batch, t, out_len);
     (logits, fmaps)
 }
@@ -183,34 +182,41 @@ pub fn disc_p(
     t_len: u32,
 ) -> (Var, Vec<Var>) {
     let prefix = format!("disc_p.{idx}");
-    // 時間軸を period の倍数へ reflect pad
     let rem = t_len % period;
     let pad = if rem == 0 { 0 } else { period - rem };
-    let x = if pad > 0 { tape.reflect_pad(x, pad) } else { x };
+    // 末尾 reflect pad (upstream: F.pad(y, (0, n_pad), "reflect"))。
+    // reflect_pad_dims は両側 pad のため、pad オフセットの gather で
+    // 先頭側を落として末尾のみの pad に変換する。
+    let x = if pad > 0 {
+        let both = tape.reflect_pad_dims(x, batch, 1, t_len, pad);
+        tape.gather_frames_pub(both, pad, 1, t_len + 2 * pad, t_len + pad)
+    } else {
+        x
+    };
     let t2 = t_len + pad;
     let h = t2 / period;
-    // 入力を (b, 1, h, period) 扱い: x 平坦 [b, 1, t2] = [b, 1, h·period]
     let chans = [32u32, 128, 512, 1024, 1024];
     let mut fmaps = Vec::new();
     let mut c_in = 1u32;
     let mut hh = h;
-    let mut ww = period;
+    let ww = period;
     let mut cur = x;
     for i in 0..chans.len() {
         let w = a.w(&format!("{prefix}.convs.{i}"));
         let b = a.bias(&format!("{prefix}.convs.{i}"));
-        let oh = (hh + 2 - 5) / 3 + 1; // pad=2, k=5, s=3
-        cur = tape.conv2d(cur, w, b, chans[i], c_in, 5, 1, 3, 1, 2, batch, hh, ww);
+        // conv2d は pad_h=2 (padding=(2,0) 相当): oh = (h + 2·2 − 5)/3 + 1
+        let oh = (hh + 4 - 5) / 3 + 1;
+        cur = tape.conv2d(cur, w, b, chans[i], c_in, 5, 1, 3, 1, 2, 0, batch, hh, ww);
         cur = tape.lrelu(cur, 0.1);
         fmaps.push(cur);
         c_in = chans[i];
         hh = oh;
-        ww = ww; // 幅方向 stride 1
     }
-    let w = a.w(&format!("{prefix}.post"));
-    let b = a.bias(&format!("{prefix}.post"));
+    let w = a.w(&format!("{prefix}.conv_post"));
+    let b = a.bias(&format!("{prefix}.conv_post"));
     let oh = (hh + 2 - 3) / 1 + 1;
-    let logits = tape.conv2d(cur, w, b, 1, c_in, 3, 1, 1, 1, 1, batch, hh, ww);
+    let _ = oh;
+    let logits = tape.conv2d(cur, w, b, 1, c_in, 3, 1, 1, 1, 1, 0, batch, hh, ww);
     (logits, fmaps)
 }
 
@@ -230,8 +236,8 @@ pub fn mpd_forward(
         logits.push(l);
         fmaps.extend(f);
     }
-    for (i, &p) in mpd.periods.iter().enumerate() {
-        let (l, f) = disc_p(tape, a, i, p, x, batch, t_len);
+    for (i, p) in mpd.periods.iter().enumerate() {
+        let (l, f) = disc_p(tape, a, i, *p, x, batch, t_len);
         logits.push(l);
         fmaps.extend(f);
     }

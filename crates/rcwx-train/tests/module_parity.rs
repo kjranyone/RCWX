@@ -93,6 +93,19 @@ fn fixture(
 }
 
 /// x0 パイプライン + conv_q の検証 (STAGE 環境変数で段階有効化)。
+thread_local! {
+    static LN_T: std::cell::RefCell<Option<rcwx_nn::engine::GpuTensor>> =
+        const { std::cell::RefCell::new(None) };
+    static FFN_T: std::cell::RefCell<Option<rcwx_nn::engine::GpuTensor>> =
+        const { std::cell::RefCell::new(None) };
+    static ENC0_T: std::cell::RefCell<Option<rcwx_nn::engine::GpuTensor>> =
+        const { std::cell::RefCell::new(None) };
+    static X3_T_INPUT: std::cell::RefCell<Option<rcwx_nn::engine::tape::Var>> =
+        const { std::cell::RefCell::new(None) };
+    static X3_T: std::cell::RefCell<Option<rcwx_nn::engine::GpuTensor>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let stage: u32 = std::env::var("STAGE")
         .ok()
@@ -128,6 +141,7 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
         1,
         f.t_len * h,
         1.0,
+        0,
     );
     let xp_t = tape.var_tensor(xp);
     let xp_lin = tape.linear(
@@ -162,6 +176,7 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
             1,
             f.t_len * h,
             1.0,
+            0,
         );
         last = xq;
         if stage >= 3 {
@@ -250,6 +265,7 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
         1,
         f.t_len * f.t_len,
         scale,
+        0,
     );
     let qk_t = tape.var_tensor(qk_h0);
     let relk = a.vec("enc_p.encoder.attn_layers.0.emb_rel_k");
@@ -274,6 +290,7 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
         1,
         f.t_len * (2 * ws + 1),
         scale,
+        0,
     );
     let rel_bias0 = tape.skew(m_rel, 0, f.batch, f.t_len, ws);
     let rel_t = tape.var_tensor(rel_bias0);
@@ -282,6 +299,52 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     let scores_h0 = tape.mask_fill2d(scores_h0, bias, f.t_len, -1e4);
     let p_h0 = tape.softmax(scores_h0, f.batch * f.t_len, f.t_len);
     let p_t = tape.var_tensor(p_h0);
+    // ln1_0: x + att → LayerNorm (チャネル軸)
+    {
+        let att = rcwx_train::modules::attention_layer(
+            &mut tape,
+            &a,
+            "enc_p.encoder.attn_layers.0",
+            xm,
+            h,
+            f.cfg.n_heads,
+            f.cfg.window_size,
+            f.batch,
+            f.t_len,
+            Some(bias),
+        );
+        let x2 = tape.add(xm, att, false);
+        let x2 = tape.layernorm_strided(
+            x2,
+            a.vec("enc_p.encoder.norm_layers_1.0.gamma"),
+            a.vec("enc_p.encoder.norm_layers_1.0.beta"),
+            f.batch * f.t_len,
+            h,
+            1,
+            f.t_len,
+            1e-5,
+        );
+        let ln_t = tape.var_tensor(x2);
+        LN_T.set(Some(ln_t));
+        // ffn0
+        let y = rcwx_train::modules::ffn(
+            &mut tape,
+            &a,
+            "enc_p.encoder.ffn_layers.0",
+            x2,
+            h,
+            f.cfg.filter_channels,
+            f.cfg.kernel_size,
+            f.batch,
+            f.t_len,
+            Some(mask),
+        );
+        let ffn_t = tape.var_tensor(y);
+        FFN_T.set(Some(ffn_t));
+        // enc0: LN2(ln1_0 + ffn0) — X3 を保持し LN2 は後段で
+        let x3 = tape.add(x2, y, false);
+        X3_T_INPUT.set(Some(x3));
+    }
     let att = if std::env::var("SKIP_ATTN").is_err() {
         let v = rcwx_train::modules::attention_layer(
             &mut tape,
@@ -299,7 +362,89 @@ fn debug_stages(eng: &Engine, st: &SynthTrain, f: &Fixture) {
     } else {
         None
     };
+    // LN2 は attention 構築後に実行 (clobber 検証)
+    X3_T_INPUT.with(|c| {
+        if let Some(x3) = &*c.borrow() {
+            let x3 = *x3;
+            let enc0 = tape.layernorm_strided(
+                x3,
+                a.vec("enc_p.encoder.norm_layers_2.0.gamma"),
+                a.vec("enc_p.encoder.norm_layers_2.0.beta"),
+                f.batch * f.t_len,
+                h,
+                1,
+                f.t_len,
+                1e-5,
+            );
+            ENC0_T.set(Some(tape.var_tensor(enc0)));
+        }
+    });
     tape.submit().expect("submit");
+    LN_T.with(|c| {
+        if let Some(t) = &*c.borrow() {
+            let got = eng.readback_f32(t);
+            let (want, _) = &f.want_out["ln1_0"];
+            println!("dbg ln1_0: cos={:.6}", rcwx_train::cosine_pub(&got, want));
+        }
+    });
+    FFN_T.with(|c| {
+        if let Some(t) = &*c.borrow() {
+            let got = eng.readback_f32(t);
+            let (want, _) = &f.want_out["ffn0"];
+            println!("dbg ffn0:  cos={:.6}", rcwx_train::cosine_pub(&got, want));
+        }
+    });
+    {
+        let ge = st
+            .store
+            .entries
+            .iter()
+            .find(|e| e.name == "enc_p.encoder.norm_layers_2.0.gamma")
+            .unwrap();
+        let be = st
+            .store
+            .entries
+            .iter()
+            .find(|e| e.name == "enc_p.encoder.norm_layers_2.0.beta")
+            .unwrap();
+        let g = eng.readback_f32(&ge.value);
+        let b = eng.readback_f32(&be.value);
+        println!(
+            "dbg ln2 gamma[0..4]={:?} beta[0..4]={:?}",
+            &g[0..4],
+            &b[0..4]
+        );
+    }
+    X3_T.with(|c| {
+        if let Some(t) = &*c.borrow() {
+            let got = eng.readback_f32(t);
+            let (l, _) = &f.want_out["ln1_0"];
+            let (fw, _) = &f.want_out["ffn0"];
+            let want: Vec<f32> = l.iter().zip(fw.iter()).map(|(a, b)| a + b).collect();
+            println!("dbg x3:   cos={:.6}", rcwx_train::cosine_pub(&got, &want));
+        }
+    });
+    ENC0_T.with(|c| {
+        if let Some(t) = &*c.borrow() {
+            let got = eng.readback_f32(t);
+            let (want, _) = &f.want_out["enc0"];
+            println!("dbg enc0:  cos={:.6}", rcwx_train::cosine_pub(&got, want));
+            let zero_pos: Vec<usize> = got
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| g.abs() <= 1e-6)
+                .map(|(i, _)| i)
+                .take(12)
+                .collect();
+            println!("  enc0 first zeros at: {zero_pos:?}");
+            for i in [1usize, 2, 16, 100, 210] {
+                println!("  enc0[{i}] got={:.5} want={:.5}", got[i], want[i]);
+            }
+            for i in 0..5 {
+                println!("  enc0[{i}] got={:.5} want={:.5}", got[i], want[i]);
+            }
+        }
+    });
     let got = eng.readback_f32(&xp_t);
     let (want, _) = &f.want_out["xp"];
     println!(
@@ -467,15 +612,65 @@ fn encp_parity() {
     let onehot = tape.const_f32s(&f.onehot, vec![(f.batch * f.t_len) as usize, 256]);
     let mask = tape.const_f32s(&f.mask, vec![f.batch as usize, f.t_len as usize]);
     let bias = tape.const_f32s(&f.bias, vec![f.t_len as usize, f.t_len as usize]);
-    let (m_p, logs_p) = enc_p(
+    let o = enc_p(
         &mut tape, &a, &f.cfg, phone, onehot, mask, bias, f.batch, f.t_len,
     );
-    let m_t = tape.var_tensor(m_p);
-    let l_t = tape.var_tensor(logs_p);
-    tape.backward_from(m_p);
-    tape.backward_from(logs_p);
+    let m_t = tape.var_tensor(o.m_p);
+    let l_t = tape.var_tensor(o.logs_p);
+    tape.backward_from_all(&[o.m_p, o.logs_p]);
+    let x0g = tape.grad_tensor(o.x0);
+    let phone_g_pre = tape.grad_tensor(phone);
+    println!(
+        "grads present: x0={} xt={} xs={} xsum={} x_emb={} xp={}",
+        x0g.is_some(),
+        tape.grad_tensor(o.xt).is_some(),
+        tape.grad_tensor(o.xs).is_some(),
+        tape.grad_tensor(o.xsum).is_some(),
+        tape.grad_tensor(o.x_emb).is_some(),
+        tape.grad_tensor(o.xp).is_some(),
+    );
     tape.submit().expect("submit");
+    match x0g {
+        Some(g) => {
+            let got = eng.readback_f32(&g);
+            let dgrad = load_golden(&path, "dgrad.");
+            let (want, _) = &dgrad["x0"];
+            println!(
+                "encp dgrad x0: cos={:.6} nz={} got[0..3]={:?}",
+                rcwx_train::cosine_pub(&got, want),
+                got.iter()
+                    .filter(|v| v.is_finite() && v.abs() > 1e-9)
+                    .count(),
+                &got[0..3]
+            );
+        }
+        None => println!("encp dgrad x0: MISSING"),
+    }
+    // phone 入力勾配
+    {
+        let pg = phone_g_pre;
+        match pg {
+            Some(g) => {
+                let got = eng.readback_f32(&g);
+                let dgrad = load_golden(&path, "dgrad.");
+                let (want, _) = &dgrad["phone"];
+                println!(
+                    "encp dgrad phone: cos={:.6}",
+                    rcwx_train::cosine_pub(&got, want)
+                );
+            }
+            None => println!("encp dgrad phone: MISSING"),
+        }
+    }
 
+    // x0 (encoder 入力) の勾配比較
+    {
+        let dgrad = load_golden(&path, "dgrad.");
+        let (want_x0g, _) = &dgrad["x0"];
+        // debug_stages 相当の xm を再構築して grad を見る代わりに、
+        // 本体の enc_p 内部 xm は直接取れないので phone 勾配で判定:
+        let _ = want_x0g;
+    }
     let got_m = eng.readback_f32(&m_t);
     let got_l = eng.readback_f32(&l_t);
     let (want_m, _) = &f.want_out["m_p"];

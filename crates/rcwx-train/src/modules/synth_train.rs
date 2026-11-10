@@ -26,6 +26,14 @@ pub struct SynthTrainCfg {
     pub gin_channels: u32,
     pub n_speakers: u32,
     pub sr: u32,
+    /// flow の coupling 数 (RVC v2: 4)
+    pub n_flows: u32,
+    /// flow WN の層数 (RVC: 3) と kernel (5)
+    pub flow_wn_layers: u32,
+    pub flow_kernel: u32,
+    /// enc_q WN の層数 (RVC: 16) と kernel (5)
+    pub encq_wn_layers: u32,
+    pub encq_kernel: u32,
 }
 
 impl SynthTrainCfg {
@@ -48,6 +56,11 @@ impl SynthTrainCfg {
             gin_channels: 256,
             n_speakers: 1,
             sr: 48000,
+            n_flows: 4,
+            flow_wn_layers: 3,
+            flow_kernel: 5,
+            encq_wn_layers: 16,
+            encq_kernel: 5,
         }
     }
 
@@ -76,34 +89,53 @@ impl SynthTrain {
         let mut store = ParamStore::new();
         let mut convs = HashMap::new();
         let mut vecs = HashMap::new();
-        let keys: Vec<&String> = w.keys().collect();
+        let keys: Vec<String> = w.keys().cloned().collect();
         for k in keys {
-            if k.ends_with(".weight_v") || k.ends_with(".weight_g") {
+            // WN 畳み込み: .weight_v を起点に登録 (plain .weight キーは存在しない)
+            if k.ends_with(".weight_v") {
+                let prefix = k.trim_end_matches(".weight_v").to_string();
+                if store
+                    .wns
+                    .iter()
+                    .any(|wn| store.entries[wn.v_idx].name == format!("{prefix}.weight_v"))
+                {
+                    continue;
+                }
+                let (v, vs) = &w[&k];
+                let g = w
+                    .get(&format!("{prefix}.weight_g"))
+                    .map(|(gv, _)| gv.as_slice())
+                    .unwrap_or(&[1.0]);
+                let idx = store.add_weight_norm(eng, &prefix, v, g, vs.clone());
+                convs.insert(prefix, ConvRef::Wn(idx));
                 continue;
             }
-            let (d, s) = &w[k];
+            if k.ends_with(".weight_g") {
+                continue;
+            }
+            let (d, s) = &w[&k];
             if k.ends_with(".weight") {
                 let prefix = k.trim_end_matches(".weight").to_string();
                 if s.len() <= 2 || k.contains("emb_rel") {
                     // Linear / embedding の重み (1 次元)
-                    vecs.insert(k.clone(), store.add(eng, k, d, s.clone()));
+                    vecs.insert(k.clone(), store.add(eng, &k, d, s.clone()));
                     continue;
                 }
                 if let Some((v, vs)) = w.get(&format!("{prefix}.weight_v")) {
                     let g = w
                         .get(&format!("{prefix}.weight_g"))
-                        .map(|(gv, _)| gv[0])
-                        .unwrap_or(1.0);
+                        .map(|(gv, _)| gv.as_slice())
+                        .unwrap_or(&[1.0]);
                     let idx = store.add_weight_norm(eng, &prefix, v, g, vs.clone());
                     convs.insert(prefix, ConvRef::Wn(idx));
                 } else {
-                    convs.insert(prefix, ConvRef::Plain(store.add(eng, k, d, s.clone())));
+                    convs.insert(prefix, ConvRef::Plain(store.add(eng, &k, d, s.clone())));
                 }
             } else if k.ends_with(".bias") {
-                vecs.insert(k.clone(), store.add(eng, k, d, s.clone()));
+                vecs.insert(k.clone(), store.add(eng, &k, d, s.clone()));
             } else {
                 // bare Parameter (LayerNorm gamma/beta 等)
-                vecs.insert(k.clone(), store.add(eng, k, d, s.clone()));
+                vecs.insert(k.clone(), store.add(eng, &k, d, s.clone()));
             }
         }
         Ok(Self {
@@ -152,11 +184,11 @@ pub fn enc_p(
     attn_bias: Var,
     batch: u32,
     t_len: u32,
-) -> (Var, Var) {
+) -> EncPOut {
     let h = cfg.hidden_channels;
     let bt = batch * t_len;
     // 埋め込みは [B, T, in] × W[in, h] → [B, T, h] (batch=B・m=T で shape 整合)
-    let x = {
+    let x_emb = {
         let w = a.vec("enc_p.emb_phone.weight");
         tape.mm(
             phone,
@@ -179,6 +211,7 @@ pub fn enc_p(
             1,
             t_len * h,
             1.0,
+            0,
         )
     };
     let xp = {
@@ -204,13 +237,15 @@ pub fn enc_p(
             1,
             t_len * h,
             1.0,
+            0,
         )
     };
-    let x = tape.add(x, xp, false);
-    let x = tape.pw(x, 7, (h as f32).sqrt());
-    let x = tape.lrelu(x, 0.1);
-    let mut x = tape.transpose_tc_ct(x, t_len, h);
-    x = tape.mul_frame_mask(x, mask, h, t_len);
+    let xsum = tape.add(x_emb, xp, false);
+    let xs = tape.pw(xsum, 7, (h as f32).sqrt());
+    let xa = tape.lrelu(xs, 0.1);
+    let xt_dbg = tape.transpose_tc_ct(xa, t_len, h);
+    let mut x = tape.mul_frame_mask(xt_dbg, mask, h, t_len);
+    let x0 = x;
     for i in 0..cfg.n_layers {
         let y = attention_layer(
             tape,
@@ -287,7 +322,28 @@ pub fn enc_p(
         batch,
         t_len,
     );
-    (m_p, logs_p)
+    EncPOut {
+        m_p,
+        logs_p,
+        x0,
+        xt: xt_dbg,
+        xs,
+        xsum,
+        x_emb,
+        xp,
+    }
+}
+
+/// enc_p の出力とデバッグ用中間変数。
+pub struct EncPOut {
+    pub m_p: Var,
+    pub logs_p: Var,
+    pub x0: Var,
+    pub xt: Var,
+    pub xs: Var,
+    pub xsum: Var,
+    pub x_emb: Var,
+    pub xp: Var,
 }
 
 /// PosteriorEncoder (enc_q)。戻り値 (z, m_q, logs_q)。
@@ -313,8 +369,8 @@ pub fn enc_q(
         "enc_q.enc",
         x,
         h,
-        5,
-        16,
+        cfg.encq_kernel,
+        cfg.encq_wn_layers,
         batch,
         t_len,
         Some(g),
@@ -370,7 +426,7 @@ pub fn flow_forward(
     let half = inter / 2;
     let h = cfg.hidden_channels;
     let mut x = z;
-    for i in 0..4u32 {
+    for i in 0..cfg.n_flows {
         let fp = format!("flow.flows.{}", i * 2);
         let x0 = tape.chslice(x, inter, 0, half, batch, t_len);
         let x1 = tape.chslice(x, inter, half, half, batch, t_len);
@@ -382,8 +438,8 @@ pub fn flow_forward(
             &format!("{fp}.enc"),
             hh,
             h,
-            5,
-            3,
+            cfg.flow_kernel,
+            cfg.flow_wn_layers,
             batch,
             t_len,
             Some(g),
@@ -443,13 +499,14 @@ pub fn decoder(
             0,
             0,
             1,
-            gin,
-            0,
-            gin,
-            cfg.upsample_initial_channel,
             1,
             0,
+            gin,
+            1,
+            1,
+            cfg.upsample_initial_channel,
             1.0,
+            1,
         );
         x = tape.add_bcast_t(x, gcond, cfg.upsample_initial_channel, t);
     }
@@ -469,7 +526,7 @@ pub fn decoder(
             let stride_f0: u32 = cfg.upsample_rates[(i + 1) as usize..].iter().product();
             let nk = 2 * stride_f0;
             let t_in = seg_t * upp;
-            let t_n = (t_in + 2 * (stride_f0 / 2)).saturating_sub(nk + 1) / stride_f0 + 1;
+            let t_n = (t_in + 2 * (stride_f0 / 2)).saturating_sub(nk) / stride_f0 + 1;
             let hw = a.w(&format!("dec.noise_convs.{i}"));
             let hb = a.bias(&format!("dec.noise_convs.{i}"));
             tape.conv1d(
@@ -516,7 +573,8 @@ pub fn decoder(
         c_in = c_cur;
         t = t_out;
     }
-    let x = tape.lrelu(x, 0.1);
+    // RVC の quirk: conv_post 直前の leaky_relu はデフォルト slope 0.01
+    let x = tape.lrelu(x, 0.01);
     let x = conv1d(tape, a, "dec.conv_post", x, 1, c_in, 7, 1, 1, 3, batch, t);
     tape.tanh(x)
 }
@@ -569,4 +627,135 @@ fn resblock1(
         x = tape.add(x, xt, false);
     }
     x
+}
+
+/// decoder の段階出力 (検証用)。decoder() と同一計算で中間 Var を返す。
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn decoder_stages(
+    tape: &mut Tape<'_>,
+    a: &Adopted,
+    cfg: &SynthTrainCfg,
+    z: Var,
+    har: Var,
+    g: Var,
+    batch: u32,
+    seg_t: u32,
+) -> Vec<(String, Var)> {
+    let inter = cfg.inter_channels;
+    let mut t = seg_t;
+    let mut x = conv1d(
+        tape,
+        a,
+        "dec.conv_pre",
+        z,
+        cfg.upsample_initial_channel,
+        inter,
+        7,
+        1,
+        1,
+        3,
+        batch,
+        t,
+    );
+    let mut out: Vec<(String, Var)> = vec![("d_pre".into(), x)];
+    {
+        let gin = tape.shape(a.w("dec.cond"))[1] as u32;
+        let gcond = tape.mm(
+            a.w("dec.cond"),
+            g,
+            a.bias("dec.cond"),
+            (batch * cfg.upsample_initial_channel) as usize,
+            cfg.upsample_initial_channel,
+            1,
+            gin,
+            batch,
+            gin,
+            1,
+            0,
+            0,
+            1,
+            1,
+            0,
+            gin,
+            1,
+            1,
+            cfg.upsample_initial_channel,
+            1.0,
+            1,
+        );
+        x = tape.add_bcast_t(x, gcond, cfg.upsample_initial_channel, t);
+    }
+    out.push(("d_cond".into(), x));
+    let n_up = cfg.upsample_rates.len() as u32;
+    let upp = cfg.upp();
+    let mut c_in = cfg.upsample_initial_channel;
+    for i in 0..n_up {
+        let u = cfg.upsample_rates[i as usize];
+        let k = cfg.upsample_kernel_sizes[i as usize];
+        let c_cur = cfg.upsample_initial_channel / (1 << (i + 1));
+        let t_out = (t - 1) * u + k - 2 * ((k - u) / 2);
+        x = tape.lrelu(x, 0.1);
+        let w = a.w(&format!("dec.ups.{i}"));
+        let b = a.bias(&format!("dec.ups.{i}"));
+        x = tape.conv_transpose1d(x, w, b, c_cur, c_in, k, u, 1, (k - u) / 2, batch, t, t_out);
+        out.push((format!("d_up{i}"), x));
+        let har_v = if i + 1 < n_up {
+            let stride_f0: u32 = cfg.upsample_rates[(i + 1) as usize..].iter().product();
+            let nk = 2 * stride_f0;
+            let t_in = seg_t * upp;
+            let t_n = (t_in + 2 * (stride_f0 / 2)).saturating_sub(nk) / stride_f0 + 1;
+            let hw = a.w(&format!("dec.noise_convs.{i}"));
+            let hb = a.bias(&format!("dec.noise_convs.{i}"));
+            tape.conv1d(
+                har,
+                hw,
+                hb,
+                c_cur,
+                1,
+                nk,
+                stride_f0,
+                1,
+                stride_f0 / 2,
+                batch,
+                t_in,
+                t_n,
+            )
+        } else {
+            let hw = a.w(&format!("dec.noise_convs.{i}"));
+            let hb = a.bias(&format!("dec.noise_convs.{i}"));
+            let t_in = seg_t * upp;
+            tape.conv1d(har, hw, hb, c_cur, 1, 1, 1, 1, 0, batch, t_in, t_in)
+        };
+        x = tape.add(x, har_v, false);
+        out.push((format!("d_noise{i}"), x));
+        let n_k = cfg.resblock_kernel_sizes.len() as u32;
+        let mut xs: Option<Var> = None;
+        for j in 0..n_k {
+            let rb = resblock1(
+                tape,
+                a,
+                &format!("dec.resblocks.{}", i * n_k + j),
+                x,
+                c_cur,
+                cfg.resblock_kernel_sizes[j as usize],
+                &cfg.resblock_dilation_sizes[j as usize],
+                batch,
+                t_out,
+            );
+            xs = Some(match xs {
+                Some(s) => tape.add(s, rb, false),
+                None => rb,
+            });
+        }
+        x = tape.pw(xs.expect("resblocks"), 7, 1.0 / n_k as f32);
+        out.push((format!("d_rb{i}"), x));
+        c_in = c_cur;
+        t = t_out;
+    }
+    // RVC の quirk: conv_post 直前の leaky_relu はデフォルト slope 0.01
+    let x = tape.lrelu(x, 0.01);
+    out.push(("d_lrelu_final".into(), x));
+    let x = conv1d(tape, a, "dec.conv_post", x, 1, c_in, 7, 1, 1, 3, batch, t);
+    out.push(("d_post".into(), tape.tanh(x)));
+    out
 }

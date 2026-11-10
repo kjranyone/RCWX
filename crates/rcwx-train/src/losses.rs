@@ -165,6 +165,7 @@ pub fn mel_l1_loss(tape: &mut Tape<'_>, y_mel: Var, y_hat_mel: Var, coef: f32) -
 }
 
 /// KL 損失: mean_masked((logs_p − logs_q − 0.5 + 0.5·d²·exp(−2·logs_p)))。
+/// mask は [b, t_len]、他は [b, inter, t_len]。
 #[allow(clippy::too_many_arguments)]
 pub fn kl_loss(
     tape: &mut Tape<'_>,
@@ -174,6 +175,8 @@ pub fn kl_loss(
     logs_p: Var,
     mask: Var,
     len: u32,
+    t_len: u32,
+    inter: u32,
     n_mask: f32,
 ) -> Var {
     let zp_t = tape.var_tensor(z_p);
@@ -184,7 +187,7 @@ pub fn kl_loss(
     let elems = tape.alloc_pub(len as usize);
     {
         let mut words = [0u32; 32];
-        words[0] = len;
+        words[0..4].copy_from_slice(&[len, t_len, inter, 0]);
         tape.dispatch_pub(
             "t_kl_elem",
             &[&zp_t, &lq_t, &mp_t, &lp_t, &m_t, &elems],
@@ -227,7 +230,7 @@ pub fn kl_loss(
                 return;
             };
             let zp_t = ctx.node_tensor(zp_id);
-            let lq_t = ctx.node_tensor(lq_id);
+            let _lq_t = ctx.node_tensor(lq_id);
             let mp_t = ctx.node_tensor(mp_id);
             let lp_t = ctx.node_tensor(lp_id);
             let m_t = ctx.node_tensor(mk_id);
@@ -236,7 +239,7 @@ pub fn kl_loss(
             let dlp = ctx.alloc(len as usize);
             let dlq = ctx.alloc(len as usize);
             let mut words = [0u32; 32];
-            words[0..3].copy_from_slice(&[len, (1.0f32 / n_mask).to_bits(), 0]);
+            words[0..4].copy_from_slice(&[len, (1.0f32 / n_mask).to_bits(), t_len, inter]);
             ctx.dispatch(
                 "t_kl_bwd_a",
                 &[&zp_t, &mp_t, &lp_t, &m_t, &dy, &dz, &dm, &dlp],

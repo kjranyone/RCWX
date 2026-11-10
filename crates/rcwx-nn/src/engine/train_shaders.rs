@@ -147,20 +147,64 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 "#
 });
 
-/// LayerNorm backward (stride 対応)。B1=x, B2=dy, B3=gamma, B4=dx, B5=xhat。
-/// x/dx/xhat は (in_row, in_k) ストライド、dy は [rows, cols] 連続。
-/// dx = rstd * (g·dy - mean(g·dy) - xhat · mean(g·dy·xhat))
+/// LayerNorm forward (学習用・バッチ対応)。x [B, C, T] のチャネル軸 LN。
+/// B1=x, B2=gamma, B3=beta, B4=out。行 = (b, t): base = b·bs + t、要素 k: k·in_k。
+pub static T_LAYERNORM: LazyLock<String> = LazyLock::new(|| {
+    theader(4)
+        + r#"
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rows_per_b = P.p0.x; let cols = P.p0.y; let in_k = P.p0.z; let eps = f32_of(P.p0.w);
+  let batch = P.p1.x; let bs = P.p1.y;
+  let r = wid.x;
+  if (r >= batch * rows_per_b) { return; }
+  let base = (r / rows_per_b) * bs + (r % rows_per_b);
+  var acc = 0.0;
+  var i = lid.x;
+  while (i < cols) { acc = acc + B1[base + i * in_k]; i = i + 64u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s: u32 = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let mean = red[0] / f32(cols);
+  workgroupBarrier();
+  var acc2 = 0.0;
+  i = lid.x;
+  while (i < cols) { let d = B1[base + i * in_k] - mean; acc2 = acc2 + d * d; i = i + 64u; }
+  red[lid.x] = acc2; workgroupBarrier();
+  s = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let inv = inverseSqrt(red[0] / f32(cols) + eps);
+  i = lid.x;
+  while (i < cols) {
+    B4[base + i * in_k] = (B1[base + i * in_k] - mean) * inv * B2[i] + B3[i];
+    i = i + 64u;
+  }
+}
+"#
+});
+
+/// LayerNorm backward (学習用・バッチ対応)。
+/// B1=x, B2=dy, B3=gamma, B4=dx, B5=xhat (x/dy は [B,C,T]、dy も同配置)。
 pub static T_LAYERNORM_BWD: LazyLock<String> = LazyLock::new(|| {
     theader(5)
         + r#"
 var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let rows = P.p0.x; let cols = P.p0.y; let eps = f32_of(P.p0.z);
-  let in_row = P.p0.w; let in_k = P.p1.x;
+  let rows_per_b = P.p0.x; let cols = P.p0.y; let in_k = P.p0.z; let eps = f32_of(P.p0.w);
+  let batch = P.p1.x; let bs = P.p1.y;
   let r = wid.x;
-  if (r >= rows) { return; }
-  let base = r * in_row;
+  if (r >= batch * rows_per_b) { return; }
+  let base = (r / rows_per_b) * bs + (r % rows_per_b);
   var acc = 0.0;
   var i = lid.x;
   while (i < cols) { acc = acc + B1[base + i * in_k]; i = i + 64u; }
@@ -191,7 +235,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   var a2 = 0.0;
   i = lid.x;
   while (i < cols) {
-    let gdy = B3[i] * B2[r * cols + i];
+    let gdy = B3[i] * B2[base + i * in_k];
     a1 = a1 + gdy;
     a2 = a2 + gdy * B5[base + i * in_k];
     i = i + 64u;
@@ -216,31 +260,32 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
   workgroupBarrier();
   i = lid.x;
   while (i < cols) {
-    B4[base + i * in_k] = rstd * (B3[i] * B2[r * cols + i] - m1 - B5[base + i * in_k] * m2);
+    B4[base + i * in_k] = rstd * (B3[i] * B2[base + i * in_k] - m1 - B5[base + i * in_k] * m2);
     i = i + 64u;
   }
 }
 "#
 });
 
-/// LayerNorm パラメータ勾配 (stride 対応)。B1=xhat (in_row/in_k), B2=dy(連続),
-/// B3=dgamma, B4=dbeta。dgamma[j] = Σ_r dy[r,j]·xhat[r,j]。
+/// LayerNorm パラメータ勾配 (学習用・バッチ対応)。
+/// B1=xhat, B2=dy ([B,C,T] 同配置), B3=dgamma, B4=dbeta。
 pub static T_LN_PARAM_GRAD: LazyLock<String> = LazyLock::new(|| {
     theader(4)
         + r#"
 var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-  let cols = P.p0.x; let rows = P.p0.y;
-  let in_row = P.p0.z; let in_k = P.p0.w;
+  let cols = P.p0.x; let rows_per_b = P.p0.y; let in_k = P.p0.z;
+  let batch = P.p0.w; let bs = P.p1.x;
   let j = wid.x;
   if (j >= cols) { return; }
   var a1 = 0.0;
   var a2 = 0.0;
   var r = lid.x;
-  while (r < rows) {
-    let dy = B2[r * cols + j];
-    a1 = a1 + dy * B1[r * in_row + j * in_k];
+  while (r < batch * rows_per_b) {
+    let base = (r / rows_per_b) * bs + (r % rows_per_b);
+    let dy = B2[base + j * in_k];
+    a1 = a1 + dy * B1[base + j * in_k];
     a2 = a2 + dy;
     r = r + 64u;
   }
@@ -273,7 +318,9 @@ var<workgroup> red: array<f32, 64>;
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
   let axis = P.p0.x; let rows = P.p0.y; let cols = P.p0.z;
-  let j = wid.x;
+  // 列 index はワークグループ線形。dispatch の 65535 超分割 (512
+  // workgroup 毎の y 折り返し) に対応するため wid.y·512 を加える。
+  let j = wid.x + wid.y * 512u;
   if (axis == 0u) {
     if (j >= cols) { return; }
     var a = 0.0;
@@ -433,6 +480,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let batch = P.p0.x; let c_in = P.p0.y; let k_dim = P.p0.z; let dil = P.p0.w;
   let stride = P.p1.x; let pad_l = P.p1.y; let in_len = P.p1.z; let out_len = P.p1.w;
   let x_base = P.p2.x;
+  // 入力側バッチストライド (要素数)。grouped conv は col をグループ単位
+  // (c_in = cin_g) で組むため、入力 x のバッチ幅 (in_c·in_len) とは一致しない。
+  let b_stride = P.p2.y;
   let gi = flat(gid);
   let per_b = c_in * k_dim * out_len;
   if (gi >= batch * per_b) { return; }
@@ -442,7 +492,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = ck / k_dim;
   let j = ck % k_dim;
   let pos = i32(t * stride) - i32(pad_l) + i32(j * dil);
-  let v = select(0.0, B1[x_base + b * (c_in * in_len) + c * in_len + u32(pos)],
+  let v = select(0.0, B1[x_base + b * b_stride + c * in_len + u32(pos)],
                  pos >= 0 && pos < i32(in_len));
   B2[gi] = v;
 }
@@ -720,7 +770,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 });
 
 /// 窓掛け (k-major): col [b, n_fft, n_frames] × win [n_fft]。
-/// B3[i] = B1[i] · B2[i / n_frames]。
+/// B3[i] = B1[i] · B2[(i / n_frames) % n_fft] — win はバッチで共有のため
+/// mod n_fft が必須 (B>1 でバッファ末尾を読み越えて 0 掛けになるバグの修正)。
 pub static T_MUL_WINDOW: LazyLock<String> = LazyLock::new(|| {
     theader(3)
         + r#"
@@ -729,7 +780,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let total = P.p0.x; let n_fft = P.p0.y; let n_frames = P.p0.z;
   let i = flat(gid);
   if (i >= total) { return; }
-  B3[i] = B1[i] * B2[i / n_frames];
+  B3[i] = B1[i] * B2[(i / n_frames) % n_fft];
 }
 "#
 });
@@ -793,35 +844,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 });
 
 /// KL 要素値: B6 = (logs_p − logs_q − 0.5 + 0.5·(z_p−m_p)²·exp(−2·logs_p))·mask。
-/// B1=z_p B2=logs_q B3=m_p B4=logs_p B5=mask B6=out。
+/// B1=z_p B2=logs_q B3=m_p B4=logs_p B5=mask [b, t] B6=out [b, c, t]。
+/// mask は [b, t_len] なので i ([b, c, t] フラット) から b/t を復元して引く。
 pub static T_KL_ELEM: LazyLock<String> = LazyLock::new(|| {
     theader(6)
         + r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let len = P.p0.x;
+  let len = P.p0.x; let t_len = P.p0.y; let chs = P.p0.z;
   let i = flat(gid);
   if (i >= len) { return; }
+  let t = i % t_len;
+  let b = i / (chs * t_len);
   let d = B1[i] - B3[i];
   let v = B4[i] - B2[i] - 0.5 + 0.5 * d * d * exp(-2.0 * B4[i]);
-  B6[i] = v * B5[i];
+  B6[i] = v * B5[b * t_len + t];
 }
 "#
 });
 
 /// KL 逆伝達 A: dz / dm / dlogs_p。scale = dy[0] / Σmask (1/Σmask は uniform)。
-/// B1=z_p B2=m_p B3=logs_p B4=mask B5=dy[1] B6=dz B7=dm B8=dlogs_p
+/// B1=z_p B2=m_p B3=logs_p B4=mask [b,t] B5=dy[1] B6=dz B7=dm B8=dlogs_p
 pub static T_KL_BWD_A: LazyLock<String> = LazyLock::new(|| {
     theader(8)
         + r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let len = P.p0.x; let inv_m = f32_of(P.p0.y);
+  let len = P.p0.x; let inv_m = f32_of(P.p0.y); let t_len = P.p0.z; let chs = P.p0.w;
   let i = flat(gid);
   if (i >= len) { return; }
+  let t = i % t_len;
+  let b = i / (chs * t_len);
   let d = B1[i] - B2[i];
   let e = exp(-2.0 * B3[i]);
-  let sm = B5[0] * inv_m * B4[i];
+  let sm = B5[0] * inv_m * B4[b * t_len + t];
   B6[i] = sm * d * e;
   B7[i] = -sm * d * e;
   B8[i] = sm * (1.0 - d * d * e);
@@ -829,16 +885,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#
 });
 
-/// KL 逆伝達 B: dlogs_q = −dy[0]/Σmask·mask。B1=mask B2=dy[1] B3=dlogs_q
+/// KL 逆伝達 B: dlogs_q = −dy[0]/Σmask·mask。B1=mask [b,t] B2=dy[1] B3=dlogs_q [b,c,t]
 pub static T_KL_BWD_B: LazyLock<String> = LazyLock::new(|| {
     theader(3)
         + r#"
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let len = P.p0.x; let inv_m = f32_of(P.p0.y);
+  let len = P.p0.x; let inv_m = f32_of(P.p0.y); let t_len = P.p0.z; let chs = P.p0.w;
   let i = flat(gid);
   if (i >= len) { return; }
-  B3[i] = -B2[0] * inv_m * B1[i];
+  let t = i % t_len;
+  let b = i / (chs * t_len);
+  B3[i] = -B2[0] * inv_m * B1[b * t_len + t];
 }
 "#
 });
@@ -925,7 +983,7 @@ pub static T_IM2COL2D: LazyLock<String> = LazyLock::new(|| {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let batch = P.p0.x; let cin = P.p0.y; let h = P.p0.z; let w = P.p0.w;
   let kh = P.p1.x; let kw = P.p1.y; let sh = P.p1.z; let sw = P.p1.w;
-  let pad = P.p2.x; let oh = P.p2.y; let ow = P.p2.z;
+  let pad_y = P.p2.x; let oh = P.p2.y; let ow = P.p2.z; let pad_x = P.p2.w;
   let gi = flat(gid);
   let per_b = cin * kh * kw * oh * ow;
   if (gi >= batch * per_b) { return; }
@@ -938,8 +996,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let rem = ck % (kh * kw);
   let j = rem / kw;
   let i = rem % kw;
-  let sy = i32(oh2 * sh) - i32(pad) + i32(j);
-  let sx = i32(ow2 * sw) - i32(pad) + i32(i);
+  let sy = i32(oh2 * sh) - i32(pad_y) + i32(j);
+  let sx = i32(ow2 * sw) - i32(pad_x) + i32(i);
   let v = select(
     0.0,
     B1[b * (cin * h * w) + c * (h * w) + u32(sy) * w + u32(sx)],
@@ -959,7 +1017,8 @@ pub static T_COL2IM2D: LazyLock<String> = LazyLock::new(|| {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let batch = P.p0.x; let cin = P.p0.y; let h = P.p0.z; let w = P.p0.w;
   let kh = P.p1.x; let kw = P.p1.y; let sh = P.p1.z; let sw = P.p1.w;
-  let pad = P.p2.x; let oh = P.p2.y; let ow = P.p2.z; let out_base = P.p2.w;
+  let pad_y = P.p2.x; let oh = P.p2.y; let ow = P.p2.z; let out_base = P.p2.w;
+  let pad_x = P.p3.x;
   let gi = flat(gid);
   if (gi >= batch * cin * h * w) { return; }
   let x = gi % w;
@@ -970,8 +1029,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   var acc = 0.0;
   for (var j: u32 = 0u; j < kh; j = j + 1u) {
     for (var i: u32 = 0u; i < kw; i = i + 1u) {
-      let sy = i32(y) + i32(pad) - i32(j);
-      let sx = i32(x) + i32(pad) - i32(i);
+      let sy = i32(y) + i32(pad_y) - i32(j);
+      let sx = i32(x) + i32(pad_x) - i32(i);
       if (sy >= 0 && sy % i32(sh) == 0 && sx >= 0 && sx % i32(sw) == 0) {
         let oy = u32(sy) / sh;
         let ox = u32(sx) / sw;
@@ -1081,6 +1140,92 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = i % c2;
   let r = (i / c2) % r2;
   B3[i] = B1[i] * B2[r * c2 + c];
+}
+"#
+});
+
+/// weight_norm fold (行単位)。weight [rows, row_len]、norm は行ごと。
+/// B1=v, B2=g[1], B3=norms[rows] (作業), B4=w。w[r,j] = v[r,j]·g/||v_r||。
+pub static T_WN_FOLD_ROWS: LazyLock<String> = LazyLock::new(|| {
+    theader(4)
+        + r#"
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rows = P.p0.x; let row_len = P.p0.y;
+  let r = wid.x;
+  if (r >= rows) { return; }
+  let base = r * row_len;
+  var acc = 0.0;
+  var j = lid.x;
+  while (j < row_len) { acc = acc + B1[base + j] * B1[base + j]; j = j + 64u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s: u32 = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let n = sqrt(red[0]);
+  if (lid.x == 0u) { B3[r] = n; }
+  workgroupBarrier();
+  let coef = B2[r] / n;
+  j = lid.x;
+  while (j < row_len) { B4[base + j] = B1[base + j] * coef; j = j + 64u; }
+}
+"#
+});
+
+/// weight_norm backward (行単位)。
+/// B1=v, B2=dw, B3=norms[rows], B4=g[1], B5=dv, B6=dg[rows]
+/// dot_r = Σ_j v·dw。dv[r,j] = (g/n_r)·(dw − v·dot/n_r²)、dg[r] = dot/n_r。
+pub static T_WN_BWD_ROWS: LazyLock<String> = LazyLock::new(|| {
+    theader(6)
+        + r#"
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rows = P.p0.x; let row_len = P.p0.y;
+  let r = wid.x;
+  if (r >= rows) { return; }
+  let base = r * row_len;
+  var acc = 0.0;
+  var j = lid.x;
+  while (j < row_len) { acc = acc + B1[base + j] * B2[base + j]; j = j + 64u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s: u32 = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let dot = red[0];
+  let n = B3[r];
+  if (lid.x == 0u) { B6[r] = dot / n; }
+  let coef = B4[r] / n;
+  let nsq = n * n;
+  j = lid.x;
+  while (j < row_len) {
+    B5[base + j] = coef * (B2[base + j] - B1[base + j] * (dot / nsq));
+    j = j + 64u;
+  }
+}
+"#
+});
+
+/// チャネル反転 (バッチ対応): out[(b·ch+c)·t+t'] = in[(b·ch+(ch-1-c))·t+t']。自己逆。
+pub static T_FLIP_CH: LazyLock<String> = LazyLock::new(|| {
+    theader(2)
+        + r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let batch = P.p0.x; let ch = P.p0.y; let t_len = P.p0.z;
+  let gi = flat(gid);
+  if (gi >= batch * ch * t_len) { return; }
+  let t = gi % t_len;
+  let c = (gi / t_len) % ch;
+  let b = gi / (ch * t_len);
+  B2[gi] = B1[(b * ch + (ch - 1u - c)) * t_len + t];
 }
 "#
 });

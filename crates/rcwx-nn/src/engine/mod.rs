@@ -979,6 +979,7 @@ impl Engine {
             try_compile(self, "flash_attn", &shaders::flash_attn_src(), 2)?;
         }
         try_compile(self, "matmul_tiled", &shaders::matmul_tiled_src(), 4)?;
+        try_compile(self, "matmul_tiled_kahan", &shaders::matmul_tiled_kahan_src(), 4)?;
         try_compile(self, "conv1d", &shaders::CONV1D, 4)?;
         try_compile(self, "groupnorm", &shaders::groupnorm_src(), 4)?;
         try_compile(self, "layernorm", &shaders::layernorm_src(), 4)?;
@@ -992,6 +993,7 @@ impl Engine {
             "conv_transpose1d",
             &shaders::conv_transpose1d_src(),
             4,
+        )?;
         )?;
         try_compile(self, "rel_attn", &shaders::rel_attn_src(), 3)?;
         try_compile(self, "flip_ch", &shaders::flip_ch_src(), 2)?;
@@ -1031,6 +1033,7 @@ impl Engine {
             try_compile(self, "t_pw_fwd", &train_shaders::T_PW_FWD, 2)?;
             try_compile(self, "t_pw_bwd", &train_shaders::T_PW_BWD, 4)?;
             try_compile(self, "t_softmax_bwd", &train_shaders::T_SOFTMAX_BWD, 3)?;
+            try_compile(self, "t_layernorm", &train_shaders::T_LAYERNORM, 4)?;
             try_compile(self, "t_layernorm_bwd", &train_shaders::T_LAYERNORM_BWD, 5)?;
             try_compile(self, "t_ln_param_grad", &train_shaders::T_LN_PARAM_GRAD, 4)?;
             try_compile(self, "t_colsum", &train_shaders::T_COLSUM, 2)?;
@@ -1043,6 +1046,9 @@ impl Engine {
             try_compile(self, "t_reduce_final", &train_shaders::T_REDUCE_FINAL, 2)?;
             try_compile(self, "t_adamw", &train_shaders::T_ADAMW, 4)?;
             try_compile(self, "t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
+            try_compile(self, "t_wn_fold_rows", &train_shaders::T_WN_FOLD_ROWS, 4)?;
+            try_compile(self, "t_wn_bwd_rows", &train_shaders::T_WN_BWD_ROWS, 6)?;
+            try_compile(self, "t_flip_ch", &train_shaders::T_FLIP_CH, 2)?;
             try_compile(self, "t_wn_bwd", &train_shaders::T_WN_BWD, 7)?;
             try_compile(self, "t_im2col", &train_shaders::T_IM2COL, 2)?;
             try_compile(self, "t_col2im", &train_shaders::T_COL2IM, 2)?;
@@ -1256,8 +1262,14 @@ impl Engine {
                     Ok(status) if status.wait_finished() => return,
                     Ok(_) => {}
                     Err(wgpu::PollError::Timeout) => {
-                        if started.elapsed() > std::time::Duration::from_secs(15) {
-                            panic!("GPU readback exceeded 15s");
+                        let limit = std::time::Duration::from_secs(
+                            std::env::var("RCWX_READBACK_TIMEOUT_SECS")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .unwrap_or(15),
+                        );
+                        if started.elapsed() > limit {
+                            panic!("GPU readback exceeded {:?}", limit);
                         }
                     }
                     Err(err) => panic!("GPU readback poll: {err}"),
@@ -1611,6 +1623,7 @@ impl Engine {
             ),
             uniform_writes: Vec::new(),
             cmds: Vec::new(),
+            kahan: false,
         }
     }
 }
@@ -1640,6 +1653,9 @@ pub struct Graph<'a> {
     encoder: Option<wgpu::CommandEncoder>,
     uniform_writes: Vec<(u32, [u32; 32])>, // (slot, words)
     cmds: Vec<Cmd>,
+    /// 学習経路 (Tape) で有効化: tiled matmul を Kahan 補償付きに切替
+    /// (f32 累積誤差 ~1e-3 相対を抑え golden パリティ 1e-3 を通す)。
+    pub kahan: bool,
 }
 
 #[derive(Clone)]
@@ -1830,7 +1846,15 @@ impl<'a> Graph<'a> {
         // K が短いデコーダ最終段 (例: 32ch×k3 → K=96) も SLM タイルで重みを再利用する。
         let use_tiled = k >= 32;
         let (kernel, wx, wy) = if use_tiled {
-            ("matmul_tiled", n.div_ceil(32), m.div_ceil(32))
+            (
+                if self.kahan {
+                    "matmul_tiled_kahan"
+                } else {
+                    "matmul_tiled"
+                },
+                n.div_ceil(32),
+                m.div_ceil(32),
+            )
         } else {
             ("matmul", n.div_ceil(8), m.div_ceil(8))
         };
@@ -2484,6 +2508,16 @@ impl<'a> Graph<'a> {
     /// uniform を一括書き込みし、**単一の compute pass** に全 dispatch を記録して submit。
     /// (Graph は Drop で uniform slot を回収するため、encoder は mem::take で取り出す)
     pub fn submit(mut self) -> Result<()> {
+        self.submit_ref()?;
+        Ok(())
+    }
+
+    /// submit を消費せず実行し、cmds/uniform をクリアして再利用可能にする
+    /// (学習ステップ分割用 — Tape::flush が呼ぶ)。
+    pub fn submit_ref(&mut self) -> Result<()> {
+        if self.cmds.is_empty() {
+            return Ok(());
+        }
         let eng = self.engine;
         eng.write_uniforms(&self.uniform_writes);
         let mut encoder = self.encoder.take().expect("graph already submitted");
@@ -2501,6 +2535,22 @@ impl<'a> Graph<'a> {
             }
         }
         eng.submit_flushed(encoder.finish());
+        // 使用済みスロットを回収してからクリア (分割 submit で消費を抑える)
+        let slots: Vec<u32> = self.uniform_writes.iter().map(|(s, _)| *s).collect();
+        self.engine.recycle_uniform_slots(slots.into_iter());
+        self.cmds.clear();
+        self.uniform_writes.clear();
+        // 後続 dispatch 用に encoder を作り直す
+        self.encoder = Some(
+            self.engine
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+        );
         Ok(())
+    }
+
+    /// 記録済み dispatch 数 (分割判断用)。
+    pub fn pending(&self) -> usize {
+        self.cmds.len()
     }
 }

@@ -179,13 +179,16 @@ fn gradcheck_weight_norm() {
         let w = tape.adopt_wn(store, 0, v, g);
         let h = tape.linear(x, w, Some(b), m, k, n);
         let out = tape.gelu(h);
-        (out, vec![(x, x_d), (v, v_d), (g, vec![1.7f32]), (b, b_d)])
+        (
+            out,
+            vec![(x, x_d), (v, v_d), (g, vec![1.7f32; 4]), (b, b_d)],
+        )
     };
     run_fd(&eng, "weight_norm", build, |s| {
         let mut st = 99u64;
         let _ = rand_vec(30, &mut st); // x
         let v = rand_vec(24, &mut st);
-        s.add_weight_norm(&eng, "lin", &v, 1.7, vec![4, 6]);
+        s.add_weight_norm(&eng, "lin", &v, &[1.7f32; 4], vec![4, 6]);
         s.add(&eng, "b", &rand_vec(4, &mut st), vec![4]);
     });
 }

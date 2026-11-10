@@ -51,6 +51,7 @@ def build() -> torch.nn.Module:
                 commons.sequence_mask(lengths, x.size(2)), 1
             ).to(x.dtype)
             x = x * x_mask
+            x.retain_grad()
             self.dbg["x0"] = x
             attn0 = self.encoder.attn_layers[0]
             attn_mask = x_mask.unsqueeze(2) * x_mask.unsqueeze(-1)
@@ -104,7 +105,7 @@ def main() -> None:
 
     model = build()
     g = torch.Generator().manual_seed(SEED + 1)
-    phone = (torch.randn(B, T, IN, generator=g) * 0.5).float()
+    phone = (torch.randn(B, T, IN, generator=g) * 0.5).float().requires_grad_(True)
     pitch = torch.randint(1, 255, (B, T), generator=g)
     lengths = torch.tensor([LENGTH, LENGTH])
 
@@ -124,6 +125,8 @@ def main() -> None:
     out["out.loss"] = torch.tensor([loss.item()])
     for k, v in model.dbg.items():
         out[f"dbg.{k}"] = c(v)
+        out[f"dgrad.{k}"] = c(v.grad if v.grad is not None else torch.zeros_like(v))
+    out["dgrad.phone"] = c(phone.grad if phone.grad is not None else torch.zeros_like(phone))
     for name, p in model.named_parameters():
         out[f"w.enc_p.{name}"] = c(p)
         out[f"g.enc_p.{name}"] = c(p.grad if p.grad is not None else torch.zeros_like(p))

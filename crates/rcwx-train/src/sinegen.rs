@@ -64,7 +64,7 @@ pub fn sinegen_train(
     let n_out = t_frames * upp;
     let mut out = vec![0.0f32; batch * n_out];
     // Box-Muller (一様 2 個 → 正規 1 個)
-    let mut normal = |rng: &mut dyn SineRng| -> f32 {
+    let normal = |rng: &mut dyn SineRng| -> f32 {
         let u1 = rng.next_f32().max(1e-7);
         let u2 = rng.next_f32();
         (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()

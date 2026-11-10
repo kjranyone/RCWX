@@ -55,7 +55,7 @@ impl StftMel {
     /// torch.stft(center=False) + 両側 reflect pad (n_fft−hop)/2 相当。
     pub fn logmel(&self, tape: &mut Tape<'_>, y: Var, batch: u32, samples: u32) -> Var {
         let pad = (self.n_fft - self.hop) / 2;
-        let y = tape.reflect_pad(y, pad);
+        let y = tape.reflect_pad_dims(y, batch, 1, samples, pad);
         let padded = samples + 2 * pad;
         let n_frames = (padded.saturating_sub(self.n_fft)) / self.hop + 1;
         let frames = tape.im2col_frames(y, self.n_fft, self.hop, batch, padded, n_frames);
@@ -86,6 +86,7 @@ impl StftMel {
                 1,
                 bins as u32 * n_frames,
                 1.0,
+                0,
             )
         };
         let im = {
@@ -112,6 +113,7 @@ impl StftMel {
                 1,
                 bins as u32 * n_frames,
                 1.0,
+                0,
             )
         };
         let len = (batch * bins as u32 * n_frames) as u32;
@@ -141,9 +143,56 @@ impl StftMel {
                 1,
                 self.n_mels * n_frames,
                 1.0,
+                0,
             )
         };
         tape.log_clamp(mel, 2e-6)
+    }
+}
+
+/// 複数解像度 mel L1 損失 (--mel-loss multi・Applio MultiScaleMel 相当)。
+/// 7 スケール (win 2048..32, hop=win/4, n_mels 320·win/2048)。各スケールの
+/// log-mel L1 を係数/n_scales で平均。log は mono と同じ ln (log_clamp) を
+/// 使用 — Applio の log10 からは定数倍のみ異なる。
+pub struct MultiScaleMel {
+    pub scales: Vec<StftMel>,
+}
+
+impl MultiScaleMel {
+    pub fn new_rust(eng: &rcwx_nn::engine::Engine, sr: u32) -> Self {
+        const WINS: [u32; 7] = [2048, 1024, 512, 256, 128, 64, 32];
+        let scales = WINS
+            .iter()
+            .map(|&w| {
+                let n_mels = (320u32 * w / 2048).max(5);
+                StftMel::new_rust(eng, w, w / 4, n_mels, sr)
+            })
+            .collect();
+        Self { scales }
+    }
+
+    /// y/y_hat [B·samples] → Σ_scales L1(logmel(y), logmel(y_hat)) · coef/n。
+    pub fn l1_loss(
+        &self,
+        tape: &mut Tape<'_>,
+        y: Var,
+        y_hat: Var,
+        batch: u32,
+        samples: u32,
+        coef: f32,
+    ) -> Var {
+        let per = coef / self.scales.len() as f32;
+        let mut acc: Option<Var> = None;
+        for s in &self.scales {
+            let ym = s.logmel(tape, y, batch, samples);
+            let hm = s.logmel(tape, y_hat, batch, samples);
+            let l = crate::losses::mel_l1_loss(tape, ym, hm, per);
+            acc = Some(match acc {
+                None => l,
+                Some(a) => tape.add(a, l, false),
+            });
+        }
+        acc.expect("scales nonempty")
     }
 }
 

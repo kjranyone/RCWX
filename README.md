@@ -58,7 +58,12 @@ RVC モデル (`.pth`) はフォルダに置いて GUI のドロップダウン�
   統計表示 / WAV 変換テスト
 - **CLI** — `run` (オフライン変換) / `rt` (リアルタイム、`--virtual` は
   デバイスなし検証モード) / `info` (自前 .pth リーダ) / `devices` /
-  `download` / `logs`
+  `download` / `logs` / `train-preprocess`・`train`・`train-export`・
+  `train-index` (学習パイプライン)
+- **学習も pure Rust** — wgpu エンジン上の autograd tape で fine-tuning から
+  エクスポート (推論形式 + RVC 互換 .pth)・IVF index 構築まで Python なしで完結。
+  PyTorch golden との fwd+bwd パリティ cos=1.0 (enc_p / enc_q / flow / decoder)。
+  GUI の学習タブからも実行可能
 - **RVC v1/v2 両対応** — 256/768 次元特徴量、F0 あり/なしモデル
 - **設定互換** — `~/.config/rcwx/config.json` を旧 Python 実装と共有
 

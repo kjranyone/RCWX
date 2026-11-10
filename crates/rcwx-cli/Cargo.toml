@@ -15,6 +15,7 @@ ureq = "3.5.1"
 serde_json = "1"
 zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
 rcwx-rt = { version = "0.1.0", path = "../rcwx-rt" }
+rcwx-train = { version = "0.1.0", path = "../rcwx-train" }
 
 [[bin]]
 name = "rcwx-cli"

@@ -46,15 +46,17 @@ pub struct ParamEntry {
 }
 
 /// weight_norm パラメータ群 (v・g は `ParamEntry`、w は fold 結果)。
+/// norm は行単位 (PyTorch weight_norm dim=0 と同一)。
 pub struct WnEntry {
     pub v_idx: usize,
     pub g_idx: usize,
     /// fold 済み実効重み (forward はこれを使う)
     pub w: GpuTensor,
-    normsq: GpuTensor,
-    partials: GpuTensor,
+    norms: GpuTensor,
     shape: Vec<usize>,
-    len: u32,
+    /// weight [rows, row_len] の行分割 (1 次元重みは rows=1)
+    pub rows: u32,
+    pub row_len: u32,
 }
 
 /// 学習パラメータストア (net_g / net_d に 1 個ずつ)。
@@ -87,30 +89,45 @@ impl ParamStore {
         self.entries.len() - 1
     }
 
-    /// weight_norm パラメータ追加。forward には戻り値 (wn index) を
-    /// `Tape::adopt_wn` に渡して得られる Var を使う。
+    /// weight_norm パラメータ追加。`g` は行単位 weight_g (PyTorch dim=0 の
+    /// [out,1,1] 相当。長さ 1 ならスカラー broadcast)。
+    /// forward には戻り値 (wn index) を `Tape::adopt_wn` に渡して得られる Var を使う。
     pub fn add_weight_norm(
         &mut self,
         eng: &Engine,
         name: &str,
         v_data: &[f32],
-        g: f32,
+        g: &[f32],
         shape: Vec<usize>,
     ) -> usize {
+        let rows: usize = if shape.len() >= 2 { shape[0] } else { 1 };
+        let g_data: Vec<f32> = if g.len() == rows {
+            g.to_vec()
+        } else {
+            vec![g.first().copied().unwrap_or(1.0); rows]
+        };
         let v_idx = self.add(eng, &format!("{name}.weight_v"), v_data, shape.clone());
-        let g_idx = self.add(eng, &format!("{name}.weight_g"), &[g], vec![1]);
+        let g_idx = self.add(eng, &format!("{name}.weight_g"), &g_data, vec![rows]);
         let n: u32 = shape.iter().map(|&v| v as u32).product();
-        let w = eng.tensor_uninit(n as usize);
-        let normsq = eng.tensor_zeros(1, vec![1]);
-        let partials = eng.tensor_uninit(n.div_ceil(256) as usize);
+        let _ = n;
+        let w = eng.tensor_uninit(shape.iter().product::<usize>());
+        let (rows, row_len) = if shape.len() >= 2 {
+            (
+                shape[0] as u32,
+                shape[1..].iter().map(|&v| v as u32).product::<u32>(),
+            )
+        } else {
+            (1, n)
+        };
+        let norms = eng.tensor_zeros(rows as usize, vec![rows as usize]);
         self.wns.push(WnEntry {
             v_idx,
             g_idx,
             w,
-            normsq,
-            partials,
+            norms,
             shape,
-            len: n,
+            rows,
+            row_len,
         });
         self.wns.len() - 1
     }
@@ -160,6 +177,9 @@ impl BwdCtx<'_, '_> {
     pub fn node_tensor(&self, id: VarId) -> GpuTensor {
         self.nodes[&id].t.clone_handle()
     }
+    pub fn shape_of(&self, id: VarId) -> Vec<usize> {
+        self.nodes[&id].shape.clone()
+    }
     fn len_of(&self, id: VarId) -> u32 {
         self.nodes[&id].t.len as u32
     }
@@ -170,6 +190,7 @@ impl BwdCtx<'_, '_> {
         self.g.engine_tensor_uninit(len)
     }
     /// 逆伝達カーネルの直接 dispatch (losses.rs 用)。
+    /// 記録が閾値を超えたら途中 submit して分割 (device loss 対策)。
     pub fn dispatch(
         &mut self,
         kernel: &'static str,
@@ -180,6 +201,10 @@ impl BwdCtx<'_, '_> {
         wz: u32,
     ) {
         self.g.dispatch_raw(kernel, bufs, words, wx, wy, wz);
+        if self.g.pending() >= tape_flush_every() {
+            let _ = self.g.submit_ref();
+            *self.g = self.g.engine.graph();
+        }
     }
     /// 勾配バッファの参照 (存在すれば)。
     pub fn grad_of(&self, id: VarId) -> Option<GpuTensor> {
@@ -205,6 +230,20 @@ impl BwdCtx<'_, '_> {
     }
 }
 
+/// 途中 submit の dispatch 閾値 (学習ステップ分割 — device loss 対策)。
+const TAPE_FLUSH_EVERY: usize = 256;
+
+/// flush 閾値 (デバッグ用に RCWX_TAPE_FLUSH_EVERY で上書き可)。
+fn tape_flush_every() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RCWX_TAPE_FLUSH_EVERY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(TAPE_FLUSH_EVERY)
+    })
+}
+
 pub struct Tape<'e> {
     eng: &'e Engine,
     g: Graph<'e>,
@@ -218,9 +257,12 @@ pub struct Tape<'e> {
 
 impl<'e> Tape<'e> {
     pub fn new(eng: &'e Engine) -> Self {
+        let mut g = eng.graph();
+        // 学習経路は Kahan 補償付き tiled matmul (f32 累積誤差低減)
+        g.kahan = true;
         Self {
             eng,
-            g: eng.graph(),
+            g,
             nodes: HashMap::new(),
             ops: Vec::new(),
             next_id: 0,
@@ -233,7 +275,28 @@ impl<'e> Tape<'e> {
         let id = self.next_id;
         self.next_id += 1;
         self.nodes.insert(id, Node { t, shape, req_grad });
+        self.maybe_flush();
         Var { id }
+    }
+
+    /// 記録済み dispatch が閾値を超えたら途中 submit して Graph を作り直す
+    /// (学習の巨大ステップを複数 submit に分割 — device loss 対策)。
+    /// ノード (保存活性) は Tape が保持するので backward に影響しない。
+    pub fn maybe_flush(&mut self) {
+        if self.g.pending() >= tape_flush_every() {
+            let _ = self.g.submit_ref();
+            let kahan = self.g.kahan;
+            self.g = self.eng.graph();
+            self.g.kahan = kahan;
+        }
+    }
+
+    /// 今すぐ途中 submit (相棒の損失読み出し前など)。
+    pub fn flush(&mut self) {
+        let _ = self.g.submit_ref();
+        let kahan = self.g.kahan;
+        self.g = self.eng.graph();
+        self.g.kahan = kahan;
     }
 
     fn t(&self, v: Var) -> GpuTensor {
@@ -298,51 +361,28 @@ impl<'e> Tape<'e> {
     /// ステップ冒頭 (モジュール forward 前) に 1 回呼ぶ。
     pub fn adopt_wn(&mut self, store: &ParamStore, wn_idx: usize, v: Var, g: Var) -> Var {
         let wn = &store.wns[wn_idx];
-        let len = wn.len;
-        let n_partials = len.div_ceil(256);
-        // normsq = Σ v²  (partials → final)
+        let (rows, row_len) = (wn.rows, wn.row_len);
         let v_t = self.t(v);
-        let partials = wn.partials.clone_handle();
-        let normsq = wn.normsq.clone_handle();
-        {
-            let mut words = [0u32; 32];
-            words[0..2].copy_from_slice(&[len, 1]);
-            self.g.dispatch_raw(
-                "t_reduce_partials",
-                &[&v_t, &v_t, &partials],
-                words,
-                n_partials,
-                1,
-                1,
-            );
-        }
-        {
-            let mut words = [0u32; 32];
-            words[0..2].copy_from_slice(&[n_partials, 1.0f32.to_bits()]);
-            self.g
-                .dispatch_raw("t_reduce_final", &[&partials, &normsq], words, 1, 1, 1);
-        }
+        let g_t = self.t(g);
+        let norms = wn.norms.clone_handle();
         let w = self.push_node(wn.w.clone_handle(), wn.shape.clone(), true);
+        let w_t = self.t(w);
         {
-            let g_t = self.t(g);
-            let w_t = self.t(w);
             let mut words = [0u32; 32];
-            words[0] = len;
+            words[0..4].copy_from_slice(&[rows, row_len, 0, 0]);
             self.g.dispatch_raw(
-                "t_wn_fold",
-                &[&v_t, &g_t, &normsq, &w_t],
+                "t_wn_fold_rows",
+                &[&v_t, &g_t, &norms, &w_t],
                 words,
-                len.div_ceil(256),
+                rows,
                 1,
                 1,
             );
         }
-        // backward: dw → dv, dg (fold はステップ先頭に記録されるので逆順処理で
-        // 最後に実行され、蓄積済み dw をすべて消費する)
         let w_id = w.id;
         let v_id = v.id;
         let g_id = g.id;
-        let normsq_c = wn.normsq.clone_handle();
+        let norms_c = wn.norms.clone_handle();
         self.ops.push(OpEntry {
             out: w_id,
             bwd: Box::new(move |ctx: &mut BwdCtx<'_, '_>| {
@@ -350,39 +390,16 @@ impl<'e> Tape<'e> {
                     return;
                 };
                 let v_t = ctx.node_tensor(v_id);
-                let len = dw.len as u32;
-                let n_partials = len.div_ceil(256);
-                // dot = Σ v·dw
-                let partials = ctx.alloc(n_partials as usize);
-                {
-                    let mut words = [0u32; 32];
-                    words[0..2].copy_from_slice(&[len, 2]);
-                    ctx.g.dispatch_raw(
-                        "t_reduce_partials",
-                        &[&v_t, &dw, &partials],
-                        words,
-                        n_partials,
-                        1,
-                        1,
-                    );
-                }
-                let dot = ctx.alloc(1);
-                {
-                    let mut words = [0u32; 32];
-                    words[0..2].copy_from_slice(&[n_partials, 1.0f32.to_bits()]);
-                    ctx.g
-                        .dispatch_raw("t_reduce_final", &[&partials, &dot], words, 1, 1, 1);
-                }
-                let dv = ctx.alloc(len as usize);
-                let dg = ctx.alloc(1);
                 let g_t = ctx.node_tensor(g_id);
+                let dv = ctx.alloc(dw.len);
+                let dg = ctx.alloc(rows as usize);
                 let mut words = [0u32; 32];
-                words[0] = len;
-                ctx.g.dispatch_raw(
-                    "t_wn_bwd",
-                    &[&v_t, &dw, &dot, &normsq_c, &g_t, &dv, &dg],
+                words[0..4].copy_from_slice(&[rows, row_len, 0, 0]);
+                ctx.dispatch(
+                    "t_wn_bwd_rows",
+                    &[&v_t, &dw, &norms_c, &g_t, &dv, &dg],
                     words,
-                    len.div_ceil(256),
+                    rows,
                     1,
                     1,
                 );
@@ -567,6 +584,7 @@ impl<'e> Tape<'e> {
             words[0..4].copy_from_slice(&[batch, in_c, kernel, dilation]);
             words[4..8].copy_from_slice(&[stride, pad_l, in_len, out_len]);
             words[8] = 0; // x_base
+            words[9] = in_c * in_len; // 入力側バッチストライド
             let total = batch * ck * out_len;
             self.g
                 .dispatch_raw("t_im2col", &[&x_t, &col], words, total.div_ceil(256), 1, 1);
@@ -656,6 +674,7 @@ impl<'e> Tape<'e> {
                     words[0..4].copy_from_slice(&[batch, in_c, kernel, dilation]);
                     words[4..8].copy_from_slice(&[stride, pad_l, in_len, out_len]);
                     words[8] = 0;
+                    words[9] = in_c * in_len;
                     ctx.g.dispatch_raw(
                         "t_im2col",
                         &[&x_t, &col],
@@ -822,6 +841,7 @@ impl<'e> Tape<'e> {
                     let mut words = [0u32; 32];
                     words[0..4].copy_from_slice(&[batch, out_c, kernel, dilation]);
                     words[4..8].copy_from_slice(&[stride, pad_l, out_len, in_len]);
+                    words[9] = out_c * out_len; // 入力 (dy) 側バッチストライド
                     ctx.g.dispatch_raw(
                         "t_im2col",
                         &[&dy, &dm],
@@ -1083,14 +1103,41 @@ impl<'e> Tape<'e> {
     ) -> Var {
         let len = self.numel(x);
         let out_t = self.eng.tensor_uninit(len as usize);
-        let out = self.push_node(out_t, vec![rows as usize, cols as usize], true);
+        // テンソルは [B, C, T] (= 入力と同配置)。rows = B·T, cols = C。
+        let batch = self.shape(x)[0] as u32;
+        let out = self.push_node(
+            out_t,
+            vec![
+                batch as usize,
+                cols as usize,
+                (rows / batch.max(1)) as usize,
+            ],
+            true,
+        );
         let out_ref = self.t(out);
         let x_t = self.t(x);
         let gamma_t = self.t(gamma);
         let beta_t = self.t(beta);
-        self.g.layer_norm(
-            &x_t, &gamma_t, &beta_t, &out_ref, rows, cols, in_row, in_k, in_row, in_k, eps,
-        );
+        // バッチ対応学習カーネル ([B, C, T] チャネル軸 LN 専用):
+        // in_row は行内 stride (=1)、in_k はチャネル stride (=T)、batch/bs は
+        // 呼び出し側レイアウトから導出
+        let batch = self.shape(x)[0] as u32;
+        let rows_per_b = rows / batch.max(1);
+        let bs = (self.numel(x) / batch.max(1)) as u32;
+        let _ = in_row;
+        {
+            let mut words = [0u32; 32];
+            words[0..4].copy_from_slice(&[rows_per_b, cols, in_k, eps.to_bits()]);
+            words[4..6].copy_from_slice(&[batch, bs]);
+            self.g.dispatch_raw(
+                "t_layernorm",
+                &[&x_t, &gamma_t, &beta_t, &out_ref],
+                words,
+                rows,
+                1,
+                1,
+            );
+        }
         let x_id = x.id;
         let gamma_id = gamma.id;
         let beta_id = beta.id;
@@ -1105,10 +1152,13 @@ impl<'e> Tape<'e> {
                 let dx = ctx.alloc(len as usize);
                 let xhat = ctx.alloc(len as usize);
                 {
+                    let batch = ctx.shape_of(x_id)[0] as u32;
+                    let rows_per_b = rows / batch.max(1);
+                    let bs = (ctx.node_tensor(x_id).len as u32) / batch.max(1);
                     let mut words = [0u32; 32];
-                    words[0..4].copy_from_slice(&[rows, cols, eps.to_bits(), in_row]);
-                    words[4] = in_k;
-                    ctx.g.dispatch_raw(
+                    words[0..4].copy_from_slice(&[rows_per_b, cols, in_k, eps.to_bits()]);
+                    words[4..6].copy_from_slice(&[batch, bs]);
+                    ctx.dispatch(
                         "t_layernorm_bwd",
                         &[&x_t, &dy, &gamma_t, &dx, &xhat],
                         words,
@@ -1121,9 +1171,13 @@ impl<'e> Tape<'e> {
                 let dgamma = ctx.alloc(cols as usize);
                 let dbeta = ctx.alloc(cols as usize);
                 {
+                    let batch = ctx.shape_of(x_id)[0] as u32;
+                    let rows_per_b = rows / batch.max(1);
+                    let bs = (ctx.node_tensor(x_id).len as u32) / batch.max(1);
                     let mut words = [0u32; 32];
-                    words[0..4].copy_from_slice(&[cols, rows, in_row, in_k]);
-                    ctx.g.dispatch_raw(
+                    words[0..4].copy_from_slice(&[cols, rows_per_b, in_k, batch]);
+                    words[4] = bs;
+                    ctx.dispatch(
                         "t_ln_param_grad",
                         &[&xhat, &dy, &dgamma, &dbeta],
                         words,
@@ -1168,6 +1222,7 @@ impl<'e> Tape<'e> {
         c_n: u32,
         c_bs: u32,
         scale: f32,
+        bias_axis: u32,
     ) -> Var {
         let out_t = self.eng.tensor_uninit(out_len);
         let out = self.push_node(out_t, vec![batch as usize, m as usize, n as usize], true);
@@ -1206,7 +1261,7 @@ impl<'e> Tape<'e> {
             0,
             c_bs,
             scale,
-            0,
+            bias_axis,
         );
         let a_id = a.id;
         let w_id = w.id;
@@ -1240,33 +1295,100 @@ impl<'e> Tape<'e> {
                 } else {
                     &dy
                 };
-                let da = ctx.alloc(a_len as usize);
-                ctx.g.matmul_ex(
-                    dy_ref, &w_t, None, &da, m, k, n, batch, c_row, c_n, 0, c_bs, w_k, w_row,
-                    w_base, w_bs, a_row, a_k, 0, a_bs, 1.0, 0,
-                );
-                ctx.accum(a_id, da);
-                let dw = ctx.alloc(w_len as usize);
-                ctx.g.matmul_ex(
-                    dy_ref, &a_t, None, &dw, n, k, m, batch, c_n, c_row, 0, c_bs, a_k, a_row,
-                    a_base, a_bs, w_row, w_k, 0, w_bs, 1.0, 0,
-                );
-                ctx.accum(w_id, dw);
+                // dA = dy · W (A のレイアウト)。a_bs==0 (バッチ共有 A) の場合は
+                // バッチ部分和を colsum で集約する (直接書き込みは上書きになる)。
+                if a_bs == 0 && batch > 1 {
+                    // バッチごとに元レイアウト (a_row, a_k) + a_base で書き分けて集約
+                    let dwp = ctx.alloc((batch * m * k) as usize);
+                    ctx.g.matmul_ex(
+                        dy_ref,
+                        &w_t,
+                        None,
+                        &dwp,
+                        m,
+                        k,
+                        n,
+                        batch,
+                        c_row,
+                        c_n,
+                        0,
+                        c_bs,
+                        w_k,
+                        w_row,
+                        w_base,
+                        w_bs,
+                        a_row,
+                        a_k,
+                        a_base,
+                        m * k,
+                        1.0,
+                        0,
+                    );
+                    let da = ctx.alloc(a_len as usize);
+                    let mut words = [0u32; 32];
+                    words[0..4].copy_from_slice(&[0, batch, m * k, 0]);
+                    ctx.dispatch("t_colsum", &[&dwp, &da], words, m * k, 1, 1);
+                    ctx.accum(a_id, da);
+                } else {
+                    let da = ctx.alloc(a_len as usize);
+                    // A'=dy (base 0)、W2'=W (w_base 読み出し)、C'=dA (c_base=a_base)
+                    ctx.g.matmul_ex(
+                        dy_ref, &w_t, None, &da, m, k, n, batch, c_row, c_n, 0, c_bs, w_k, w_row,
+                        w_base, w_bs, a_row, a_k, a_base, a_bs, 1.0, 0,
+                    );
+                    ctx.accum(a_id, da);
+                }
+                // dW = dyᵀ · A (W のレイアウト)。w_bs==0 (共有重み) は colsum 集約。
+                if w_bs == 0 && batch > 1 {
+                    // バッチごとに元レイアウト (w_row, w_k) + w_base で書き分けて集約
+                    let dwp = ctx.alloc((batch * n * k) as usize);
+                    ctx.g.matmul_ex(
+                        dy_ref,
+                        &a_t,
+                        None,
+                        &dwp,
+                        n,
+                        k,
+                        m,
+                        batch,
+                        c_n,
+                        c_row,
+                        0,
+                        c_bs,
+                        a_k,
+                        a_row,
+                        a_base,
+                        a_bs,
+                        w_row,
+                        w_k,
+                        w_base,
+                        n * k,
+                        1.0,
+                        0,
+                    );
+                    let dw = ctx.alloc(w_len as usize);
+                    let mut words = [0u32; 32];
+                    words[0..4].copy_from_slice(&[0, batch, n * k, 0]);
+                    ctx.dispatch("t_colsum", &[&dwp, &dw], words, n * k, 1, 1);
+                    ctx.accum(w_id, dw);
+                } else {
+                    let dw = ctx.alloc(w_len as usize);
+                    // A'=dy (base 0)、W2'=A (a_base 読み出し)、C'=dW (c_base=w_base)
+                    ctx.g.matmul_ex(
+                        dy_ref, &a_t, None, &dw, n, k, m, batch, c_n, c_row, 0, c_bs, a_k, a_row,
+                        a_base, a_bs, w_row, w_k, w_base, w_bs, 1.0, 0,
+                    );
+                    ctx.accum(w_id, dw);
+                }
                 if let Some(b_id) = b_id {
                     // bias[n] = Σ_{b,m} dy (out が [b, m, n] 連続前提)
                     debug_assert!(c_row == n && c_n == 1);
-                    let bm = ctx.alloc((batch * m) as usize);
-                    {
-                        let mut words = [0u32; 32];
-                        words[0..4].copy_from_slice(&[1, batch * m, n, 0]);
-                        ctx.g
-                            .dispatch_raw("t_colsum", &[dy_ref, &bm], words, batch * m, 1, 1);
-                    }
                     let db = ctx.alloc(n as usize);
                     {
                         let mut words = [0u32; 32];
-                        words[0..4].copy_from_slice(&[0, batch, n, 0]);
-                        ctx.g.dispatch_raw("t_colsum", &[&bm, &db], words, n, 1, 1);
+                        words[0..4].copy_from_slice(&[0, batch * m, n, 0]);
+                        ctx.g
+                            .dispatch_raw("t_colsum", &[dy_ref, &db], words, n, 1, 1);
                     }
                     ctx.accum(b_id, db);
                 }
@@ -1439,6 +1561,15 @@ impl<'e> Tape<'e> {
     /// ランダムセグメント抽出: in [b, ch, t_len] から out [b, ch, seg]。
     /// start は [batch] の f32 バッファ (start_scale を掛けて丸めたオフセット)。
     /// 逆伝達は in へ scatter-add (書き込み先は要素ごとに一意)。
+    /// 全バッチ同一オフセットの gather_frames (start テンソル不要)。
+    pub fn gather_frames_pub(&mut self, x: Var, start: u32, ch: u32, t_len: u32, seg: u32) -> Var {
+        let batch = self.shape(x)[0] as u32;
+        let start_t = self
+            .eng
+            .tensor_from_f32(&vec![start as f32; batch as usize], vec![batch as usize]);
+        self.gather_frames(x, &start_t, ch, t_len, seg, 1.0)
+    }
+
     pub fn gather_frames(
         &mut self,
         x: Var,
@@ -1647,8 +1778,9 @@ impl<'e> Tape<'e> {
                     return;
                 };
                 let dx = ctx.alloc(total as usize);
+                // 転置の逆は同一カーネルで次元を入れ替えて適用
                 let mut words = [0u32; 32];
-                words[0..4].copy_from_slice(&[batch, t_len, c, 0]);
+                words[0..4].copy_from_slice(&[batch, c, t_len, 0]);
                 ctx.g
                     .dispatch_raw("t_transpose", &[&dy, &dx], words, total.div_ceil(256), 1, 1);
                 ctx.accum(x_id, dx);
@@ -1659,10 +1791,19 @@ impl<'e> Tape<'e> {
 
     /// 1D reflect pad: x [b, c, in_len] → [b, c, in_len + 2·pad]。
     pub fn reflect_pad(&mut self, x: Var, pad: u32) -> Var {
-        let (batch, c, in_len) = {
-            let s = self.shape(x);
-            (s[0] as u32, s[1] as u32, s[2] as u32)
-        };
+        let s = self.shape(x);
+        if s.len() >= 3 {
+            self.reflect_pad_dims(x, s[0] as u32, s[1] as u32, s[2] as u32, pad)
+        } else {
+            // 平坦 [b·t] は [b, 1, t] 扱い (バッチは呼び出し側情報不可 → 1 扱い)
+            self.reflect_pad_dims(x, 1, 1, self.numel(x), pad)
+        }
+    }
+
+    /// dims 明示版。平坦バッファも (batch, c, in_len) で解釈させる。
+    pub fn reflect_pad_dims(&mut self, x: Var, batch: u32, c: u32, in_len: u32, pad: u32) -> Var {
+        let x = x;
+        let _ = &x;
         let out_len = in_len + 2 * pad;
         let out_t = self.eng.tensor_uninit((batch * c * out_len) as usize);
         let out = self.push_node(
@@ -1753,6 +1894,7 @@ impl<'e> Tape<'e> {
                 words[0..4].copy_from_slice(&[batch, cin_g, kernel, 1]);
                 words[4..8].copy_from_slice(&[stride, pad_l, in_len, out_len]);
                 words[8] = g * cin_g * in_len; // x_base
+                words[9] = in_c * in_len; // 入力側バッチストライド (cin_g ではない)
                 self.g.dispatch_raw(
                     "t_im2col",
                     &[&x_t, &col],
@@ -1780,7 +1922,7 @@ impl<'e> Tape<'e> {
                 1,
                 out_len,
                 0,
-                0,
+                ck * out_len, // col はバッチ毎に独立 (旧: 0 = 常に b0 の col を参照)
                 out_len,
                 1,
                 c_base,
@@ -1897,6 +2039,7 @@ impl<'e> Tape<'e> {
                         words[0..4].copy_from_slice(&[batch, cin_g, kernel, 1]);
                         words[4..8].copy_from_slice(&[stride, pad_l, in_len, out_len]);
                         words[8] = g * cin_g * in_len;
+                        words[9] = in_c * in_len;
                         ctx.g.dispatch_raw(
                             "t_im2col",
                             &[&x_t, &col],
@@ -2144,9 +2287,9 @@ impl<'e> Tape<'e> {
         let x_t = self.t(x);
         {
             let mut words = [0u32; 32];
-            words[0..4].copy_from_slice(&[total, t_len, ch, 0]);
+            words[0..4].copy_from_slice(&[batch, ch, t_len, 0]);
             self.g.dispatch_raw(
-                "flip_ch",
+                "t_flip_ch",
                 &[&x_t, &out_ref],
                 words,
                 total.div_ceil(256),
@@ -2163,9 +2306,9 @@ impl<'e> Tape<'e> {
                 };
                 let dx = ctx.alloc(total as usize);
                 let mut words = [0u32; 32];
-                words[0..4].copy_from_slice(&[total, t_len, ch, 0]);
+                words[0..4].copy_from_slice(&[batch, ch, t_len, 0]);
                 ctx.g
-                    .dispatch_raw("flip_ch", &[&dy, &dx], words, total.div_ceil(256), 1, 1);
+                    .dispatch_raw("t_flip_ch", &[&dy, &dx], words, total.div_ceil(256), 1, 1);
                 ctx.accum(x_id, dx);
             }),
         });
@@ -2197,6 +2340,7 @@ impl<'e> Tape<'e> {
             words[0..4].copy_from_slice(&[batch, 1, n_fft, 1]);
             words[4..8].copy_from_slice(&[hop, 0, in_len, n_frames]);
             words[8] = 0;
+            words[9] = in_len;
             self.g.dispatch_raw(
                 "t_im2col",
                 &[&x_t, &out_ref],
@@ -2383,13 +2527,14 @@ impl<'e> Tape<'e> {
         sh: u32,
         sw: u32,
         pad: u32,
+        pad_w: u32,
         batch: u32,
         h: u32,
         w_dim: u32,
     ) -> Var {
         let ck = in_c * kh * kw;
         let oh = (h + 2 * pad).saturating_sub(kh) / sh + 1;
-        let ow = (w_dim + 2 * pad).saturating_sub(kw) / sw + 1;
+        let ow = (w_dim + 2 * pad_w).saturating_sub(kw) / sw + 1;
         let out_t = self.eng.tensor_uninit((batch * out_c * oh * ow) as usize);
         let out = self.push_node(
             out_t,
@@ -2405,7 +2550,7 @@ impl<'e> Tape<'e> {
             let mut words = [0u32; 32];
             words[0..4].copy_from_slice(&[batch, in_c, h, w_dim]);
             words[4..8].copy_from_slice(&[kh, kw, sh, sw]);
-            words[8..12].copy_from_slice(&[pad, oh, ow, 0]);
+            words[8..12].copy_from_slice(&[pad, oh, ow, pad_w]);
             self.g.dispatch_raw(
                 "t_im2col2d",
                 &[&x_t, &col],
@@ -2431,7 +2576,7 @@ impl<'e> Tape<'e> {
             1,
             oh * ow,
             0,
-            0,
+            ck * oh * ow, // col はバッチ毎に独立 (旧: 0 = 常に b0 の col)
             oh * ow,
             1,
             0,
@@ -2470,7 +2615,7 @@ impl<'e> Tape<'e> {
                     1,
                     oh * ow,
                     0,
-                    0,
+                    out_c * oh * ow,
                     oh * ow,
                     1,
                     0,
@@ -2485,6 +2630,7 @@ impl<'e> Tape<'e> {
                     words[0..4].copy_from_slice(&[batch, in_c, h, w_dim]);
                     words[4..8].copy_from_slice(&[kh, kw, sh, sw]);
                     words[8..12].copy_from_slice(&[pad, oh, ow, 0]);
+                    words[12] = pad_w;
                     ctx.g.dispatch_raw(
                         "t_col2im2d",
                         &[&dx, &dcol],
@@ -2501,7 +2647,7 @@ impl<'e> Tape<'e> {
                     let mut words = [0u32; 32];
                     words[0..4].copy_from_slice(&[batch, in_c, h, w_dim]);
                     words[4..8].copy_from_slice(&[kh, kw, sh, sw]);
-                    words[8..12].copy_from_slice(&[pad, oh, ow, 0]);
+                    words[8..12].copy_from_slice(&[pad, oh, ow, pad_w]);
                     ctx.g.dispatch_raw(
                         "t_im2col2d",
                         &[&x_t, &col],
@@ -2595,6 +2741,12 @@ impl<'e> Tape<'e> {
     pub fn push_scalar(&mut self, t: GpuTensor) -> Var {
         self.push_node(t, vec![1], true)
     }
+    /// 定数スカラー var。
+    pub fn const_scalar(&mut self, v: f32) -> Var {
+        let t = self.eng.tensor_from_f32(&[v], vec![1]);
+        self.push_node(t, vec![1], false)
+    }
+
     /// スカラー同士の加算。
     pub fn add_scalar(&mut self, a: Var, b: Var) -> Var {
         self.add(a, b, false)
@@ -2658,6 +2810,37 @@ impl<'e> Tape<'e> {
 
     // ---- backward / optimizer ----
 
+    /// 複数 seed の出力勾配を 1.0 ずつ (loss = Σ_all) 逆伝搬。共有幹が
+    /// 両方の loss から寄与を受ける場合に使う (単発 backward_from の逐次呼び
+    /// では先の backward が幹 op を消費してしまうため)。
+    pub fn backward_from_all(&mut self, seeds: &[Var]) {
+        for &seed in seeds {
+            let len = self.numel(seed);
+            let seed_grad = self.eng.tensor_uninit(len as usize);
+            let mut words = [0u32; 32];
+            words[0..4].copy_from_slice(&[len, 1, 1.0f32.to_bits(), 0]);
+            self.g
+                .dispatch_raw("t_fill", &[&seed_grad], words, len.div_ceil(256), 1, 1);
+            self.grads.insert(seed.id, seed_grad);
+        }
+        let mut ops = std::mem::take(&mut self.ops);
+        let mut keep: Vec<OpEntry> = Vec::new();
+        while let Some(op) = ops.pop() {
+            if self.grads.contains_key(&op.out) {
+                let mut ctx = BwdCtx {
+                    g: &mut self.g,
+                    nodes: &self.nodes,
+                    grads: &mut self.grads,
+                };
+                (op.bwd)(&mut ctx);
+            } else {
+                keep.push(op);
+            }
+        }
+        keep.reverse();
+        self.ops = keep;
+    }
+
     /// `seed` の出力勾配を 1.0 として (すなわち loss = Σ seed) 逆伝搬を記録。
     /// 到達可能な op のみ処理し、未到達の op は残す (後続の backward_from で使用)。
     pub fn backward_from(&mut self, seed: Var) {
@@ -2689,9 +2872,10 @@ impl<'e> Tape<'e> {
     }
 
     /// adopt 済み全パラメータの勾配をゼロに (ステップ冒頭)。
+    /// 指定ストアの全パラメータ勾配をゼロに (複数ストア混在でも安全)。
     pub fn zero_grads(&mut self, store: &ParamStore) {
-        for (idx, _) in &self.adopted {
-            let g = store.entries[*idx].grad.clone_handle();
+        for e in &store.entries {
+            let g = e.grad.clone_handle();
             let len = g.len as u32;
             let mut words = [0u32; 32];
             words[0..4].copy_from_slice(&[len, 0, 0.0f32.to_bits(), 0]);
@@ -2700,8 +2884,46 @@ impl<'e> Tape<'e> {
         }
     }
 
+    /// WN 実効重みを再 fold (D 更新後の再 forward 用。fwd のみ・勾配 op は
+    /// 対応する adopt_wn のものがそのまま消費する)。
+    pub fn refold_wn(&mut self, store: &ParamStore, wn_idx: usize, v: Var, g: Var) {
+        let wn = &store.wns[wn_idx];
+        let (rows, row_len) = (wn.rows, wn.row_len);
+        let v_t = self.t(v);
+        let g_t = self.t(g);
+        let norms = wn.norms.clone_handle();
+        let w_t = wn.w.clone_handle();
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[rows, row_len, 0, 0]);
+        self.g.dispatch_raw(
+            "t_wn_fold_rows",
+            &[&v_t, &g_t, &norms, &w_t],
+            words,
+            rows,
+            1,
+            1,
+        );
+    }
+
     /// adopt 済みパラメータを AdamW で更新 (Graph へ dispatch)。
     /// `only` が None なら全 adopt 済みパラメータ。
+    /// ストアの全パラメータを AdamW 更新 (adam 状態は引数で持つ版)。
+    pub fn adamw_step_all(&mut self, adam: &mut AdamW, store: &mut ParamStore) {
+        let n = store.entries.len();
+        let indices: Vec<usize> = (0..n).collect();
+        // adam 設定を store.adam へ移して既存経路を流用
+        let saved = store.adam.step;
+        store.adam.lr = adam.lr;
+        store.adam.beta1 = adam.beta1;
+        store.adam.beta2 = adam.beta2;
+        store.adam.eps = adam.eps;
+        store.adam.weight_decay = adam.weight_decay;
+        store.adam.step = adam.step;
+        self.adamw_step(store, Some(&indices));
+        adam.step = store.adam.step;
+        let _ = saved;
+    }
+
     pub fn adamw_step(&mut self, store: &mut ParamStore, only: Option<&[usize]>) {
         store.adam.step += 1;
         let bc1 = 1.0 - store.adam.beta1.powi(store.adam.step as i32);

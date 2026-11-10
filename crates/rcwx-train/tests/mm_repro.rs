@@ -49,6 +49,7 @@ fn mm_batch2_repro() {
         1,
         oc * t,
         1.0,
+        0,
     );
     let out = tape.add_ch_bias(out, pv[1], oc, t);
     let out_t = tape.var_tensor(out);

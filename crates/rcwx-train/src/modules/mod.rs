@@ -27,7 +27,16 @@ impl Adopted {
         v
     }
     pub fn w(&self, prefix: &str) -> Var {
-        self.p[&format!("{prefix}.w")]
+        let key = format!("{prefix}.w");
+        self.p.get(&key).copied().unwrap_or_else(|| {
+            let mut ks: Vec<&String> = self.p.keys().collect();
+            ks.sort();
+            panic!(
+                "w key missing: {key} ({} keys, first: {:?})",
+                ks.len(),
+                ks.first()
+            )
+        })
     }
     pub fn bias(&self, prefix: &str) -> Option<Var> {
         self.p.get(&format!("{prefix}.bias")).copied()
@@ -101,6 +110,7 @@ pub fn conv1x1(
         1,
         out_c * t_len,
         1.0,
+        0,
     );
     if let Some(b) = a.bias(prefix) {
         tape.add_ch_bias(out, b, out_c, t_len)
@@ -143,13 +153,14 @@ pub fn wn(
             0,
             0,
             1,
-            gin,
-            0,
-            gin,
-            2 * h * n_layers,
             1,
             0,
+            gin,
+            1,
+            1,
+            2 * h * n_layers,
             1.0,
+            1,
         )
     });
     let mut x_cur = x;
@@ -261,6 +272,7 @@ pub fn attention_layer(
             1,
             t_len * t_len,
             scale,
+            0,
         );
         // rel bias: M = q_h · relkᵀ · scale [B, t, 2ws+1] → skew → [B, t, t]
         let m_rel = tape.mm(
@@ -284,6 +296,7 @@ pub fn attention_layer(
             1,
             t_len * (2 * ws + 1),
             scale,
+            0,
         );
         let rel_bias = tape.skew(m_rel, 0, batch, t_len, ws);
         let scores_h = tape.add(scores_h, rel_bias, false);
@@ -315,6 +328,7 @@ pub fn attention_layer(
             t_len,
             dk * t_len,
             1.0,
+            0,
         );
         // rel values: P2 = skew1(p) [B, t, 2ws+1] → · relv [B, dk, t]
         let p2 = tape.skew(p, 1, batch, t_len, ws);
@@ -339,6 +353,7 @@ pub fn attention_layer(
             t_len,
             dk * t_len,
             1.0,
+            0,
         );
         let out_h = tape.add(out_h, rel_out, false);
         attn = Some(match attn {
