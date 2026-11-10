@@ -1484,6 +1484,53 @@ impl Synth {
     /// `chunk` フレーム窓 (左右 margin フレームの受容野マージン付き) に
     /// 分割する。窓内の中間出力はフルバッチ演算と同一 (受容野外は零埋め)。
     /// 戻り値: 音声 [t * zc] (CPU)。
+    /// 長尺 T 用の窓分割エンコード。T ≤ 1200 は従来どおり一括 (full attention)。
+    /// 超過分は 1000 フレーム窓 + 100 フレーム余白でエンコードし中央のみ採録
+    /// (attention コンテキストが 1s で切れる近似 — corr で品質確認)。
+    /// 戻り値は z を CPU に読み戻した [inter, T]。
+    fn encode_windowed_cpu(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        t: u32,
+    ) -> Vec<f32> {
+        let inter = self.cfg.inter_channels as usize;
+        let t = t as usize;
+        if t <= 1200 {
+            let z = self.encode_raw(eng, feats, pitch_idx, t as u32);
+            return eng.readback_f32(&z);
+        }
+        let feats_cpu = eng.readback_f32(feats); // [t, 768] row-major
+        let win = 1000usize;
+        let margin = 100usize;
+        let mut z = vec![0.0f32; inter * t];
+        let mut start = 0usize;
+        while start < t {
+            let end = (start + win).min(t);
+            let w_start = start.saturating_sub(margin);
+            let w_end = (end + margin).min(t);
+            let n = w_end - w_start;
+            let feats_win = eng.tensor_from_f32(&feats_cpu[w_start * 768..w_end * 768], vec![]);
+            let pitch_emb = eng.tensor_from_f32(
+                &self.pitch_embedding(&pitch_idx[w_start..w_end], n as u32),
+                vec![],
+            );
+            let mut g = eng.graph();
+            let z_win = self.encode_graph(eng, &mut g, &feats_win, &pitch_emb, n as u32);
+            g.submit().expect("submit");
+            let zw = eng.readback_f32(&z_win); // [inter, n]
+            let lo = start - w_start;
+            let take = end - start;
+            for c in 0..inter {
+                z[c * t + start..c * t + end]
+                    .copy_from_slice(&zw[c * n + lo..c * n + lo + take]);
+            }
+            start = end;
+        }
+        z
+    }
+
     pub fn infer_chunked(
         &self,
         eng: &Engine,
@@ -1501,8 +1548,7 @@ impl Synth {
         let chunk = chunk as usize;
         let margin = margin as usize;
 
-        let z = self.encode_raw(eng, feats, pitch_idx, t as u32);
-        let z_cpu = eng.readback_f32(&z); // [inter, T] — 小さい
+        let z_cpu = self.encode_windowed_cpu(eng, feats, pitch_idx, t as u32); // [inter, T]
 
         let mut out = vec![0.0f32; t * zc as usize];
         let mut start = 0usize;

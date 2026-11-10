@@ -19,7 +19,12 @@ use wgpu::util::DeviceExt;
 
 /// 1 スロット 128B の uniform 共有バッファ。
 pub const UNIFORM_SLOT_SIZE: wgpu::BufferAddress = 256; // min_uniform_buffer_offset_alignment=256
-const UNIFORM_SLOTS: u32 = 16384;
+/// スロットは dispatch 単位で永久消費 (プラン再生時の再書込を避ける設計)。
+/// リアルタイムは数百で足りるが、オフライン長尺 (デコード ~1 チャンク/96fr
+/// × 数百 dispatch) は万単位で消費するため 64MB 分確保する (~10 分入力相当)。
+/// さらに長い入力は今後 arena 増設 (バッファ追加 + bind group が buffer 参照を
+/// 持つため共存可能) で対応する。
+const UNIFORM_SLOTS: u32 = 1 << 18;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Backend {
@@ -402,9 +407,14 @@ impl Engine {
         if adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
+        // 既定 limits は max_buffer_size=256MB / binding=128MB で、オフライン
+        // full-context 推論 (HuBERT attention の T² スコア行列) が ~10s 入力で
+        // 上限に当たる。アダプタがサポートする最大まで引き上げる。
+        let adapter_limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rcwx-engine"),
             required_features: features,
+            required_limits: adapter_limits,
             ..Default::default()
         }))
         .with_context(|| "request_device")?;
@@ -1009,8 +1019,8 @@ impl Engine {
                 ) {
                     return;
                 }
-                if started.elapsed() > std::time::Duration::from_secs(5) {
-                    panic!("GPU readback exceeded 5s");
+                if started.elapsed() > std::time::Duration::from_secs(15) {
+                    panic!("GPU readback exceeded 15s");
                 }
                 std::hint::spin_loop();
             },
@@ -1031,8 +1041,8 @@ impl Engine {
                     Ok(status) if status.wait_finished() => return,
                     Ok(_) => {}
                     Err(wgpu::PollError::Timeout) => {
-                        if started.elapsed() > std::time::Duration::from_secs(5) {
-                            panic!("GPU readback exceeded 5s");
+                        if started.elapsed() > std::time::Duration::from_secs(15) {
+                            panic!("GPU readback exceeded 15s");
                         }
                     }
                     Err(err) => panic!("GPU readback poll: {err}"),
@@ -1874,13 +1884,13 @@ impl<'a> Graph<'a> {
         w[20..24].copy_from_slice(&[pad, dil, in_len, post_op]);
         let dummy = a;
         let bias_ref = bias.unwrap_or(dummy);
-        // f16 版は現状 DXC が packed 命令を出さず速度劣化 + 数値劣化のため無効
+        // 32x32 タイル版 (matmul_tiled と同一構造)
         self.dispatch(
             "matmul_conv",
             &[a, x, bias_ref, c],
             w,
-            n.div_ceil(16),
-            m.div_ceil(16),
+            n.div_ceil(32),
+            m.div_ceil(32),
             1,
         );
     }

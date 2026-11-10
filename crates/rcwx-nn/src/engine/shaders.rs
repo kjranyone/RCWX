@@ -615,13 +615,17 @@ pub fn matmul_conv_src() -> String {
         + r#"
 fn post1(v: f32, op: u32) -> f32 {
   if (op == 1u) { return select(0.1 * v, v, v > 0.0); }
+  if (op == 2u) { return select(0.0, v, v > 0.0); }  // relu (FFN conv_1 fuse)
   return v;
 }
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
+// matmul_tiled と同一の 32x32 タイル構造 (16x16 レーン x 2x2)。
+// B オペランドだけ conv gather: K = cin*conv_k を 16 幅ストリップで処理し、
+// (ci, j) はストリップ内 k のみ依存なので workgroup 共有テーブルで事前計算。
+var<workgroup> ta: array<f32, 640>;
+var<workgroup> tb: array<f32, 640>;
 var<workgroup> idxci: array<u32, 16>;
 var<workgroup> idxj: array<u32, 16>;
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(16, 16)
 fn main(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -632,8 +636,8 @@ fn main(
   let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
   let conv_k = P.p4.w;
   let pad = P.p5.x; let dil = P.p5.y; let in_len = P.p5.z; let post_op = P.p5.w;
-  let tile_m = wid.y * 16u;
-  let tile_n = wid.x * 16u;
+  let tile_m = wid.y * 32u;
+  let tile_n = wid.x * 32u;
   let lx = lid.x * 2u;
   let ly = lid.y * 2u;
   var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
@@ -641,6 +645,7 @@ fn main(
   let m1 = tile_m + lx + 1u;
   let n0 = tile_n + ly;
   let n1 = tile_n + ly + 1u;
+  let linear = lid.y * 16u + lid.x;
   var kt: u32 = 0u;
   while (kt < k_dim) {
     if (lid.x == 0u && lid.y == 0u) {
@@ -651,27 +656,28 @@ fn main(
       }
     }
     workgroupBarrier();
-    var idx = lid.y * 8u + lid.x;
-    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
-      let r = idx / 16u;
-      let c = idx % 16u;
-      let gm = tile_m + r;
-      let gk = kt + c;
-      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
-      // B = conv gather: 位置 = gn - pad + j*dil
-      let gn = tile_n + r;
-      let pos = i32(gn) - i32(pad) + i32(idxj[c] * dil);
-      let v = select(0.0, B2[idxci[c] * in_len + u32(pos)],
-                     (gn < n_dim && gk < k_dim) && pos >= 0 && pos < i32(in_len));
-      tb[r * 16u + c] = v;
-      idx = idx + 64u;
+    for (var rep: u32 = 0u; rep < 2u; rep = rep + 1u) {
+      let e = linear + rep * 256u;
+      let am = e >> 4u;
+      let ak = e & 15u;
+      let gm = tile_m + am;
+      let gk = kt + ak;
+      ta[am * 20u + ak] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      let bn = e & 31u;
+      let bk = e >> 5u;
+      let gn = tile_n + bn;
+      let gk3 = kt + bk;
+      let pos = i32(gn) - i32(pad) + i32(idxj[bk] * dil);
+      let v = select(0.0, B2[idxci[bk] * in_len + u32(pos)],
+                     (gn < n_dim && gk3 < k_dim) && pos >= 0 && pos < i32(in_len));
+      tb[bn * 20u + bk] = v;
     }
     workgroupBarrier();
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-      let a0 = ta[lx * 16u + kk];
-      let a1 = ta[(lx + 1u) * 16u + kk];
-      let b0 = tb[ly * 16u + kk];
-      let b1 = tb[(ly + 1u) * 16u + kk];
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
       acc00 = acc00 + a0 * b0;
       acc01 = acc01 + a0 * b1;
       acc10 = acc10 + a1 * b0;
@@ -698,6 +704,7 @@ fn main(
 }
 "#
 }
+
 
 /// チャネル major 行列の末尾 n_out フレーム抽出: out[c, t] = in[c, off+t]。
 pub fn slice_ch_src() -> String {

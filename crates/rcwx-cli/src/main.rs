@@ -131,6 +131,35 @@ fn condition_f0(f0v: &mut [f32], shift_st: f64) {
 }
 
 /// stabilize_f0_boundaries (f0_processing.py と同一): 端の有声フレームを中央値へ ramp blend。
+/// 長尺入力の F0 抽出を窓分割する (RMVPE の dispatch グリッド上限対策)。
+/// 25s 窓 + 1s 文脈で中央のフレームのみ採録。100fps (160 samples/frame)。
+fn windowed_f0(wav: &[f32], n_total: usize, want_frames: usize, infer: impl Fn(&[f32]) -> Vec<f32>) -> Vec<f32> {
+    let win = 400_000usize;
+    let ctx = 16_000usize;
+    if n_total <= win + ctx {
+        return infer(wav);
+    }
+    let mut out: Vec<f32> = Vec::with_capacity(want_frames);
+    let mut seg_start = 0usize;
+    while seg_start < n_total {
+        let seg_end = (seg_start + win).min(n_total);
+        let w_start = seg_start.saturating_sub(ctx);
+        let w_end = (seg_end + ctx).min(n_total);
+        let f = infer(&wav[w_start..w_end]);
+        let ctx_f = (seg_start - w_start) / 160;
+        let lo = if seg_start == 0 { 0 } else { ctx_f };
+        let hi = if seg_end == n_total {
+            f.len()
+        } else {
+            (ctx_f + (seg_end - seg_start) / 160).min(f.len())
+        };
+        out.extend_from_slice(&f[lo..hi]);
+        seg_start = seg_end;
+    }
+    out.resize(want_frames, 0.0);
+    out
+}
+
 fn stabilize_f0_boundaries(f0: &mut [f32], edge_frames: usize) {
     let n = f0.len();
     if n < 4 || edge_frames == 0 {
@@ -409,10 +438,54 @@ fn main() -> Result<()> {
         synth.cfg.sr
     );
 
-    // ---- HuBERT FIRST (RMVPE が uniform slot を上書きする問題の切り分け) ----
-    let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
-    let feats = hubert.features_ver(&eng, &wav_t, n_total as u32, model_version);
-    let mut feats_data = eng.readback_f32(&feats);
+    // ---- HuBERT → [T50, fd] (v1=256-dim/layer9, v2=768-dim/layer12) ----
+    // full-context の attention は T² のスコア行列をレイヤー分保持するため
+    // 約束 40s (T50=2000) を超える入力は窓分割する (両側 2s コンテキスト付き、
+    // 中央のみ採録)。窓内は完全 full-context 相当。
+    // RCWX_HUBERT_CHUNK=1 で短尺でも分割パスを強制 (品質比較用)。
+    let force_hubert_chunk = std::env::var("RCWX_HUBERT_CHUNK").ok().as_deref() == Some("1");
+    let ctx_samples = 64_000usize; // 2s @16k
+    let win_samples = 480_000usize; // 30s @16k
+    let mut feats_data: Vec<f32> = if t50 <= 2000 && !force_hubert_chunk {
+        let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
+        let feats = hubert.features_ver(&eng, &wav_t, n_total as u32, model_version);
+        eng.readback_f32(&feats)
+    } else {
+        // wav_pad 全体 (パッド込み) を窓分割。採録フレーム数を full-context と
+        // 同一 (t50) に揃えるため、先頭窓は左端から、末尾窓は右端まで採る。
+        let hop = hubert_hop;
+        let mut out: Vec<f32> = Vec::with_capacity(t50 * fd);
+        println!("hubert: chunked ({t50} frames > 2000)");
+        let mut seg_start = 0usize;
+        while seg_start < n_total {
+            let seg_end = (seg_start + win_samples).min(n_total);
+            let w_start = seg_start.saturating_sub(ctx_samples);
+            let w_end = (seg_end + ctx_samples).min(n_total);
+            let w = &wav_pad[w_start..w_end];
+            let w_t = eng.tensor_from_f32(w, vec![w.len()]);
+            let feats = hubert.features_ver(&eng, &w_t, w.len() as u32, model_version);
+            let f = eng.readback_f32(&feats);
+            let f_frames = f.len() / fd;
+            let ctx_f = (seg_start - w_start) / hop;
+            let lo = if seg_start == 0 { 0 } else { ctx_f };
+            let hi = if seg_end == n_total {
+                f_frames
+            } else {
+                (ctx_f + (seg_end - seg_start) / hop).min(f_frames)
+            };
+            out.extend_from_slice(&f[lo * fd..hi.min(f_frames) * fd]);
+            seg_start = seg_end;
+        }
+        if out.len() / fd != t50 {
+            // 保険: フレーム数がずれたらトリム/延長 (ここを通るのは異常時のみ)
+            eprintln!(
+                "hubert chunked frame mismatch: {} vs t50={t50} — adjusting",
+                out.len() / fd
+            );
+            out.resize(t50 * fd, 0.0);
+        }
+        out
+    };
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write(
             "target/golden/cli_rust_feats.bin",
@@ -439,12 +512,14 @@ fn main() -> Result<()> {
 
     // ---- F0 ----
     let mut f0v = match args.f0_method.as_str() {
-        "rmvpe" => rmvpe.infer(&eng, &wav_pad),
+        // RMVPE は conv の dispatch グリッド上限 (x≤65535) に当たるため長尺は
+        // 窓分割 (25s 窓 + 1s 文脈、中央のみ採録)。SwiftF0 も同条件で統一。
+        "rmvpe" => windowed_f0(&wav_pad, n_total, t100, |w| rmvpe.infer(&eng, w)),
         "swiftf0" => {
             let sf0 =
                 rcwx_nn::swiftf0::SwiftF0::load(&eng, &rcwx_nn::swiftf0::default_swiftf0_path())
                     .context("SwiftF0 load")?;
-            sf0.detect(&eng, &wav_pad)
+            windowed_f0(&wav_pad, n_total, t100, |w| sf0.detect(&eng, w))
         }
         _ => vec![0.0f32; t100],
     };

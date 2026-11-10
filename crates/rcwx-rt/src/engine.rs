@@ -625,9 +625,24 @@ impl RtEngine {
             eng.write_f32(&p.har_in, &har);
             let dbg = !priming && std::env::var("RCWX_RT_STAGES").is_ok();
             let ts_probe = !priming && std::env::var_os("RCWX_TS_PROBE").is_some();
+            let ts_split = !priming && std::env::var_os("RCWX_TS_SPLIT").is_some();
             if ts_probe {
                 // 診断: 1 submit 統合 + GPU パス時間の分離計測
                 eng.run_plans_timed(&[&p.encode_plan, &p.decode_plan], &p.audio_out)
+            } else if ts_split {
+                // 診断: encode / decode を別 submit で個別に時間計測
+                let t0 = std::time::Instant::now();
+                eng.replay_plans(&[&p.encode_plan]);
+                let _ = eng.readback_f32(&p.audio_out); // fence 待ち (値は使わない)
+                let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let t1 = std::time::Instant::now();
+                let out = eng.run_plans_readback(&[&p.decode_plan], &p.audio_out);
+                eprintln!(
+                    "    [split] encode={:.2}ms decode={:.2}ms",
+                    enc_ms,
+                    t1.elapsed().as_secs_f64() * 1000.0
+                );
+                out
             } else {
                 // 計算と読み戻しを 1 submit に統合 (submit 数・fence 境界を削減)
                 let tt = std::time::Instant::now();
