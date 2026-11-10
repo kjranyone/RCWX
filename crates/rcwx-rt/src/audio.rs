@@ -51,19 +51,22 @@ pub fn run_virtual(
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(output_wav, spec)?;
+    // ウォームアップ: 最初の 2 バッチ分は時計・出力から除外 (プラン構築)
+    let warmup_hops = (engine.cfg.batch_hops * 2) as usize;
+    let chunks: Vec<&[f32]> = mono.chunks(hop).filter(|c| c.len() == hop).collect();
+    for c in chunks.iter().take(warmup_hops) {
+        let _ = engine.process_hop(c);
+    }
     let start = std::time::Instant::now();
-    let mut n_hops = 0usize;
-    for chunk in mono.chunks(hop) {
-        if chunk.len() < hop {
-            break;
-        }
+    let mut n_hops = warmup_hops;
+    for chunk in chunks.iter().skip(warmup_hops) {
         let out = engine.process_hop(chunk);
         for v in &out {
             writer.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16)?;
         }
         n_hops += 1;
         if realtime_pacing {
-            let target = start + hop_dur * n_hops as u32;
+            let target = start + hop_dur * (n_hops - warmup_hops) as u32;
             let now = std::time::Instant::now();
             if target > now {
                 std::thread::sleep(target - now);
@@ -71,6 +74,17 @@ pub fn run_virtual(
         }
     }
     writer.finalize()?;
+    if realtime_pacing {
+        let audio_dur = (n_hops - warmup_hops) as f64 * hop as f64 / sr as f64;
+        let wall = start.elapsed().as_secs_f64();
+        // 初回バッチ分 (prebuffer 相当) の一定遅延は許容
+        let batch_period = engine.cfg.batch_hops as f64 * hop as f64 / sr as f64;
+        let ok = wall <= audio_dur * 1.02 + batch_period;
+        println!(
+            "realtime pacing: audio {audio_dur:.2}s / wall {wall:.2}s → {}",
+            if ok { "追従OK (underrun 相当ゼロ)" } else { "遅延蓄積" }
+        );
+    }
     let s = &engine.stats;
     println!(
         "virtual run: {n_hops} hops, inference p50={:.2}ms p99={:.2}ms max={:.2}ms (budget {:.1}ms)",

@@ -43,6 +43,9 @@ pub struct RtConfig {
     pub input_channel: Option<usize>,
     /// 出力チャンネル (None = 両ch)
     pub output_channel: Option<usize>,
+    /// 1 推論あたりにまとめる hop 数 (入力 hop 粒度は変わらず推論をバッチ。
+    /// decoder マージンを償却し GPU 形状を大きくして持続レートを稼ぐ)
+    pub batch_hops: u32,
 }
 
 impl Default for RtConfig {
@@ -71,6 +74,7 @@ impl Default for RtConfig {
             feedback_detect: true,
             input_channel: None,
             output_channel: None,
+            batch_hops: 1,
         }
     }
 }

@@ -32,7 +32,7 @@ use rcwx_nn::synth::Synth;
 
 const MODEL_SR: u32 = 48000; // kurumi (synth.json の sr)
 const ZC: usize = MODEL_SR as usize / 100; // 480 samples/frame @100fps
-const DECODER_OVERLAP_FRAMES: usize = 2;
+const DECODER_OVERLAP_FRAMES: usize = 3;
 /// 特徴/F0 キャッシュの上限 (秒)
 const CACHE_SEC: f64 = 4.0;
 
@@ -83,6 +83,10 @@ pub struct RtEngine {
     post: Postprocessor,
     out_hist: Vec<f32>,
     plans: Option<Box<SynthPlans>>,
+    // hop バッチング: 入力 hop を貯めて batch_hops 分を一度に推論
+    batch_pending: Vec<f32>,
+    batch_count: u32,
+    warmups: u32,
     pub stats: RtStats,
     pub warn: Vec<String>,
 }
@@ -143,6 +147,9 @@ impl RtEngine {
             post: Postprocessor::new(MODEL_SR, PostprocessConfig::default()),
             out_hist: Vec::new(),
             plans: None,
+            batch_pending: Vec::new(),
+            batch_count: 0,
+            warmups: 0,
             eng,
             hubert,
             rmvpe,
@@ -159,8 +166,27 @@ impl RtEngine {
         })
     }
 
-    /// hop (mic レート) → 変換音声 (出力レート)。戻り長は毎 hop 固定。
+    /// hop (mic レート) → 変換音声 (出力レート)。
+    /// batch_hops > 1 のときは貯めてから一括推論し、非最終 hop は空 Vec を返す。
+    /// 戻り値の平均長は hop あたり new100*zc (出力レート)。
     pub fn process_hop(&mut self, hop_mic: &[f32]) -> Vec<f32> {
+        if self.cfg.batch_hops > 1 {
+            self.batch_pending.extend_from_slice(hop_mic);
+            self.batch_count += 1;
+            if self.batch_count < self.cfg.batch_hops {
+                return Vec::new();
+            }
+            let batched = std::mem::take(&mut self.batch_pending);
+            self.batch_count = 0;
+            let n = self.cfg.batch_hops as usize;
+            let out = self.process_batch(&batched, n);
+            return out;
+        }
+        self.process_batch(hop_mic, 1)
+    }
+
+    /// hop_mic: (batch_n hop 分を連結した) 入力。batch_n=1 で単一 hop。
+    fn process_batch(&mut self, hop_mic: &[f32], batch_n: usize) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         let mut stage_t = std::time::Instant::now();
         let mut stage = |name: &str, t: &mut std::time::Instant| {
@@ -169,7 +195,7 @@ impl RtEngine {
             }
             *t = std::time::Instant::now();
         };
-        let hop16 = self.cfg.hop_16k();
+        let hop16 = self.cfg.hop_16k() * batch_n.max(1);
         let new50 = hop16 / 320;
         let new100 = new50 * 2;
 
@@ -443,8 +469,12 @@ impl RtEngine {
         }
 
         stage("sola+post", &mut stage_t);
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        self.stats.record_inference(ms);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0 / batch_n.max(1) as f64;
+        // 初回 2 推論 (プラン構築) はウォームアップとして統計から除外
+        self.warmups += 1;
+        if self.warmups > 2 {
+            self.stats.record_inference(ms);
+        }
 
         // 履歴を窓長に縮める
         let win_target = self.cfg.hubert_ctx_samples() + hop16;

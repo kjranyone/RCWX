@@ -174,8 +174,10 @@ impl App {
         if self.running.load(Ordering::Acquire) {
             return;
         }
+        let batch_hops = if self.settings.chunk_sec < 0.05 { 4 } else { 1 };
         let cfg = rcwx_rt::RtConfig {
             chunk_sec: self.settings.chunk_sec,
+            batch_hops,
             pitch: self.settings.pitch,
             f0_method: self.settings.f0_method.clone(),
             denoise: if self.settings.denoise { "spectral".into() } else { "none".into() },

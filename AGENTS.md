@@ -32,11 +32,15 @@ crates/
 - 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15]`、
   `... rt --virtual in.wav -o out.wav --chunk 0.06` (デバイスなし検証)、`... rt` (実デバイス)、
   `cargo run -p rcwx-gui --release`
-- **既知の制限**: リアルタイム推論 p50 ≈ 45ms/hop (20ms chunk 設定、仮想実行)。
-  implicit-GEMM conv カーネル (matmul_conv・im2col 廃止・lrelu fuse・z GPU 直結) で
-  125ms → 45ms (2.8倍) まで改善。20ms hop 予算達成には更なるカーネル最適化
-  (conv_transpose 高速化・HuBERT frontend・encode の dispatch 縮減) が残務。
-  fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)
+- **リアルタイム性能 (20ms hop)**: implicit-GEMM conv カーネル (matmul_conv・
+  im2col 廃止・lrelu fuse・z GPU 直結 slice_ch) で 125ms/hop → 45ms、さらに
+  **hop バッチング** (入力は 20ms hop のまま推論を 4 hop 分統合・decoder マージン
+  と固定費を償却) で **p50 16.8ms / p99 18.9ms・全 hop 予算内・リアルタイム追従OK**
+  (rt --virtual --chunk 0.02 で検証)。E2E レイテンシ ≈ 80ms (入力蓄積) + 推論。
+  chunk < 50ms で自動的に batch 4 (GUI/CLI とも)。バッチ内境界は連続合成で
+  スプライスなし、バッチ境界のみ SOLA。
+  fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)。
+  単発 (バッチなし) では p50 ≈ 45ms/hop — さらなる単発高速化は今後の課題
 
 
 ## Quick Start

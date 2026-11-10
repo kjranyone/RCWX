@@ -15,6 +15,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
     let mut index_rate = 0.0f32;
     let mut moe = 0.0f64;
     let mut realtime_pacing = false;
+    let mut batch_hops = 1u32;
     let mut dev_in: Option<String> = None;
     let mut dev_out: Option<String> = None;
     let mut seconds: Option<u64> = None;
@@ -39,6 +40,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
             "--index-rate" => index_rate = it.next().context("--index-rate")?.parse()?,
             "--moe" => moe = it.next().context("--moe")?.parse()?,
             "--realtime" => realtime_pacing = true,
+            "--batch" => batch_hops = it.next().context("--batch")?.parse()?,
             "--in" => dev_in = Some(it.next().context("--in")?.clone()),
             "--out" => dev_out = Some(it.next().context("--out")?.clone()),
             "--seconds" => seconds = Some(it.next().context("--seconds")?.parse()?),
@@ -51,8 +53,17 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
         "vulkan" => rcwx_nn::engine::Backend::Vulkan,
         _ => rcwx_nn::engine::Backend::Dx12,
     };
+    // 既定: 低遅延 chunk は 4 hop バッチ (20ms hop で全 hop 予算内を実測)
+    let batch_hops = if args.iter().any(|a| a == "--batch") {
+        batch_hops
+    } else if chunk < 0.05 {
+        4
+    } else {
+        1
+    };
     let cfg = rcwx_rt::RtConfig {
         chunk_sec: chunk,
+        batch_hops,
         pitch,
         f0_method,
         denoise,
