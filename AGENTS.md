@@ -32,9 +32,11 @@ crates/
 - 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15]`、
   `... rt --virtual in.wav -o out.wav --chunk 0.06` (デバイスなし検証)、`... rt` (実デバイス)、
   `cargo run -p rcwx-gui --release`
-- **既知の制限**: リアルタイム推論 p50 ≈ 140ms/hop (60ms chunk)。decode WGSL カーネルが
-  ~170 GFLOPS に留まる (生 matmul は 721 GFLOPS)。20ms hop 予達成には Issue #6 の
-  カーネル最適化 (fp16 compute / im2col+matmul fusion / tile チューニング) が残務
+- **既知の制限**: リアルタイム推論 p50 ≈ 45ms/hop (20ms chunk 設定、仮想実行)。
+  implicit-GEMM conv カーネル (matmul_conv・im2col 廃止・lrelu fuse・z GPU 直結) で
+  125ms → 45ms (2.8倍) まで改善。20ms hop 予算達成には更なるカーネル最適化
+  (conv_transpose 高速化・HuBERT frontend・encode の dispatch 縮減) が残務。
+  fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)
 
 
 ## Quick Start

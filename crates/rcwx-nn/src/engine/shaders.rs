@@ -589,3 +589,206 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#
 }
+
+/// implicit-GEMM conv1d (stride 1・tiled matmul 構造・im2col 省略)。
+/// A = 重み [cout, k_dim=cin*ck]、B2 = 信号 X [cin, in_len]、出力 [cout, len]。
+/// gk→(ci,j) の除算はチャンク毎の SLM テーブルで hot path から除去。
+/// post_op (P.p5.w): 0=none 1=lrelu — 畳み込み直後の活性化を fuse。
+pub fn matmul_conv_src() -> String {
+    header(4)
+        + r#"
+fn post1(v: f32, op: u32) -> f32 {
+  if (op == 1u) { return select(0.1 * v, v, v > 0.0); }
+  return v;
+}
+var<workgroup> ta: array<f32, 256>;
+var<workgroup> tb: array<f32, 256>;
+var<workgroup> idxci: array<u32, 16>;
+var<workgroup> idxj: array<u32, 16>;
+@compute @workgroup_size(8, 8)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let m_dim = P.p0.x; let n_dim = P.p0.y; let k_dim = P.p0.z;
+  let a_row = P.p1.x; let a_k = P.p1.y; let a_base = P.p1.z;
+  let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z;
+  let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
+  let conv_k = P.p4.w;
+  let pad = P.p5.x; let dil = P.p5.y; let in_len = P.p5.z; let post_op = P.p5.w;
+  let tile_m = wid.y * 16u;
+  let tile_n = wid.x * 16u;
+  let lx = lid.x * 2u;
+  let ly = lid.y * 2u;
+  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  let m0 = tile_m + lx;
+  let m1 = tile_m + lx + 1u;
+  let n0 = tile_n + ly;
+  let n1 = tile_n + ly + 1u;
+  var kt: u32 = 0u;
+  while (kt < k_dim) {
+    if (lid.x == 0u && lid.y == 0u) {
+      for (var c2: u32 = 0u; c2 < 16u; c2 = c2 + 1u) {
+        let gk2 = kt + c2;
+        idxci[c2] = gk2 / conv_k;
+        idxj[c2] = gk2 % conv_k;
+      }
+    }
+    workgroupBarrier();
+    var idx = lid.y * 8u + lid.x;
+    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
+      let r = idx / 16u;
+      let c = idx % 16u;
+      let gm = tile_m + r;
+      let gk = kt + c;
+      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      // B = conv gather: 位置 = gn - pad + j*dil
+      let gn = tile_n + r;
+      let pos = i32(gn) - i32(pad) + i32(idxj[c] * dil);
+      let v = select(0.0, B2[idxci[c] * in_len + u32(pos)],
+                     (gn < n_dim && gk < k_dim) && pos >= 0 && pos < i32(in_len));
+      tb[r * 16u + c] = v;
+      idx = idx + 64u;
+    }
+    workgroupBarrier();
+    for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = ta[lx * 16u + kk];
+      let a1 = ta[(lx + 1u) * 16u + kk];
+      let b0 = tb[ly * 16u + kk];
+      let b1 = tb[(ly + 1u) * 16u + kk];
+      acc00 = acc00 + a0 * b0;
+      acc01 = acc01 + a0 * b1;
+      acc10 = acc10 + a1 * b0;
+      acc11 = acc11 + a1 * b1;
+    }
+    workgroupBarrier();
+    kt = kt + 16u;
+  }
+  if (has_bias == 1u) {
+    let b00 = B3[m0];
+    let b01 = B3[m0];
+    let b10 = B3[m1];
+    let b11 = B3[m1];
+    if (m0 < m_dim && n0 < n_dim) { B4[c_base + c_row * m0 + c_n * n0] = post1((acc00 + b00) * scale, post_op); }
+    if (m0 < m_dim && n1 < n_dim) { B4[c_base + c_row * m0 + c_n * n1] = post1((acc01 + b01) * scale, post_op); }
+    if (m1 < m_dim && n0 < n_dim) { B4[c_base + c_row * m1 + c_n * n0] = post1((acc10 + b10) * scale, post_op); }
+    if (m1 < m_dim && n1 < n_dim) { B4[c_base + c_row * m1 + c_n * n1] = post1((acc11 + b11) * scale, post_op); }
+  } else {
+    if (m0 < m_dim && n0 < n_dim) { B4[c_base + c_row * m0 + c_n * n0] = post1(acc00 * scale, post_op); }
+    if (m0 < m_dim && n1 < n_dim) { B4[c_base + c_row * m0 + c_n * n1] = post1(acc01 * scale, post_op); }
+    if (m1 < m_dim && n0 < n_dim) { B4[c_base + c_row * m1 + c_n * n0] = post1(acc10 * scale, post_op); }
+    if (m1 < m_dim && n1 < n_dim) { B4[c_base + c_row * m1 + c_n * n1] = post1(acc11 * scale, post_op); }
+  }
+}
+"#
+}
+
+/// チャネル major 行列の末尾 n_out フレーム抽出: out[c, t] = in[c, off+t]。
+pub fn slice_ch_src() -> String {
+    header(2)
+        + r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let n_out = P.p0.x; let n_in = P.p0.y; let ch = P.p0.z; let off = P.p0.w;
+  let i = gid.x + gid.y * 131072u;
+  if (i >= ch * n_out) { return; }
+  let c = i / n_out;
+  let t = i % n_out;
+  B2[i] = B1[c * n_in + off + t];
+}
+"#
+}
+
+/// matmul_conv の fp16 版: SLM タイルと内積を f16 で計算 (16 項ごとに f32 昇格)。
+/// 入力バッファは f32 のまま (ロード時に変換)。
+pub fn matmul_conv_f16_src() -> String {
+    header(4)
+        + r#"
+enable f16;
+fn post1(v: f32, op: u32) -> f32 {
+  if (op == 1u) { return select(0.1 * v, v, v > 0.0); }
+  return v;
+}
+var<workgroup> ta: array<f16, 256>;
+var<workgroup> tb: array<f16, 256>;
+var<workgroup> idxci: array<u32, 16>;
+var<workgroup> idxj: array<u32, 16>;
+@compute @workgroup_size(8, 8)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let m_dim = P.p0.x; let n_dim = P.p0.y; let k_dim = P.p0.z;
+  let a_row = P.p1.x; let a_k = P.p1.y; let a_base = P.p1.z;
+  let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z;
+  let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
+  let conv_k = P.p4.w;
+  let pad = P.p5.x; let dil = P.p5.y; let in_len = P.p5.z; let post_op = P.p5.w;
+  let tile_m = wid.y * 16u;
+  let tile_n = wid.x * 16u;
+  let lx = lid.x * 2u;
+  let ly = lid.y * 2u;
+  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  let m0 = tile_m + lx;
+  let m1 = tile_m + lx + 1u;
+  let n0 = tile_n + ly;
+  let n1 = tile_n + ly + 1u;
+  var kt: u32 = 0u;
+  while (kt < k_dim) {
+    if (lid.x == 0u && lid.y == 0u) {
+      for (var c2: u32 = 0u; c2 < 16u; c2 = c2 + 1u) {
+        let gk2 = kt + c2;
+        idxci[c2] = gk2 / conv_k;
+        idxj[c2] = gk2 % conv_k;
+      }
+    }
+    workgroupBarrier();
+    var idx = lid.y * 8u + lid.x;
+    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
+      let r = idx / 16u;
+      let c = idx % 16u;
+      let gm = tile_m + r;
+      let gk = kt + c;
+      ta[r * 16u + c] = f16(select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim));
+      let gn = tile_n + r;
+      let pos = i32(gn) - i32(pad) + i32(idxj[c] * dil);
+      let v = select(0.0, B2[idxci[c] * in_len + u32(pos)],
+                     (gn < n_dim && gk < k_dim) && pos >= 0 && pos < i32(in_len));
+      tb[r * 16u + c] = f16(v);
+      idx = idx + 64u;
+    }
+    workgroupBarrier();
+    var h00 = f16(0.0); var h01 = f16(0.0); var h10 = f16(0.0); var h11 = f16(0.0);
+    for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = ta[lx * 16u + kk];
+      let a1 = ta[(lx + 1u) * 16u + kk];
+      let b0 = tb[ly * 16u + kk];
+      let b1 = tb[(ly + 1u) * 16u + kk];
+      h00 = h00 + a0 * b0;
+      h01 = h01 + a0 * b1;
+      h10 = h10 + a1 * b0;
+      h11 = h11 + a1 * b1;
+    }
+    acc00 = acc00 + f32(h00);
+    acc01 = acc01 + f32(h01);
+    acc10 = acc10 + f32(h10);
+    acc11 = acc11 + f32(h11);
+    workgroupBarrier();
+    kt = kt + 16u;
+  }
+  if (has_bias == 1u) {
+    let b00 = B3[m0];
+    let b10 = B3[m1];
+    if (m0 < m_dim && n0 < n_dim) { B4[c_base + c_row * m0 + c_n * n0] = post1((acc00 + b00) * scale, post_op); }
+    if (m0 < m_dim && n1 < n_dim) { B4[c_base + c_row * m0 + c_n * n1] = post1((acc01 + b00) * scale, post_op); }
+    if (m1 < m_dim && n0 < n_dim) { B4[c_base + c_row * m1 + c_n * n0] = post1((acc10 + b10) * scale, post_op); }
+    if (m1 < m_dim && n1 < n_dim) { B4[c_base + c_row * m1 + c_n * n1] = post1((acc11 + b10) * scale, post_op); }
+  } else {
+    if (m0 < m_dim && n0 < n_dim) { B4[c_base + c_row * m0 + c_n * n0] = post1(acc00 * scale, post_op); }
+    if (m0 < m_dim && n1 < n_dim) { B4[c_base + c_row * m0 + c_n * n1] = post1(acc01 * scale, post_op); }
+    if (m1 < m_dim && n0 < n_dim) { B4[c_base + c_row * m1 + c_n * n0] = post1(acc10 * scale, post_op); }
+    if (m1 < m_dim && n1 < n_dim) { B4[c_base + c_row * m1 + c_n * n1] = post1(acc11 * scale, post_op); }
+  }
+}
+"#
+}

@@ -58,6 +58,7 @@ pub struct Engine {
     pub adapter_info: wgpu::AdapterInfo,
     uniform_buf: wgpu::Buffer,
     kernels: HashMap<&'static str, Kernel>,
+    pub has_f16: bool,
 }
 
 impl Engine {
@@ -140,12 +141,22 @@ impl Engine {
             | (Backend::Auto, _) => {}
             (want, got) => bail!("backend mismatch: requested {want:?}, got {got:?}"),
         }
+        // SHADER_F16 が使えるなら要求 (fp16 compute カーネル用)
+        let features = if adapter
+            .features()
+            .contains(wgpu::Features::SHADER_F16)
+        {
+            wgpu::Features::SHADER_F16
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("rcwx-engine"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             ..Default::default()
         }))
         .with_context(|| "request_device")?;
+        let has_f16 = device.features().contains(wgpu::Features::SHADER_F16);
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
             size: UNIFORM_SLOT_SIZE * UNIFORM_SLOTS as u64,
@@ -158,6 +169,7 @@ impl Engine {
             adapter_info: info,
             uniform_buf,
             kernels: HashMap::new(),
+            has_f16,
         };
         e.compile_all()?;
         Ok(e)
@@ -237,6 +249,8 @@ impl Engine {
         self.compile("flip_ch", &shaders::flip_ch_src(), 2)?;
         self.compile("im2col2d", &shaders::im2col2d_src(), 2)?;
         self.compile("im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
+        self.compile("matmul_conv", &shaders::matmul_conv_src(), 4)?;
+        self.compile("slice_ch", &shaders::slice_ch_src(), 2)?;
         self.compile("avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
         self.compile("conv_transpose2d", &shaders::conv_transpose2d_src(), 4)?;
         self.compile("concat_ch", &shaders::concat_ch_src(), 3)?;
@@ -609,6 +623,51 @@ impl<'a> Graph<'a> {
             let rows = wg.div_ceil(cols);
             self.dispatch("im2col2d", &[x, ic], words, cols, rows, 1);
         }
+    }
+
+    /// チャネル major [ch, n_in] の [off, off+n_out) フレームを [ch, n_out] へ (GPU 直結)。
+    pub fn slice_ch(&mut self, src: &GpuTensor, dst: &GpuTensor, ch: u32, n_in: u32, off: u32, n_out: u32) {
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[n_out, n_in, ch, off]);
+        let total = ch * n_out;
+        let wg = total.div_ceil(256);
+        if wg <= 65535 {
+            self.dispatch("slice_ch", &[src, dst], words, wg, 1, 1);
+        } else {
+            self.dispatch("slice_ch", &[src, dst], words, 512, wg.div_ceil(512), 1);
+        }
+    }
+
+    /// implicit-GEMM conv1d (stride 1・tiled matmul 構造・im2col 省略)。
+    /// a = 重み [cout, k_dim=cin*ck], x = 信号 [cin, in_len], out = [cout, len]。
+    /// post_op: 0=none 1=lrelu。
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_conv(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        c: &GpuTensor,
+        m: u32,
+        n: u32,
+        k_dim: u32,
+        conv_k: u32,
+        dil: u32,
+        pad: u32,
+        in_len: u32,
+        post_op: u32,
+    ) {
+        let has_bias = bias.is_some();
+        let mut w = [0u32; 32];
+        w[0..4].copy_from_slice(&[m, n, k_dim, 1]);
+        w[4..8].copy_from_slice(&[k_dim, 1, 0, 0]); // a_row=k_dim, a_k=1
+        w[12..16].copy_from_slice(&[n, 1, 0, 0]);   // c_row=n, c_n=1
+        w[16..20].copy_from_slice(&[has_bias as u32, 1.0f32.to_bits(), 1, conv_k]);
+        w[20..24].copy_from_slice(&[pad, dil, in_len, post_op]);
+        let dummy = a;
+        let bias_ref = bias.unwrap_or(dummy);
+        // f16 版は現状 DXC が packed 命令を出さず速度劣化 + 数値劣化のため無効
+        self.dispatch("matmul_conv", &[a, x, bias_ref, c], w, n.div_ceil(16), m.div_ceil(16), 1);
     }
 
     /// 汎用 im2col2d (kernel k・pad p)。出力 [c*k*k, h*w]。

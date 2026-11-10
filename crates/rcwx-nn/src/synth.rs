@@ -167,8 +167,7 @@ impl Synth {
         self.conv_k(g, x, 0, wname, out, cin, cout, k, dil, t);
     }
 
-    /// k 番 conv (same padding) [C, T] → [C', T]。im2col + matmul。
-    /// 大規模 T では 128MB バッファ上限を超えるため直接 conv1d カーネルへ切替。
+    /// k 番 conv (same padding) [C, T] → [C', T]。
     fn conv_k(
         &self,
         g: &mut Graph<'_>,
@@ -182,6 +181,33 @@ impl Synth {
         dil: u32,
         t: u32,
     ) {
+        self.conv_k_post(g, x, x_base, wname, out, cin, cout, k, dil, t, 0)
+    }
+
+    /// conv_k + 畳み込み直後の活性化 fuse (post: 0=none 1=lrelu)。
+    /// 既定は implicit-GEMM (im2col なし)。RCWX_CONV=im2col で従来経路。
+    fn conv_k_post(
+        &self,
+        g: &mut Graph<'_>,
+        x: &GpuTensor,
+        x_base: u32,
+        wname: &str,
+        out: &GpuTensor,
+        cin: u32,
+        cout: u32,
+        k: u32,
+        dil: u32,
+        t: u32,
+        post: u32,
+    ) {
+        if x_base == 0 && std::env::var("RCWX_CONV").ok().as_deref() != Some("im2col") {
+            g.matmul_conv(
+                self.g(&format!("{wname}.weight")), x,
+                Some(self.g(&format!("{wname}.bias"))), out,
+                cout, t, cin * k, k, dil, (k - 1) * dil / 2, t, post,
+            );
+            return;
+        }
         if x_base == 0 && (cin * k * t) as usize * 4 > 96_000_000 {
             g.conv1d(
                 x, self.g(&format!("{wname}.weight")),
@@ -685,14 +711,53 @@ impl Synth {
     pub fn decode_window_har(&self, eng: &Engine, z: &GpuTensor, har: &[f32], n: u32) -> GpuTensor {
         let har_t = eng.tensor_from_f32(har, vec![]);
         let mut g = eng.graph();
-        let audio = self.decode_graph(eng, &mut g, z, &har_t, n);
+        let audio = self.decode_graph(eng, &mut g, z, &har_t, n, n);
         g.submit().expect("submit");
         audio
     }
 
+    /// decode_graph の任意オフセット版 (チャンク分割生成用)。
+    pub fn decode_graph_off(
+        &self,
+        eng: &Engine,
+        g: &mut Graph<'_>,
+        z_full: &GpuTensor,
+        har_t: &GpuTensor,
+        n_in: u32,
+        off: u32,
+        n: u32,
+    ) -> GpuTensor {
+        let inter = self.cfg.inter_channels;
+        let z_dec = eng.tensor_uninit((inter * n) as usize);
+        g.slice_ch(z_full, &z_dec, inter, n_in, off, n);
+        self.decode_graph_inner(eng, g, &z_dec, har_t, n)
+    }
+
     /// デコーダを graph に記録 (submit しない・プランキャッシュ用)。
-    /// z [inter, n] + har_t [n*zc] → 音声 [n * zc]。
+    /// z_full [inter, n_in] (n_in > n なら末尾 n フレームを GPU で抽出) +
+    /// har_t [n*zc] → 音声 [n * zc]。
     pub fn decode_graph(
+        &self,
+        eng: &Engine,
+        mut g: &mut Graph<'_>,
+        z_full: &GpuTensor,
+        har_t: &GpuTensor,
+        n_in: u32,
+        n: u32,
+    ) -> GpuTensor {
+        let inter = self.cfg.inter_channels;
+        let z_dec;
+        let z: &GpuTensor = if n_in > n {
+            z_dec = eng.tensor_uninit((inter * n) as usize);
+            g.slice_ch(z_full, &z_dec, inter, n_in, n_in - n, n);
+            &z_dec
+        } else {
+            z_full
+        };
+        self.decode_graph_inner(eng, g, z, har_t, n)
+    }
+
+    fn decode_graph_inner(
         &self,
         eng: &Engine,
         mut g: &mut Graph<'_>,
@@ -774,22 +839,19 @@ impl Synth {
             for j in 0..3usize {
                 let rb = format!("dec.resblocks.{}.convs", i * 3 + j);
                 let k_j = cfg.resblock_kernel_sizes[j as usize];
-                let mut bx = eng.tensor_uninit((cout * len * u) as usize);
-                let zeros = eng.tensor_from_f32(&vec![0.0f32; (cout * len * u) as usize], vec![]);
-                g.add_off(&summed, &zeros, &bx, cout * len * u, 0, 0, false); // copy
+                // summed は読み取り専用 → 初回コピー不要 (bx は m ループ内で読むだけ)
+                let mut bx = summed.clone_handle();
                 for m in 0..3u32 {
                     let dil = [1u32, 3, 5][m as usize];
                     let xt = eng.tensor_uninit((cout * len * u) as usize);
-                    // lrelu → convs1[m] → lrelu → convs2[m] → 残差加算
+                    // lrelu → convs1[m] (lrelu fuse) → convs2[m] → 残差加算
                     let lr = eng.tensor_uninit((cout * len * u) as usize);
                     g.pointwise(&bx, Some(&lr), cout * len * u, 1, 0.1, 0, 0, 0);
 
                     let c1 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u);
-                    let lr2 = eng.tensor_uninit((cout * len * u) as usize);
-                    g.pointwise(&c1, Some(&lr2), cout * len * u, 1, 0.1, 0, 0, 0);
+                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, 1);
                     let c2 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k(&mut g, &lr2, 0, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u);
+                    self.conv_k_post(&mut g, &c1, 0, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u, 0);
                     g.add_off(&bx, &c2, &xt, cout * len * u, 0, 0, false);
                     bx = xt;
                 }
@@ -886,11 +948,13 @@ impl Synth {
             let w_start = start.saturating_sub(margin);
             let w_end = (end + margin).min(t);
             let n = (w_end - w_start) as u32;
-            let z_win: Vec<f32> = (0..inter as usize)
-                .flat_map(|c| z_cpu[c * t + w_start..c * t + w_end].to_vec())
-                .collect();
-            let z_win_t = eng.tensor_from_f32(&z_win, vec![]);
-            let audio = self.decode_window(eng, &z_win_t, pitchf, w_start as u32, n);
+            // z の末尾抽出は GPU 内で (slice_ch) — 全 z を一度アップロード
+            let z_full_t = eng.tensor_from_f32(&z_cpu, vec![]);
+            let har = self.sinegen_range(pitchf, w_start, n as usize);
+            let har_t = eng.tensor_from_f32(&har, vec![]);
+            let mut g = eng.graph();
+            let audio = self.decode_graph_off(eng, &mut g, &z_full_t, &har_t, t as u32, w_start as u32, n);
+            g.submit().expect("submit");
             let samples = eng.readback_f32(&audio);
             let s_off = start - w_start;
             let take = end - start;

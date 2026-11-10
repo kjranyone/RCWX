@@ -39,10 +39,10 @@ const CACHE_SEC: f64 = 4.0;
 /// synth の形状別プランキャッシュ (encode/decode)。
 struct SynthPlans {
     n100: usize,
+    n_dec: usize,
     feats_in: GpuTensor,
     pitch_emb_in: GpuTensor,
     z_out: GpuTensor,
-    z_in: GpuTensor,
     har_in: GpuTensor,
     encode_plan: Plan,
     decode_plan: Plan,
@@ -292,11 +292,12 @@ impl RtEngine {
 
         stage("f0", &mut stage_t);
         // 5) IVF ブレンド + 100fps 化 + decoder 窓
-        let enc_ctx50 = 28 + 8; // hubert ctx (0.56s) + 受容野マージン
+        // encode 窓 = hubert ctx (0.56s, Python Aggressive と同じ) + new。
+        // decoder の受容野マージンは n_dec 側で確保するため含めない。
+        let enc_ctx50 = 28;
         let n100 = {
             let avail100 = self.f0_filt.len();
             let enc_ctx100 = enc_ctx50 * 2;
-            // 窓 = 100fps で ctx + new + decoder overlap (履歴不足時は縮小)
             (enc_ctx100 + new100 + DECODER_OVERLAP_FRAMES).min(avail100)
         };
         let win100_start = self.f0_filt.len().saturating_sub(n100);
@@ -333,7 +334,7 @@ impl RtEngine {
         // 6) encode → decode → SOLA (固定形状はプランをキャッシュして再生)
         //    TextEncoder/Flow は全窓で attention コンテキストを取るが、
         //    デコーダは受容野マージン分 (8fr) の z で十分 → 計算量 1/5 に削減
-        let n_dec = (new100 + 8 + DECODER_OVERLAP_FRAMES).min(n100);
+        let n_dec = (new100 + 4 + DECODER_OVERLAP_FRAMES).min(n100);
         let pitch_emb = self.synth.pitch_embedding(&pitch, n100 as u32);
         let f0_dec = {
             let s = self.f0_filt.len().saturating_sub(n_dec);
@@ -348,25 +349,25 @@ impl RtEngine {
                 ..
             } = self;
             // 形状が変わったらプラン再構築 (ウォームアップ中のみ)
-            if plans.as_ref().map(|p| p.n100) != Some(n100) {
+            if plans.as_ref().map(|p| (p.n100, p.n_dec)) != Some((n100, n_dec)) {
                 let feats_in = eng.tensor_uninit(n100 * 768);
                 let pitch_emb_in = eng.tensor_uninit(synth.cfg.hidden_channels as usize * n100);
                 // encode plan
                 let mut g = eng.graph();
                 let z_out = synth.encode_graph(eng, &mut g, &feats_in, &pitch_emb_in, n100 as u32);
                 let encode_plan = g.into_plan().expect("encode plan");
-                // decode plan (z は CPU 経由でトリムして供給)
-                let z_in = eng.tensor_uninit(synth.cfg.inter_channels as usize * n_dec);
+                // decode plan: encode の z を GPU 直結 (slice_ch で末尾抽出)
                 let har_in = eng.tensor_uninit(har.len());
+                let z_link = z_out.clone_handle();
                 let mut g = eng.graph();
-                let audio = synth.decode_graph(eng, &mut g, &z_in, &har_in, n_dec as u32);
+                let audio = synth.decode_graph(eng, &mut g, &z_link, &har_in, n100 as u32, n_dec as u32);
                 let decode_plan = g.into_plan().expect("decode plan");
                 *plans = Some(Box::new(SynthPlans {
                     n100,
+                    n_dec,
                     feats_in,
                     pitch_emb_in,
                     z_out,
-                    z_in,
                     har_in,
                     encode_plan,
                     decode_plan,
@@ -379,16 +380,7 @@ impl RtEngine {
             let dbg = std::env::var("RCWX_RT_STAGES").is_ok();
             let mut tt = std::time::Instant::now();
             eng.replay_inputs(&p.encode_plan, &[]);
-            let z_all = eng.readback_f32(&p.z_out);
             if dbg { eprintln!("    [synth] encode: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); tt = std::time::Instant::now(); }
-            // z [192, n100] → 末尾 n_dec フレーム
-            let inter = synth.cfg.inter_channels as usize;
-            let mut z_dec = Vec::with_capacity(inter * n_dec);
-            for c in 0..inter {
-                let s = c * n100 + (n100 - n_dec);
-                z_dec.extend_from_slice(&z_all[s..s + n_dec]);
-            }
-            eng.write_f32(&p.z_in, &z_dec);
             eng.write_f32(&p.har_in, &har);
             eng.replay_inputs(&p.decode_plan, &[]);
             if dbg { eprintln!("    [synth] decode replay: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); tt = std::time::Instant::now(); }
