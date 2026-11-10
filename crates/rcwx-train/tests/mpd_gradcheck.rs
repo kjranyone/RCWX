@@ -542,34 +542,32 @@ fn conv1d_dilated_fd() {
     assert!(wdx < 1e-3, "dilated dX {wdx}");
 }
 
-/// logmel 逆伝達の FD 検証 (mel 経路の G 勾配残差の原因特定)。
-/// 損失は学習と同じ l1_mean(logmel(a), logmel(b)) — a 側のみ FD する。
+/// logmel 逆伝達の py (torch autograd) 参照との直接比較。
+/// 事前生成: uv run python tools/logmel_bwd_ref.py
 #[test]
-fn logmel_backward_fd() {
+fn logmel_backward_parity() {
+    let path = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap())
+        .join(".cache/rcwx/train/golden/logmel_bwd.safetensors");
+    if !path.exists() {
+        eprintln!("skipping: run `uv run python tools/logmel_bwd_ref.py` first");
+        return;
+    }
+    let raw = std::fs::read(&path).unwrap();
+    let st = safetensors::SafeTensors::deserialize(&raw).unwrap();
+    let read = |name: &str| -> Vec<f32> {
+        let v = st.tensor(name).unwrap();
+        v.data()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    };
+    let ya = read("ya");
+    let yb = read("yb");
+    let want = read("dy");
+    let (batch, samples) = (2u32, 18400u32);
     let eng = Engine::new(Backend::Vulkan).expect("engine");
     let stft = rcwx_train::modules::stft_mel::StftMel::new_rust(&eng, 2048, 480, 128, 48000);
-    let batch = 2u32;
-    let samples = 18400u32;
-    let ya: Vec<f32> = (0..batch as usize * samples as usize)
-        .map(|i| ((i as f64 * 0.37 + (i % 7) as f64 * 0.11) % 1.0 - 0.5) as f32)
-        .collect();
-    let yb: Vec<f32> = (0..batch as usize * samples as usize)
-        .map(|i| ((i as f64 * 0.71 + (i % 5) as f64 * 0.13) % 1.0 - 0.5) as f32)
-        .collect();
 
-    let run = |ya: &[f32]| -> f32 {
-        let mut tape = Tape::new(&eng);
-        let av = tape.const_f32s(ya, vec![ya.len()]);
-        let bv = tape.const_f32s(&yb, vec![yb.len()]);
-        let ma = stft.logmel(&mut tape, av, batch, samples);
-        let mb = stft.logmel(&mut tape, bv, batch, samples);
-        let l = rcwx_train::losses::mel_l1_loss(&mut tape, ma, mb, 1.0);
-        let lt = tape.var_tensor(l);
-        tape.submit().expect("submit");
-        eng.readback_f32(&lt)[0]
-    };
-
-    // 解析 dy (a 側)
     let mut tape = Tape::new(&eng);
     let av = tape.input_f32s(&ya, vec![ya.len()]);
     let bv = tape.const_f32s(&yb, vec![yb.len()]);
@@ -581,34 +579,157 @@ fn logmel_backward_fd() {
     tape.submit().expect("submit");
     let dy = eng.readback_f32(&dy_t);
 
-    // FD: |解析 dy| が大きい上位 30 点のみ (小値は FD ノイズに埋もれる)
-    let eps = 0.5f32;
-    let mut idxs: Vec<usize> = (0..dy.len()).collect();
-    idxs.sort_by(|&a, &b| dy[a].abs().partial_cmp(&dy[b].abs()).unwrap());
-    let picks: Vec<usize> = idxs[dy.len() - 30..].to_vec();
-    let mut worst = 0.0f64;
-    let mut worst_i = 0usize;
-    let mut n_big = 0usize;
-    for &i in &picks {
-        let mut yp = ya.clone();
-        yp[i] += eps;
-        let fp = run(&yp);
-        yp[i] -= 2.0 * eps;
-        let fm = run(&yp);
-        let fd = (f64::from(fp) - f64::from(fm)) / f64::from(2.0 * eps);
-        let d = ((fd - f64::from(dy[i])) / fd.abs().max(1e-2)).abs();
+    // 比較: cos + 比率分布
+    let dot: f64 = dy.iter().zip(want.iter()).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum();
+    let na = (dy.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()).sqrt();
+    let nb = (want.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>()).sqrt();
+    println!("logmel bwd: cos={:.6} |ru|={na:.4} |py|={nb:.4} ratio={}", dot / (na * nb), na / nb);
+    // 誤差上位の位置構造 (mod hop / エッジ距離)
+    let mut diffs: Vec<(usize, f32)> = (0..dy.len())
+        .map(|i| (i, (dy[i] - want[i]).abs()))
+        .collect();
+    diffs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    for &(i, d) in diffs[..12].iter() {
+        println!(
+            "  worst[{i}]: |d|={d:.6} ru={:.6} py={:.6} mod480={} edge_min={}",
+            dy[i],
+            want[i],
+            i % 480,
+            i.min(dy.len() - i)
+        );
+    }
+    assert!((dot / (na * nb)) > 0.99, "logmel bwd cos {}", dot / (na * nb));
+}
+
+/// reflect_pad_dims 逆伝達の FD 検証 (mel 経路エッジ誤差の原因候補)。
+#[test]
+fn reflect_pad_backward_fd() {
+    let eng = Engine::new(Backend::Vulkan).expect("engine");
+    let batch = 2u32;
+    let in_len = 18400u32;
+    let pad = 784u32;
+    let x: Vec<f32> = (0..batch as usize * in_len as usize)
+        .map(|i| ((i as f64 * 0.37 + (i % 7) as f64 * 0.11) % 1.0 - 0.5) as f32)
+        .collect();
+    let wlen = (batch * (in_len + 2 * pad)) as usize;
+
+    // sum_all は勾配非伝播のため l1_mean 経路で backward を駆動する:
+    // loss = mean |pad(x) − pad(x2)| (x2 固定 → dx 側だけ見る)
+    let x2: Vec<f32> = (0..x.len())
+        .map(|i| ((i as f64 * 0.71 + (i % 5) as f64 * 0.13) % 1.0 - 0.5) as f32)
+        .collect();
+
+    let mut tape = Tape::new(&eng);
+    let xv = tape.input_f32s(&x, vec![batch as usize, 1, in_len as usize]);
+    let x2v = tape.const_f32s(&x2, vec![batch as usize, 1, in_len as usize]);
+    let y = tape.reflect_pad_dims(xv, batch, 1, in_len, pad);
+    let y2 = tape.reflect_pad_dims(x2v, batch, 1, in_len, pad);
+    let l = rcwx_train::losses::l1_mean(&mut tape, y, y2);
+    tape.backward_from(l);
+    let dy_t = tape.grad_tensor(xv).expect("dy");
+    tape.submit().expect("submit");
+    let dy = eng.readback_f32(&dy_t);
+
+    // CPU 参照: dx[j] = (Σ_i sign(pad(x)[i] − pad(x2)[i])) / N over mirror positions
+    let out_len = (in_len + 2 * pad) as usize;
+    let mirror = |i: usize| -> usize {
+        let src = i as i64 - pad as i64;
+        let m: i64 = if src < 0 {
+            -src - 1
+        } else if src >= in_len as i64 {
+            2 * in_len as i64 - 1 - src
+        } else {
+            src
+        };
+        m as usize
+    };
+    let mut want = vec![0.0f64; x.len()];
+    let n_total = (batch as usize) * out_len;
+    for b in 0..batch as usize {
+        for i in 0..out_len {
+            let j = b * in_len as usize + mirror(i);
+            let va = x[j] as f64;
+            // pad 値は mirror 先の x/x2
+            let a = x[b * in_len as usize + mirror(i)] as f64;
+            let b2 = x2[b * in_len as usize + mirror(i)] as f64;
+            let _ = va;
+            want[j] += (a - b2).signum();
+        }
+    }
+    for wv in want.iter_mut() {
+        *wv /= n_total as f64;
+    }
+    let want: Vec<f32> = want.iter().map(|v| *v as f32).collect();
+    let mut worst = 0.0f32;
+    let mut at = 0usize;
+    for i in 0..want.len() {
+        let d = (dy[i] - want[i]).abs();
         if d > worst {
             worst = d;
-            worst_i = i;
+            at = i;
         }
-        n_big += 1;
-        println!("  dy[{i}]: fd={fd:.6} an={:.6}", dy[i]);
     }
-    println!("entries checked: {n_big}");
     println!(
-        "logmel bwd FD worst rel = {worst:.4} at {worst_i} (fd dy={:.5}, an={:.5})",
-        (run(&ya.clone()) - run(&ya)) as f64 / 1.0, // dummy to keep types
-        dy[worst_i]
+        "reflect bwd worst = {worst:.6} at {at} (ru={:.5} py={:.5})",
+        dy[at], want[at]
     );
-    assert!(worst < 0.05, "logmel backward FD mismatch {worst} at {worst_i}");
+    assert!(worst < 5e-4, "reflect_pad backward mismatch {worst} at {at}");
+}
+
+/// im2col_frames 逆伝達 (col2im, k=2048 stride=480) の CPU 参照検証。
+#[test]
+fn im2col_frames_backward_cpu() {
+    let eng = Engine::new(Backend::Vulkan).expect("engine");
+    let batch = 2u32;
+    let in_len = 18400u32;
+    let (n_fft, hop) = (2048u32, 480u32);
+    let n_frames = (in_len - n_fft) / hop + 1;
+    let x: Vec<f32> = (0..batch as usize * in_len as usize)
+        .map(|i| ((i as f64 * 0.37 + (i % 7) as f64 * 0.11) % 1.0 - 0.5) as f32)
+        .collect();
+    let x2: Vec<f32> = (0..x.len())
+        .map(|i| ((i as f64 * 0.71 + (i % 5) as f64 * 0.13) % 1.0 - 0.5) as f32)
+        .collect();
+
+    let mut tape = Tape::new(&eng);
+    let xv = tape.input_f32s(&x, vec![batch as usize, 1, in_len as usize]);
+    let x2v = tape.const_f32s(&x2, vec![batch as usize, 1, in_len as usize]);
+    let f1 = tape.im2col_frames(xv, n_fft, hop, batch, in_len, n_frames);
+    let f2 = tape.im2col_frames(x2v, n_fft, hop, batch, in_len, n_frames);
+    let l = rcwx_train::losses::l1_mean(&mut tape, f1, f2);
+    tape.backward_from(l);
+    let dy_t = tape.grad_tensor(xv).expect("dy");
+    tape.submit().expect("submit");
+    let dy = eng.readback_f32(&dy_t);
+
+    // CPU 参照: dx[pos] = Σ_{t: 0≤t<n_f, 0≤pos−t·hop<n_fft} sign/N
+    let n_total = (batch * n_fft * n_frames) as f64;
+    let mut want = vec![0.0f64; x.len()];
+    for b in 0..batch as usize {
+        for t in 0..n_frames as usize {
+            for j in 0..n_fft as usize {
+                let pos = t * hop as usize + j;
+                let sa = x[b * in_len as usize + pos] as f64;
+                let sb = x2[b * in_len as usize + pos] as f64;
+                want[b * in_len as usize + pos] += (sa - sb).signum();
+            }
+        }
+    }
+    for w in want.iter_mut() {
+        *w /= n_total;
+    }
+    let mut worst = 0.0f32;
+    let mut at = 0usize;
+    for i in 0..want.len() {
+        let d = (dy[i] - want[i] as f32).abs();
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    println!(
+        "im2col_frames bwd worst = {worst:.7} at {at} (ru={:.7} py={:.7})",
+        dy[at], want[at] as f32
+    );
+    assert!(worst < 5e-4, "im2col_frames backward mismatch {worst} at {at}");
 }

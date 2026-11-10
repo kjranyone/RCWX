@@ -30,6 +30,14 @@ pub struct RtConfig {
     /// IVF index ブレンド率 (0 = off)
     pub index_rate: f32,
     pub index_k: usize,
+    /// formant shift (半音)。ピッチを保ったまま声質を移動 (upstream rtrvc と同一手法)
+    pub formant_shift: f64,
+    /// 無声フレーム保護 (0..0.5)。index 混入前の特徴へブレンドして子音・息を守る
+    pub protect: f64,
+    /// 音量エンベロープ追従 (upstream rms_mix_rate: 1 = off, 0 = 完全追従)
+    pub rms_mix_rate: f64,
+    /// 出力側スペクトルゲート (decoder 残留ノイズ低減)
+    pub output_denoise: bool,
     /// moe f0 スタイル強度
     pub moe_boost: f64,
     /// ポストプロセス
@@ -89,7 +97,11 @@ impl Default for RtConfig {
             crossfade_sec: 0.012,
             sola_search_sec: 0.010,
             index_rate: 0.0,
-            index_k: 4,
+            index_k: 8,
+            formant_shift: 0.0,
+            protect: 0.0,
+            rms_mix_rate: 1.0,
+            output_denoise: false,
             moe_boost: 0.0,
             postprocess: true,
             buffer_margin: 0.25,
@@ -127,6 +139,10 @@ pub struct LiveParams {
     pub output_gain_db: f64,
     pub index_rate: f32,
     pub index_k: usize,
+    pub formant_shift: f64,
+    pub protect: f64,
+    pub rms_mix_rate: f64,
+    pub output_denoise: bool,
     pub denoise: String,
     pub denoise_strength: f64,
     pub noise_gate: bool,
@@ -156,6 +172,10 @@ impl LiveParams {
             output_gain_db: cfg.output_gain_db,
             index_rate: cfg.index_rate,
             index_k: cfg.index_k,
+            formant_shift: cfg.formant_shift,
+            protect: cfg.protect.clamp(0.0, 0.5),
+            rms_mix_rate: cfg.rms_mix_rate.clamp(0.0, 1.0),
+            output_denoise: cfg.output_denoise,
             denoise: cfg.denoise.clone(),
             denoise_strength: cfg.denoise_strength,
             noise_gate: cfg.noise_gate,
@@ -186,6 +206,10 @@ impl RtConfig {
         self.output_gain_db = live.output_gain_db;
         self.index_rate = live.index_rate;
         self.index_k = live.index_k.max(1);
+        self.formant_shift = live.formant_shift;
+        self.protect = live.protect.clamp(0.0, 0.5);
+        self.rms_mix_rate = live.rms_mix_rate.clamp(0.0, 1.0);
+        self.output_denoise = live.output_denoise;
         self.denoise = live.denoise.clone();
         self.denoise_strength = live.denoise_strength;
         self.noise_gate = live.noise_gate;

@@ -164,6 +164,7 @@ fn main(
   }
 }
 "#
+}
 
 /// 学習経路用 Kahan 補償付き tiled matmul (matmul_tiled と同一レイアウト)。
 /// f32 累積誤差 (~1e-3 相対) を ~100x 抑える。使い方: Graph::matmul_ex_kahan。
@@ -882,6 +883,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 
+/// チャネル major [ch, t_in] を [ch, t_out] へ時間方向 線形補間 (formant 用 z 伸長)。
+/// torch F.interpolate(mode="linear", align_corners=False) と同一式
+/// (src < 0 は 0 へクランプ — area_pixel_compute_source_index 準拠)。
+pub fn interp_time_src() -> String {
+    header(2)
+        + r#"
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  let t_out = P.p0.x; let t_in = P.p0.y; let ch = P.p0.z;
+  let i = gid.x + gid.y * 131072u;
+  if (i >= ch * t_out) { return; }
+  let c = i / t_out;
+  let t = i % t_out;
+  let s = max((f32(t) + 0.5) * f32(t_in) / f32(t_out) - 0.5, 0.0);
+  let fi = floor(s);
+  let i0 = u32(min(fi, f32(t_in) - 1.0));
+  let i1 = min(i0 + 1u, t_in - 1u);
+  let fr = min(s - fi, 1.0);
+  let base = c * t_in;
+  B2[i] = B1[base + i0] * (1.0 - fr) + B1[base + i1] * fr;
+}
+"#
+}
 /// matmul_conv の fp16 版: SLM タイルと内積を f16 で計算 (16 項ごとに f32 昇格)。
 /// 入力バッファは f32 のまま (ロード時に変換)。
 pub fn matmul_conv_f16_src() -> String {

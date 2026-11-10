@@ -994,7 +994,6 @@ impl Engine {
             &shaders::conv_transpose1d_src(),
             4,
         )?;
-        )?;
         try_compile(self, "rel_attn", &shaders::rel_attn_src(), 3)?;
         try_compile(self, "flip_ch", &shaders::flip_ch_src(), 2)?;
         try_compile(self, "im2col2d", &shaders::im2col2d_src(), 2)?;
@@ -1009,6 +1008,7 @@ impl Engine {
         try_compile(self, "matmul_tiled_x", &shaders::matmul_tiled_x_src(), 5)?;
         try_compile(self, "add_layernorm", &shaders::add_layernorm_src(), 5)?;
         try_compile(self, "slice_ch", &shaders::slice_ch_src(), 2)?;
+        try_compile(self, "interp_time", &shaders::interp_time_src(), 2)?;
         try_compile(self, "avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
         try_compile(
             self,
@@ -1994,6 +1994,27 @@ impl<'a> Graph<'a> {
             self.dispatch("slice_ch", &[src, dst], words, wg, 1, 1);
         } else {
             self.dispatch("slice_ch", &[src, dst], words, 512, wg.div_ceil(512), 1);
+        }
+    }
+
+    /// チャネル major [ch, t_in] を [ch, t_out] へ時間方向線形補間 (formant 用)。
+    /// torch F.interpolate(mode="linear", align_corners=False) 相当。
+    pub fn interp_time(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        ch: u32,
+        t_in: u32,
+        t_out: u32,
+    ) {
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[t_out, t_in, ch, 0]);
+        let total = ch * t_out;
+        let wg = total.div_ceil(256);
+        if wg <= 65535 {
+            self.dispatch("interp_time", &[src, dst], words, wg, 1, 1);
+        } else {
+            self.dispatch("interp_time", &[src, dst], words, 512, wg.div_ceil(512), 1);
         }
     }
 

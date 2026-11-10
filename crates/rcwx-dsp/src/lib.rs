@@ -1,6 +1,7 @@
 //! RCWX ホスト DSP (Issue #6 M4): Python 実装と厳密一致する純 Rust ポート。
 
 pub mod drift;
+pub mod envelope;
 pub mod feedback;
 pub mod moe;
 pub mod noise_gate;

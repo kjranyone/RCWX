@@ -8,6 +8,7 @@
 mod commands;
 mod pth_info;
 mod rt_cmd;
+mod train_cmd;
 
 use anyhow::{Context, Result, bail};
 use rcwx_nn::engine::{Backend, Engine};
@@ -233,6 +234,12 @@ struct Args {
     input: String,
     output: String,
     pitch: f64,
+    /// formant shift (半音)。ピッチを保ったまま声質を移動
+    formant: f64,
+    /// 無声フレーム保護 (0..0.5)
+    protect: f64,
+    /// 音量エンベロープ追従 (1 = off, 0 = 完全追従)
+    rms_mix: f64,
     noise: f64,
     f0_method: String,
     backend: String,
@@ -248,12 +255,15 @@ fn parse_args() -> Result<Args> {
         input: String::new(),
         output: "output.wav".into(),
         pitch: 0.0,
+        formant: 0.0,
+        protect: 0.0,
+        rms_mix: 1.0,
         noise: 0.0,
         f0_method: "rmvpe".into(),
         backend: "dx12".into(),
         moe: 0.0,
         index_rate: 0.0,
-        index_k: 4,
+        index_k: 8,
         model: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -264,6 +274,18 @@ fn parse_args() -> Result<Args> {
             "--pitch" | "-p" => {
                 i += 1;
                 a.pitch = args.get(i).context("--pitch value")?.parse()?;
+            }
+            "--formant" => {
+                i += 1;
+                a.formant = args.get(i).context("--formant value")?.parse()?;
+            }
+            "--protect" => {
+                i += 1;
+                a.protect = args.get(i).context("--protect value")?.parse()?;
+            }
+            "--rms-mix" => {
+                i += 1;
+                a.rms_mix = args.get(i).context("--rms-mix value")?.parse()?;
             }
             "--model" | "-m" => {
                 i += 1;
@@ -319,6 +341,10 @@ fn main() -> Result<()> {
         Some("download") => return commands::cmd_download(&raw_args[1..]),
         Some("logs") => return commands::cmd_logs(&raw_args[1..]),
         Some("rt") => return rt_cmd::cmd_rt(&raw_args[1..]),
+        Some("train-preprocess") => return train_cmd::cmd_train_preprocess(&raw_args[1..]),
+        Some("train") => return train_cmd::cmd_train(&raw_args[1..]),
+        Some("train-export") => return train_cmd::cmd_train_export(&raw_args[1..]),
+        Some("train-index") => return train_cmd::cmd_train_index(&raw_args[1..]),
         _ => {}
     }
     let args = parse_args()?;
@@ -376,7 +402,14 @@ fn main() -> Result<()> {
     );
 
     // ---- 16k 化 + HPF ----
-    audio = resample_linear(&audio, sr, 16000);
+    // Python 参照 (scipy resample_poly) と厳密一致する多相位リサンプラを使う。
+    // 線形補間は入力が 16k 以外のとき波形差 → F0/特徴に微小差 → 正弦位相ドリフト
+    // → 出力波形が Python とデコリレートする (48k 入力の E2E corr ゲート阻害)。
+    audio = if sr == 16000 {
+        audio
+    } else {
+        rcwx_dsp::resample::resample_poly(&audio, 16000, sr as usize)
+    };
     audio = highpass_filter(&audio, 16000, 48.0);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write(
@@ -546,6 +579,12 @@ fn main() -> Result<()> {
     }
     // ---- IVF index ブレンド (補間前・Python と同じ位置) ----
     mark("hubert", timing);
+    // protect 用にブレンド前の特徴を退避 (upstream pipeline.py の feats0 相当)
+    let feats_orig = if args.protect > 0.0 && args.index_rate > 0.0 {
+        Some(feats_data.clone())
+    } else {
+        None
+    };
     if args.index_rate > 0.0 {
         match rcwx_nn::ivf::IvfIndex::load(&dir) {
             Ok(ivf) if ivf.dim == fd => {
@@ -587,13 +626,28 @@ fn main() -> Result<()> {
             bytemuck::cast_slice(&f0v),
         );
     }
-    condition_f0(&mut f0v, args.pitch);
+    // formant は F0 を逆補償 (upstream: key − formant)。合成後にリサンプル戻しで
+    // ×factor されるため最終ピッチには pitch のみが残る。
+    condition_f0(&mut f0v, args.pitch - args.formant);
     if args.moe > 0.0 {
         rcwx_dsp::moe::apply_moe_f0_style(&mut f0v, args.moe);
     }
-    f0::apply_f0_filter_chain(&mut f0v, 16.0, true, true, 3.6, 30.0);
+    // py 推論既定は 2.8 (pipeline.infer シグネチャ既定。config 既定 3.6 は
+    // リアルタイム経路で使われる値でオフライン run には伝播しない)
+    f0::apply_f0_filter_chain(&mut f0v, 16.0, true, true, 2.8, 30.0);
     stabilize_f0_boundaries(&mut f0v, 10);
     let pitch = f0::quantize_f0_to_pitch(&f0v);
+    let factor = if args.formant != 0.0 {
+        (2.0f64).powf(args.formant / 12.0)
+    } else {
+        1.0
+    };
+    // sinegen 用 F0 は ×factor (upstream: pitchf × return_length2/return_length)
+    let f0_sine: Vec<f32> = if factor != 1.0 {
+        f0v.iter().map(|v| v * factor as f32).collect()
+    } else {
+        f0v.clone()
+    };
     println!(
         "f0: {} frames (voiced {})",
         t100,
@@ -632,6 +686,33 @@ fn main() -> Result<()> {
         }
     }
 
+    // ---- protect: 無声フレーム (f0=0) は index 混入前の特徴へ戻す ----
+    // (upstream pipeline.py: feats = feats·protect + feats0·(1−protect) 相当)
+    if let Some(orig) = feats_orig.as_ref() {
+        let p = args.protect.clamp(0.0, 0.5) as f32;
+        let mut feats100_orig = vec![0.0f32; t100 * fd];
+        for r in 0..t100 {
+            let pos = (r as f32) * 0.5 - 0.25;
+            let i0 = (pos.floor() as i32).clamp(0, t50 as i32 - 1) as usize;
+            let i1 = (i0 + 1).min(t50.saturating_sub(1));
+            let fr = (pos - i0 as f32).clamp(0.0, 1.0);
+            for c in 0..fd {
+                let a = orig[i0 * fd + c];
+                let b = orig[i1 * fd + c];
+                feats100_orig[r * fd + c] = a + (b - a) * fr;
+            }
+        }
+        for r in 0..t100 {
+            if f0v.get(r).copied().unwrap_or(0.0) > 0.0 {
+                continue;
+            }
+            for c in 0..fd {
+                let i = r * fd + c;
+                feats100[i] = p * feats100[i] + (1.0 - p) * feats100_orig[i];
+            }
+        }
+    }
+
     // ---- Synth (noise_scale=0 決定論) ----
     mark("interp+cpu", timing);
     let feats_t = eng.tensor_from_f32(&feats100, vec![]);
@@ -652,16 +733,23 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
-    let mut out: Vec<f32> = if t100 > 96 || force_chunk {
-        synth.infer_chunked(
-            &eng,
-            &feats_t,
-            &pitch,
-            &f0v,
-            t100 as u32,
-            dec_chunk,
-            dec_margin,
-        )
+    let mut out: Vec<f32> = if factor != 1.0 {
+        if t100 > 96 || force_chunk {
+            synth.infer_chunked_formant(
+                &eng,
+                &feats_t,
+                &pitch,
+                &f0_sine,
+                t100 as u32,
+                96,
+                8,
+                factor,
+            )
+        } else {
+            synth.infer_formant(&eng, &feats_t, &pitch, &f0_sine, t100 as u32, factor)
+        }
+    } else if t100 > 96 || force_chunk {
+        synth.infer_chunked(&eng, &feats_t, &pitch, &f0v, t100 as u32, dec_chunk, dec_margin)
     } else {
         let audio_out = synth.infer(&eng, &feats_t, &pitch, &f0v, t100 as u32);
         eng.readback_f32(&audio_out)
@@ -693,6 +781,16 @@ fn main() -> Result<()> {
     let expected = input_length * model_sr as usize / 16000;
     if out.len() != expected {
         out = resample_to(&out, expected);
+    }
+    // ---- 音量エンベロープ追従 (upstream rms_mix_rate。1 = off) ----
+    if args.rms_mix < 1.0 {
+        rcwx_dsp::envelope::apply_envelope_mix_full(
+            &audio,
+            16000,
+            &mut out,
+            model_sr,
+            args.rms_mix,
+        );
     }
     edge_fade(&mut out, model_sr);
 

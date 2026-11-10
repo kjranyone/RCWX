@@ -301,6 +301,34 @@ function Invoke-Bench {
     Write-Host "判定: budget 行に対して hops over budget 0 かつ p99 < budget が合格。" -ForegroundColor Cyan
 }
 
+
+function Invoke-TrainGolden {
+    <# 学習 golden 再生成 (PyTorch 参照: tools/train_ref*.py)。 #>
+    Write-Host "=== 学習 golden 再生成 (PyTorch 参照) ===" -ForegroundColor Cyan
+    & uv run --no-sync python tools/train_ref.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "[NG] train_ref.py 失敗。" -ForegroundColor Red; return }
+    & uv run --no-sync python tools/train_ref2.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "[NG] train_ref2.py 失敗。" -ForegroundColor Red; return }
+    Write-Host "[OK] 学習 golden 更新。" -ForegroundColor Green
+}
+
+function Invoke-TrainParity {
+    <# 学習 golden パリティ (module_parity / module_parity2)。 #>
+    if (-not (Invoke-CargoBuild)) { return }
+    Write-Host "=== 学習 golden パリティ ===" -ForegroundColor Cyan
+    & cargo test --release -p rcwx-train --test module_parity --test module_parity2 -- --nocapture
+    if ($LASTEXITCODE -eq 0) { Write-Host "[OK] 学習パリティ合格。" -ForegroundColor Green }
+    else { Write-Host "[NG] 学習パリティ失敗。" -ForegroundColor Red }
+}
+
+function Invoke-TrainSmoke {
+    <# 学習 smoke 収束 (合成データで mel 損失の低下を確認)。 #>
+    if (-not (Invoke-CargoBuild)) { return }
+    Write-Host "=== 学習 smoke 収束 (合成データ) ===" -ForegroundColor Cyan
+    & cargo run --release -p rcwx-train --bin train_smoke
+    if ($LASTEXITCODE -eq 0) { Write-Host "[OK] smoke 完了。" -ForegroundColor Green }
+}
+
 function Invoke-E2E {
     <# オフライン E2E: Rust CLI と Python rcwx run を同条件で実行し corr 比較。 #>
     if (-not (Test-Cargo)) { return }

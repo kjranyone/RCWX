@@ -9,6 +9,7 @@
 
 mod settings;
 mod theme;
+mod train_tab;
 mod view;
 
 use gpui_kit::*;

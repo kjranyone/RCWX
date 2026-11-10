@@ -49,6 +49,51 @@ pub struct Synth {
     pub l_linear_b: f32,
 }
 
+/// 時間方向の線形補間 (torch F.interpolate(mode="linear", align_corners=False) 相当)。
+/// src < 0 は 0 へクランプ (PyTorch area_pixel_compute_source_index と同じ)。
+/// formant shift の har 伸長に使用。
+pub fn stretch_time(src: &[f32], t_in: usize, t_out: usize) -> Vec<f32> {
+    if t_in == 0 || t_out == 0 {
+        return Vec::new();
+    }
+    if t_in == t_out {
+        return src[..t_in.min(src.len())].to_vec();
+    }
+    let mut out = vec![0.0f32; t_out];
+    for (i, o) in out.iter_mut().enumerate() {
+        let s = ((i as f32 + 0.5) * t_in as f32 / t_out as f32 - 0.5).max(0.0);
+        let fi = s.floor();
+        let i0 = (fi as usize).min(t_in - 1);
+        let i1 = (i0 + 1).min(t_in - 1);
+        let fr = (s - fi).min(1.0);
+        *o = src[i0] * (1.0 - fr) + src[i1] * fr;
+    }
+    out
+}
+
+/// 伸長済み音声 (約 `n2 * zc` サンプル) を元の時間軸 `n * zc` へ戻す
+/// (upstream rtrvc の resample_kernel 相当)。
+/// 比は upstream と同じ `floor(factor * zc) : zc` の有理近似。
+pub fn formant_resample_back(audio: &[f32], n: usize, zc: usize, factor: f64) -> Vec<f32> {
+    let target = n * zc;
+    let zg = ((factor * zc as f64).floor() as usize).max(1);
+    let mut out = if zg == zc || audio.is_empty() {
+        audio.to_vec()
+    } else {
+        let g = gcd(zg, zc);
+        rcwx_dsp::resample::resample_poly(audio, zc / g, zg / g)
+    };
+    out.truncate(target);
+    if out.len() < target {
+        out.resize(target, 0.0);
+    }
+    out
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 pub fn default_synth_dir() -> std::path::PathBuf {
     crate::rust_models_dir()
 }
@@ -641,6 +686,46 @@ impl Synth {
         self.decode_window(eng, &z, pitchf, 0, t)
     }
 
+    /// formant shift 版推論 (upstream `return_length2` 経路と同一数学)。
+    /// `pitch_idx` は (pitch − formant) 補償済みの coarse bins、
+    /// `pitchf` は同じ補償に加えて ×factor (2^(formant/12)) 済みの Hz。
+    /// 伸長状態の音声 [n2*zc] を返す (リサンプル戻し前 — パリティ検証用)。
+    pub fn infer_formant_stretched(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        pitchf: &[f32],
+        t: u32,
+        factor: f64,
+    ) -> Vec<f32> {
+        let z = self.encode_raw(eng, feats, pitch_idx, t);
+        let zc = (self.cfg.sr / 100) as usize;
+        let n2 = (((t as f64) * factor).ceil() as u32).max(1);
+        let har = self.sinegen(pitchf, t);
+        let har2 = stretch_time(&har, t as usize * zc, n2 as usize * zc);
+        let har_t = eng.tensor_from_f32(&har2, vec![]);
+        let mut g = eng.graph();
+        let audio = self.decode_graph_formant(eng, &mut g, &z, &har_t, t, t, n2);
+        g.submit().expect("submit");
+        eng.readback_f32(&audio)
+    }
+
+    /// `infer_formant_stretched` + 元の時間軸へのリサンプル戻し。出力 [t*zc]。
+    pub fn infer_formant(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        pitchf: &[f32],
+        t: u32,
+        factor: f64,
+    ) -> Vec<f32> {
+        let stretched = self.infer_formant_stretched(eng, feats, pitch_idx, pitchf, t, factor);
+        let zc = (self.cfg.sr / 100) as usize;
+        formant_resample_back(&stretched, t as usize, zc, factor)
+    }
+
     /// TextEncoder + Flow。z [inter, T] を返す。
     pub fn encode_raw(
         &self,
@@ -1176,6 +1261,65 @@ impl Synth {
         self.decode_graph_inner(eng, g, &z_dec, har_t, n)
     }
 
+    /// decode_graph_off の formant 版: [off, off+n) フレームを n2 フレームへ
+    /// 時間伸長してデコード。har は n2*zc サンプル (伸長済み) を渡す。
+    pub fn decode_graph_off_formant(
+        &self,
+        eng: &Engine,
+        g: &mut Graph<'_>,
+        z_full: &GpuTensor,
+        har_t: &GpuTensor,
+        n_in: u32,
+        off: u32,
+        n: u32,
+        n2: u32,
+    ) -> GpuTensor {
+        let inter = self.cfg.inter_channels;
+        let z_dec = eng.tensor_uninit((inter * n) as usize);
+        g.slice_ch(z_full, &z_dec, inter, n_in, off, n);
+        self.decode_formant_inner(eng, g, &z_dec, har_t, n, n2)
+    }
+
+    /// デコーダの formant 版: z [inter, n_in] の末尾 n フレームを
+    /// n2 フレームへ時間伸長してデコード (upstream return_length2 経路)。
+    /// har は n2*zc サンプル (呼び出し側で stretch_time 済み)。
+    /// 音声 [n2*zc] を返す (呼び出し側で 1/factor リサンプル戻し)。
+    pub fn decode_graph_formant(
+        &self,
+        eng: &Engine,
+        g: &mut Graph<'_>,
+        z_full: &GpuTensor,
+        har_t: &GpuTensor,
+        n_in: u32,
+        n: u32,
+        n2: u32,
+    ) -> GpuTensor {
+        let inter = self.cfg.inter_channels;
+        if n_in > n {
+            let z_dec = eng.tensor_uninit((inter * n) as usize);
+            g.slice_ch(z_full, &z_dec, inter, n_in, n_in - n, n);
+            self.decode_formant_inner(eng, g, &z_dec, har_t, n, n2)
+        } else {
+            self.decode_formant_inner(eng, g, z_full, har_t, n, n2)
+        }
+    }
+
+    /// z [inter, n] を [inter, n2] へ GPU で伸長してから decode_graph_inner。
+    fn decode_formant_inner(
+        &self,
+        eng: &Engine,
+        g: &mut Graph<'_>,
+        z: &GpuTensor,
+        har_t: &GpuTensor,
+        n: u32,
+        n2: u32,
+    ) -> GpuTensor {
+        let inter = self.cfg.inter_channels;
+        let z2 = eng.tensor_uninit((inter * n2) as usize);
+        g.interp_time(z, &z2, inter, n, n2);
+        self.decode_graph_inner(eng, g, &z2, har_t, n2)
+    }
+
     /// デコーダを graph に記録 (submit しない・プランキャッシュ用)。
     /// z_full [inter, n_in] (n_in > n なら末尾 n フレームを GPU で抽出) +
     /// har_t [n*zc] → 音声 [n * zc]。
@@ -1540,6 +1684,37 @@ impl Synth {
         chunk: u32,
         margin: u32,
     ) -> Vec<f32> {
+        self.infer_chunked_impl(eng, feats, pitch_idx, pitchf, t, chunk, margin, 1.0)
+    }
+
+    /// infer_chunked の formant 版 (factor = 2^(formant/12))。
+    /// pitchf は (pitch − formant) 補償 + ×factor 済み。出力 [t*zc]。
+    pub fn infer_chunked_formant(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        pitchf: &[f32],
+        t: u32,
+        chunk: u32,
+        margin: u32,
+        factor: f64,
+    ) -> Vec<f32> {
+        self.infer_chunked_impl(eng, feats, pitch_idx, pitchf, t, chunk, margin, factor)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn infer_chunked_impl(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        pitchf: &[f32],
+        t: u32,
+        chunk: u32,
+        margin: u32,
+        factor: f64,
+    ) -> Vec<f32> {
         let cfg = &self.cfg;
         let ups = &cfg.upsample_rates;
         let zc: u32 = ups.iter().product();
@@ -1592,6 +1767,7 @@ impl Synth {
         let mut har_full = vec![0.0f32; nf * zc as usize];
         let mut start = 0usize;
         while start < t {
+            if factor == 1.0 {
             let ts = std::time::Instant::now();
             let mut group: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, w_start)
             let mut plan_refs: Vec<&Plan> = Vec::new();
@@ -1643,6 +1819,54 @@ impl Synth {
             }
             acc_rb += tr.elapsed().as_secs_f64();
             start = group.last().unwrap().1;
+            } else {
+            let end = (start + chunk).min(t);
+            let w_start = start.saturating_sub(margin);
+            let w_end = (end + margin).min(t);
+            let n = (w_end - w_start) as u32;
+            // z の末尾抽出は GPU 内で (slice_ch) — 全 z を一度アップロード
+            let z_full_t = eng.tensor_from_f32(&z_cpu, vec![]);
+            let har = self.sinegen_range(pitchf, w_start, n as usize);
+            let samples = if factor == 1.0 {
+                let har_t = eng.tensor_from_f32(&har, vec![]);
+                let mut g = eng.graph();
+                let audio = self.decode_graph_off(
+                    eng,
+                    &mut g,
+                    &z_full_t,
+                    &har_t,
+                    t as u32,
+                    w_start as u32,
+                    n,
+                );
+                g.submit().expect("submit");
+                eng.readback_f32(&audio)
+            } else {
+                let n2 = (((n as f64) * factor).ceil() as u32).max(1);
+                let har2 = stretch_time(&har, n as usize * zc as usize, n2 as usize * zc as usize);
+                let har_t = eng.tensor_from_f32(&har2, vec![]);
+                let mut g = eng.graph();
+                let audio = self.decode_graph_off_formant(
+                    eng,
+                    &mut g,
+                    &z_full_t,
+                    &har_t,
+                    t as u32,
+                    w_start as u32,
+                    n,
+                    n2,
+                );
+                g.submit().expect("submit");
+                let stretched = eng.readback_f32(&audio);
+                formant_resample_back(&stretched, n as usize, zc as usize, factor)
+            };
+            let s_off = start - w_start;
+            let take = end - start;
+            let row = zc as usize * take;
+            out[start * zc as usize..start * zc as usize + row]
+                .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
+            start = end;
+            }
         }
         if timing {
             eprintln!(

@@ -75,8 +75,26 @@ crates/
   引数は `$args` で生受取し、`-o` 等の共通パラメータ衝突を回避)
 - 重み変換は dev ツール (`tools/convert_*.py`) で `~/.cache/rcwx/models/rust/` へ
   (`RCWX_MODELS_DIR` で重みディレクトリを切替可能)
-- パリティ: HuBERT cosine 1.0 / synth 0.9996 / RMVPE 0.9999 / swift-f0 0.999 /
+- パリティ: HuBERT cosine 1.0 / synth 0.9996 / **formant (return_length2) 0.9993** /
+  RMVPE 0.9999 / swift-f0 0.999 /
   DSP 全モジュール golden 一致 / オフライン E2E corr 0.983 (>0.95)
+- **本家 RVC 由来の品質機能 (2026-11 追加・いずれも既定 OFF で出力は従来同一)**:
+  - **formant shift** (`--formant <st>` / GUI「フォルマント」): ピッチを保ったまま
+    声質を移動。upstream `rtrvc.py`/`return_length2` と同一数学 — F0 を
+    `pitch − formant` で逆補償し sinegen F0 を ×factor、z/har を
+    `interp_time` カーネル (torch F.interpolate linear/align_corners=False 相当) で
+    時間伸長して decode、`floor(factor·zc):zc` の polyphase でリサンプル戻し。
+    decode が ×factor になるため大きい値は hop 予算に注意 (+5 で p99 約 +2ms)
+  - **protect** (`--protect <0..0.5>` / GUI「子音保護」): 無声フレーム (f0≤0) で
+    特徴を index 混入前へブレンドし子音・息の濁りを防止 (upstream pipeline.py 相当)
+  - **rms_mix (音量エンベロープ追従)** (`--rms-mix <0..1>` / GUI スライダー%):
+    出力ラウドネス包絡を入力へ追従 (upstream realtime_gui 相当・1=off)。
+    `rcwx-dsp/src/envelope.rs`
+  - **出力ノイズ除去** (`rt --output-denoise` / GUI チェック): 既存
+    `StreamingSpectralGate` を出力側 (output_sr・リサンプル後) にも適用
+  - `index_k` 既定を 4→8 (upstream と同一の 1/d² 重み付き和)
+  - golden: `tools/dump_synth_formant.py` → `synth_formant_{pos,neg}.safetensors`
+    (伸長状態で Python と照合・`synth_formant_parity` テスト)
 - **モデルは RVC v1 (256-dim) / v2 (768-dim) 両対応**。synth.json の `version` から
   HuBERT 抽出 (v1: layer 9 + final_proj / v2: layer 12) と TextEncoder 形状
   (n_layers 3/6・kernel 5/3・emb_phone 入力次元) を切替。モデル SR (40k/48k 等) も
@@ -88,8 +106,8 @@ crates/
   または `RCWX_MODELS_DIR_V1` があるときのみ実行)。ランダム重みモデルの parity は
   分布の関係で v1 0.9998 / v2 0.996 程度に落ちるため gate を 0.995 に緩和
   (synth.json の `random_test` フラグで判定・実モデルは従来どおり 0.999)
-- 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15]`、
-  `... rt --virtual in.wav -o out.wav --chunk 0.06` (デバイスなし検証)、`... rt` (実デバイス)、
+- 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15 --formant 5 --protect 0.3 --rms-mix 0.4]`、
+  `... rt --virtual in.wav -o out.wav --chunk 0.06 [--formant 5 --protect 0.3 --rms-mix 0.4 --output-denoise]` (デバイスなし検証)、`... rt` (実デバイス)、
   `cargo run -p rcwx-gui --release`
 - **リアルタイム性能 (20ms hop)**: implicit-GEMM conv カーネル (matmul_conv・
   im2col 廃止・lrelu fuse・z GPU 直結 slice_ch) で 125ms/hop → 45ms、さらに
@@ -525,3 +543,109 @@ uv run python tests/audio/test_denoise_aggressive_policy.py
 - Facebook Denoiser (`denoiser`)
 - torchfcpe / swift-f0
 - ユーザー向けセットアップ: [docs/SETUP.md](docs/SETUP.md) / [README.md](README.md)
+
+## 学習 (Issue #8 — 純 Rust パイプライン)
+
+推論と同じ wgpu エンジン上に autograd tape (`rcwx-nn/src/engine/tape.rs`) を実装し、
+学習も完全純 Rust 化 (`rcwx-train` crate + `rcwx-cli train-*`)。
+
+- **tape autograd**: 1 学習ステップ = 1 Graph = 1 submit (forward + backward +
+  AdamW 更新を単一 compute pass 内の dispatch 順序で実現)。WN は `_v`/`_g` を
+  学習パラメータとし行単位 fold (PyTorch dim=0 と同一)。uniform slot は使い捨て
+  Graph で回収 (rt 推論経路は不変)。
+- **検証**: PyTorch golden との fwd+bwd パリティ — enc_p (attention 6 層) と
+  enc_q/flow/decoder すべて cos=1.0 (`tools/train_ref.py` / `train_ref2.py` →
+  `crates/rcwx-train/tests/module_parity*.rs`)。op 単位の FD gradcheck も全通過。
+- **パイプライン**: `train-preprocess` (3s/0.3s チャンク + RMVPE F0 + HuBERT 特徴 +
+  spec キャッシュ) → `train --base-g/--base-d` (LSGAN + FM + 45·mel-L1 + KL、
+  AdamW 1e-4/(0.8,0.99)、fp32) → `train-export` (WN fold → synth.safetensors/
+  synth.json = 推論ローダ無変更 + RVC 互換 .pth 中間生成) → `train-index`
+  (IVF nlist=min(16√N, N/39) → 既存 ivf.rs 形式)。base は本家
+  `f0G48k_v2.pth`/`f0D48k_v2.pth` (WN 保持 checkpoint 形式)。
+- **Applio 差分取り込み**: 前処理は Applio Automatic/Simple 相当。MPD は
+  periods [2,3,5,7,11,17,23,37] + DiscriminatorS。`--mel-loss multi`
+  (MultiScaleMel) 実装済み。RefineGAN は後続課題。
+- **GUI**: 学習タブ (`rcwx-gui/src/train_tab.rs`) から前処理・学習・エクスポート。
+- **Skill**: `tools/skill/rcwx-train/SKILL.md` がパイプラインを自動化。
+- **実スケール学習 (検証済み)**: Tape の分割 submit (`maybe_flush`, 256 dispatch
+  ごとに途中 submit + uniform slot 回収) で device loss を解消。本家
+  f0G48k_v2/f0D48k_v2 base からの fine-tuning を実走行 (e2e_test: 20 epoch で
+  mel 197→31.9、~40s/epoch。engine の weight 勾配修正後は D が本格学習し
+  ~63s/epoch、disc/fm が実値に)。device loss 時は `--resume` で
+  checkpoint から再開 — エポック単位 checkpoint を実装。
+  エクスポート: native (推論即使用) + .pth (WN v/g 保持 + weight_g 形状復元 —
+  `load_state_dict` missing 0 keys)。ただし RVC 48k v2 checkpoint は判別器キーが
+  `discriminators.{i}` 形式のためローダでリマップ。
+- **E2E corr ゲート (≥0.98) 達成** — 学習済みモデル (e2e_test) の
+  full-pipeline 比較で **py(fp32) vs rust = 0.9956〜0.9968**
+  (`tools/e2e_parity.py` — 製品経路・fp32・monkeypatch なし)。原因調査の結論:
+  1. **py CLI は既定 `--dtype float16`**。fp16 のまま比較すると py(fp16) vs
+     py(fp32) 自体が corr 0.988 しか出ない (fp16 ノイズフロア)。ゲートは
+     **fp32 同士**で測ること。
+  2. 学習前の旧調査で見えた波形デコリレーション (−0.36 等) は **末尾 f0 の
+     `stabilize_f0_boundaries` クリフ**: 最終有声フレームが `n-1-edge_frames`
+     境界を跨ぐと片側だけ平滑化が発火し ±197 cent の f0 ダイバージェンス →
+     位相ドリフト。両実装は bit-exact 同一アルゴリズム (クリフはアルゴリズム
+     自身の感度)。定常部の f0 一致は 0.0〜0.3 cent。
+  3. rust `run` の `resample_linear` を scipy 厳密 `resample_poly` に変更済み。
+  - 併せて実機確認済み: `rcwx-cli rt` 10 秒 (FB200 mic → E2x2、定常 underrun 0、
+    hop 予算内)、index ブレンド `--index-rate 0.5` が実際に効くこと
+    (出力が index=0 と corr 0.982 で変化)。
+- **E2E 調査で見つかった形式バグの修正** (いずれも再発防止に回帰テストあり):
+  - `train-index` の IVF 書き出しが推論ローダと非互換 (json キー `dim`→`d`、
+    slots を u32→i64、`packed_features` をリスト連結→**ID 順テーブル**、
+    slots を可変長→`[nlist, cap]` 固定ストライド -1 パディング)。
+  - 学習前処理 `butter5_hpf` が 16k 用 scipy 係数を 48k に流用していた
+    (sr 引数を無視)。48k 設計の係数に分離。golden は scipy lfilter と
+    maxdiff 7.4e-6 (`tools/dump_preproc_golden.py` → `tests/preproc_parity.rs`)。
+  - `spectrogram` を f64 FFT 化 — torch.stft (f64) と rtol 0 (f32 だと累積誤差
+    ~4e-4 で 1e-4 ゲート超過)。
+- **M-T4 3-step パリティ** (`tools/train_step_ref.py` → `tests/step_parity.rs`):
+  step 1 の全損失が一致 (d 0.12% / adv 0.34% / mel 0.008% / **kl 0.000%**)、
+  mel/kl は 3 step 通して追従 (kl rel 0.00000)。**G param delta cos 0.989**。
+  この検証で engine の実バグ 3 件を発見・修正:
+  1. `t_mul_window` が `B2[i / n_frames]` でバッチ 1 の窓バッファを読み越え
+     (B>1 で後続バッチの窓掛けがゼロ化) → `% n_fft` 修正。実学習は B=1 だった
+     ため潜在化していた。
+  2. `t_kl_elem`/`t_kl_bwd_*` が [b, t] マスクを [b, inter, t] フラット index で
+     読んでいた (B>1 で out-of-bounds) → b/t 復元 index に修正。
+  3. `conv2d` backward の dcol matmul で w_row/w_k ストライドが入れ替わって
+     いた (dX が全滅) → 修正 + FD gradcheck 追加 (`tests/mpd_gradcheck.rs`)。
+- **WN fold × grouped conv (g≥2) dW 逆伝達バグ — 修正済み**。3-step parity 構築で
+ 発覚した engine の実バグ 5 件をすべて修正 (いずれも回帰テスト付き):
+  1. `t_im2col` がバッチストライドに `cin_g` (グループ内 ch 数) を使っていた
+     (batch>1 で後続バッチが別チャネルを読む) → 入力側バッチストライドを
+     独立 word (`b_stride = in_c·in_len`) に分離。**forward も壊れていた**。
+  2. `conv1d_grouped` / `conv2d` の forward matmul で col オペランドの
+     `w_bs=0` (b≥1 が常に b0 の col を再利用)。小テストは x パターンが
+     200 要素周期で偶然一致していたため潜在化。
+  3. `disc_p` の手元 `oh` 計算が pad=2 なのに `+2` (pad=1 相当) → 出力形が
+     py と 2 行ずれる。`(hh + 2·pad − k)/s + 1` に修正。
+  4. `t_colsum` が dispatch x 上限 65535 を超える列数で大部分の列を計算せず
+     uninit メモリを返していた (dW の norm が数百分の一に崩れる) →
+     ワークグループ線形 index (`wid.x + wid.y·512`) に修正。
+     **実トレーニングの G/D の大部分の weight 勾配がこれで黙って落ちていた**
+     (bias と小さい層だけ学習していた — mel は 197→31.9 に下がっていたため
+     気づかず)。修正後 D が本格学習 (disc/fm が実値に)。
+  5. KL 損失の mask 参照が [b, inter, t] フラット index で [b, t] マップを
+     読み越えていた (B>1) → b/t 復元 index に修正。
+- **D 再 forward を upstream RVC 仕様に統一**: D 更新後に WN を refold して
+  更新後重みで G 側 adv/fm を計算 (旧: 更新前 fold を使い、bias だけ更新後の
+  混在セマンティクス。py 参照も旧重み snapshot を使っており双方が変則)。
+  これで adv も 5 桁一致。
+- **M-T4 3-step パリティ完全合格** (`tools/train_step_ref.py` →
+  `tests/step_parity.rs`): **全 15 損失 (5 種 × 3 step) が rtol 1e-3 以内**
+  (d/adv/kl は 5 桁一致)、**D param delta cos = 1.000000**、G delta 0.989。
+  G の残り ~1e-3 は fp32 逆伝播の累積順差フロア: 全 op を CPU 参照と完全一致
+  させ (dilated/grouped/conv2d/WN/gather)、G 勾配 140/144 パラメータが
+  cos ≥ 0.99 (残り 4 つは要素数 8〜128 の小パラメータ)。0.999 到達には
+  補償付き逆伝播カーネルが今後課題 (Tape は `matmul_tiled_kahan` を搭載済み
+  だが DX12/naga が代数的最適化で打ち消すため効果なし — 実測 bit 一致)。
+- 長系列 (T=2310, B=2) の generator golden も追加
+  (`tools/train_ref2_long.py` → `RCWX_MP2_LONG=1 cargo test -p rcwx-train
+  --test module_parity2`)。
+
+- **QoL**: `--mel-loss mono|multi` (MultiScaleMel: 7 スケール win 2048..32・
+  hop=win/4・n_mels 320·win/2048)、mel EMA 5 epoch 改善なしで `[OVERFIT?]`
+  警告、学習完了後に index 自動生成、D も checkpoint 保存 (`d.` prefix、
+  resume で復元 — 旧 checkpointは base-d にフォールバック)。

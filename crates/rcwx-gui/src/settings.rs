@@ -25,6 +25,14 @@ pub struct GuiSettings {
     pub use_index: bool,
     pub index_rate: f64,
     pub index_k: f64,
+    /// formant shift (半音)。ピッチを保ったまま声質を移動
+    pub formant: f64,
+    /// 無声フレーム保護 (0..0.5)。index 混入前の特徴へブレンド
+    pub protect: f64,
+    /// 音量エンベロープ追従の強さ (0 = off。1 で完全追従)
+    pub envelope_follow: f64,
+    /// 出力側スペクトルゲート
+    pub output_denoise: bool,
     /// none / spectral
     pub denoise: String,
     pub denoise_strength: f64,
@@ -72,7 +80,11 @@ impl Default for GuiSettings {
             moe: 0.0,
             use_index: false,
             index_rate: 0.15,
-            index_k: 4.0,
+            index_k: 8.0,
+            formant: 0.0,
+            protect: 0.0,
+            envelope_follow: 0.0,
+            output_denoise: false,
             denoise: "none".into(),
             denoise_strength: 1.0,
             noise_gate: false,
@@ -256,6 +268,18 @@ fn settings_from_value(v: &serde_json::Value) -> GuiSettings {
     } else if let Some(x) = i["index_k"].as_u64() {
         s.index_k = x as f64;
     }
+    if let Some(x) = i["formant_shift"].as_f64() {
+        s.formant = x.clamp(-12.0, 12.0);
+    }
+    if let Some(x) = i["protect"].as_f64() {
+        s.protect = x.clamp(0.0, 0.5);
+    }
+    if let Some(x) = i["envelope_follow"].as_f64() {
+        s.envelope_follow = x.clamp(0.0, 1.0);
+    }
+    if let Some(x) = i["output_denoise"].as_bool() {
+        s.output_denoise = x;
+    }
     if let Some(x) = i["noise_gate_enabled"].as_bool() {
         s.noise_gate = x;
     }
@@ -355,6 +379,10 @@ pub fn save_settings(s: &GuiSettings) {
     v["inference"]["use_index"] = serde_json::json!(s.use_index);
     v["inference"]["index_ratio"] = serde_json::json!(s.index_rate);
     v["inference"]["index_k"] = serde_json::json!(s.index_k as u32);
+    v["inference"]["formant_shift"] = serde_json::json!(s.formant);
+    v["inference"]["protect"] = serde_json::json!(s.protect);
+    v["inference"]["envelope_follow"] = serde_json::json!(s.envelope_follow);
+    v["inference"]["output_denoise"] = serde_json::json!(s.output_denoise);
     v["inference"]["denoise"]["enabled"] = serde_json::json!(s.denoise != "none");
     v["inference"]["denoise"]["method"] = serde_json::json!(s.denoise);
     v["inference"]["denoise"]["strength"] = serde_json::json!(s.denoise_strength);
@@ -661,6 +689,10 @@ impl GuiSettings {
                 0.0
             },
             index_k: self.index_k.max(1.0) as usize,
+            formant_shift: self.formant,
+            protect: self.protect,
+            rms_mix_rate: 1.0 - self.envelope_follow.clamp(0.0, 1.0),
+            output_denoise: self.output_denoise,
             moe_boost: self.moe,
             input_gain_db: self.input_gain_db,
             output_gain_db: self.output_gain_db,
@@ -818,6 +850,15 @@ pub fn convert_wav(input: &str, cfg: &RtConfig) -> Result<String, String> {
         .arg(cfg.index_rate.to_string())
         .arg("--index-k")
         .arg(cfg.index_k.to_string());
+    if cfg.formant_shift != 0.0 {
+        cmd.arg("--formant").arg(cfg.formant_shift.to_string());
+    }
+    if cfg.protect > 0.0 {
+        cmd.arg("--protect").arg(cfg.protect.to_string());
+    }
+    if cfg.rms_mix_rate < 1.0 {
+        cmd.arg("--rms-mix").arg(cfg.rms_mix_rate.to_string());
+    }
     hide_window(&mut cmd);
     match cmd.output() {
         Ok(o) if o.status.success() => Ok(out),

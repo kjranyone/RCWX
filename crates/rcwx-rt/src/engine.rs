@@ -17,6 +17,7 @@ use anyhow::Result;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use rcwx_dsp::envelope::VolumeEnvelopeMixer;
 use rcwx_dsp::noise_gate::{NoiseGate, Sensitivity};
 use rcwx_dsp::postprocess::{PostprocessConfig, Postprocessor};
 use rcwx_dsp::resample::StatefulResampler;
@@ -45,6 +46,8 @@ const CACHE_SEC: f64 = 4.0;
 struct SynthPlans {
     n100: usize,
     n_dec: usize,
+    /// formant 有効時の伸長フレーム数 (無効時は n_dec と同じ)
+    n2: usize,
     feats_in: GpuTensor,
     pitch_emb_in: GpuTensor,
     har_in: GpuTensor,
@@ -97,6 +100,14 @@ pub struct RtEngine {
     f0_filt: Vec<f32>,
     sola: SolaState,
     post: Postprocessor,
+    /// 出力側スペクトルゲート (output_denoise。遅延構築・output_sr で動く)
+    out_spectral: Option<StreamingSpectralGate>,
+    /// 音量エンベロープ追従 (model_sr で動く・入力は 16k を別レート指定)
+    envelope: VolumeEnvelopeMixer,
+    /// formant リサンプル戻し (zg → zc。factor 変更で作り直し)
+    formant_rs: Option<StatefulResampler>,
+    /// formant_rs の現在の zg (factor 変更検出。0 = 未構築)
+    formant_zg: usize,
     out_hist: Vec<f32>,
     plans: Option<Box<SynthPlans>>,
     // hop バッチング: 入力 hop を貯めて batch_hops 分を一度に推論
@@ -219,6 +230,10 @@ impl RtEngine {
                 },
             ),
             out_hist: Vec::new(),
+            out_spectral: None,
+            envelope: VolumeEnvelopeMixer::new(model_sr, cfg.rms_mix_rate),
+            formant_rs: None,
+            formant_zg: 0,
             plans: None,
             batch_pending: Vec::new(),
             batch_count: 0,
@@ -285,6 +300,13 @@ impl RtEngine {
         if let Some(g) = self.gate.as_mut() {
             g.reset();
         }
+        if let Some(sp) = self.out_spectral.as_mut() {
+            sp.reset();
+        }
+        if let Some(rs) = self.formant_rs.as_mut() {
+            rs.reset();
+        }
+        self.envelope.reset();
         self.post.reset();
         self.sola = SolaState::new(
             (self.cfg.crossfade_sec * self.model_sr as f64).round() as usize,
@@ -324,6 +346,15 @@ impl RtEngine {
         if sens_changed && let Some(gate) = self.gate.as_mut() {
             gate.set_sensitivity(sensitivity_of(sensitivity));
         }
+        // 出力スペクトルゲート: 有効化時に遅延構築 (無効化後も状態は保持・進めない)
+        if self.cfg.output_denoise && self.out_spectral.is_none() {
+            self.out_spectral = Some(StreamingSpectralGate::new(
+                self.cfg.output_sample_rate,
+                6.0,
+                -24.0,
+            ));
+        }
+        self.envelope.set_rate(self.cfg.rms_mix_rate);
         self.post.update_config(post);
     }
 
@@ -490,8 +521,10 @@ impl RtEngine {
         let want = f0_win_samples / 160;
         f0_win.resize(want, 0.0);
 
-        // 条件付け: pitch shift + moe (窓全体)
-        condition_f0(&mut f0_win, self.cfg.pitch);
+        // 条件付け: pitch shift + moe (窓全体)。
+        // formant は F0 を逆補償 (upstream: key − formant) し、合成後に
+        // リサンプル戻しで ×factor されるため最終ピッチは pitch のみ反映される。
+        condition_f0(&mut f0_win, self.cfg.pitch - self.cfg.formant_shift);
         if self.cfg.moe_boost > 0.0 {
             rcwx_dsp::moe::apply_moe_f0_style(&mut f0_win, self.cfg.moe_boost);
         }
@@ -555,12 +588,36 @@ impl RtEngine {
             && let Some(ivf) = self.ivf.as_ref()
             && feats_win_frames > 0
         {
+            let protect = self.cfg.protect;
+            let orig = if protect > 0.0 {
+                Some(feats_win.clone())
+            } else {
+                None
+            };
             ivf.blend(
                 &mut feats_win,
                 feats_win_frames,
                 self.cfg.index_rate,
                 self.cfg.index_k,
             );
+            // protect: 無声フレーム (子音・息) は index 混入前の特徴へ戻す
+            // (upstream pipeline.py の pitchff ブレンド相当)
+            if let Some(orig) = orig {
+                for i in 0..feats_win_frames {
+                    let t100 = win100_start + i * 2;
+                    let unvoiced = t100 + 1 < self.f0_filt.len()
+                        && self.f0_filt[t100] <= 0.0
+                        && self.f0_filt[t100 + 1] <= 0.0;
+                    if !unvoiced {
+                        continue;
+                    }
+                    for c in 0..fd {
+                        let idx = i * fd + c;
+                        feats_win[idx] =
+                            protect as f32 * feats_win[idx] + (1.0 - protect as f32) * orig[idx];
+                    }
+                }
+            }
         }
 
         // 100fps 補間 (align_corners=False 相当)
@@ -583,34 +640,68 @@ impl RtEngine {
         //    TextEncoder/Flow は全窓で attention コンテキストを取るが、
         //    デコーダは受容野マージン分 (8fr) の z で十分 → 計算量 1/5 に削減
         let n_dec = (new100 + DECODER_LEFT_MARGIN_FRAMES + DECODER_OVERLAP_FRAMES).min(n100);
+        // formant: z/har を factor 倍に時間伸長して decode し、出力をリサンプル戻し
+        // (upstream return_length2 経路と同一数学)
+        let factor = if self.cfg.formant_shift != 0.0 {
+            (2.0f64).powf(self.cfg.formant_shift / 12.0)
+        } else {
+            1.0
+        };
+        let n2 = if factor != 1.0 {
+            (((n_dec as f64) * factor).ceil() as usize).max(1)
+        } else {
+            n_dec
+        };
         let pitch_emb = self.synth.pitch_embedding(&pitch, n100 as u32);
         let f0_dec = {
             let s = self.f0_filt.len().saturating_sub(n_dec);
             self.f0_filt[s..].to_vec()
         };
-        let har = self.synth.sinegen(&f0_dec, n_dec as u32);
+        // sinegen の F0 は ×factor (upstream: pitchf × return_length2/return_length)。
+        // 伸長 (周波数 ÷factor) とリサンプル戻し (×factor) が相殺し、
+        // 最終ピッチには pitch のみが残る。
+        let har = if factor != 1.0 {
+            let scaled: Vec<f32> = f0_dec.iter().map(|v| v * factor as f32).collect();
+            let har = self.synth.sinegen(&scaled, n_dec as u32);
+            rcwx_nn::synth::stretch_time(&har, n_dec * self.zc, n2 * self.zc)
+        } else {
+            self.synth.sinegen(&f0_dec, n_dec as u32)
+        };
         let mut audio48: Vec<f32> = {
             let RtEngine {
                 eng, synth, plans, ..
             } = self;
             // 形状が変わったらプラン再構築 (ウォームアップ中のみ)
-            if plans.as_ref().map(|p| (p.n100, p.n_dec)) != Some((n100, n_dec)) {
+            if plans.as_ref().map(|p| (p.n100, p.n_dec, p.n2)) != Some((n100, n_dec, n2)) {
                 let feats_in = eng.tensor_uninit(n100 * fd);
                 let pitch_emb_in = eng.tensor_uninit(synth.cfg.hidden_channels as usize * n100);
                 // encode plan
                 let mut g = eng.graph();
                 let z_out = synth.encode_graph(eng, &mut g, &feats_in, &pitch_emb_in, n100 as u32);
                 let encode_plan = g.into_plan().expect("encode plan");
-                // decode plan: encode の z を GPU 直結 (slice_ch で末尾抽出)
+                // decode plan: encode の z を GPU 直結 (slice_ch 末尾抽出 +
+                // formant 時は interp_time で n2 フレームへ伸長)
                 let har_in = eng.tensor_uninit(har.len());
                 let z_link = z_out.clone_handle();
                 let mut g = eng.graph();
-                let audio =
-                    synth.decode_graph(eng, &mut g, &z_link, &har_in, n100 as u32, n_dec as u32);
+                let audio = if n2 != n_dec {
+                    synth.decode_graph_formant(
+                        eng,
+                        &mut g,
+                        &z_link,
+                        &har_in,
+                        n100 as u32,
+                        n_dec as u32,
+                        n2 as u32,
+                    )
+                } else {
+                    synth.decode_graph(eng, &mut g, &z_link, &har_in, n100 as u32, n_dec as u32)
+                };
                 let decode_plan = g.into_plan().expect("decode plan");
                 *plans = Some(Box::new(SynthPlans {
                     n100,
                     n_dec,
+                    n2,
                     feats_in,
                     pitch_emb_in,
                     har_in,
@@ -660,6 +751,26 @@ impl RtEngine {
                 out
             }
         };
+        // formant: 伸長出力 [n2*zc] を元の時間軸 [n_dec*zc] へリサンプル戻し
+        // (比は upstream と同じ floor(factor*zc):zc の有理近似)
+        if factor != 1.0 {
+            let zg = (factor * self.zc as f64).floor() as usize;
+            if self.formant_zg != zg {
+                self.formant_zg = zg;
+                self.formant_rs =
+                    (zg != self.zc).then(|| StatefulResampler::new(zg as u32, self.zc as u32));
+            }
+            let target = n_dec * self.zc;
+            let mut a = match self.formant_rs.as_mut() {
+                Some(rs) => rs.resample_chunk(&audio48),
+                None => std::mem::take(&mut audio48),
+            };
+            a.truncate(target);
+            if a.len() < target {
+                a.resize(target, 0.0);
+            }
+            audio48 = a;
+        }
 
         stage("synth", &mut stage_t);
         // 出力対象はこの hop の新規分 = 末尾から new100+overlap 手前 ... 実際は
@@ -672,7 +783,14 @@ impl RtEngine {
         audio48.clear();
 
         // soft clip
-        let clipped: Vec<f32> = raw.iter().map(|v| soft_clip(*v)).collect();
+        let mut clipped: Vec<f32> = raw.iter().map(|v| soft_clip(*v)).collect();
+        // 音量エンベロープ追従 (upstream rms_mix_rate): 出力のラウドネス包絡を
+        // 入力 (denoise 後の 16k) へ揃える。SOLA 前に適用して相関探索と
+        // バッファ状態の一貫性を保つ。
+        self.envelope.note_input(&chunk16, 16000);
+        if self.cfg.rms_mix_rate < 1.0 {
+            self.envelope.process(&mut clipped);
+        }
         let target = new100 * self.zc;
         let mut out = sola_crossfade(&clipped, &mut self.sola, target);
         self.stats.solo_offset = self.sola.last_offset;
@@ -695,6 +813,13 @@ impl RtEngine {
         // 出力レート変換
         if let Some(rs) = self.resampler_out.as_mut() {
             out = rs.resample_chunk(&out);
+        }
+        // 出力ノイズ除去 (decoder 残留ノイズ低減・追加遅延ゼロのストリーミング
+        // スペクトルゲート。output_sr で動く)
+        if self.cfg.output_denoise
+            && let Some(sp) = self.out_spectral.as_mut()
+        {
+            out = sp.process(&out);
         }
         let out_gain = 10f64.powf(self.cfg.output_gain_db / 20.0) as f32;
         if out_gain != 1.0 {

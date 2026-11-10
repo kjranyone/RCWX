@@ -52,10 +52,13 @@ struct Sliders {
     output_gain: Entity<SliderState>,
     chunk: Entity<SliderState>,
     pitch: Entity<SliderState>,
+    formant: Entity<SliderState>,
     moe: Entity<SliderState>,
     index_rate: Entity<SliderState>,
     index_k: Entity<SliderState>,
+    protect: Entity<SliderState>,
     denoise_strength: Entity<SliderState>,
+    envelope: Entity<SliderState>,
     treble_boost: Entity<SliderState>,
     treble_cutoff: Entity<SliderState>,
     limiter_threshold: Entity<SliderState>,
@@ -83,6 +86,7 @@ pub struct RcwxApp {
     input_rate: Option<u32>,
     output_rate: Option<u32>,
     tab: usize,
+    pub train: crate::train_tab::TrainTab,
     model_select: Entity<ChoiceSelect>,
     host_select: Entity<ChoiceSelect>,
     input_select: Entity<ChoiceSelect>,
@@ -298,10 +302,13 @@ impl RcwxApp {
             output_gain: new_slider(cx, -30.0, 24.0, s.output_gain_db as f32, 0.5),
             chunk: new_slider(cx, 20.0, 600.0, (s.chunk_sec * 1000.0) as f32, 20.0),
             pitch: new_slider(cx, -24.0, 24.0, s.pitch as f32, 0.5),
+            formant: new_slider(cx, -12.0, 12.0, s.formant as f32, 0.5),
             moe: new_slider(cx, 0.0, 1.0, s.moe as f32, 0.01),
             index_rate: new_slider(cx, 0.0, 1.0, s.index_rate as f32, 0.01),
-            index_k: new_slider(cx, 1.0, 8.0, s.index_k as f32, 1.0),
+            index_k: new_slider(cx, 1.0, 16.0, s.index_k as f32, 1.0),
+            protect: new_slider(cx, 0.0, 0.5, s.protect as f32, 0.05),
             denoise_strength: new_slider(cx, 0.5, 2.0, s.denoise_strength as f32, 0.05),
+            envelope: new_slider(cx, 0.0, 1.0, s.envelope_follow as f32, 0.05),
             treble_boost: new_slider(cx, 0.0, 12.0, s.treble_boost_db as f32, 0.5),
             treble_cutoff: new_slider(cx, 1000.0, 6000.0, s.treble_cutoff_hz as f32, 50.0),
             limiter_threshold: new_slider(cx, -12.0, 0.0, s.limiter_threshold_db as f32, 0.5),
@@ -324,6 +331,7 @@ impl RcwxApp {
             input_rate,
             output_rate,
             // 実機確認用: RCWX_START_TAB=1/2 で初期タブを指定
+            train: crate::train_tab::TrainTab::new(window, cx),
             tab: std::env::var("RCWX_START_TAB")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -490,6 +498,9 @@ impl RcwxApp {
         self.watch_slider(window, cx, &self.sliders.pitch.clone(), |this, v| {
             this.s.pitch = f64::from(v)
         });
+        self.watch_slider(window, cx, &self.sliders.formant.clone(), |this, v| {
+            this.s.formant = f64::from(v)
+        });
         self.watch_slider(window, cx, &self.sliders.moe.clone(), |this, v| {
             this.s.moe = f64::from(v)
         });
@@ -498,6 +509,12 @@ impl RcwxApp {
         });
         self.watch_slider(window, cx, &self.sliders.index_k.clone(), |this, v| {
             this.s.index_k = f64::from(v)
+        });
+        self.watch_slider(window, cx, &self.sliders.protect.clone(), |this, v| {
+            this.s.protect = f64::from(v)
+        });
+        self.watch_slider(window, cx, &self.sliders.envelope.clone(), |this, v| {
+            this.s.envelope_follow = f64::from(v);
         });
         self.watch_slider(
             window,
@@ -691,6 +708,10 @@ impl RcwxApp {
             .pitch
             .update(cx, |state, cx| state.set_value(pitch, window, cx));
         self.push_live();
+    }
+
+    pub fn ensure_poll_pub(&mut self, cx: &mut Context<Self>) {
+        self.ensure_poll(cx);
     }
 
     fn ensure_poll(&mut self, cx: &mut Context<Self>) {
@@ -1210,7 +1231,7 @@ impl RcwxApp {
 }
 
 /// 色つぼみアイコンつきのガラスカード。
-fn card(
+pub fn card(
     icon: IconName,
     tint: Hsla,
     title: &'static str,
@@ -1253,7 +1274,7 @@ fn value_text(text: impl Into<SharedString>) -> AnyElement {
     theme::value_chip(text)
 }
 
-fn note(text: impl Into<SharedString>) -> AnyElement {
+pub fn note(text: impl Into<SharedString>) -> AnyElement {
     div()
         .text_xs()
         .text_color(theme::muted_lilac().opacity(0.85))
@@ -1435,6 +1456,11 @@ impl RcwxApp {
                         icon: IconName::SlidersHorizontal,
                         label: "詳細設定",
                     },
+                    PillTab {
+                        id: "tab-train",
+                        icon: IconName::GraduationCap,
+                        label: "学習",
+                    },
                 ],
                 self.tab,
                 cx.listener(|this, index: &usize, _, cx| {
@@ -1449,6 +1475,7 @@ impl RcwxApp {
         let page = match self.tab {
             1 => self.tab_audio(cx),
             2 => self.tab_settings(cx),
+            3 => self.train.render(cx),
             _ => self.tab_main(cx),
         };
         v_flex()
@@ -1812,6 +1839,14 @@ impl RcwxApp {
                     Slider::new(&self.sliders.pitch),
                 ))
                 .child(presets)
+                .child(slider_row(
+                    "フォルマント",
+                    format!("{:+.1} st", self.s.formant),
+                    Slider::new(&self.sliders.formant),
+                ))
+                .child(note(
+                    "フォルマント: ピッチを保ったまま声質を移動 (upstream RVC 準拠)。大きい値はデコーダ負荷が増加",
+                ))
                 .child(select_row("F0", &self.f0_select))
                 .child(slider_row(
                     "Moe Boost",
@@ -1891,6 +1926,14 @@ impl RcwxApp {
                     "検索数 k",
                     format!("{:.0}", self.s.index_k),
                     Slider::new(&self.sliders.index_k).disabled(!self.s.use_index),
+                ))
+                .child(slider_row(
+                    "子音保護",
+                    format!("{:.2}", self.s.protect),
+                    Slider::new(&self.sliders.protect).disabled(!self.s.use_index),
+                ))
+                .child(note(
+                    "子音保護: 無声区間 (子音・息) を index 混入前の特徴で保護",
                 )),
         )
     }
@@ -1960,7 +2003,20 @@ impl RcwxApp {
                                 .w(px(150.))
                                 .child(Select::new(&self.gate_select).disabled(!self.s.noise_gate)),
                         ),
-                ),
+                )
+                .child(
+                    Checkbox::new("output-denoise")
+                        .label("出力ノイズ除去 (スペクトルゲート)")
+                        .checked(self.s.output_denoise)
+                        .on_change(cx.listener(|this, checked, _, cx| {
+                            this.s.output_denoise = *checked;
+                            this.push_live();
+                            cx.notify();
+                        })),
+                )
+                .child(note(
+                    "出力ノイズ除去: 変換後の残留ノイズを減衰 (追加遅延なし)",
+                )),
         )
     }
 
@@ -2164,6 +2220,14 @@ impl RcwxApp {
                     format!("{:.2}", self.s.normalizer_target_rms),
                     Slider::new(&self.sliders.normalizer_rms)
                         .disabled(!enabled || !self.s.normalizer_enabled),
+                ))
+                .child(slider_row(
+                    "音量エンベロープ追従",
+                    format!("{:.0}%", self.s.envelope_follow * 100.0),
+                    Slider::new(&self.sliders.envelope),
+                ))
+                .child(note(
+                    "エンベロープ追従: 出力の抑揚を入力に合わせる (0% = オフ)。音量正規化とは併用しない方が自然",
                 )),
         )
     }
