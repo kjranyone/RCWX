@@ -1,221 +1,202 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    RCWX ランチャー / 環境チェック用の対話式スクリプト。
+    RCWX ランチャー (Rust 単一バイナリ版)。
 
 .DESCRIPTION
-    uv 環境を確認し、対話メニューから GUI 起動・デバイス一覧・モデルダウンロード
-    などを実行する。引数を渡した場合はメニューを介さず、そのまま `uv run rcwx`
-    のサブコマンドへ転送する（配布・自動化向け）。
+    Rust 実装 (rcwx-gui / rcwx-cli) を起動する。このランチャーと製品の実行経路に
+    Python 依存は一切ない。
 
-    ML デノイザ (Facebook denoiser, 任意依存 extra "ml-denoise", CC BY-NC 4.0) は
-    既定では未インストール。有効化を対話（メニュー / 環境チェック）または -Denoise
-    スイッチで選択できる。uv は extra 無しの実行で extra 依存を prune するため、
-    有効時は全ての `uv run` を `--extra ml-denoise` 付きで実行する。
+    - cargo があれば cargo build --release (インクリメンタル) を実行してから起動
+    - 無ければ既存バイナリ (target/release/*.exe) を直接使用
+    - モデルバンドル (~/.cache/rcwx/models/rust) を確認し、未変換なら
+      開発ランチャー (.\dev.ps1 golden) での生成を案内
 
-.PARAMETER Denoise
-    ML デノイザ(denoiser)を有効化して起動する（uv run --extra ml-denoise ...）。
+    開発・検証 (モデルバンドル生成、旧 Python 実装とのパリティ比較) は
+    dev.ps1 を使用。
 
 .EXAMPLE
     .\rcwx.ps1
-    引数なし → 環境チェック後に対話メニューを表示。
+    引数なし → 環境チェック後に対話メニュー。
 
 .EXAMPLE
     .\rcwx.ps1 gui
-    メニューを介さず GUI を直接起動。
+    GUI を直接起動。
 
 .EXAMPLE
-    .\rcwx.ps1 -Denoise gui
-    ML デノイザを有効化した状態で GUI を起動。
+    .\rcwx.ps1 rt --seconds 10 --chunk 0.02
+    リアルタイム変換を 10 秒だけ実行 (実機確認)。
 
 .EXAMPLE
-    .\rcwx.ps1 download --force
-    渡した引数はそのまま `uv run rcwx` へ転送される。
+    .\rcwx.ps1 run input.wav -o out.wav --pitch 5
+    オフライン変換 (-o 等はそのまま rcwx-cli へ転送)。
 
 .NOTES
     実行ポリシーで弾かれる場合:
         powershell -ExecutionPolicy Bypass -File .\rcwx.ps1
 #>
-[CmdletBinding()]
-param(
-    [switch]$Denoise,
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$RcwxArgs
-)
 
 $ErrorActionPreference = 'Stop'
 
-# コンソール出力を UTF-8 に（日本語の文字化け対策）
+# 引数は param で束ねず $args で生受け取り (-o 等が共通パラメータと衝突するのを避ける)
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-
-# スクリプトのある場所（= リポジトリルート）へ移動
 Set-Location -Path $PSScriptRoot
 
-# ML デノイザを有効にするか（-Denoise 指定 / 既存インストール検出 / 対話で決定）
-$script:UseDenoiser = [bool]$Denoise
+# ---------------------------------------------------------------------------
+# パス
+# ---------------------------------------------------------------------------
+$ModelsRust = Join-Path $HOME '.cache\rcwx\models\rust'
+$CliExe     = Join-Path $PSScriptRoot 'target\release\rcwx-cli.exe'
+$GuiExe     = Join-Path $PSScriptRoot 'target\release\rcwx-gui.exe'
 
 # ---------------------------------------------------------------------------
 # ヘルパー
 # ---------------------------------------------------------------------------
+function Test-Cargo {
+    return [bool](Get-Command cargo -ErrorAction SilentlyContinue)
+}
 
-function Test-Uv {
-    <# uv の有無を確認。無ければ導入方法を案内して $false を返す。 #>
-    if (Get-Command uv -ErrorAction SilentlyContinue) {
+function Invoke-RustBuild {
+    if (Test-Cargo) {
+        & cargo build --release --workspace --quiet
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host '[NG] cargo build に失敗。' -ForegroundColor Red
+            return $false
+        }
         return $true
     }
-    Write-Host "[NG] uv が見つかりません。" -ForegroundColor Red
-    Write-Host "     インストール手順: https://docs.astral.sh/uv/getting-started/installation/"
-    Write-Host '     PowerShell 例:    powershell -c "irm https://astral.sh/uv/install.ps1 | iex"'
-    return $false
-}
-
-function Test-DenoiserInstalled {
-    <# 現在の venv に denoiser が入っているか（uv pip list で確認）。 #>
-    $list = & uv pip list
-    return [bool]($list | Select-String -Pattern '(?i)^denoiser\s' -Quiet)
-}
-
-function Get-ExtraArgs {
-    <# ML デノイザ有効時は uv の extra 引数を返す。 #>
-    if ($script:UseDenoiser) { return @('--extra', 'ml-denoise') }
-    return @()
-}
-
-function Invoke-Rcwx {
-    <# uv run [--extra ml-denoise] rcwx <args> を実行。 #>
-    param([string[]]$CmdArgs)
-    $extra = Get-ExtraArgs
-    & uv run @extra rcwx @CmdArgs
-}
-
-function Enable-Denoiser {
-    <# ML デノイザ(denoiser)を有効化し、依存をインストールする。 #>
-    Write-Host ""
-    Write-Host "ML Denoiser (Facebook denoiser, CC BY-NC 4.0) をインストールします..." -ForegroundColor Cyan
-    Write-Host "  実行: uv sync --extra ml-denoise"
-    & uv sync --extra ml-denoise
-    if ($LASTEXITCODE -eq 0) {
-        $script:UseDenoiser = $true
-        Write-Host "[OK] 有効化しました。以降の起動は --extra ml-denoise 付きで実行します。" -ForegroundColor Green
-    } else {
-        Write-Host "[NG] インストールに失敗しました。ネットワーク等を確認してください。" -ForegroundColor Red
+    if (-not (Test-Path $CliExe)) {
+        Write-Host "[NG] バイナリがありません: $CliExe" -ForegroundColor Red
+        Write-Host '     rustup を導入 (https://rustup.rs/) して再実行するか、'
+        Write-Host '     ビルド済みバイナリを target/release/ に配置してください。'
+        return $false
     }
+    return $true
+}
+
+function Get-MissingWeights {
+    $need = @(
+        'hubert.safetensors',
+        'rmvpe_folded.safetensors',
+        'swiftf0.safetensors',
+        'synth.safetensors',
+        'synth.json'
+    )
+    $missing = @()
+    foreach ($w in $need) {
+        if (-not (Test-Path (Join-Path $ModelsRust $w))) { $missing += $w }
+    }
+    return $missing
 }
 
 function Invoke-EnvCheck {
-    <# uv / PyTorch(XPU) / 必須モデル / ML デノイザの状態を確認。 #>
-    Write-Host ""
-    Write-Host "=============== 環境チェック ===============" -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '========= 環境チェック (Rust) =========' -ForegroundColor Cyan
 
-    $uvVer = & uv --version
-    Write-Host "[OK] uv: $uvVer" -ForegroundColor Green
-
-    # 既存の denoiser を検出したら有効扱い（base sync による prune を防ぐ）
-    if (-not $script:UseDenoiser -and (Test-DenoiserInstalled)) {
-        $script:UseDenoiser = $true
-        Write-Host "[i] 既存の denoiser を検出。ML デノイザを有効として扱います。"
-    }
-
-    # 依存関係の同期（denoiser 有効時は extra 付きで prune を回避）
-    $extra = Get-ExtraArgs
-    Write-Host "-- 依存関係の同期 (uv sync $($extra -join ' ')) --"
-    & uv sync @extra
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[OK] 依存関係は最新です。" -ForegroundColor Green
+    if (Test-Cargo) {
+        $rustVer = & rustc --version
+        Write-Host "[OK] $rustVer" -ForegroundColor Green
+        Write-Host '-- ビルド (cargo build --release) --'
+        if (-not (Invoke-RustBuild)) { return $false }
     } else {
-        Write-Host "[!] uv sync が失敗しました。ネットワーク / pyproject.toml を確認してください。" -ForegroundColor Yellow
+        Write-Host '[i] cargo なし — 既存バイナリを使用。' -ForegroundColor DarkGray
+        if (-not (Test-Path $CliExe)) {
+            Write-Host "[NG] バイナリがありません: $CliExe" -ForegroundColor Red
+            return $false
+        }
     }
+    Write-Host "[OK] rcwx-cli: $CliExe" -ForegroundColor Green
 
-    # PyTorch / XPU
-    Write-Host "-- PyTorch / XPU --"
-    & uv run @extra python -c "import torch; print('     torch', torch.__version__, '| XPU available:', torch.xpu.is_available())"
-
-    # 必須モデル (既定の配置先を確認)
-    Write-Host "-- 必須モデル (HuBERT / RMVPE) --"
-    $modelsDir = Join-Path $HOME ".cache\rcwx\models"
-    $hubert = Join-Path $modelsDir "hubert\hubert_base.pt"
-    $rmvpe  = Join-Path $modelsDir "rmvpe\rmvpe.pt"
-    if ((Test-Path $hubert) -and (Test-Path $rmvpe)) {
-        Write-Host "[OK] 配置済み: $modelsDir" -ForegroundColor Green
+    Write-Host "-- モデルバンドル ($ModelsRust) --"
+    $mw = Get-MissingWeights
+    if ($mw.Count -eq 0) {
+        Write-Host '[OK] モデルバンドル配置済み。' -ForegroundColor Green
     } else {
-        Write-Host "[!] 未取得。メニュー 3) または 'uv run rcwx download' を実行してください。" -ForegroundColor Yellow
-        Write-Host "     (既定の探索先: $modelsDir)"
+        Write-Host "[!] 不足: $($mw -join ', ')" -ForegroundColor Yellow
+        Write-Host '     モデルバンドルが未生成です。開発ランチャーで生成してください:'
+        Write-Host '       .\dev.ps1 golden'
+        Write-Host '     (生成は開発環境での一回限りの作業です)'
     }
-
-    # ML Denoiser (任意)
-    Write-Host "-- ML Denoiser (任意, CC BY-NC 4.0) --"
-    if ($script:UseDenoiser) {
-        Write-Host "[OK] 有効（--extra ml-denoise 付きで起動）。" -ForegroundColor Green
-    } else {
-        Write-Host "[!] 無効。config の denoise.method='ml' のままだと実行時に ImportError になります。" -ForegroundColor Yellow
-        Write-Host "     回避策: GUI でデノイズ方式を spectral / off にする、または今すぐ有効化。"
-        $ans = Read-Host "     ML デノイザを今すぐ有効化(インストール)しますか? (y/N)"
-        if ($ans -match '^(y|Y|yes|YES)$') { Enable-Denoiser }
-    }
-    Write-Host "===========================================" -ForegroundColor Cyan
+    Write-Host '=======================================' -ForegroundColor Cyan
+    return $true
 }
 
-function Show-Menu {
-    if ($script:UseDenoiser) { $dn = "有効" } else { $dn = "無効" }
-    Write-Host ""
-    Write-Host "================== RCWX ==================" -ForegroundColor Cyan
-    Write-Host "  1) GUI を起動"
-    Write-Host "  2) オーディオデバイス一覧"
-    Write-Host "  3) 必須モデルをダウンロード"
-    Write-Host "  4) フィードバック診断"
-    Write-Host "  5) 最新ログを表示 (tail 50)"
-    Write-Host "  6) 環境チェックを再実行"
-    Write-Host "  7) 依存関係を同期 (uv sync)"
-    Write-Host "  8) 任意の rcwx コマンドを入力"
-    Write-Host "  9) ML デノイザを有効化 (denoiser インストール)  [現在: $dn]"
-    Write-Host "  0) 終了"
-    Write-Host "=========================================" -ForegroundColor Cyan
+function Invoke-Cli {
+    param([string[]]$CmdArgs)
+    if (-not (Invoke-RustBuild)) { return }
+    & $CliExe @CmdArgs
 }
 
 # ---------------------------------------------------------------------------
-# メイン
+# 引数転送 (メニューを介さない)
 # ---------------------------------------------------------------------------
+$forward = @()
+foreach ($a in @($args)) { $forward += "$a" }
 
-if (-not (Test-Uv)) { exit 1 }
-
-# 既存の denoiser を検出したら有効扱い（-Denoise 未指定でも prune を防ぐ）
-if (-not $script:UseDenoiser -and (Test-DenoiserInstalled)) {
-    $script:UseDenoiser = $true
-}
-
-# 引数があればメニューを介さず rcwx へ直接転送（extra は現在の設定に従う）
-if ($RcwxArgs -and $RcwxArgs.Count -gt 0) {
-    $extra = Get-ExtraArgs
-    & uv run @extra rcwx @RcwxArgs
+if ($forward -and $forward.Count -gt 0) {
+    # gui だけは rcwx-gui を起動
+    if ($forward[0] -ieq 'gui') {
+        if (-not (Invoke-RustBuild)) { exit 1 }
+        if (Test-Path $GuiExe) {
+            & $GuiExe
+            exit $LASTEXITCODE
+        }
+        Write-Host '[i] rcwx-gui.exe が無いため cargo run で起動...' -ForegroundColor DarkGray
+        & cargo run --release -p rcwx-gui --quiet
+        exit $LASTEXITCODE
+    }
+    Invoke-Cli $forward
     exit $LASTEXITCODE
 }
 
-# 初回に環境チェック
-Invoke-EnvCheck
+# ---------------------------------------------------------------------------
+# 対話メニュー
+# ---------------------------------------------------------------------------
+if (-not (Invoke-EnvCheck)) { exit 1 }
 
 $running = $true
 while ($running) {
-    Show-Menu
-    $choice = Read-Host "選択"
+    Write-Host ''
+    Write-Host '==== RCWX (Rust 単一バイナリ) ====' -ForegroundColor Cyan
+    Write-Host '  1) GUI を起動'
+    Write-Host '  2) オーディオデバイス一覧'
+    Write-Host '  3) リアルタイム変換 (rt) — 引数入力'
+    Write-Host '  4) オフライン変換 (run) — 引数入力'
+    Write-Host '  5) モデル情報 (info)'
+    Write-Host '  6) 最新ログを表示 (tail 50)'
+    Write-Host '  7) 環境チェックを再実行'
+    Write-Host '  0) 終了'
+    Write-Host '==================================' -ForegroundColor Cyan
+    $choice = Read-Host '選択'
     switch ($choice) {
-        '1' { Invoke-Rcwx @('gui') }
-        '2' { Invoke-Rcwx @('devices') }
-        '3' { Invoke-Rcwx @('download') }
-        '4' { Invoke-Rcwx @('diagnose') }
-        '5' { Invoke-Rcwx @('logs', '--tail', '50') }
-        '6' { Invoke-EnvCheck }
-        '7' { $e = Get-ExtraArgs; & uv sync @e }
-        '8' {
-            $custom = Read-Host "rcwx への引数 (例: run in.wav model.pth -o out.wav -p 5)"
-            if ($custom) {
-                $parts = $custom -split '\s+' | Where-Object { $_ -ne '' }
-                Invoke-Rcwx $parts
+        '1' {
+            if (-not (Invoke-RustBuild)) { break }
+            if (Test-Path $GuiExe) { & $GuiExe }
+            else { & cargo run --release -p rcwx-gui --quiet }
+        }
+        '2' { Invoke-Cli @('devices') }
+        '3' {
+            $a = Read-Host 'rt への引数 (例: --seconds 10 --chunk 0.02 / 空で既定)'
+            $parts = @('rt')
+            if ($a) { $parts += ($a -split '\s+' | Where-Object { $_ -ne '' }) }
+            Invoke-Cli $parts
+        }
+        '4' {
+            $c = Read-Host 'run への引数 (例: input.wav -o out.wav --pitch 5)'
+            if ($c) {
+                $parts = @('run') + ($c -split '\s+' | Where-Object { $_ -ne '' })
+                Invoke-Cli $parts
             }
         }
-        '9' { Enable-Denoiser }
+        '5' {
+            $m = Read-Host 'モデル .pth のパス (空で model/kurumi/kurumi.pth)'
+            if (-not $m) { $m = 'model/kurumi/kurumi.pth' }
+            Invoke-Cli @('info', $m)
+        }
+        '6' { Invoke-Cli @('logs', '--tail', '50') }
+        '7' { Invoke-EnvCheck | Out-Null }
         '0' { $running = $false }
         default { Write-Host "無効な選択です: $choice" -ForegroundColor Yellow }
     }
 }
-
-Write-Host "終了しました。"
+Write-Host '終了しました。'

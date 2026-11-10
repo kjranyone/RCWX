@@ -4,8 +4,9 @@
 
 **RCWX** = RVC Real-time Voice Changer on Intel Arc (XPU)
 
-RVC v2モデルを使ったリアルタイムボイスチェンジャー。現行のリアルタイム処理は
-`RealtimeVoiceChangerUnified` を中心とした単一パス実装です。
+RVC v2モデルを使ったリアルタイムボイスチェンジャー。**製品は Rust 単一バイナリ**
+(`crates/` ワークスペース) で、Python 実装 (`rcwx/`) はパリティ検証の
+リファレンスとして残している。
 
 対象環境は **Windows + Intel Arc (XPU)**。CUDA / NVIDIA は未検証（コード上に分岐は残るがサポート対象外）。
 
@@ -51,29 +52,42 @@ crates/
 
 ## Quick Start
 
-推奨は同梱ランチャー。`uv sync` / XPU 確認 / モデル有無 / ML デノイザ確認を自動で行う。
+製品は **Rust 単一バイナリ**。`rcwx.ps1` は cargo ビルド→バイナリ起動のみを行い、
+実行経路に Python 依存は一切ない。
 
 ```powershell
-# uv 未導入時
-irm https://astral.sh/uv/install.ps1 | iex
-
-.\rcwx.ps1                    # 環境チェック → 対話メニュー
+.\rcwx.ps1                    # 環境チェック (Rust) → 対話メニュー
 .\rcwx.ps1 gui                # GUI 直接起動
-.\rcwx.ps1 -Denoise gui       # ML デノイザ有効化で GUI
-.\rcwx.ps1 download           # 必須モデル DL
-.\rcwx.ps1 diagnose           # 診断
+.\rcwx.ps1 rt --seconds 10    # リアルタイム 10 秒実機確認
+.\rcwx.ps1 run in.wav -o out.wav --pitch 5
+.\rcwx.ps1 devices / info model/kurumi/kurumi.pth / logs --tail 50
 ```
 
-手動（開発者向け）:
+初回のみ、モデルバンドル (変換済み重み) の生成が開発環境で必要:
+
+```powershell
+.\dev.ps1 check               # 不足物確認 (cargo / 重み / golden)
+.\dev.ps1 golden              # 重み変換 + golden 生成 → ~/.cache/rcwx/models/rust/
+```
+
+## 開発・検証 (Python 参照実装)
+
+Python (`.venv` / `rcwx/`) は **パリティ検証のリファレンス専用**。製品経路からは
+完全に分離されており、`dev.ps1` 経由でのみ使う:
+
+```powershell
+.\dev.ps1 test                # Rust テスト一式 (golden パリティ)
+.\dev.ps1 bench               # 30 秒持続ベンチ (batch 1/4)
+.\dev.ps1 e2e                 # Python rcwx run との corr 比較 (gate 0.95)
+.\dev.ps1 fmt / clippy / clean
+```
+
+旧 Python ランチャー (`uv sync` / ML デノイザ等) の機能は git 履歴
+(`git show 84a75fe:rcwx.ps1`) に保存。Python 実装の直接実行:
 
 ```powershell
 uv sync
-uv run rcwx download
-uv run rcwx diagnose
-uv run rcwx
-
-# (オプション) ML Denoiser — CC BY-NC 4.0
-uv sync --extra ml-denoise
+uv run rcwx diagnose          # フィードバック診断 (Rust は rt ログ/GUI の corr 表示で代替)
 ```
 
 補足:
