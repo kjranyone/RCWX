@@ -5,6 +5,7 @@ pub mod hubert;
 pub mod synth;
 pub mod rmvpe;
 pub mod swiftf0;
+pub mod ivf;
 pub mod f0;
 
 /// safetensors から名前付きテンソルを f32 の平坦配列 + shape で読むヘルパ。

@@ -194,6 +194,9 @@ struct Args {
     noise: f64,
     f0_method: String,
     backend: String,
+    moe: f64,
+    index_rate: f64,
+    index_k: usize,
 }
 
 fn parse_args() -> Result<Args> {
@@ -204,6 +207,9 @@ fn parse_args() -> Result<Args> {
         noise: 0.0,
         f0_method: "rmvpe".into(),
         backend: "dx12".into(),
+        moe: 0.0,
+        index_rate: 0.0,
+        index_k: 4,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -217,6 +223,18 @@ fn parse_args() -> Result<Args> {
             "--noise" => {
                 i += 1;
                 a.noise = args.get(i).context("--noise value")?.parse()?;
+            }
+            "--moe" => {
+                i += 1;
+                a.moe = args.get(i).context("--moe value")?.parse()?;
+            }
+            "--index-rate" => {
+                i += 1;
+                a.index_rate = args.get(i).context("--index-rate value")?.parse()?;
+            }
+            "--index-k" => {
+                i += 1;
+                a.index_k = args.get(i).context("--index-k value")?.parse()?;
             }
             "--f0-method" => {
                 i += 1;
@@ -236,7 +254,7 @@ fn parse_args() -> Result<Args> {
         i += 1;
     }
     if a.input.is_empty() {
-        bail!("usage: rcwx-cli run input.wav [-o output.wav] [--pitch N] [--noise N]");
+        bail!("usage: rcwx-cli run input.wav [-o output.wav] [--pitch N] [--moe 0.45] [--index-rate 0.15]");
     }
     Ok(a)
 }
@@ -340,9 +358,22 @@ fn main() -> Result<()> {
     // ---- HuBERT FIRST (RMVPE が uniform slot を上書きする問題の切り分け) ----
     let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
     let feats = hubert.features(&eng, &wav_t, n_total as u32);
-    let feats_data = eng.readback_f32(&feats);
+    let mut feats_data = eng.readback_f32(&feats);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write("target/golden/cli_rust_feats.bin", bytemuck::cast_slice(&feats_data));
+    }
+    // ---- IVF index ブレンド (補間前・Python と同じ位置) ----
+    if args.index_rate > 0.0 {
+        match rcwx_nn::ivf::IvfIndex::load(&dir) {
+            Ok(ivf) => {
+                ivf.blend(&mut feats_data, t50, args.index_rate as f32, args.index_k);
+                println!(
+                    "index: rate={} k={} lists={}",
+                    args.index_rate, args.index_k, ivf.nlist
+                );
+            }
+            Err(e) => eprintln!("index: ivf.safetensors not found ({e}); skipping blend"),
+        }
     }
 
     // ---- F0 ----
@@ -363,6 +394,9 @@ fn main() -> Result<()> {
         let _ = std::fs::write("target/golden/cli_rust_f0raw.bin", bytemuck::cast_slice(&f0v));
     }
     condition_f0(&mut f0v, args.pitch);
+    if args.moe > 0.0 {
+        rcwx_dsp::moe::apply_moe_f0_style(&mut f0v, args.moe);
+    }
     f0::apply_f0_filter_chain(&mut f0v, 16.0, true, true, 3.6, 30.0);
     stabilize_f0_boundaries(&mut f0v, 10);
     let pitch = f0::quantize_f0_to_pitch(&f0v);
@@ -375,13 +409,7 @@ fn main() -> Result<()> {
     }
 
     // ---- HuBERT (v2: layer 12) → [T50, 768] → 100fps ----
-    // デバッグ: Python wavpad を直接 HuBERT へ
-    let wav_pad_debug = if let Ok(py_wav) = std::fs::read("target/golden/py_wavpad_debug.bin") {
-        bytemuck::cast_slice::<u8, f32>(&py_wav).to_vec()
-    } else {
-        wav_pad.clone()
-    };
-    let wav_t = eng.tensor_from_f32(&wav_pad_debug, vec![n_total]);
+    let wav_t = eng.tensor_from_f32(&wav_pad, vec![n_total]);
     let feats = hubert.features(&eng, &wav_t, n_total as u32);
     let feats_data = eng.readback_f32(&feats);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
@@ -403,8 +431,16 @@ fn main() -> Result<()> {
 
     // ---- Synth (noise_scale=0 決定論) ----
     let feats_t = eng.tensor_from_f32(&feats100, vec![]);
-    let audio_out = synth.infer(&eng, &feats_t, &pitch, &f0v, t100 as u32);
-    let mut out = eng.readback_f32(&audio_out);
+    // T が大きいとデコーダ中間バッファが 128MB バインド上限を超えるため、
+    // 96 フレーム窓 + 8 フレーム受容野マージンで分割生成
+    // (RCWX_CHUNK=1 で短尺でもチャンクパスを強制して検証できる)
+    let force_chunk = std::env::var("RCWX_CHUNK").ok().as_deref() == Some("1");
+    let mut out: Vec<f32> = if t100 > 96 || force_chunk {
+        synth.infer_chunked(&eng, &feats_t, &pitch, &f0v, t100 as u32, 96, 8)
+    } else {
+        let audio_out = synth.infer(&eng, &feats_t, &pitch, &f0v, t100 as u32);
+        eng.readback_f32(&audio_out)
+    };
     println!("synth out: {} samples", out.len());
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let _ = std::fs::write("target/golden/cli_rust_synthout.bin", bytemuck::cast_slice(&out));

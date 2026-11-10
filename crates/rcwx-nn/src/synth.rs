@@ -158,6 +158,7 @@ impl Synth {
     }
 
     /// k 番 conv (same padding) [C, T] → [C', T]。im2col + matmul。
+    /// 大規模 T では 128MB バッファ上限を超えるため直接 conv1d カーネルへ切替。
     fn conv_k(
         &self,
         g: &mut Graph<'_>,
@@ -171,6 +172,14 @@ impl Synth {
         dil: u32,
         t: u32,
     ) {
+        if x_base == 0 && (cin * k * t) as usize * 4 > 96_000_000 {
+            g.conv1d(
+                x, self.g(&format!("{wname}.weight")),
+                Some(self.g(&format!("{wname}.bias"))), out,
+                cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1,
+            );
+            return;
+        }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
         g.im2col_off(x, x_base, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
         g.matmul_ex(
@@ -233,6 +242,55 @@ impl Synth {
         out
     }
 
+    /// sinegen のフレーム範囲版: [frame_start, frame_start+n) フレーム分の样本のみ
+    /// 生成 (位相・補間はフル系列と同一の値)。
+    pub fn sinegen_range(&self, f0: &[f32], frame_start: usize, n_frames: usize) -> Vec<f32> {
+        let upp = self.cfg.sr as usize / 100;
+        let l = f0.len();
+        let n_all = l * upp;
+        let s = frame_start * upp;
+        let e = (frame_start + n_frames) * upp;
+        let sr = self.cfg.sr as f32;
+        let rad: Vec<f32> = f0.iter().map(|f| (*f / sr).rem_euclid(1.0)).collect();
+        let mut cum = vec![0.0f32; l];
+        let mut acc = 0.0f32;
+        for i in 0..l {
+            acc += rad[i];
+            cum[i] = acc * upp as f32;
+        }
+        // フル系列と同じ tou 補間を大域位置 i_g に適用
+        let tou = |i_g: usize| -> f32 {
+            if n_all == 1 {
+                return cum[0];
+            }
+            let scale = (l - 1) as f32 / (n_all - 1) as f32;
+            let pos = i_g as f32 * scale;
+            let i0 = pos.floor() as usize;
+            let i1 = (i0 + 1).min(l - 1);
+            let fr = pos - i0 as f32;
+            cum[i0] + (cum[i1] - cum[i0]) * fr
+        };
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let mut out = vec![0.0f32; e - s];
+        let mut phase = 0.0f32;
+        let mut prev_rem = 0.0f32;
+        for i_g in 0..e {
+            let rem = tou(i_g).rem_euclid(1.0);
+            if i_g > 0 && rem < prev_rem {
+                phase -= 1.0;
+            }
+            prev_rem = rem;
+            let f_idx = (i_g / upp).min(l - 1);
+            phase += rad[f_idx];
+            if i_g >= s {
+                let uv = if f0[f_idx] > 0.0 { 1.0 } else { 0.0 };
+                let sine = (phase * two_pi).sin() * 0.1 * uv;
+                out[i_g - s] = (self.l_linear_w * sine + self.l_linear_b).tanh();
+            }
+        }
+        out
+    }
+
     /// feats [T, 768] (GPU) + pitch idx (CPU) + pitchf Hz (CPU) → 音声 [T * zc]。
     /// noise_scale=0 決定論 (z = m)。
     pub fn infer(
@@ -243,14 +301,26 @@ impl Synth {
         pitchf: &[f32],
         t: u32,
     ) -> GpuTensor {
+        let z = self.encode_raw(eng, feats, pitch_idx, t);
+        self.decode_window(eng, &z, pitchf, 0, t)
+    }
+
+    /// TextEncoder + Flow。z [inter, T] を返す。
+    fn encode_raw(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        t: u32,
+    ) -> GpuTensor {
         let cfg = &self.cfg;
         let h = cfg.hidden_channels;
-        let inter = cfg.inter_channels;
         let heads = cfg.n_heads;
         let dk = h / heads;
         let ws: u32 = 10;
         let filt = cfg.filter_channels;
         let nl = cfg.n_layers;
+        let inter = cfg.inter_channels;
         let mut g = eng.graph();
 
         // ---- TextEncoder ----
@@ -515,6 +585,33 @@ impl Synth {
             }
             z = zn;
         }
+        g.submit().expect("submit");
+        z
+    }
+
+    /// デコーダ窓生成: z [inter, n] + pitchf フル系列 → 音声 [n * zc]。
+    /// frame_start は sinegen 大域位相整合用 (オフライン全体では 0)。
+    pub fn decode_window(
+        &self,
+        eng: &Engine,
+        z: &GpuTensor,
+        pitchf: &[f32],
+        frame_start: u32,
+        n: u32,
+    ) -> GpuTensor {
+        let cfg = &self.cfg;
+        let h = cfg.hidden_channels;
+        let inter = cfg.inter_channels;
+        let t = n;
+        let mut g = eng.graph();
+        // cond(g) 行列
+        let mut gbuf = vec![0.0f32; (cfg.gin_channels * t) as usize];
+        for c in 0..cfg.gin_channels as usize {
+            for r in 0..t as usize {
+                gbuf[c * t as usize + r] = self.emb_g_row0[c];
+            }
+        }
+        let gt = eng.tensor_from_f32(&gbuf, vec![]);
 
         // ---- Decoder ----
         let ups = &cfg.upsample_rates;
@@ -524,7 +621,7 @@ impl Synth {
             .collect();
         // conv_pre + cond(g)
         let mut dx = eng.tensor_uninit((chs[0] * t) as usize);
-        self.conv_k(&mut g, &z, 0, "dec.conv_pre", &dx, inter, chs[0], 7, 1, t);
+        self.conv_k(&mut g, z, 0, "dec.conv_pre", &dx, inter, chs[0], 7, 1, t);
         let gcond = eng.tensor_uninit((chs[0] * t) as usize);
         self.conv1x1(&mut g, &gt, 0, "dec.cond", &gcond, cfg.gin_channels, chs[0], t, 1.0);
         if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
@@ -534,8 +631,8 @@ impl Synth {
         g.add(&dx, &gcond, &dx2, chs[0] * t);
         dx = dx2;
 
-        // har (CPU) → GPU
-        let har = self.sinegen(pitchf, t);
+        // har (CPU, フル系列と同一の位相) → GPU
+        let har = self.sinegen_range(pitchf, frame_start as usize, n as usize);
         let har_t = eng.tensor_from_f32(&har, vec![]);
         if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
             kk.push(("har", har_t.clone_handle()));
@@ -640,6 +737,13 @@ impl Synth {
         dil: u32,
         t: u32,
     ) {
+        if (cin * k * t) as usize * 4 > 96_000_000 {
+            g.conv1d(
+                x, self.g(wname), None, out,
+                cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1,
+            );
+            return;
+        }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
         g.im2col_off(x, 0, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
         g.matmul(
@@ -650,5 +754,54 @@ impl Synth {
             t, 1, 0, 0,
             1.0,
         );
+    }
+
+    /// 長尺オフライン用チャンク分割生成。
+    /// TextEncoder/Flow は全 T で一度だけ実行し、デコーダを
+    /// `chunk` フレーム窓 (左右 margin フレームの受容野マージン付き) に
+    /// 分割する。窓内の中間出力はフルバッチ演算と同一 (受容野外は零埋め)。
+    /// 戻り値: 音声 [t * zc] (CPU)。
+    pub fn infer_chunked(
+        &self,
+        eng: &Engine,
+        feats: &GpuTensor,
+        pitch_idx: &[u32],
+        pitchf: &[f32],
+        t: u32,
+        chunk: u32,
+        margin: u32,
+    ) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let ups = &cfg.upsample_rates;
+        let zc: u32 = ups.iter().product();
+        let inter = cfg.inter_channels;
+        let t = t as usize;
+        let chunk = chunk as usize;
+        let margin = margin as usize;
+
+        let z = self.encode_raw(eng, feats, pitch_idx, t as u32);
+        let z_cpu = eng.readback_f32(&z); // [inter, T] — 小さい
+
+        let mut out = vec![0.0f32; t * zc as usize];
+        let mut start = 0usize;
+        while start < t {
+            let end = (start + chunk).min(t);
+            let w_start = start.saturating_sub(margin);
+            let w_end = (end + margin).min(t);
+            let n = (w_end - w_start) as u32;
+            let z_win: Vec<f32> = (0..inter as usize)
+                .flat_map(|c| z_cpu[c * t + w_start..c * t + w_end].to_vec())
+                .collect();
+            let z_win_t = eng.tensor_from_f32(&z_win, vec![]);
+            let audio = self.decode_window(eng, &z_win_t, pitchf, w_start as u32, n);
+            let samples = eng.readback_f32(&audio);
+            let s_off = start - w_start;
+            let take = end - start;
+            let row = zc as usize * take;
+            out[start * zc as usize..start * zc as usize + row]
+                .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
+            start = end;
+        }
+        out
     }
 }

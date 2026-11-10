@@ -9,6 +9,7 @@ rcwx-nn = { path = "../rcwx-nn" }
 hound = "3.5"
 anyhow = "1"
 bytemuck = "1.25.2"
+rcwx-dsp = { version = "0.1.0", path = "../rcwx-dsp" }
 
 [[bin]]
 name = "rcwx-cli"
