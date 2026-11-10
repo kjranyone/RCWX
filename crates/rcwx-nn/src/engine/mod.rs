@@ -67,6 +67,17 @@ impl Engine {
 
     /// プランを再生: 入力 copy (任意) + 単一 compute pass + submit。
     pub fn replay(&self, plan: &Plan, input_copy: Option<(&GpuTensor, &GpuTensor)>) {
+        match input_copy {
+            Some((src, dst)) => {
+                let pair = [(src, dst.clone_handle())];
+                self.replay_inputs(plan, &pair);
+            }
+            None => self.replay_inputs(plan, &[]),
+        }
+    }
+
+    /// 複数入力 copy 対応のプラン再生。
+    pub fn replay_inputs(&self, plan: &Plan, copies: &[(&GpuTensor, GpuTensor)]) {
         for (slot, words) in &plan.uniform_writes {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             self.queue.write_buffer(
@@ -76,20 +87,28 @@ impl Engine {
             );
         }
         let mut enc = self.device.create_command_encoder(&Default::default());
-        if let Some((src, dst)) = input_copy {
+        for (src, dst) in copies {
             enc.copy_buffer_to_buffer(&src.buffer, 0, &dst.buffer, 0, src.bytes());
         }
-        for cmd in &plan.cmds {
+        {
             let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: None,
                 timestamp_writes: None,
             });
-            let k = self.kernels.get(cmd.kernel).unwrap();
-            cpass.set_pipeline(&k.pipeline);
-            cpass.set_bind_group(0, &cmd.bind_group, &[]);
-            cpass.dispatch_workgroups(cmd.wx, cmd.wy, cmd.wz);
+            for cmd in &plan.cmds {
+                let k = self.kernels.get(cmd.kernel).unwrap();
+                cpass.set_pipeline(&k.pipeline);
+                cpass.set_bind_group(0, &cmd.bind_group, &[]);
+                cpass.dispatch_workgroups(cmd.wx, cmd.wy, cmd.wz);
+            }
         }
         self.queue.submit(Some(enc.finish()));
+    }
+
+    /// バッファへ f32 データを直接書き込む (永続バッファ再利用用)。
+    pub fn write_f32(&self, dst: &GpuTensor, data: &[f32]) {
+        self.queue
+            .write_buffer(&dst.buffer, 0, bytemuck::cast_slice(data));
     }
 }
 

@@ -1,0 +1,12 @@
+[package]
+name = "rcwx-rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rcwx-nn = { path = "../rcwx-nn" }
+rcwx-dsp = { path = "../rcwx-dsp" }
+anyhow = "1.0"
+cpal = "0.18.2"
+hound = "3.5"

@@ -13,6 +13,7 @@ rcwx-dsp = { version = "0.1.0", path = "../rcwx-dsp" }
 cpal = "0.18.2"
 ureq = "3.5.1"
 zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
+rcwx-rt = { version = "0.1.0", path = "../rcwx-rt" }
 
 [[bin]]
 name = "rcwx-cli"

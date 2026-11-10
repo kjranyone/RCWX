@@ -7,6 +7,7 @@
 
 mod commands;
 mod pth_info;
+mod rt_cmd;
 
 use anyhow::{Context, Result, bail};
 use rcwx_nn::engine::{Backend, Engine};
@@ -270,6 +271,7 @@ fn main() -> Result<()> {
         Some("devices") => return commands::cmd_devices(),
         Some("download") => return commands::cmd_download(&raw_args[1..]),
         Some("logs") => return commands::cmd_logs(&raw_args[1..]),
+        Some("rt") => return rt_cmd::cmd_rt(&raw_args[1..]),
         _ => {}
     }
     let args = parse_args()?;

@@ -23,6 +23,16 @@ pub struct SynthConfig {
     pub n_speakers: u32,
 }
 
+
+
+/// ストリーミング sinegen の持ち越し位相状態。
+#[derive(Default, Clone)]
+pub struct SineState {
+    phase: f32,
+    prev_rem: f32,
+    fresh: bool,
+}
+
 pub struct Synth {
     pub cfg: SynthConfig,
     w: std::collections::HashMap<String, GpuTensor>,
@@ -291,6 +301,55 @@ impl Synth {
         out
     }
 
+    /// ストリーミング用 sinegen: 位相を SineState で持ち越す。
+    /// 窓はローカルの cum/tou 補間で計算し、wrap 補正は持ち越し位相に適用する。
+    pub fn sinegen_carry(&self, f0_win: &[f32], state: &mut SineState) -> Vec<f32> {
+        let upp = self.cfg.sr as usize / 100;
+        let l = f0_win.len();
+        let n = l * upp;
+        let sr = self.cfg.sr as f32;
+        let rad: Vec<f32> = f0_win.iter().map(|f| (*f / sr).rem_euclid(1.0)).collect();
+        let mut cum = vec![0.0f32; l];
+        let mut acc = 0.0f32;
+        for i in 0..l {
+            acc += rad[i];
+            cum[i] = acc * upp as f32;
+        }
+        let tou = |i: usize| -> f32 {
+            if n == 1 {
+                return cum[0];
+            }
+            let scale = (l - 1) as f32 / (n - 1) as f32;
+            let pos = i as f32 * scale;
+            let i0 = pos.floor() as usize;
+            let i1 = (i0 + 1).min(l - 1);
+            let fr = pos - i0 as f32;
+            cum[i0] + (cum[i1] - cum[i0]) * fr
+        };
+        let two_pi = 2.0 * std::f32::consts::PI;
+        let mut out = vec![0.0f32; n];
+        let mut phase = state.phase;
+        let mut prev_rem = state.prev_rem;
+        let mut first = state.fresh;
+        for i in 0..n {
+            let rem = tou(i).rem_euclid(1.0);
+            if !first && rem < prev_rem {
+                phase -= 1.0;
+            }
+            first = false;
+            prev_rem = rem;
+            let f_idx = (i / upp).min(l - 1);
+            phase += rad[f_idx];
+            let uv = if f0_win[f_idx] > 0.0 { 1.0 } else { 0.0 };
+            let sine = (phase * two_pi).sin() * 0.1 * uv;
+            out[i] = (self.l_linear_w * sine + self.l_linear_b).tanh();
+        }
+        state.phase = phase;
+        state.prev_rem = prev_rem;
+        state.fresh = false;
+        out
+    }
+
     /// feats [T, 768] (GPU) + pitch idx (CPU) + pitchf Hz (CPU) → 音声 [T * zc]。
     /// noise_scale=0 決定論 (z = m)。
     pub fn infer(
@@ -306,11 +365,41 @@ impl Synth {
     }
 
     /// TextEncoder + Flow。z [inter, T] を返す。
-    fn encode_raw(
+    pub fn encode_raw(
         &self,
         eng: &Engine,
         feats: &GpuTensor,
         pitch_idx: &[u32],
+        t: u32,
+    ) -> GpuTensor {
+        let pitch_emb = eng.tensor_from_f32(&self.pitch_embedding(pitch_idx, t), vec![]);
+        let mut g = eng.graph();
+        let z = self.encode_graph(eng, &mut g, feats, &pitch_emb, t);
+        g.submit().expect("submit");
+        z
+    }
+
+    /// pitch 埋め込み行 [h, t] (ch-major) を CPU で構築。
+    pub fn pitch_embedding(&self, pitch_idx: &[u32], t: u32) -> Vec<f32> {
+        let h = self.cfg.hidden_channels as usize;
+        let mut out = vec![0.0f32; h * t as usize];
+        for r in 0..t as usize {
+            let idx = pitch_idx.get(r).copied().unwrap_or(0).clamp(0, 255) as usize;
+            for c in 0..h {
+                out[c * t as usize + r] =
+                    self.emb_pitch[idx * h + c] * (h as f32).sqrt();
+            }
+        }
+        out
+    }
+
+    /// TextEncoder + Flow を graph に記録 (submit しない・プランキャッシュ用)。
+    pub fn encode_graph(
+        &self,
+        eng: &Engine,
+        mut g: &mut Graph<'_>,
+        feats: &GpuTensor,
+        pitch_emb: &GpuTensor,
         t: u32,
     ) -> GpuTensor {
         let cfg = &self.cfg;
@@ -321,19 +410,9 @@ impl Synth {
         let filt = cfg.filter_channels;
         let nl = cfg.n_layers;
         let inter = cfg.inter_channels;
-        let mut g = eng.graph();
 
         // ---- TextEncoder ----
         // x[ch, t] = (Σ_k feats[t,k]·W_phone[ch,k])·√h + emb_pitch[pitch[t]][ch]
-        let mut pitch_emb_ct = vec![0.0f32; (h * t) as usize];
-        for r in 0..t as usize {
-            let idx = pitch_idx[r].clamp(0, 255) as usize;
-            for c in 0..h as usize {
-                pitch_emb_ct[c * t as usize + r] =
-                    self.emb_pitch[idx * h as usize + c] * (h as f32).sqrt();
-            }
-        }
-        let pitch_emb = eng.tensor_from_f32(&pitch_emb_ct, vec![]);
         let x0 = eng.tensor_uninit((h * t) as usize);
         g.matmul_ex(
             self.g("enc_p.emb_phone.weight"), feats,
@@ -345,7 +424,7 @@ impl Synth {
             (h as f32).sqrt(), 1,
         );
         let mut x = eng.tensor_uninit((h * t) as usize);
-        g.add(&x0, &pitch_emb, &x, h * t);
+        g.add(&x0, pitch_emb, &x, h * t);
         g.lrelu(&x, h * t);
         if let Some(k) = self.debug_keep.borrow_mut().as_mut() {
             k.push(("x_in", x.clone_handle()));
@@ -585,7 +664,6 @@ impl Synth {
             }
             z = zn;
         }
-        g.submit().expect("submit");
         z
     }
 
@@ -599,11 +677,33 @@ impl Synth {
         frame_start: u32,
         n: u32,
     ) -> GpuTensor {
+        let har = self.sinegen_range(pitchf, frame_start as usize, n as usize);
+        self.decode_window_har(eng, z, &har, n)
+    }
+
+    /// har (窓分・CPU 生成済み) を与えるデコーダ窓生成。ストリーミング用。
+    pub fn decode_window_har(&self, eng: &Engine, z: &GpuTensor, har: &[f32], n: u32) -> GpuTensor {
+        let har_t = eng.tensor_from_f32(har, vec![]);
+        let mut g = eng.graph();
+        let audio = self.decode_graph(eng, &mut g, z, &har_t, n);
+        g.submit().expect("submit");
+        audio
+    }
+
+    /// デコーダを graph に記録 (submit しない・プランキャッシュ用)。
+    /// z [inter, n] + har_t [n*zc] → 音声 [n * zc]。
+    pub fn decode_graph(
+        &self,
+        eng: &Engine,
+        mut g: &mut Graph<'_>,
+        z: &GpuTensor,
+        har_t: &GpuTensor,
+        n: u32,
+    ) -> GpuTensor {
         let cfg = &self.cfg;
         let h = cfg.hidden_channels;
         let inter = cfg.inter_channels;
         let t = n;
-        let mut g = eng.graph();
         // cond(g) 行列
         let mut gbuf = vec![0.0f32; (cfg.gin_channels * t) as usize];
         for c in 0..cfg.gin_channels as usize {
@@ -631,9 +731,7 @@ impl Synth {
         g.add(&dx, &gcond, &dx2, chs[0] * t);
         dx = dx2;
 
-        // har (CPU, フル系列と同一の位相) → GPU
-        let har = self.sinegen_range(pitchf, frame_start as usize, n as usize);
-        let har_t = eng.tensor_from_f32(&har, vec![]);
+        // har → GPU (呼び出し側で用意)
         if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
             kk.push(("har", har_t.clone_handle()));
         }
@@ -657,11 +755,11 @@ impl Synth {
             if nk == 1 {
                 g.conv1d(&har_t, self.g(&format!("dec.noise_convs.{i}.weight")),
                     Some(self.g(&format!("dec.noise_convs.{i}.bias"))), &ns,
-                    cout, 1, 1, 1, 1, 0, har.len() as u32, len * u, 1);
+                    cout, 1, 1, 1, 1, 0, har_t.len as u32, len * u, 1);
             } else {
                 g.conv1d(&har_t, self.g(&format!("dec.noise_convs.{i}.weight")),
                     Some(self.g(&format!("dec.noise_convs.{i}.bias"))), &ns,
-                    cout, 1, nk, stride_f0, 1, stride_f0 / 2, har.len() as u32, len * u, 1);
+                    cout, 1, nk, stride_f0, 1, stride_f0 / 2, har_t.len as u32, len * u, 1);
             }
             let summed = eng.tensor_uninit((cout * len * u) as usize);
             g.add(&up, &ns, &summed, cout * len * u);
@@ -717,10 +815,9 @@ impl Synth {
         // 最終: lrelu → conv_post (bias 無し) → tanh
         g.lrelu(&dx, chs[ups.len()] * len);
         let audio = eng.tensor_uninit(len as usize);
-        self.conv_k_nobias(&mut g, &dx, "dec.conv_post.weight", &audio, chs[ups.len()], 1, 7, 1, len);
+        self.conv_k_nobias(g, &dx, "dec.conv_post.weight", &audio, chs[ups.len()], 1, 7, 1, len);
         g.tanh_inplace(&audio, len);
 
-        g.submit().expect("submit");
         audio
     }
 
