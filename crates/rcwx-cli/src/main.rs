@@ -5,6 +5,9 @@
 //! 使い方:
 //!   rcwx-cli run input.wav -o output.wav [--pitch 0] [--moe 0.45] [--noise 0.0]
 
+mod commands;
+mod pth_info;
+
 use anyhow::{Context, Result, bail};
 use rcwx_nn::engine::{Backend, Engine};
 use rcwx_nn::f0;
@@ -260,6 +263,15 @@ fn parse_args() -> Result<Args> {
 }
 
 fn main() -> Result<()> {
+    // サブコマンド: run / info / devices / download / logs
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    match raw_args.first().map(|s| s.as_str()) {
+        Some("info") => return commands::cmd_info(&raw_args[1..]),
+        Some("devices") => return commands::cmd_devices(),
+        Some("download") => return commands::cmd_download(&raw_args[1..]),
+        Some("logs") => return commands::cmd_logs(&raw_args[1..]),
+        _ => {}
+    }
     let args = parse_args()?;
     let dir = weights_dir();
     for f in [

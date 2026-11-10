@@ -10,6 +10,9 @@ hound = "3.5"
 anyhow = "1"
 bytemuck = "1.25.2"
 rcwx-dsp = { version = "0.1.0", path = "../rcwx-dsp" }
+cpal = "0.18.2"
+ureq = "3.5.1"
+zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "rcwx-cli"
