@@ -9,6 +9,34 @@ RVC v2モデルを使ったリアルタイムボイスチェンジャー。現�
 
 対象環境は **Windows + Intel Arc (XPU)**。CUDA / NVIDIA は未検証（コード上に分岐は残るがサポート対象外）。
 
+## Rust 単一バイナリ (Issue #6 — M0〜M7 実装済み)
+
+Python/torch 依存ゼロの完全 Rust 実装。`crates/` ワークスペース:
+
+```text
+crates/
+├── rcwx-nn/     # 独自 wgpu+WGSL 推論エンジン (burn/ort 不使用)
+│   ├── engine/  #   matmul(tiled)/conv1d/conv2d/softmax/graph/plan 再生
+│   ├── hubert.rs / synth.rs / rmvpe.rs / swiftf0.rs / ivf.rs / f0.rs
+├── rcwx-dsp/    # scipy 厳密一致ポリフェーズ resample / SOLA / spectral gate /
+│   #            # noise gate / postprocess / drift / feedback / moe
+├── rcwx-rt/     # リアルタイムエンジン: ストリーミング推論 (特徴/F0 sigmoid
+│   #            # ブレンド・decode 受容野マージン・SOLA hold-back) + cpal + SPSC ring
+├── rcwx-cli/    # run / info (自前 .pth pickle リーダ) / devices / download / logs / rt
+└── rcwx-gui/    # egui GUI (モデル/デバイス/レイテンシ/pitch/denoise/統計)
+```
+
+- 重み変換は dev ツール (`tools/convert_*.py`) で `~/.cache/rcwx/models/rust/` へ
+- パリティ: HuBERT cosine 1.0 / synth 0.9996 / RMVPE 0.9999 / swift-f0 0.999 /
+  DSP 全モジュール golden 一致 / オフライン E2E corr 0.983 (>0.95)
+- 実行: `cargo run -p rcwx-cli --release -- run in.wav -o out.wav [--moe 0.45 --index-rate 0.15]`、
+  `... rt --virtual in.wav -o out.wav --chunk 0.06` (デバイスなし検証)、`... rt` (実デバイス)、
+  `cargo run -p rcwx-gui --release`
+- **既知の制限**: リアルタイム推論 p50 ≈ 140ms/hop (60ms chunk)。decode WGSL カーネルが
+  ~170 GFLOPS に留まる (生 matmul は 721 GFLOPS)。20ms hop 予達成には Issue #6 の
+  カーネル最適化 (fp16 compute / im2col+matmul fusion / tile チューニング) が残務
+
+
 ## Quick Start
 
 推奨は同梱ランチャー。`uv sync` / XPU 確認 / モデル有無 / ML デノイザ確認を自動で行う。
