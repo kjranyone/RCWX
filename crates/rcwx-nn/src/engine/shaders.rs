@@ -43,9 +43,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 pub fn matmul_tiled_src() -> String {
     header(4)
         + r#"
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
-@compute @workgroup_size(8, 8)
+var<workgroup> ta: array<f32, 640>;
+var<workgroup> tb: array<f32, 640>;
+@compute @workgroup_size(16, 16)
 fn main(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -57,8 +57,8 @@ fn main(
   let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z; let c_bs = P.p3.w;
   let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
   let b_idx = gid.z;
-  let tile_m = wid.y * 16u;
-  let tile_n = wid.x * 16u;
+  let tile_m = wid.y * 32u;
+  let tile_n = wid.x * 32u;
   let lx = lid.x * 2u;
   let ly = lid.y * 2u;
   var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
@@ -68,25 +68,36 @@ fn main(
   let n1 = tile_n + ly + 1u;
   let a_off = a_base + b_idx * a_bs;
   let w_off = w_base + b_idx * w_bs;
+  let b_k_inner = (w_k == 1u);
+  let linear = lid.y * 16u + lid.x;
   var kt: u32 = 0u;
   while (kt < k_dim) {
-    var idx = lid.y * 8u + lid.x;
-    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
-      let r = idx / 16u;
-      let c = idx % 16u;
-      let gm = tile_m + r;
-      let gk = kt + c;
-      ta[r * 16u + c] = select(0.0, B1[a_off + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
-      let gn = tile_n + r;
-      tb[r * 16u + c] = select(0.0, B2[w_off + gn * w_row + gk * w_k], gn < n_dim && gk < k_dim);
-      idx = idx + 64u;
+    for (var rep: u32 = 0u; rep < 2u; rep = rep + 1u) {
+      let e = linear + rep * 256u;
+      let am = e >> 4u;
+      let ak = e & 15u;
+      let gm = tile_m + am;
+      let gk = kt + ak;
+      ta[am * 20u + ak] = select(0.0, B1[a_off + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      var bn: u32;
+      var bk: u32;
+      if (b_k_inner) {
+        bn = e >> 4u;
+        bk = e & 15u;
+      } else {
+        bn = e & 31u;
+        bk = e >> 5u;
+      }
+      let gn = tile_n + bn;
+      let gk2 = kt + bk;
+      tb[bn * 20u + bk] = select(0.0, B2[w_off + gn * w_row + gk2 * w_k], gn < n_dim && gk2 < k_dim);
     }
     workgroupBarrier();
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-      let a0 = ta[lx * 16u + kk];
-      let a1 = ta[(lx + 1u) * 16u + kk];
-      let b0 = tb[ly * 16u + kk];
-      let b1 = tb[(ly + 1u) * 16u + kk];
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
       acc00 = acc00 + a0 * b0;
       acc01 = acc01 + a0 * b1;
       acc10 = acc10 + a1 * b0;
@@ -407,12 +418,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ch = gid.y; let pos = gid.x;
   if (ch >= out_c || pos >= out_len) { return; }
   var acc = 0.0;
+  let start = (pos + pad_l) % stride;
   for (var c: u32 = 0u; c < in_c; c = c + 1u) {
-    for (var j: u32 = 0u; j < k_dim; j = j + 1u) {
-      let src = i32(pos) + i32(pad_l) - i32(j);
-      if (src >= 0 && (u32(src) % stride) == 0u && u32(src) / stride < in_len) {
+    let wbase = c * (out_c * k_dim) + ch * k_dim;
+    let xbase = c * in_len;
+    for (var j: u32 = start; j < k_dim; j = j + stride) {
+      let src = i32(pos + pad_l) - i32(j);
+      if (src >= 0) {
         let t = u32(src) / stride;
-        acc = acc + B2[c * (out_c * k_dim) + ch * k_dim + j] * B1[c * in_len + t];
+        if (t < in_len) {
+          acc = acc + B2[wbase + j] * B1[xbase + t];
+        }
       }
     }
   }
@@ -798,9 +814,9 @@ fn main(
 pub fn matmul_tiled_res_src() -> String {
     header(5)
         + r#"
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
-@compute @workgroup_size(8, 8)
+var<workgroup> ta: array<f32, 640>;
+var<workgroup> tb: array<f32, 640>;
+@compute @workgroup_size(16, 16)
 fn main(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -810,8 +826,8 @@ fn main(
   let w_row = P.p2.x; let w_k = P.p2.y; let w_base = P.p2.z;
   let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z;
   let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
-  let tile_m = wid.y * 16u;
-  let tile_n = wid.x * 16u;
+  let tile_m = wid.y * 32u;
+  let tile_n = wid.x * 32u;
   let lx = lid.x * 2u;
   let ly = lid.y * 2u;
   var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
@@ -819,25 +835,36 @@ fn main(
   let m1 = tile_m + lx + 1u;
   let n0 = tile_n + ly;
   let n1 = tile_n + ly + 1u;
+  let b_k_inner = (w_k == 1u);
+  let linear = lid.y * 16u + lid.x;
   var kt: u32 = 0u;
   while (kt < k_dim) {
-    var idx = lid.y * 8u + lid.x;
-    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
-      let r = idx / 16u;
-      let c = idx % 16u;
-      let gm = tile_m + r;
-      let gk = kt + c;
-      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
-      let gn = tile_n + r;
-      tb[r * 16u + c] = select(0.0, B2[w_base + gn * w_row + gk * w_k], gn < n_dim && gk < k_dim);
-      idx = idx + 64u;
+    for (var rep: u32 = 0u; rep < 2u; rep = rep + 1u) {
+      let e = linear + rep * 256u;
+      let am = e >> 4u;
+      let ak = e & 15u;
+      let gm = tile_m + am;
+      let gk = kt + ak;
+      ta[am * 20u + ak] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      var bn: u32;
+      var bk: u32;
+      if (b_k_inner) {
+        bn = e >> 4u;
+        bk = e & 15u;
+      } else {
+        bn = e & 31u;
+        bk = e >> 5u;
+      }
+      let gn = tile_n + bn;
+      let gk2 = kt + bk;
+      tb[bn * 20u + bk] = select(0.0, B2[w_base + gn * w_row + gk2 * w_k], gn < n_dim && gk2 < k_dim);
     }
     workgroupBarrier();
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-      let a0 = ta[lx * 16u + kk];
-      let a1 = ta[(lx + 1u) * 16u + kk];
-      let b0 = tb[ly * 16u + kk];
-      let b1 = tb[(ly + 1u) * 16u + kk];
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
       acc00 = acc00 + a0 * b0;
       acc01 = acc01 + a0 * b1;
       acc10 = acc10 + a1 * b0;
@@ -889,9 +916,9 @@ fn apply_post(v: f32, op: u32) -> f32 {
   if (op == 3u) { return 0.5 * v * (1.0 + erf_of2(v)); }
   return v;
 }
-var<workgroup> ta: array<f32, 256>;
-var<workgroup> tb: array<f32, 256>;
-@compute @workgroup_size(8, 8)
+var<workgroup> ta: array<f32, 640>;
+var<workgroup> tb: array<f32, 640>;
+@compute @workgroup_size(16, 16)
 fn main(
   @builtin(workgroup_id) wid: vec3<u32>,
   @builtin(local_invocation_id) lid: vec3<u32>,
@@ -903,8 +930,8 @@ fn main(
   let has_bias = P.p4.x; let scale = f32_of(P.p4.y);
   let post = P.p4.w;
   let b_idx = 0u;
-  let tile_m = wid.y * 16u;
-  let tile_n = wid.x * 16u;
+  let tile_m = wid.y * 32u;
+  let tile_n = wid.x * 32u;
   let lx = lid.x * 2u;
   let ly = lid.y * 2u;
   var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
@@ -912,25 +939,36 @@ fn main(
   let m1 = tile_m + lx + 1u;
   let n0 = tile_n + ly;
   let n1 = tile_n + ly + 1u;
+  let b_k_inner = (w_k == 1u);
+  let linear = lid.y * 16u + lid.x;
   var kt: u32 = 0u;
   while (kt < k_dim) {
-    var idx = lid.y * 8u + lid.x;
-    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
-      let r = idx / 16u;
-      let c = idx % 16u;
-      let gm = tile_m + r;
-      let gk = kt + c;
-      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
-      let gn = tile_n + r;
-      tb[r * 16u + c] = select(0.0, B2[w_base + gn * w_row + gk * w_k], gn < n_dim && gk < k_dim);
-      idx = idx + 64u;
+    for (var rep: u32 = 0u; rep < 2u; rep = rep + 1u) {
+      let e = linear + rep * 256u;
+      let am = e >> 4u;
+      let ak = e & 15u;
+      let gm = tile_m + am;
+      let gk = kt + ak;
+      ta[am * 20u + ak] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      var bn: u32;
+      var bk: u32;
+      if (b_k_inner) {
+        bn = e >> 4u;
+        bk = e & 15u;
+      } else {
+        bn = e & 31u;
+        bk = e >> 5u;
+      }
+      let gn = tile_n + bn;
+      let gk2 = kt + bk;
+      tb[bn * 20u + bk] = select(0.0, B2[w_base + gn * w_row + gk2 * w_k], gn < n_dim && gk2 < k_dim);
     }
     workgroupBarrier();
     for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
-      let a0 = ta[lx * 16u + kk];
-      let a1 = ta[(lx + 1u) * 16u + kk];
-      let b0 = tb[ly * 16u + kk];
-      let b1 = tb[(ly + 1u) * 16u + kk];
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
       acc00 = acc00 + a0 * b0;
       acc01 = acc01 + a0 * b1;
       acc10 = acc10 + a1 * b0;

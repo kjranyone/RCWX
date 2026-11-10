@@ -14,6 +14,8 @@
 //! HuBERT 窓長は毎 hop 同一 → plan キャッシュが 1 エントリで定常化する。
 
 use anyhow::Result;
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use rcwx_dsp::noise_gate::{NoiseGate, Sensitivity};
 use rcwx_dsp::postprocess::{PostprocessConfig, Postprocessor};
@@ -21,7 +23,7 @@ use rcwx_dsp::resample::StatefulResampler;
 use rcwx_dsp::sola::{sola_crossfade, SolaState};
 use rcwx_dsp::spectral::StreamingSpectralGate;
 
-use crate::config::{RtConfig, RtStats};
+use crate::config::{LiveParams, RtConfig, RtStats};
 use rcwx_nn::engine::{Backend, Engine, GpuTensor, Plan};
 use rcwx_nn::f0;
 use rcwx_nn::hubert::Hubert;
@@ -33,6 +35,10 @@ use rcwx_nn::synth::Synth;
 const MODEL_SR: u32 = 48000; // kurumi (synth.json の sr)
 const ZC: usize = MODEL_SR as usize / 100; // 480 samples/frame @100fps
 const DECODER_OVERLAP_FRAMES: usize = 3;
+/// decoder 窓の左マージン (受容野ウォームアップ分)。出力は末尾 new100+overlap
+/// のみなので左端は捨て枠。4→2 を実測したら整相 corr 0.19 / スペクトル差
+/// -14.9dB と品質が大幅劣化したため 4 を維持する (ref15 との比較)。
+const DECODER_LEFT_MARGIN_FRAMES: usize = 4;
 /// 特徴/F0 キャッシュの上限 (秒)
 const CACHE_SEC: f64 = 4.0;
 
@@ -65,6 +71,8 @@ pub struct RtEngine {
     synth: Synth,
     ivf: Option<IvfIndex>,
     pub cfg: RtConfig,
+    /// 実行中のスライダー。毎 hop の先頭で `cfg` へ写す。
+    pub live: Option<Arc<Mutex<LiveParams>>>,
     // 入力側
     resampler_in: StatefulResampler,
     resampler_out: Option<StatefulResampler>,
@@ -72,6 +80,8 @@ pub struct RtEngine {
     gate: Option<NoiseGate>,
     // 16k 履歴 (HuBERT 窓 = hubert_ctx + hop)
     hist: Vec<f32>,
+    /// HuBERT 入力。長さが同じ間は作り直さない。
+    hubert_wav: Option<GpuTensor>,
     // 特徴キャッシュ (blended, 50fps, flat [T,768])
     feat_cache: Vec<f32>,
     // F0 (条件付け済み・フィルタ前) 100fps
@@ -86,8 +96,14 @@ pub struct RtEngine {
     batch_pending: Vec<f32>,
     batch_count: u32,
     warmups: u32,
+    /// 起動時の形状プライム中。統計と stage ログに載せない。
+    priming: bool,
     pub stats: RtStats,
     pub warn: Vec<String>,
+    /// フィードバック相関 FFT 用ワーカー (try_send・キューは最新 1 件)。
+    /// 10 hop ごとの FFT (~3.6ms) を推論タイマーと出力レイテンシの両方から外す。
+    fb_jobs: Option<mpsc::SyncSender<(Vec<f32>, Vec<f32>)>>,
+    fb_results: Option<mpsc::Receiver<f64>>,
 }
 
 impl RtEngine {
@@ -107,38 +123,49 @@ impl RtEngine {
                 )?),
             ),
         };
-        let ivf = if cfg.index_rate > 0.0 {
-            IvfIndex::load(&dir).ok()
+        // 実行中のオンオフに備えて、ファイルがあるときは最初から載せる。
+        let ivf = IvfIndex::load(&dir).ok();
+
+        let (fb_jobs, fb_results) = if cfg.feedback_detect {
+            let (job_tx, job_rx) = mpsc::sync_channel::<(Vec<f32>, Vec<f32>)>(1);
+            let (res_tx, res_rx) = mpsc::channel::<f64>();
+            match std::thread::Builder::new()
+                .name("rcwx-fb-fft".into())
+                .spawn(move || {
+                    while let Ok((out, hay)) = job_rx.recv() {
+                        let corr =
+                            rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&out, &hay);
+                        if res_tx.send(corr as f64).is_err() {
+                            break;
+                        }
+                    }
+                })
+            {
+                Ok(_) => (Some(job_tx), Some(res_rx)),
+                Err(_) => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
 
         let ctx = cfg.hubert_ctx_samples();
-        let spectral = if cfg.denoise == "spectral" {
-            Some(StreamingSpectralGate::new(16000, 6.0, -24.0 * cfg.denoise_strength.clamp(0.5, 2.0)))
-        } else {
-            None
-        };
-        let gate = if cfg.noise_gate {
-            let mut g = NoiseGate::new(16000, -40.0);
-            g.auto_threshold = true;
-            g.set_sensitivity(match cfg.noise_gate_sensitivity {
-                0 => Sensitivity::Low,
-                2 => Sensitivity::High,
-                _ => Sensitivity::Mid,
-            });
-            Some(g)
-        } else {
-            None
-        };
+        let spectral = Some(StreamingSpectralGate::new(
+            16000,
+            6.0,
+            -24.0 * cfg.denoise_strength.clamp(0.5, 2.0),
+        ));
+        let mut gate = NoiseGate::new(16000, -40.0);
+        gate.auto_threshold = true;
+        gate.set_sensitivity(sensitivity_of(cfg.noise_gate_sensitivity));
 
-        Ok(Self {
+        let mut engine = Self {
             resampler_in: StatefulResampler::new(cfg.mic_sample_rate, 16000),
             resampler_out: (cfg.output_sample_rate != MODEL_SR)
                 .then(|| StatefulResampler::new(MODEL_SR, cfg.output_sample_rate)),
             spectral,
-            gate,
+            gate: Some(gate),
             hist: vec![0.0; ctx], // ゼロ充填履歴 (prime 相当)
+            hubert_wav: None,
             feat_cache: Vec::new(),
             f0_cond: Vec::new(),
             f0_filt: Vec::new(),
@@ -163,6 +190,7 @@ impl RtEngine {
             batch_pending: Vec::new(),
             batch_count: 0,
             warmups: 0,
+            priming: false,
             eng,
             hubert,
             rmvpe,
@@ -170,9 +198,100 @@ impl RtEngine {
             synth,
             ivf,
             cfg,
+            live: None,
             stats: RtStats::default(),
             warn: Vec::new(),
-        })
+            fb_jobs,
+            fb_results,
+        };
+        engine.prime_steady_shape();
+        Ok(engine)
+    }
+
+    /// 定常の HuBERT / SwiftF0 / synth 形状を起動時に作る。
+    /// 計測対象の先頭バッチでプラン再構築が p99 を押し上げないようにする。
+    /// 履歴の長さと GPU プランは残し、中身と DSP 状態だけ戻す。
+    fn prime_steady_shape(&mut self) {
+        let batch_n = self.cfg.batch_hops.max(1) as usize;
+        let n = self.cfg.hop_mic() * batch_n;
+        if n == 0 {
+            return;
+        }
+        let hop16 = self.cfg.hop_16k() * batch_n;
+        let new100 = (hop16 / 320) * 2;
+        if new100 == 0 {
+            return;
+        }
+        let mut hop = vec![0.0f32; n];
+        for (i, s) in hop.iter_mut().enumerate() {
+            // 無音だと SwiftF0 がプランを作らない。小さい正弦で形状だけ通す。
+            *s = (i as f32 * 0.02).sin() * 0.05;
+        }
+        let target = 28 * 2 + new100 + DECODER_OVERLAP_FRAMES;
+        let batches = target.div_ceil(new100) + 3;
+        self.priming = true;
+        for _ in 0..batches {
+            let _ = self.process_batch(&hop, batch_n);
+        }
+        self.priming = false;
+        self.hist.fill(0.0);
+        self.feat_cache.fill(0.0);
+        self.f0_cond.fill(0.0);
+        self.f0_filt.fill(0.0);
+        self.resampler_in.reset();
+        if let Some(rs) = self.resampler_out.as_mut() {
+            rs.reset();
+        }
+        if let Some(sp) = self.spectral.as_mut() {
+            sp.reset();
+        }
+        if let Some(g) = self.gate.as_mut() {
+            g.reset();
+        }
+        self.post.reset();
+        self.sola = SolaState::new(
+            (self.cfg.crossfade_sec * MODEL_SR as f64).round() as usize,
+            (self.cfg.sola_search_sec * MODEL_SR as f64).round() as usize,
+        );
+        self.out_hist.clear();
+        self.batch_pending.clear();
+        self.batch_count = 0;
+        self.warmups = 0;
+        self.stats = RtStats::default();
+        self.warn.clear();
+        eprintln!("[WARMUP] steady shape primed ({batches} batches)");
+    }
+
+    pub fn adapter_name(&self) -> String {
+        self.eng.adapter_info.name.clone()
+    }
+
+    fn pull_live(&mut self) {
+        let Some(live) = self.live.clone() else {
+            return;
+        };
+        let params = match live.lock() {
+            Ok(guard) => guard,
+            Err(err) => err.into_inner(),
+        };
+        let strength_changed = (params.denoise_strength - self.cfg.denoise_strength).abs() > 1e-4;
+        let sens_changed = params.noise_gate_sensitivity != self.cfg.noise_gate_sensitivity;
+        self.cfg.apply_live(&params);
+        let strength = self.cfg.denoise_strength;
+        let sensitivity = self.cfg.noise_gate_sensitivity;
+        let post = post_config_from(&self.cfg);
+        drop(params);
+        if strength_changed
+            && let Some(spectral) = self.spectral.as_mut()
+        {
+            spectral.configure(6.0, -24.0 * strength.clamp(0.5, 2.0));
+        }
+        if sens_changed
+            && let Some(gate) = self.gate.as_mut()
+        {
+            gate.set_sensitivity(sensitivity_of(sensitivity));
+        }
+        self.post.update_config(post);
     }
 
     /// hop (mic レート) → 変換音声 (出力レート)。
@@ -196,10 +315,13 @@ impl RtEngine {
 
     /// hop_mic: (batch_n hop 分を連結した) 入力。batch_n=1 で単一 hop。
     fn process_batch(&mut self, hop_mic: &[f32], batch_n: usize) -> Vec<f32> {
+        rcwx_nn::engine::pin_realtime_thread();
+        self.pull_live();
         let t0 = std::time::Instant::now();
         let mut stage_t = std::time::Instant::now();
+        let priming = self.priming;
         let stage = |name: &str, t: &mut std::time::Instant| {
-            if std::env::var("RCWX_RT_STAGES").is_ok() {
+            if !priming && std::env::var("RCWX_RT_STAGES").is_ok() {
                 eprintln!("  [stage] {name}: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
             }
             *t = std::time::Instant::now();
@@ -221,21 +343,57 @@ impl RtEngine {
         }
         chunk16.truncate(hop16);
 
-        // 2) denoise / gate
-        if let Some(sp) = self.spectral.as_mut() {
+        // 2) denoise / gate。オフのあいだは状態を進めない。
+        if self.cfg.denoise == "spectral"
+            && let Some(sp) = self.spectral.as_mut()
+        {
             chunk16 = sp.process(&chunk16);
         }
-        if let Some(g) = self.gate.as_mut() {
+        if self.cfg.noise_gate
+            && let Some(g) = self.gate.as_mut()
+        {
             chunk16 = g.process(&chunk16);
         }
 
         stage("input+denoise", &mut stage_t);
-        // 3) HuBERT 窓
+        // 3) HuBERT 窓 + SwiftF0。STFT (CPU) → 入力書き込み → 両モデルの計算と
+        //    読み戻しを 1 submit に統合 (submit 数・fence 境界を削減)。
         self.hist.extend_from_slice(&chunk16);
         let win_len = self.hist.len();
-        let wav_t = self.eng.tensor_from_f32(&self.hist, vec![win_len]);
-        let feats = self.hubert.features(&self.eng, &wav_t, win_len as u32);
-        let feats_data = self.eng.readback_f32(&feats);
+        if self.hubert_wav.as_ref().map(|t| t.len) != Some(win_len) {
+            self.hubert_wav = Some(self.eng.tensor_uninit(win_len));
+        }
+        let wav_t = self.hubert_wav.as_ref().unwrap();
+        self.eng.write_f32(wav_t, &self.hist);
+
+        let f0_ctx_samples = self.cfg.f0_ctx_samples();
+        let f0_win_samples = f0_ctx_samples + hop16;
+        let win_start = self.hist.len().saturating_sub(f0_win_samples);
+        let f0_audio = self.hist[win_start..].to_vec();
+        let (feats_data, swift_probs) = if let Some(sf) = self.swiftf0.as_ref() {
+            match sf.prepare_gpu(&self.eng, &f0_audio) {
+                Some(t) => {
+                    let (proj, swift_plan) = sf.plan_and_proj_clone(t);
+                    let (hb_in, hb_out, hb_plan) =
+                        self.hubert.features_plan_clone(&self.eng, win_len as u32);
+                    let (feats_data, probs) = self.eng.run_inputs_plans_readback_two(
+                        &[(wav_t, &hb_in)],
+                        &[&hb_plan, &swift_plan],
+                        &hb_out,
+                        &proj,
+                    );
+                    (feats_data, Some((t, probs)))
+                }
+                None => {
+                    // 無音など SwiftF0 不要: HuBERT のみ従来経路
+                    let feats = self.hubert.features(&self.eng, wav_t, win_len as u32);
+                    (self.eng.readback_f32(&feats), None)
+                }
+            }
+        } else {
+            let feats = self.hubert.features(&self.eng, wav_t, win_len as u32);
+            (self.eng.readback_f32(&feats), None)
+        };
         let t50_win = feats_data.len() / 768;
 
         // 新規フレーム → キャッシュ (sigmoid ブレンド)
@@ -269,15 +427,17 @@ impl RtEngine {
         stage("hubert+blend", &mut stage_t);
         let cache_t50 = self.feat_cache.len() / 768;
 
-        // 4) F0 窓 [ctx | new]
-        let f0_ctx_samples = self.cfg.f0_ctx_samples();
-        let f0_win_samples = f0_ctx_samples + hop16;
-        let win_start = self.hist.len().saturating_sub(f0_win_samples);
-        let f0_audio = self.hist[win_start..].to_vec();
-        let mut f0_win = match (&self.swiftf0, &self.rmvpe) {
-            (Some(sf), _) => sf.detect(&self.eng, &f0_audio),
-            (_, Some(rm)) => rm.infer(&self.eng, &f0_audio),
-            _ => vec![0.0; f0_win_samples / 160],
+        // 4) F0。Swift は上で GPU 済み。無音はゼロ、RMVPE / none は従来どおり。
+        let mut f0_win = if let Some((t, probs)) = swift_probs {
+            let sf = self.swiftf0.as_ref().unwrap();
+            let (pitch, conf) = sf.pitch_from_probs(&probs, t);
+            sf.finish(&f0_audio, &pitch, &conf)
+        } else if self.swiftf0.is_some() {
+            vec![0.0; f0_audio.len() / 160]
+        } else if let Some(rm) = &self.rmvpe {
+            rm.infer(&self.eng, &f0_audio)
+        } else {
+            vec![0.0; f0_win_samples / 160]
         };
         let want = f0_win_samples / 160;
         f0_win.resize(want, 0.0);
@@ -314,10 +474,10 @@ impl RtEngine {
         rcwx_nn::f0::apply_f0_filter_chain(
             &mut f0_to_filter,
             16.0,
-            true,
-            true,
-            3.6,
-            30.0,
+            self.cfg.octave_suppress,
+            self.cfg.f0_slew_limit,
+            self.cfg.f0_slew_max_step,
+            self.cfg.f0_hole_fill_ms,
         );
         self.f0_filt
             .extend_from_slice(&f0_to_filter[filter_ctx..]);
@@ -344,10 +504,16 @@ impl RtEngine {
         let mut feats_win = self.feat_cache[win50_start * 768..].to_vec();
         let feats_win_frames = feats_win.len() / 768;
         feats_win.truncate(feats_win_frames * 768);
-        if let Some(ivf) = self.ivf.as_ref() {
-            if feats_win_frames > 0 {
-                ivf.blend(&mut feats_win, feats_win_frames, self.cfg.index_rate, self.cfg.index_k);
-            }
+        if self.cfg.index_rate > 0.0
+            && let Some(ivf) = self.ivf.as_ref()
+            && feats_win_frames > 0
+        {
+            ivf.blend(
+                &mut feats_win,
+                feats_win_frames,
+                self.cfg.index_rate,
+                self.cfg.index_k,
+            );
         }
 
         // 100fps 補間 (align_corners=False 相当)
@@ -369,7 +535,7 @@ impl RtEngine {
         // 6) encode → decode → SOLA (固定形状はプランをキャッシュして再生)
         //    TextEncoder/Flow は全窓で attention コンテキストを取るが、
         //    デコーダは受容野マージン分 (8fr) の z で十分 → 計算量 1/5 に削減
-        let n_dec = (new100 + 4 + DECODER_OVERLAP_FRAMES).min(n100);
+        let n_dec = (new100 + DECODER_LEFT_MARGIN_FRAMES + DECODER_OVERLAP_FRAMES).min(n100);
         let pitch_emb = self.synth.pitch_embedding(&pitch, n100 as u32);
         let f0_dec = {
             let s = self.f0_filt.len().saturating_sub(n_dec);
@@ -409,18 +575,25 @@ impl RtEngine {
                 }));
             }
             let p = plans.as_ref().unwrap();
+            if !priming && std::env::var_os("RCWX_NOOP_PROBE").is_some() {
+                let ms = eng.probe_noop();
+                eprintln!("    [probe] noop roundtrip: {ms:.2}ms");
+            }
             eng.write_f32(&p.feats_in, &feats100);
             eng.write_f32(&p.pitch_emb_in, &pitch_emb);
-            let dbg = std::env::var("RCWX_RT_STAGES").is_ok();
-            let mut tt = std::time::Instant::now();
-            eng.replay_inputs(&p.encode_plan, &[]);
-            if dbg { eprintln!("    [synth] encode: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); tt = std::time::Instant::now(); }
             eng.write_f32(&p.har_in, &har);
-            eng.replay_inputs(&p.decode_plan, &[]);
-            if dbg { eprintln!("    [synth] decode replay: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); tt = std::time::Instant::now(); }
-            let out = eng.readback_f32(&p.audio_out);
-            if dbg { eprintln!("    [synth] readback: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); }
-            out
+            let dbg = !priming && std::env::var("RCWX_RT_STAGES").is_ok();
+            let ts_probe = !priming && std::env::var_os("RCWX_TS_PROBE").is_some();
+            if ts_probe {
+                // 診断: 1 submit 統合 + GPU パス時間の分離計測
+                eng.run_plans_timed(&[&p.encode_plan, &p.decode_plan], &p.audio_out)
+            } else {
+                // 計算と読み戻しを 1 submit に統合 (submit 数・fence 境界を削減)
+                let tt = std::time::Instant::now();
+                let out = eng.run_plans_readback(&[&p.encode_plan, &p.decode_plan], &p.audio_out);
+                if dbg { eprintln!("    [synth] encode+decode+rb: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); }
+                out
+            }
         };
 
         stage("synth", &mut stage_t);
@@ -439,6 +612,21 @@ impl RtEngine {
         let mut out = sola_crossfade(&clipped, &mut self.sola, target);
         self.stats.solo_offset = self.sola.last_offset;
 
+        if self.cfg.voice_gate_mode != "off" && new100 > 0 {
+            let start = self.f0_filt.len().saturating_sub(new100);
+            let mask: Vec<f32> = self.f0_filt[start..]
+                .iter()
+                .map(|v| if *v > 0.0 { 1.0 } else { 0.0 })
+                .collect();
+            rcwx_dsp::voice_gate::apply_voice_gate(
+                &mut out,
+                &mask,
+                &self.cfg.voice_gate_mode,
+                self.cfg.energy_threshold as f32,
+                MODEL_SR,
+            );
+        }
+
         // 出力レート変換
         if let Some(rs) = self.resampler_out.as_mut() {
             out = rs.resample_chunk(&out);
@@ -453,7 +641,8 @@ impl RtEngine {
             out = self.post.process(&out);
         }
 
-        // フィードバック検出 (10 hop ごと)
+        // フィードバック検出 (10 hop ごと)。FFT 本体はワーカースレッドで
+        // 非同期実行し、推論タイマー・出力レイテンシのどちらにも載せない。
         if self.cfg.feedback_detect {
             self.out_hist.extend_from_slice(&out);
             let keep = MODEL_SR as usize; // 1s
@@ -462,13 +651,23 @@ impl RtEngine {
                 self.out_hist.drain(..drop);
             }
             self.stats.hops += 1;
+            if let Some(rx) = self.fb_results.as_ref() {
+                while let Ok(corr) = rx.try_recv() {
+                    self.stats.feedback_corr = corr;
+                }
+            }
             if self.stats.hops % 10 == 0 && self.out_hist.len() > keep + out.len() {
                 let hay_start = self.out_hist.len() - keep - out.len();
-                let corr = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(
-                    &out,
-                    &self.out_hist[hay_start..hay_start + keep],
-                );
-                self.stats.feedback_corr = corr as f64;
+                let hay = self.out_hist[hay_start..hay_start + keep].to_vec();
+                match self.fb_jobs.as_ref() {
+                    Some(tx) => {
+                        let _ = tx.try_send((out.clone(), hay));
+                    }
+                    None => {
+                        let corr = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&out, &hay);
+                        self.stats.feedback_corr = corr as f64;
+                    }
+                }
             }
         } else {
             self.stats.hops += 1;
@@ -476,10 +675,12 @@ impl RtEngine {
 
         stage("sola+post", &mut stage_t);
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / batch_n.max(1) as f64;
-        // 初回 2 推論 (プラン構築) はウォームアップとして統計から除外
-        self.warmups += 1;
-        if self.warmups > 2 {
-            self.stats.record_inference(ms);
+        // 初回 2 推論 (プラン構築) はウォームアップとして統計から除外。プライム中は記録しない。
+        if !self.priming {
+            self.warmups += 1;
+            if self.warmups > 2 {
+                self.stats.record_inference(ms);
+            }
         }
 
         // 履歴を窓長に縮める
@@ -489,6 +690,27 @@ impl RtEngine {
             self.hist.drain(..drop);
         }
         out
+    }
+}
+
+fn sensitivity_of(value: u8) -> Sensitivity {
+    match value {
+        0 => Sensitivity::Low,
+        2 => Sensitivity::High,
+        _ => Sensitivity::Mid,
+    }
+}
+
+fn post_config_from(cfg: &RtConfig) -> rcwx_dsp::postprocess::PostprocessConfig {
+    rcwx_dsp::postprocess::PostprocessConfig {
+        enabled: cfg.postprocess,
+        treble_boost_db: cfg.treble_boost_db,
+        treble_cutoff_hz: cfg.treble_cutoff_hz,
+        limiter_threshold_db: cfg.limiter_threshold_db,
+        limiter_release_ms: cfg.limiter_release_ms,
+        normalizer_enabled: cfg.normalizer_enabled,
+        normalizer_target_rms: cfg.normalizer_target_rms,
+        ..rcwx_dsp::postprocess::PostprocessConfig::default()
     }
 }
 

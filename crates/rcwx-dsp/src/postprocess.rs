@@ -1,7 +1,7 @@
 //! ポストプロセス (rcwx/audio/postprocess.py 相当):
 //! トレブルブースト (ピーキング biquad) + EMA RMS ノーマライザ + ルックアヘッドリミッタ。
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct PostprocessConfig {
     pub enabled: bool,
     pub treble_boost_db: f64,
@@ -56,6 +56,22 @@ impl TrebleBoost {
         };
         t.design_filter();
         t
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// 係数が変わるときだけフィルタを作り直す。状態は係数変更時に捨てる。
+    pub fn set_config(&mut self, cfg: PostprocessConfig) {
+        let redesign = cfg.treble_boost_db != self.cfg.treble_boost_db
+            || cfg.treble_cutoff_hz != self.cfg.treble_cutoff_hz;
+        self.cfg = cfg;
+        if redesign {
+            self.design_filter();
+            self.zi = [0.0, 0.0];
+            self.warm_start = true;
+        }
     }
 
     fn design_filter(&mut self) {
@@ -150,6 +166,10 @@ impl RmsNormalizer {
         self.prev_gain = 1.0;
     }
 
+    pub fn set_config(&mut self, cfg: PostprocessConfig) {
+        self.cfg = cfg;
+    }
+
     pub fn process(&mut self, audio: &[f32]) -> Vec<f32> {
         if !self.cfg.normalizer_enabled || audio.is_empty() {
             return audio.to_vec();
@@ -226,6 +246,19 @@ impl LookaheadLimiter {
         self.delay_buffer = None;
     }
 
+    /// しきい値とリリースを差し替える。ルックアヘッド長が変わるときだけ遅延を捨てる。
+    pub fn reconfigure(&mut self, sample_rate: u32, cfg: &PostprocessConfig) {
+        let lookahead =
+            ((cfg.limiter_lookahead_ms * sample_rate as f64 / 1000.0) as usize).clamp(1, 256);
+        if lookahead != self.lookahead {
+            self.lookahead = lookahead;
+            self.delay_buffer = None;
+        }
+        let release_samples = cfg.limiter_release_ms * sample_rate as f64 / 1000.0;
+        self.threshold = 10f64.powf(cfg.limiter_threshold_db / 20.0);
+        self.release_coeff = (-1.0 / release_samples.max(1.0)).exp();
+    }
+
     pub fn process(&mut self, audio: &[f32]) -> Vec<f32> {
         if audio.is_empty() {
             return audio.to_vec();
@@ -285,6 +318,23 @@ impl Postprocessor {
         self.treble.reset();
         self.normalizer.reset();
         self.limiter.reset();
+    }
+
+    /// 実行中のスライダー反映。トレブル係数とリミッタ時定数だけを必要なら組み直す。
+    pub fn update_config(&mut self, cfg: PostprocessConfig) {
+        if self.cfg == cfg {
+            return;
+        }
+        let limiter_changed = cfg.limiter_threshold_db != self.cfg.limiter_threshold_db
+            || cfg.limiter_release_ms != self.cfg.limiter_release_ms
+            || cfg.limiter_lookahead_ms != self.cfg.limiter_lookahead_ms;
+        let sample_rate = self.treble.sample_rate();
+        self.treble.set_config(cfg.clone());
+        self.normalizer.set_config(cfg.clone());
+        if limiter_changed {
+            self.limiter.reconfigure(sample_rate, &cfg);
+        }
+        self.cfg = cfg;
     }
 
     pub fn process(&mut self, audio: &[f32]) -> Vec<f32> {

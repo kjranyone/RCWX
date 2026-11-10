@@ -8,6 +8,7 @@ pub mod postprocess;
 pub mod resample;
 pub mod sola;
 pub mod spectral;
+pub mod voice_gate;
 
 /// 比較用 cosine 類似度。
 pub fn spectral_corr(a: &[f32], b: &[f32]) -> f64 {

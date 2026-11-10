@@ -12,4 +12,4 @@ pub mod config;
 pub mod engine;
 pub mod ring;
 
-pub use config::{RtConfig, RtStats};
+pub use config::{LiveParams, RtConfig, RtReport, RtStats};

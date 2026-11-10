@@ -107,8 +107,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
         dev_in.as_deref(),
         dev_out.as_deref(),
         stop,
-        None,
-        None,
+        rcwx_rt::audio::RtHooks::default(),
     )
 }
 

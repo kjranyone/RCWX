@@ -143,6 +143,21 @@ impl Hubert {
         self.extract(eng, wav, n_samples, 12, 768)
     }
 
+    /// キャッシュ済み v2 プランのクローン (input への wav copy と out 読み戻しは
+    /// 呼び出し側の統合 submit に載せる)。実行は extract 相当を自前で組み立てる
+    /// リアルタイム経路のみが使う。
+    pub fn features_plan_clone(
+        &self,
+        eng: &Engine,
+        n_samples: u32,
+    ) -> (GpuTensor, GpuTensor, crate::engine::Plan) {
+        let mut plans = self.plans.borrow_mut();
+        let entry = plans
+            .entry((n_samples, 12, 768))
+            .or_insert_with(|| self.build_plan(eng, n_samples, 12, 768));
+        (entry.input.clone_handle(), entry.out.clone_handle(), entry.plan.clone())
+    }
+
     /// layer=12 (v2) / 9 (v1), dim=768/256。戻り値 [T, dim]。
     /// 形状ごとに実行プランを構築して再利用 (バッファ・bind group・uniform はキャッシュ)。
     pub fn extract(

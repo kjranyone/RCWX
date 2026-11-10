@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::engine::{Engine, GpuTensor};
+use crate::engine::{Engine, GpuTensor, Plan};
 
 const N_FFT: usize = 1024;
 const STFT_HOP: usize = 256;
@@ -31,10 +31,18 @@ const MODEL_FMAX: f64 = 2093.75;
 
 const TARGET_HOP: usize = 160;
 
+struct SwiftPlan {
+    input: GpuTensor,
+    proj: GpuTensor,
+    plan: Plan,
+}
+
 pub struct SwiftF0 {
     w: std::collections::HashMap<String, GpuTensor>,
     pub window: Vec<f32>,  // [1024]
     pub centers: Vec<f32>, // [200]
+    /// n_frames ごとに GPU プランを再利用し、毎 hop のバッファ破棄を避ける。
+    plans: std::cell::RefCell<std::collections::HashMap<u32, SwiftPlan>>,
 }
 
 pub fn default_swiftf0_path() -> std::path::PathBuf {
@@ -65,23 +73,100 @@ impl SwiftF0 {
             w,
             window: cpu.get("window").context("window")?.clone(),
             centers: cpu.get("centers").context("centers")?.clone(),
+            plans: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
+    }
+
+    fn gpu_plan(&self, eng: &Engine, t: u32) -> SwiftPlan {
+        let mut g = eng.graph();
+        let input = eng.tensor_uninit((FREQ_BINS as usize) * t as usize);
+        let mut cur = input.clone_handle();
+        let (mut cin, layers) = (1u32, [(1u32, 8u32), (8, 16), (16, 32), (32, 64), (64, 1)]);
+        for (i, &(c_in, c_out)) in layers.iter().enumerate() {
+            debug_assert_eq!(cin, c_in);
+            let ic = eng.tensor_uninit((cin as usize) * 25 * FREQ_BINS as usize * t as usize);
+            g.im2col2d_k(&cur, &ic, cin, FREQ_BINS, t, 5, 2);
+            let out = eng.tensor_uninit((c_out as usize) * FREQ_BINS as usize * t as usize);
+            g.matmul_ex(
+                self.g(&format!("conv{i}.weight")),
+                &ic,
+                Some(self.g(&format!("conv{i}.bias"))),
+                &out,
+                c_out,
+                FREQ_BINS * t,
+                cin * 25,
+                1,
+                cin * 25,
+                1,
+                0,
+                0,
+                1,
+                FREQ_BINS * t,
+                0,
+                0,
+                FREQ_BINS * t,
+                1,
+                0,
+                0,
+                1.0,
+                1,
+            );
+            g.relu(&out, c_out * FREQ_BINS * t);
+            cur = out;
+            cin = c_out;
+        }
+        let proj = eng.tensor_uninit(N_PITCH_BINS * t as usize);
+        g.matmul_ex(
+            self.g("proj.weight"),
+            &cur,
+            Some(self.g("proj.bias")),
+            &proj,
+            N_PITCH_BINS as u32,
+            t,
+            FREQ_BINS,
+            1,
+            FREQ_BINS,
+            1,
+            0,
+            0,
+            1,
+            t,
+            0,
+            0,
+            t,
+            1,
+            0,
+            0,
+            1.0,
+            1,
+        );
+        let plan = g.into_plan().expect("swiftf0 plan");
+        SwiftPlan { input, proj, plan }
     }
 
     fn g(&self, name: &str) -> &GpuTensor {
         self.w.get(name).unwrap_or_else(|| panic!("weight {name}"))
     }
 
-    /// 内部 hop 256 での生検出。(pitch_hz, confidence) を返す。
-    pub fn infer_raw(&self, eng: &Engine, audio: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    /// STFT と GPU conv を投入する。読み戻しは呼び出し側。無音や空は None。
+    pub fn launch_gpu(&self, eng: &Engine, audio: &[f32]) -> Option<u32> {
+        let t = self.prepare_gpu(eng, audio)?;
+        let plans = self.plans.borrow();
+        let entry = plans.get(&t).unwrap();
+        eng.replay(&entry.plan, None);
+        Some(t)
+    }
+
+    /// STFT (CPU) + 入力書き込み + プラン構築まで。submit は呼び出し側で
+    /// 統合する (リアルタイム経路)。無音や空は None。
+    pub fn prepare_gpu(&self, eng: &Engine, audio: &[f32]) -> Option<u32> {
         let n = audio.len();
         let n_frames = 1 + (n + 2 * PAD).saturating_sub(N_FFT) / STFT_HOP;
         if n == 0 || n_frames == 0 {
-            return (Vec::new(), Vec::new());
+            return None;
         }
-        let n_target = n / TARGET_HOP;
         if audio.iter().fold(0.0f32, |m, v| m.max(v.abs())) < 1e-6 {
-            return (vec![0.0; n_target.max(1)], vec![0.0; n_frames]);
+            return None;
         }
 
         // ---- STFT (CPU fp32, rustfft) → log magnitude [132, T] ----
@@ -115,74 +200,29 @@ impl SwiftF0 {
 
         // ---- conv スタック (GPU) + freq_projection → probs [200, T] ----
         let t = n_frames as u32;
-        let mut g = eng.graph();
-        let mut cur = eng.tensor_from_f32(&logmag, vec![]);
-        let (mut cin, layers) = (1u32, [(1u32, 8u32), (8, 16), (16, 32), (32, 64), (64, 1)]);
-        for (i, &(c_in, c_out)) in layers.iter().enumerate() {
-            debug_assert_eq!(cin, c_in);
-            let ic = eng.tensor_uninit((cin * 25 * FREQ_BINS * t) as usize);
-            g.im2col2d_k(&cur, &ic, cin, FREQ_BINS, t, 5, 2);
-            let out = eng.tensor_uninit((c_out * FREQ_BINS * t) as usize);
-            g.matmul_ex(
-                self.g(&format!("conv{i}.weight")),
-                &ic,
-                Some(self.g(&format!("conv{i}.bias"))),
-                &out,
-                c_out,
-                FREQ_BINS * t,
-                cin * 25,
-                1,
-                cin * 25,
-                1,
-                0,
-                0,
-                1,
-                FREQ_BINS * t,
-                0,
-                0,
-                FREQ_BINS * t,
-                1,
-                0,
-                0,
-                1.0,
-                1,
-            );
-            g.relu(&out, c_out * FREQ_BINS * t);
-            cur = out;
-            cin = c_out;
+        if !self.plans.borrow().contains_key(&t) {
+            let built = self.gpu_plan(eng, t);
+            self.plans.borrow_mut().insert(t, built);
         }
-        let proj = eng.tensor_uninit((N_PITCH_BINS * t as usize) as usize);
-        g.matmul_ex(
-            self.g("proj.weight"),
-            &cur,
-            Some(self.g("proj.bias")),
-            &proj,
-            N_PITCH_BINS as u32,
-            t,
-            FREQ_BINS,
-            1,
-            FREQ_BINS,
-            1,
-            0,
-            0,
-            1,
-            t,
-            0,
-            0,
-            t,
-            1,
-            0,
-            0,
-            1.0,
-            1,
-        );
-        if g.submit().is_err() {
-            return (vec![0.0; n_frames], vec![0.0; n_frames]);
-        }
-        let probs = eng.readback_f32(&proj);
+        let plans = self.plans.borrow();
+        let entry = plans.get(&t).unwrap();
+        eng.write_f32(&entry.input, &logmag);
+        Some(t)
+    }
 
-        // ---- softmax + argmax + ±9bin 加重平均 (CPU) ----
-        // probs は [200, T] (bin 主導) レイアウト
+    /// キャッシュ済み plan と proj 出力のクローン (統合 submit 用)。
+    pub fn plan_and_proj_clone(&self, t: u32) -> (GpuTensor, crate::engine::Plan) {
+        let plans = self.plans.borrow();
+        let entry = plans.get(&t).unwrap();
+        (entry.proj.clone_handle(), entry.plan.clone())
+    }
+
+    pub fn proj_handle(&self, t: u32) -> GpuTensor {
+        self.plans.borrow().get(&t).unwrap().proj.clone_handle()
+    }
+
+    /// probs は [200, T] (bin 主導)。
+    pub fn pitch_from_probs(&self, probs: &[f32], t: u32) -> (Vec<f32>, Vec<f32>) {
         let mut pitch = vec![0.0f32; t as usize];
         let mut conf = vec![0.0f32; t as usize];
         let mut row = vec![0.0f32; N_PITCH_BINS];
@@ -220,6 +260,27 @@ impl SwiftF0 {
         (pitch, conf)
     }
 
+    /// 内部 hop 256 での生検出。(pitch_hz, confidence) を返す。
+    pub fn infer_raw(&self, eng: &Engine, audio: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let n = audio.len();
+        let n_frames = 1 + (n + 2 * PAD).saturating_sub(N_FFT) / STFT_HOP;
+        if n == 0 || n_frames == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let n_target = n / TARGET_HOP;
+        if audio.iter().fold(0.0f32, |m, v| m.max(v.abs())) < 1e-6 {
+            return (vec![0.0; n_target.max(1)], vec![0.0; n_frames]);
+        }
+        let Some(t) = self.launch_gpu(eng, audio) else {
+            return (Vec::new(), Vec::new());
+        };
+        let probs = {
+            let plans = self.plans.borrow();
+            eng.readback_f32(&plans.get(&t).unwrap().proj)
+        };
+        self.pitch_from_probs(&probs, t)
+    }
+
     /// RCWX 相当の検出: 100fps (hop 160) への補間 + オクターブ解決済み F0。
     pub fn detect(&self, eng: &Engine, audio: &[f32]) -> Vec<f32> {
         let n = audio.len();
@@ -228,6 +289,16 @@ impl SwiftF0 {
             return Vec::new();
         }
         let (pitch, conf) = self.infer_raw(eng, audio);
+        self.finish(audio, &pitch, &conf)
+    }
+
+    /// GPU 読み戻し済みの (pitch, confidence) から 100fps F0 を作る。
+    pub fn finish(&self, audio: &[f32], pitch: &[f32], conf: &[f32]) -> Vec<f32> {
+        let n = audio.len();
+        let n_target = n / TARGET_HOP;
+        if n == 0 || n_target == 0 {
+            return Vec::new();
+        }
         let n_swift = pitch.len();
         if n_swift == 0 {
             return vec![0.0; n_target];
@@ -236,7 +307,7 @@ impl SwiftF0 {
         // voicing (モデル域 + RCWX 域の積)
         let voiced: Vec<bool> = pitch
             .iter()
-            .zip(&conf)
+            .zip(conf.iter())
             .map(|(&p, &c)| {
                 c > CONFIDENCE_THRESHOLD
                     && (p as f64) >= MODEL_FMIN
@@ -252,7 +323,7 @@ impl SwiftF0 {
 
         // hop 256 → 160 補間 (linear align_corners=False / voiced nearest)
         let (f0_r, conf_r, voiced_r): (Vec<f32>, Vec<f32>, Vec<bool>) = if n_swift == n_target {
-            (f0.clone(), conf.clone(), voiced.clone())
+            (f0.clone(), conf.to_vec(), voiced.clone())
         } else {
             let scale = n_swift as f32 / n_target as f32;
             let mut fo = vec![0.0f32; n_target];

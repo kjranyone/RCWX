@@ -20,7 +20,7 @@
         e2e      オフライン E2E を Python 版と corr 比較 (uv + モデル必要)
         rt ...   リアルタイム CLI へ転送 (例: rt --seconds 10)
         run ...  オフライン変換へ転送
-        gui      egui GUI を起動
+        gui      GPUI GUI を起動
         fmt      cargo fmt
         clippy   cargo clippy
         clean    cargo clean

@@ -55,6 +55,18 @@ pub struct RtConfig {
     /// 1 推論あたりにまとめる hop 数 (入力 hop 粒度は変わらず推論をバッチ。
     /// decoder マージンを償却し GPU 形状を大きくして持続レートを稼ぐ)
     pub batch_hops: u32,
+    /// 変換後ボイスゲート: off / strict / expand / energy
+    pub voice_gate_mode: String,
+    pub energy_threshold: f64,
+    /// F0 オクターブ飛び抑制とスルー制限
+    pub octave_suppress: bool,
+    pub f0_slew_limit: bool,
+    pub f0_slew_max_step: f64,
+    pub f0_hole_fill_ms: f64,
+    /// マイクの代わりにループ再生する WAV。None なら入力デバイス。
+    pub input_wav: Option<String>,
+    /// cpal ホスト名。空なら既定ホスト。
+    pub host_name: String,
 }
 
 impl Default for RtConfig {
@@ -91,7 +103,104 @@ impl Default for RtConfig {
             normalizer_enabled: true,
             normalizer_target_rms: 0.1,
             batch_hops: 1,
+            voice_gate_mode: "off".into(),
+            energy_threshold: 0.2,
+            octave_suppress: true,
+            f0_slew_limit: true,
+            f0_slew_max_step: 3.6,
+            f0_hole_fill_ms: 30.0,
+            input_wav: None,
+            host_name: String::new(),
         }
+    }
+}
+
+/// 実行中に hop ごとに読み出すパラメータ。チャンク長・F0 方式・デバイスは含まない。
+#[derive(Clone)]
+pub struct LiveParams {
+    pub pitch: f64,
+    pub moe_boost: f64,
+    pub input_gain_db: f64,
+    pub output_gain_db: f64,
+    pub index_rate: f32,
+    pub index_k: usize,
+    pub denoise: String,
+    pub denoise_strength: f64,
+    pub noise_gate: bool,
+    pub noise_gate_sensitivity: u8,
+    pub postprocess: bool,
+    pub treble_boost_db: f64,
+    pub treble_cutoff_hz: f64,
+    pub limiter_threshold_db: f64,
+    pub limiter_release_ms: f64,
+    pub normalizer_enabled: bool,
+    pub normalizer_target_rms: f64,
+    pub octave_suppress: bool,
+    pub f0_slew_limit: bool,
+    pub f0_slew_max_step: f64,
+    pub voice_gate_mode: String,
+    pub energy_threshold: f64,
+    pub input_channel: Option<usize>,
+    pub output_channel: Option<usize>,
+}
+
+impl LiveParams {
+    pub fn from_config(cfg: &RtConfig) -> Self {
+        Self {
+            pitch: cfg.pitch,
+            moe_boost: cfg.moe_boost,
+            input_gain_db: cfg.input_gain_db,
+            output_gain_db: cfg.output_gain_db,
+            index_rate: cfg.index_rate,
+            index_k: cfg.index_k,
+            denoise: cfg.denoise.clone(),
+            denoise_strength: cfg.denoise_strength,
+            noise_gate: cfg.noise_gate,
+            noise_gate_sensitivity: cfg.noise_gate_sensitivity,
+            postprocess: cfg.postprocess,
+            treble_boost_db: cfg.treble_boost_db,
+            treble_cutoff_hz: cfg.treble_cutoff_hz,
+            limiter_threshold_db: cfg.limiter_threshold_db,
+            limiter_release_ms: cfg.limiter_release_ms,
+            normalizer_enabled: cfg.normalizer_enabled,
+            normalizer_target_rms: cfg.normalizer_target_rms,
+            octave_suppress: cfg.octave_suppress,
+            f0_slew_limit: cfg.f0_slew_limit,
+            f0_slew_max_step: cfg.f0_slew_max_step,
+            voice_gate_mode: cfg.voice_gate_mode.clone(),
+            energy_threshold: cfg.energy_threshold,
+            input_channel: cfg.input_channel,
+            output_channel: cfg.output_channel,
+        }
+    }
+}
+
+impl RtConfig {
+    pub fn apply_live(&mut self, live: &LiveParams) {
+        self.pitch = live.pitch;
+        self.moe_boost = live.moe_boost;
+        self.input_gain_db = live.input_gain_db;
+        self.output_gain_db = live.output_gain_db;
+        self.index_rate = live.index_rate;
+        self.index_k = live.index_k.max(1);
+        self.denoise = live.denoise.clone();
+        self.denoise_strength = live.denoise_strength;
+        self.noise_gate = live.noise_gate;
+        self.noise_gate_sensitivity = live.noise_gate_sensitivity;
+        self.postprocess = live.postprocess;
+        self.treble_boost_db = live.treble_boost_db;
+        self.treble_cutoff_hz = live.treble_cutoff_hz;
+        self.limiter_threshold_db = live.limiter_threshold_db;
+        self.limiter_release_ms = live.limiter_release_ms;
+        self.normalizer_enabled = live.normalizer_enabled;
+        self.normalizer_target_rms = live.normalizer_target_rms;
+        self.octave_suppress = live.octave_suppress;
+        self.f0_slew_limit = live.f0_slew_limit;
+        self.f0_slew_max_step = live.f0_slew_max_step;
+        self.voice_gate_mode = live.voice_gate_mode.clone();
+        self.energy_threshold = live.energy_threshold;
+        self.input_channel = live.input_channel;
+        self.output_channel = live.output_channel;
     }
 }
 
@@ -111,6 +220,19 @@ impl RtConfig {
     pub fn f0_ctx_samples(&self) -> usize {
         (self.f0_context_sec * 16000.0).round() as usize
     }
+}
+
+/// GUI へ 1 秒ごとに渡すスナップショット。
+#[derive(Clone, Copy, Default)]
+pub struct RtReport {
+    pub hops: u64,
+    pub underruns: u64,
+    pub queue_full: u64,
+    pub trims: u64,
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub last_ms: f64,
 }
 
 /// 統計 (表示/テレメトリ用)。

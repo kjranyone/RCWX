@@ -51,7 +51,7 @@ crates/
 ├── rcwx-rt/     # リアルタイムエンジン: ストリーミング推論 (特徴/F0 sigmoid
 │   #            # ブレンド・decode 受容野マージン・SOLA hold-back) + cpal + SPSC ring
 ├── rcwx-cli/    # run / info (自前 .pth pickle リーダ) / devices / download / logs / rt
-└── rcwx-gui/    # egui GUI (旧GUIの全セクション復元・GPUI 移行は次期方針)
+└── rcwx-gui/    # GPUI GUI (モデル/デバイス/レイテンシ/pitch/denoise/統計)
 ```
 
 - 開発ランチャー `dev.ps1` (rcwx.ps1 の Rust 版・同じ流儀):

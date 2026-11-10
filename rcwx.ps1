@@ -58,7 +58,9 @@ function Test-Cargo {
 
 function Invoke-RustBuild {
     if (Test-Cargo) {
-        & cargo build --release --workspace --quiet
+        # --quiet だと初回の GPUI release 最適化が無言のまま数分続く。
+        # 製品バイナリだけを対象にし、進捗は cargo の表示に任せる。
+        & cargo build --release -p rcwx-cli -p rcwx-gui
         if ($LASTEXITCODE -ne 0) {
             Write-Host '[NG] cargo build に失敗。' -ForegroundColor Red
             return $false
@@ -97,6 +99,7 @@ function Invoke-EnvCheck {
         $rustVer = & rustc --version
         Write-Host "[OK] $rustVer" -ForegroundColor Green
         Write-Host '-- ビルド (cargo build --release) --'
+        Write-Host '   初回は GPUI の release 最適化で数分かかります。進捗は下に出ます。' -ForegroundColor DarkGray
         if (-not (Invoke-RustBuild)) { return $false }
     } else {
         Write-Host '[i] cargo なし — 既存バイナリを使用。' -ForegroundColor DarkGray
@@ -142,7 +145,7 @@ if ($forward -and $forward.Count -gt 0) {
             exit $LASTEXITCODE
         }
         Write-Host '[i] rcwx-gui.exe が無いため cargo run で起動...' -ForegroundColor DarkGray
-        & cargo run --release -p rcwx-gui --quiet
+        & cargo run --release -p rcwx-gui
         exit $LASTEXITCODE
     }
     Invoke-Cli $forward
@@ -172,7 +175,7 @@ while ($running) {
         '1' {
             if (-not (Invoke-RustBuild)) { break }
             if (Test-Path $GuiExe) { & $GuiExe }
-            else { & cargo run --release -p rcwx-gui --quiet }
+            else { & cargo run --release -p rcwx-gui }
         }
         '2' { Invoke-Cli @('devices') }
         '3' {

@@ -304,6 +304,9 @@ impl Synth {
                 Some(self.g(&format!("{wname}.bias"))), out,
                 cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1,
             );
+            if post == 1 {
+                g.pointwise(out, None, cout * t, 1, 0.1, 0, 0, 0);
+            }
             return;
         }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
@@ -952,18 +955,12 @@ impl Synth {
                     let lr = eng.tensor_uninit((cout * len * u) as usize);
                     g.pointwise(&bx, Some(&lr), cout * len * u, 1, 0.1, 0, 0, 0);
 
-                    let fuse_lrelu = std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm");
+                    // conv1 の lrelu は GEMM のストアに融合する。別カーネルだと p99 が 20ms を超える。
                     let c1 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, u32::from(fuse_lrelu));
-                    // im2col 経路は conv1 後の lrelu が別パスになる
-                    let lr2 = eng.tensor_uninit((cout * len * u) as usize);
-                    if !fuse_lrelu {
-                        g.pointwise(&c1, Some(&lr2), cout * len * u, 1, 0.1, 0, 0, 0);
-                    }
-                    let conv2_in = if fuse_lrelu { c1 } else { lr2 };
+                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, 1);
                     let c2 = eng.tensor_uninit((cout * len * u) as usize);
                     self.conv_k_res(
-                        &mut g, &conv2_in, &bx, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u,
+                        &mut g, &c1, &bx, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u,
                     );
                     bx = c2;
                 }
