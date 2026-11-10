@@ -184,6 +184,45 @@ impl Synth {
         self.conv_k_post(g, x, x_base, wname, out, cin, cout, k, dil, t, 0)
     }
 
+    /// conv + 残差加算 fuse: out = conv(x) + bias + residual。
+    /// im2col 経路は matmul_tiled_res、gemm 経路は conv 後 add_off。
+    #[allow(clippy::too_many_arguments)]
+    fn conv_k_res(
+        &self,
+        g: &mut Graph<'_>,
+        x: &GpuTensor,
+        residual: &GpuTensor,
+        wname: &str,
+        out: &GpuTensor,
+        cin: u32,
+        cout: u32,
+        k: u32,
+        dil: u32,
+        t: u32,
+    ) {
+        let w = self.g(&format!("{wname}.weight"));
+        let b = self.g(&format!("{wname}.bias"));
+        if std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm") {
+            g.matmul_conv(w, x, Some(b), out, cout, t, cin * k, k, dil, (k - 1) * dil / 2, t, 0);
+            g.add_off(out, residual, out, cout * t, 0, 0, false);
+            return;
+        }
+        if (cin * k * t) as usize * 4 > 96_000_000 {
+            g.conv1d(x, w, Some(b), out, cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1);
+            g.add_off(out, residual, out, cout * t, 0, 0, false);
+            return;
+        }
+        let ic = g.engine_tensor_uninit((cin * k * t) as usize);
+        g.im2col_off(x, 0, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
+        g.matmul_ex_res(
+            w, &ic, Some(b), residual, out,
+            cout, t, cin * k,
+            cin * k, 1,
+            1, t,
+            t, 1,
+        );
+    }
+
     /// conv_k + 畳み込み直後の活性化 fuse (post: 0=none 1=lrelu)。
     /// 既定は implicit-GEMM (im2col なし)。RCWX_CONV=im2col で従来経路。
     fn conv_k_post(
@@ -200,7 +239,10 @@ impl Synth {
         t: u32,
         post: u32,
     ) {
-        if x_base == 0 && std::env::var("RCWX_CONV").ok().as_deref() != Some("im2col") {
+        // 30s 持続 A/B: im2col+matmul_tiled 43.8ms vs implicit-GEMM 49.0ms → im2col 既定。
+        // RCWX_CONV=gemm で implicit-GEMM、かつ lrelu fuse は gemm のみ有効。
+        let use_gemm = x_base == 0 && std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm");
+        if use_gemm {
             g.matmul_conv(
                 self.g(&format!("{wname}.weight")), x,
                 Some(self.g(&format!("{wname}.bias"))), out,
@@ -802,9 +844,19 @@ impl Synth {
         }
 
         let mut len = t;
+        // 計測用: RCWX_DEC_STAGES=k は段 k まで実施し以降をゼロ化 (タイミング研究専用)
+        let dec_stages: i32 = std::env::var("RCWX_DEC_STAGES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(99);
         for i in 0..ups.len() {
             let (u, kk) = (ups[i], cfg.upsample_kernel_sizes[i]);
             let (cin, cout) = (chs[i], chs[i + 1]);
+            if i as i32 > dec_stages {
+                len *= u;
+                dx = eng.tensor_zeros((chs[i + 1] * len) as usize, vec![]);
+                continue;
+            }
             // lrelu → upsample
             g.lrelu(&dx, cin * len);
             let up = eng.tensor_uninit((cout * len * u) as usize);
@@ -843,17 +895,24 @@ impl Synth {
                 let mut bx = summed.clone_handle();
                 for m in 0..3u32 {
                     let dil = [1u32, 3, 5][m as usize];
-                    let xt = eng.tensor_uninit((cout * len * u) as usize);
-                    // lrelu → convs1[m] (lrelu fuse) → convs2[m] → 残差加算
+                    // lrelu → convs1[m] → convs2[m] (残差加算 fuse) → bx 更新
                     let lr = eng.tensor_uninit((cout * len * u) as usize);
                     g.pointwise(&bx, Some(&lr), cout * len * u, 1, 0.1, 0, 0, 0);
 
+                    let fuse_lrelu = std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm");
                     let c1 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, 1);
+                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, u32::from(fuse_lrelu));
+                    // im2col 経路は conv1 後の lrelu が別パスになる
+                    let lr2 = eng.tensor_uninit((cout * len * u) as usize);
+                    if !fuse_lrelu {
+                        g.pointwise(&c1, Some(&lr2), cout * len * u, 1, 0.1, 0, 0, 0);
+                    }
+                    let conv2_in = if fuse_lrelu { c1 } else { lr2 };
                     let c2 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k_post(&mut g, &c1, 0, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u, 0);
-                    g.add_off(&bx, &c2, &xt, cout * len * u, 0, 0, false);
-                    bx = xt;
+                    self.conv_k_res(
+                        &mut g, &conv2_in, &bx, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u,
+                    );
+                    bx = c2;
                 }
                 if i == 0 && j == 0 {
                     if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {

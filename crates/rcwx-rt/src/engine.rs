@@ -458,7 +458,7 @@ impl RtEngine {
             self.stats.hops += 1;
             if self.stats.hops % 10 == 0 && self.out_hist.len() > keep + out.len() {
                 let hay_start = self.out_hist.len() - keep - out.len();
-                let corr = rcwx_dsp::feedback::max_normalized_lag_correlation(
+                let corr = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(
                     &out,
                     &self.out_hist[hay_start..hay_start + keep],
                 );

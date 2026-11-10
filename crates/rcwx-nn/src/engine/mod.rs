@@ -250,6 +250,7 @@ impl Engine {
         self.compile("im2col2d", &shaders::im2col2d_src(), 2)?;
         self.compile("im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
         self.compile("matmul_conv", &shaders::matmul_conv_src(), 4)?;
+        self.compile("matmul_tiled_res", &shaders::matmul_tiled_res_src(), 5)?;
         self.compile("slice_ch", &shaders::slice_ch_src(), 2)?;
         self.compile("avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
         self.compile("conv_transpose2d", &shaders::conv_transpose2d_src(), 4)?;
@@ -636,6 +637,39 @@ impl<'a> Graph<'a> {
         } else {
             self.dispatch("slice_ch", &[src, dst], words, 512, wg.div_ceil(512), 1);
         }
+    }
+
+    /// matmul + 残差加算 (im2col 済み B を想定)。B5 = residual [m, n]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ex_res(
+        &mut self,
+        a: &GpuTensor,
+        w: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        residual: &GpuTensor,
+        c: &GpuTensor,
+        m: u32,
+        n: u32,
+        k: u32,
+        a_row_stride: u32,
+        a_k_stride: u32,
+        w_row_stride: u32,
+        w_k_stride: u32,
+        c_row_stride: u32,
+        c_n_stride: u32,
+    ) {
+        let has_bias = bias.is_some();
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[m, n, k, 1]);
+        words[4..8].copy_from_slice(&[a_row_stride, a_k_stride, 0, 0]);
+        words[8..12].copy_from_slice(&[w_row_stride, w_k_stride, 0, 0]);
+        words[12..16].copy_from_slice(&[c_row_stride, c_n_stride, 0, 0]);
+        words[16] = has_bias as u32;
+        words[17] = 1.0f32.to_bits();
+        let dummy = a;
+        let bias_ref = bias.unwrap_or(dummy);
+        let (wx, wy) = (n.div_ceil(16), m.div_ceil(16));
+        self.dispatch("matmul_tiled_res", &[a, w, bias_ref, c, residual], words, wx, wy, 1);
     }
 
     /// implicit-GEMM conv1d (stride 1・tiled matmul 構造・im2col 省略)。

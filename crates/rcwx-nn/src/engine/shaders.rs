@@ -792,3 +792,80 @@ fn main(
 }
 "#
 }
+
+/// matmul_tiled + 残差加算 (B5 = residual [m, n]、c_stride と同じ配置)。
+/// 出力 = acc + bias + residual。残差 fuse で add_off パスを削減。
+pub fn matmul_tiled_res_src() -> String {
+    header(5)
+        + r#"
+var<workgroup> ta: array<f32, 256>;
+var<workgroup> tb: array<f32, 256>;
+@compute @workgroup_size(8, 8)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let m_dim = P.p0.x; let n_dim = P.p0.y; let k_dim = P.p0.z;
+  let a_row = P.p1.x; let a_k = P.p1.y; let a_base = P.p1.z;
+  let w_row = P.p2.x; let w_k = P.p2.y; let w_base = P.p2.z;
+  let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z;
+  let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
+  let tile_m = wid.y * 16u;
+  let tile_n = wid.x * 16u;
+  let lx = lid.x * 2u;
+  let ly = lid.y * 2u;
+  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  let m0 = tile_m + lx;
+  let m1 = tile_m + lx + 1u;
+  let n0 = tile_n + ly;
+  let n1 = tile_n + ly + 1u;
+  var kt: u32 = 0u;
+  while (kt < k_dim) {
+    var idx = lid.y * 8u + lid.x;
+    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
+      let r = idx / 16u;
+      let c = idx % 16u;
+      let gm = tile_m + r;
+      let gk = kt + c;
+      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      let gn = tile_n + r;
+      tb[r * 16u + c] = select(0.0, B2[w_base + gn * w_row + gk * w_k], gn < n_dim && gk < k_dim);
+      idx = idx + 64u;
+    }
+    workgroupBarrier();
+    for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = ta[lx * 16u + kk];
+      let a1 = ta[(lx + 1u) * 16u + kk];
+      let b0 = tb[ly * 16u + kk];
+      let b1 = tb[(ly + 1u) * 16u + kk];
+      acc00 = acc00 + a0 * b0;
+      acc01 = acc01 + a0 * b1;
+      acc10 = acc10 + a1 * b0;
+      acc11 = acc11 + a1 * b1;
+    }
+    workgroupBarrier();
+    kt = kt + 16u;
+  }
+  if (m0 < m_dim && n0 < n_dim) {
+    var v = acc00 * scale + B5[c_base + c_row * m0 + c_n * n0];
+    if (has_bias == 1u) { v = v + B3[m0]; }
+    B4[c_base + c_row * m0 + c_n * n0] = v;
+  }
+  if (m0 < m_dim && n1 < n_dim) {
+    var v = acc01 * scale + B5[c_base + c_row * m0 + c_n * n1];
+    if (has_bias == 1u) { v = v + B3[m0]; }
+    B4[c_base + c_row * m0 + c_n * n1] = v;
+  }
+  if (m1 < m_dim && n0 < n_dim) {
+    var v = acc10 * scale + B5[c_base + c_row * m1 + c_n * n0];
+    if (has_bias == 1u) { v = v + B3[m1]; }
+    B4[c_base + c_row * m1 + c_n * n0] = v;
+  }
+  if (m1 < m_dim && n1 < n_dim) {
+    var v = acc11 * scale + B5[c_base + c_row * m1 + c_n * n1];
+    if (has_bias == 1u) { v = v + B3[m1]; }
+    B4[c_base + c_row * m1 + c_n * n1] = v;
+  }
+}
+"#
+}

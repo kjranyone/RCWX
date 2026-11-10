@@ -222,6 +222,11 @@ fn feedback_corr_matches_python() {
     let ref2 = read_npz_f64(&gp, "fb_corr2")[0];
     let mine1 = max_normalized_lag_correlation(&needle, &hay);
     let mine2 = max_normalized_lag_correlation(&needle, &hay2);
+    let fft1 = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&needle, &hay);
+    let fft2 = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&needle, &hay2);
+    println!("fb fft corr: {fft1:.9} vs {mine1:.9} | {fft2:.9} vs {mine2:.9}");
+    assert!((fft1 - mine1).abs() < 1e-6, "fft corr1 mismatch");
+    assert!((fft2 - mine2).abs() < 1e-6, "fft corr2 mismatch");
     println!(
         "fb corr: {mine1:.12} vs {ref1:.12} | {mine2:.12} vs {ref2:.12}"
     );
