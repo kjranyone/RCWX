@@ -251,6 +251,8 @@ impl Engine {
         self.compile("im2col2d_k", &shaders::im2col2d_k_src(), 2)?;
         self.compile("matmul_conv", &shaders::matmul_conv_src(), 4)?;
         self.compile("matmul_tiled_res", &shaders::matmul_tiled_res_src(), 5)?;
+        self.compile("matmul_tiled_x", &shaders::matmul_tiled_x_src(), 5)?;
+        self.compile("add_layernorm", &shaders::add_layernorm_src(), 5)?;
         self.compile("slice_ch", &shaders::slice_ch_src(), 2)?;
         self.compile("avg_pool2x2", &shaders::avg_pool2x2_src(), 2)?;
         self.compile("conv_transpose2d", &shaders::conv_transpose2d_src(), 4)?;
@@ -637,6 +639,65 @@ impl<'a> Graph<'a> {
         } else {
             self.dispatch("slice_ch", &[src, dst], words, 512, wg.div_ceil(512), 1);
         }
+    }
+
+    /// matmul_tiled_x: post_op 0=none 1=lrelu 2=relu 3=gelu 4=+residual 5=+residual+lrelu。
+    /// extra = residual (post>=4 のとき)。bias は B3[m]。
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_ex_x(
+        &mut self,
+        a: &GpuTensor,
+        w: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        extra: Option<&GpuTensor>,
+        c: &GpuTensor,
+        m: u32,
+        n: u32,
+        k: u32,
+        a_row_stride: u32,
+        a_k_stride: u32,
+        w_row_stride: u32,
+        w_k_stride: u32,
+        c_row_stride: u32,
+        c_n_stride: u32,
+        scale: f32,
+        post: u32,
+    ) {
+        let has_bias = bias.is_some();
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[m, n, k, 1]);
+        words[4..8].copy_from_slice(&[a_row_stride, a_k_stride, 0, 0]);
+        words[8..12].copy_from_slice(&[w_row_stride, w_k_stride, 0, 0]);
+        words[12..16].copy_from_slice(&[c_row_stride, c_n_stride, 0, 0]);
+        words[16..20].copy_from_slice(&[has_bias as u32, scale.to_bits(), 0, post]);
+        let dummy = a;
+        let bias_ref = bias.unwrap_or(dummy);
+        let extra_ref = extra.unwrap_or(dummy);
+        let (wx, wy) = (n.div_ceil(16), m.div_ceil(16));
+        self.dispatch("matmul_tiled_x", &[a, w, bias_ref, c, extra_ref], words, wx, wy, 1);
+    }
+
+    /// LN(x + y) を 1 dispatch で (残差 + LayerNorm 融合)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_layer_norm(
+        &mut self,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        out: &GpuTensor,
+        rows: u32,
+        cols: u32,
+        in_row_stride: u32,
+        in_k_stride: u32,
+        out_row_stride: u32,
+        out_k_stride: u32,
+        eps: f32,
+    ) {
+        let mut words = [0u32; 32];
+        words[0..4].copy_from_slice(&[rows, cols, in_row_stride, in_k_stride]);
+        words[4..7].copy_from_slice(&[out_row_stride, eps.to_bits(), out_k_stride]);
+        self.dispatch("add_layernorm", &[x, y, gamma, beta, out], words, rows, 1, 1);
     }
 
     /// matmul + 残差加算 (im2col 済み B を想定)。B5 = residual [m, n]。

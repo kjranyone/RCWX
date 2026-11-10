@@ -72,6 +72,54 @@ impl Synth {
             }
             w.insert(name.to_string(), eng.tensor_from_f32(&out, shape));
         }
+        // TextEncoder QKV fusion: conv_q/k/v (192x192) を連結して 1 matmul 化
+        {
+            let hd = 192usize;
+            let names: Vec<String> = (0..6u32)
+                .flat_map(|l| {
+                    [
+                        format!("enc_p.encoder.attn_layers.{l}.conv_q.weight"),
+                        format!("enc_p.encoder.attn_layers.{l}.conv_k.weight"),
+                        format!("enc_p.encoder.attn_layers.{l}.conv_v.weight"),
+                        format!("enc_p.encoder.attn_layers.{l}.conv_q.bias"),
+                        format!("enc_p.encoder.attn_layers.{l}.conv_k.bias"),
+                        format!("enc_p.encoder.attn_layers.{l}.conv_v.bias"),
+                    ]
+                })
+                .collect();
+            let data: std::collections::HashMap<String, Vec<f32>> = names
+                .iter()
+                .map(|n| {
+                    let t = w.get(n).expect(n);
+                    (n.clone(), eng.readback_f32(t))
+                })
+                .collect();
+            for l in 0..6u32 {
+                let get = |k: &str| -> Vec<f32> { data.get(k).expect(k).clone() };
+                let qw = get(&format!("enc_p.encoder.attn_layers.{l}.conv_q.weight"));
+                let kw = get(&format!("enc_p.encoder.attn_layers.{l}.conv_k.weight"));
+                let vw = get(&format!("enc_p.encoder.attn_layers.{l}.conv_v.weight"));
+                let mut qkv_w = Vec::with_capacity(hd * 3 * hd);
+                qkv_w.extend_from_slice(&qw);
+                qkv_w.extend_from_slice(&kw);
+                qkv_w.extend_from_slice(&vw);
+                w.insert(
+                    format!("enc_p.encoder.attn_layers.{l}.qkv.weight"),
+                    eng.tensor_from_f32(&qkv_w, vec![]),
+                );
+                let qb = get(&format!("enc_p.encoder.attn_layers.{l}.conv_q.bias"));
+                let kb = get(&format!("enc_p.encoder.attn_layers.{l}.conv_k.bias"));
+                let vb = get(&format!("enc_p.encoder.attn_layers.{l}.conv_v.bias"));
+                let mut qkv_b = Vec::with_capacity(hd * 3);
+                qkv_b.extend_from_slice(&qb);
+                qkv_b.extend_from_slice(&kb);
+                qkv_b.extend_from_slice(&vb);
+                w.insert(
+                    format!("enc_p.encoder.attn_layers.{l}.qkv.bias"),
+                    eng.tensor_from_f32(&qkv_b, vec![]),
+                );
+            }
+        }
         let cfg_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("synth.json"))?)?;
         let gu = |k: &str, d: u64| cfg_json[k].as_u64().unwrap_or(d) as u32;
@@ -260,15 +308,27 @@ impl Synth {
         }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
         g.im2col_off(x, x_base, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
-        g.matmul_ex(
-            self.g(&format!("{wname}.weight")), &ic,
-            Some(self.g(&format!("{wname}.bias"))), out,
-            cout, t, cin * k, 1,
-            cin * k, 1, 0, 0,
-            1, t, 0, 0,
-            t, 1, 0, 0,
-            1.0, 1,
-        );
+        if post == 0 {
+            g.matmul_ex(
+                self.g(&format!("{wname}.weight")), &ic,
+                Some(self.g(&format!("{wname}.bias"))), out,
+                cout, t, cin * k, 1,
+                cin * k, 1, 0, 0,
+                1, t, 0, 0,
+                t, 1, 0, 0,
+                1.0, 1,
+            );
+        } else {
+            g.matmul_ex_x(
+                self.g(&format!("{wname}.weight")), &ic,
+                Some(self.g(&format!("{wname}.bias"))), None, out,
+                cout, t, cin * k,
+                cin * k, 1,
+                1, t,
+                t, 1,
+                1.0, post,
+            );
+        }
     }
 
     /// SineGen legacy (純 Rust, fp32, noise=0) → har [T*upp]
@@ -498,33 +558,30 @@ impl Synth {
             k.push(("x_in", x.clone_handle()));
         }
 
-        // Encoder 6 層
+        // Encoder 6 層 (QKV は fusion 済み重みで 1 matmul、q/k/v は base offset 参照)
         for l in 0..nl {
             let p = format!("enc_p.encoder.attn_layers.{l}");
-            let q = eng.tensor_uninit((h * t) as usize);
-            let k = eng.tensor_uninit((h * t) as usize);
-            let v = eng.tensor_uninit((h * t) as usize);
-            self.conv1x1(&mut g, &x, 0, &format!("{p}.conv_q"), &q, h, h, t, 1.0);
-            self.conv1x1(&mut g, &x, 0, &format!("{p}.conv_k"), &k, h, h, t, 1.0);
-            self.conv1x1(&mut g, &x, 0, &format!("{p}.conv_v"), &v, h, h, t, 1.0);
-            // scores[heads, T, T] = (q·k^T)/√dk + rel
-            if l == 0 {
-                if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
-                    kk.push(("q0", q.clone_handle()));
-                    kk.push(("k0", k.clone_handle()));
-                    kk.push(("v0", v.clone_handle()));
-                }
-            }
+            let qkv = eng.tensor_uninit((3 * h * t) as usize);
+            g.matmul_ex(
+                self.g(&format!("{p}.qkv.weight")), &x,
+                Some(self.g(&format!("{p}.qkv.bias"))), &qkv,
+                3 * h, t, h, 1,
+                h, 1, 0, 0,
+                1, t, 0, 0,
+                t, 1, 0, 0,
+                1.0, 1,
+            );
+            // scores[heads, T, T] = (q·k^T)/√dk + rel (q = qkv[0:h], k = qkv[h:2h])
             let scores = eng.tensor_uninit((heads * t * t) as usize);
             g.matmul(
-                &q, &k, None, &scores,
+                &qkv, &qkv, None, &scores,
                 t, t, dk, heads,
                 1, t, 0, dk * t,
-                1, t, 0, dk * t,
+                1, t, h * t, dk * t,
                 t, 1, 0, t * t,
                 1.0 / (dk as f32).sqrt(),
             );
-            g.rel_attn_scores(&q, self.g(&format!("{p}.emb_rel_k")), &scores, t, dk, ws, heads, 1.0 / (dk as f32).sqrt());
+            g.rel_attn_scores(&qkv, self.g(&format!("{p}.emb_rel_k")), &scores, t, dk, ws, heads, 1.0 / (dk as f32).sqrt());
 
             if l == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
@@ -532,13 +589,13 @@ impl Synth {
                 }
             }
             g.softmax(&scores, heads * t, t);
-            // ctx = p·v + p·rel_v
+            // ctx = p·v + p·rel_v (v = qkv[2h:3h])
             let ctx = eng.tensor_uninit((h * t) as usize);
             g.matmul(
-                &scores, &v, None, &ctx,
+                &scores, &qkv, None, &ctx,
                 t, dk, t, heads,
                 t, 1, 0, t * t,
-                t, 1, 0, dk * t,
+                t, 1, 2 * h * t, dk * t,
                 1, t, 0, dk * t,   // C: channel-major [ch=h*96+d, i] — ch*T + i
                 1.0,
             );
@@ -556,10 +613,9 @@ impl Synth {
                     k.push(("attn0", attn.clone_handle()));
                 }
             }
-            let xr = eng.tensor_uninit((h * t) as usize);
-            g.add(&x, &attn, &xr, h * t);
             let xn = eng.tensor_uninit((h * t) as usize);
-            g.layer_norm(&xr, self.g(&format!("enc_p.encoder.norm_layers_1.{l}.gamma")),
+            g.add_layer_norm(&x, &attn,
+                self.g(&format!("enc_p.encoder.norm_layers_1.{l}.gamma")),
                 self.g(&format!("enc_p.encoder.norm_layers_1.{l}.beta")), &xn,
                 t, h, 1, t, 1, t, 1e-5);
             x = xn;
@@ -572,8 +628,8 @@ impl Synth {
             // FFN: conv k3 → gelu_approx → conv k3 → 残差 → LN
             let f = format!("enc_p.encoder.ffn_layers.{l}");
             let ff1 = eng.tensor_uninit((filt * t) as usize);
-            self.conv_k(&mut g, &x, 0, &format!("{f}.conv_1"), &ff1, h, filt, cfg.kernel_size, 1, t);
-            g.pointwise(&ff1, None, filt * t, 7, 0.0, 0, 0, 0); // relu (RCWX Encoder FFN)
+            // FFN conv1 の relu は matmul 出力に fuse
+            self.conv_k_post(&mut g, &x, 0, &format!("{f}.conv_1"), &ff1, h, filt, cfg.kernel_size, 1, t, 2);
             if l == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
                     kk.push(("ffn0_gelu_mid", ff1.clone_handle()));
@@ -586,10 +642,9 @@ impl Synth {
                     kk.push(("ffn0", ff2.clone_handle()));
                 }
             }
-            let xr2 = eng.tensor_uninit((h * t) as usize);
-            g.add(&x, &ff2, &xr2, h * t);
             let xn2 = eng.tensor_uninit((h * t) as usize);
-            g.layer_norm(&xr2, self.g(&format!("enc_p.encoder.norm_layers_2.{l}.gamma")),
+            g.add_layer_norm(&x, &ff2,
+                self.g(&format!("enc_p.encoder.norm_layers_2.{l}.gamma")),
                 self.g(&format!("enc_p.encoder.norm_layers_2.{l}.beta")), &xn2,
                 t, h, 1, t, 1, t, 1e-5);
             x = xn2;

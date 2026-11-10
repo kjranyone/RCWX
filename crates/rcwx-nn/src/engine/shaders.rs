@@ -869,3 +869,152 @@ fn main(
 }
 "#
 }
+
+/// matmul_tiled 汎用拡張版 (5 binding)。post_op:
+/// 0=none 1=lrelu 2=relu 3=gelu(erf) 4=+residual(B5) 5=+residual+lrelu。
+/// bias_axis は 1 (=B3[m]) のみ (resblock/FFN 用)。
+pub fn matmul_tiled_x_src() -> String {
+    header(5)
+        + r#"
+fn erf_of2(x: f32) -> f32 {
+  let s = select(-1.0, 1.0, x >= 0.0);
+  let ax = abs(x);
+  let t = 1.0 / (1.0 + 0.3275911 * ax);
+  let poly = ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t;
+  return s * (1.0 - poly * exp(-ax * ax));
+}
+fn apply_post(v: f32, op: u32) -> f32 {
+  if (op == 1u) { return select(0.1 * v, v, v > 0.0); }
+  if (op == 2u) { return select(0.0, v, v > 0.0); }
+  if (op == 3u) { return 0.5 * v * (1.0 + erf_of2(v)); }
+  return v;
+}
+var<workgroup> ta: array<f32, 256>;
+var<workgroup> tb: array<f32, 256>;
+@compute @workgroup_size(8, 8)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let m_dim = P.p0.x; let n_dim = P.p0.y; let k_dim = P.p0.z; let batch = P.p0.w;
+  let a_row = P.p1.x; let a_k = P.p1.y; let a_base = P.p1.z; let a_bs = P.p1.w;
+  let w_row = P.p2.x; let w_k = P.p2.y; let w_base = P.p2.z; let w_bs = P.p2.w;
+  let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z; let c_bs = P.p3.w;
+  let has_bias = P.p4.x; let scale = f32_of(P.p4.y);
+  let post = P.p4.w;
+  let b_idx = 0u;
+  let tile_m = wid.y * 16u;
+  let tile_n = wid.x * 16u;
+  let lx = lid.x * 2u;
+  let ly = lid.y * 2u;
+  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  let m0 = tile_m + lx;
+  let m1 = tile_m + lx + 1u;
+  let n0 = tile_n + ly;
+  let n1 = tile_n + ly + 1u;
+  var kt: u32 = 0u;
+  while (kt < k_dim) {
+    var idx = lid.y * 8u + lid.x;
+    for (var rep: u32 = 0u; rep < 4u; rep = rep + 1u) {
+      let r = idx / 16u;
+      let c = idx % 16u;
+      let gm = tile_m + r;
+      let gk = kt + c;
+      ta[r * 16u + c] = select(0.0, B1[a_base + gm * a_row + gk * a_k], gm < m_dim && gk < k_dim);
+      let gn = tile_n + r;
+      tb[r * 16u + c] = select(0.0, B2[w_base + gn * w_row + gk * w_k], gn < n_dim && gk < k_dim);
+      idx = idx + 64u;
+    }
+    workgroupBarrier();
+    for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = ta[lx * 16u + kk];
+      let a1 = ta[(lx + 1u) * 16u + kk];
+      let b0 = tb[ly * 16u + kk];
+      let b1 = tb[(ly + 1u) * 16u + kk];
+      acc00 = acc00 + a0 * b0;
+      acc01 = acc01 + a0 * b1;
+      acc10 = acc10 + a1 * b0;
+      acc11 = acc11 + a1 * b1;
+    }
+    workgroupBarrier();
+    kt = kt + 16u;
+  }
+  if (m0 < m_dim && n0 < n_dim) {
+    var v = acc00 * scale;
+    if (has_bias == 1u) { v = v + B3[m0]; }
+    if (post >= 4u) { v = v + B5[c_base + c_row * m0 + c_n * n0]; }
+    B4[c_base + c_row * m0 + c_n * n0] = apply_post(v, post);
+  }
+  if (m0 < m_dim && n1 < n_dim) {
+    var v = acc01 * scale;
+    if (has_bias == 1u) { v = v + B3[m0]; }
+    if (post >= 4u) { v = v + B5[c_base + c_row * m0 + c_n * n1]; }
+    B4[c_base + c_row * m0 + c_n * n1] = apply_post(v, post);
+  }
+  if (m1 < m_dim && n0 < n_dim) {
+    var v = acc10 * scale;
+    if (has_bias == 1u) { v = v + B3[m1]; }
+    if (post >= 4u) { v = v + B5[c_base + c_row * m1 + c_n * n0]; }
+    B4[c_base + c_row * m1 + c_n * n0] = apply_post(v, post);
+  }
+  if (m1 < m_dim && n1 < n_dim) {
+    var v = acc11 * scale;
+    if (has_bias == 1u) { v = v + B3[m1]; }
+    if (post >= 4u) { v = v + B5[c_base + c_row * m1 + c_n * n1]; }
+    B4[c_base + c_row * m1 + c_n * n1] = apply_post(v, post);
+  }
+}
+"#
+}
+
+/// LN(x + y): hubert/synth の残差 + LayerNorm を 1 dispatch に融合。
+/// x/y は同レイアウト [rows, cols] (in_row/in_k stride)。
+pub fn add_layernorm_src() -> String {
+    header(5)
+        + r#"
+var<workgroup> red: array<f32, 64>;
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let rows = P.p0.x; let cols = P.p0.y; let in_row = P.p0.z; let in_k = P.p0.w;
+  let out_row = P.p1.x; let eps = f32_of(P.p1.y); let out_k = P.p1.z;
+  let r = wid.x;
+  if (r >= rows) { return; }
+  var acc = 0.0;
+  var i = lid.x;
+  while (i < cols) { acc = acc + B1[r * in_row + i * in_k] + B2[r * in_row + i * in_k]; i = i + 64u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s: u32 = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let mean = red[0] / f32(cols);
+  workgroupBarrier();
+  var acc2 = 0.0;
+  i = lid.x;
+  while (i < cols) {
+    let d = B1[r * in_row + i * in_k] + B2[r * in_row + i * in_k] - mean;
+    acc2 = acc2 + d * d;
+    i = i + 64u;
+  }
+  red[lid.x] = acc2; workgroupBarrier();
+  s = 32u;
+  while (s > 0u) {
+    if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+    workgroupBarrier();
+    s = s / 2u;
+  }
+  let var_ = red[0] / f32(cols);
+  let inv_std = inverseSqrt(var_ + eps);
+  i = lid.x;
+  while (i < cols) {
+    let v = B1[r * in_row + i * in_k] + B2[r * in_row + i * in_k];
+    let g = B3[i];
+    let b = B4[i];
+    B5[r * out_row + i * out_k] = (v - mean) * inv_std * g + b;
+    i = i + 64u;
+  }
+}
+"#
+}

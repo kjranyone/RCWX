@@ -275,10 +275,8 @@ impl Hubert {
                 H, 1, 0, 0,
                 1.0,
             );
-            let x2 = eng.tensor_uninit((t * H) as usize);
-            g.add(&x, &o_out, &x2, t * H);
             let x3 = eng.tensor_uninit((t * H) as usize);
-            g.layer_norm(&x2, &l.ln_a_g, &l.ln_a_b, &x3, t, H, H, 1, H, 1, LN_EPS);
+            g.add_layer_norm(&x, &o_out, &l.ln_a_g, &l.ln_a_b, &x3, t, H, H, 1, H, 1, LN_EPS);
 
             let ff = eng.tensor_uninit((t * FFN) as usize);
             g.matmul(
@@ -299,10 +297,8 @@ impl Hubert {
                 H, 1, 0, 0,
                 1.0,
             );
-            let x4 = eng.tensor_uninit((t * H) as usize);
-            g.add(&x3, &ff2, &x4, t * H);
             let x5 = eng.tensor_uninit((t * H) as usize);
-            g.layer_norm(&x4, &l.ln_f_g, &l.ln_f_b, &x5, t, H, H, 1, H, 1, LN_EPS);
+            g.add_layer_norm(&x3, &ff2, &l.ln_f_g, &l.ln_f_b, &x5, t, H, H, 1, H, 1, LN_EPS);
             x = x5;
         }
 
@@ -396,20 +392,23 @@ impl Hubert {
             let o_out = eng.tensor_uninit((t * H) as usize);
             g.matmul(&ctx, &l.o_w, Some(&l.o_b), &o_out, t, H, H, 1, H, 1, 0, 0, H, 1, 0, 0, H, 1, 0, 0, 1.0);
             if li == 0 { keep.push(("L0.ctx", ctx.clone_buf())); keep.push(("L0.attn_out", o_out.clone_buf())); }
-            let x2 = eng.tensor_uninit((t * H) as usize);
-            g.add(&x, &o_out, &x2, t * H);
             let x3 = eng.tensor_uninit((t * H) as usize);
-            g.layer_norm(&x2, &l.ln_a_g, &l.ln_a_b, &x3, t, H, H, 1, H, 1, LN_EPS);
+            g.add_layer_norm(&x, &o_out, &l.ln_a_g, &l.ln_a_b, &x3, t, H, H, 1, H, 1, LN_EPS);
             let ff = eng.tensor_uninit((t * FFN) as usize);
-            g.matmul(&x3, &l.ff1_w, Some(&l.ff1_b), &ff, t, FFN, H, 1, H, 1, 0, 0, H, 1, 0, 0, FFN, 1, 0, 0, 1.0);
-            g.gelu(&ff, t * FFN);
+            // gelu は matmul 出力に fuse (erf 近似は GELU カーネルと同一式)
+            g.matmul_ex_x(
+                &x3, &l.ff1_w, Some(&l.ff1_b), None, &ff,
+                t, FFN, H,
+                H, 1,
+                H, 1,
+                FFN, 1,
+                1.0, 3,
+            );
             if li == 0 { keep.push(("L0.ff_hidden", ff.clone_buf())); }
             let ff2 = eng.tensor_uninit((t * H) as usize);
             g.matmul(&ff, &l.ff2_w, Some(&l.ff2_b), &ff2, t, H, FFN, 1, FFN, 1, 0, 0, FFN, 1, 0, 0, H, 1, 0, 0, 1.0);
-            let x4 = eng.tensor_uninit((t * H) as usize);
-            g.add(&x3, &ff2, &x4, t * H);
             let x5 = eng.tensor_uninit((t * H) as usize);
-            g.layer_norm(&x4, &l.ln_f_g, &l.ln_f_b, &x5, t, H, H, 1, H, 1, LN_EPS);
+            g.add_layer_norm(&x3, &ff2, &l.ln_f_g, &l.ln_f_b, &x5, t, H, H, 1, H, 1, LN_EPS);
             x = x5;
             if li == 0 { keep.push(("L0.ff_out", ff2.clone_buf())); keep.push(("L0.ln_a", x3.clone_buf())); }
             if li < 2 || li == 11 {
