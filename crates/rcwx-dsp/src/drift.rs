@@ -37,7 +37,8 @@ pub fn compute_shed_policy(
         let mut guard_ms = (hop_ms * 0.5).max(jitter_ms + callback_ms);
         guard_ms = guard_ms.min(hop_ms * 0.875);
         let target = ((guard_ms * output_sample_rate as f64 / 1000.0).round() as i64).max(1);
-        let band = (hop_samples_out / 4).max((callback_ms * output_sample_rate as f64 / 1000.0).round() as i64);
+        let band = (hop_samples_out / 4)
+            .max((callback_ms * output_sample_rate as f64 / 1000.0).round() as i64);
         let threshold = (hop_samples_out * 5 / 4).min(target + band);
         return ShedPolicy {
             threshold: threshold.max(1),
@@ -85,7 +86,9 @@ impl FloorTracker {
         if self.window_frames != frames || self.maxlen == 0 {
             self.window_frames = frames;
             // ceil(2*hop/frames)、最小 4
-            let window_len = ((2 * hop_samples_out + frames.max(1) as i64 - 1) / frames.max(1) as i64).max(4) as usize;
+            let window_len = ((2 * hop_samples_out + frames.max(1) as i64 - 1)
+                / frames.max(1) as i64)
+                .max(4) as usize;
             self.window.clear();
             self.maxlen = window_len;
             self.floor_samples = 0;

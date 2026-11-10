@@ -174,7 +174,9 @@ impl RmsNormalizer {
         if !self.cfg.normalizer_enabled || audio.is_empty() {
             return audio.to_vec();
         }
-        let rms = (audio.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>() / audio.len() as f64).sqrt();
+        let rms = (audio.iter().map(|v| (*v as f64) * (*v as f64)).sum::<f64>()
+            / audio.len() as f64)
+            .sqrt();
         if rms < Self::MIN_RMS {
             return audio.to_vec();
         }
@@ -183,7 +185,8 @@ impl RmsNormalizer {
             self.ema_rms = rms;
         } else {
             let chunk_sec = audio.len() as f64 / self.sample_rate as f64;
-            let alpha = 1.0 - (1.0 - self.cfg.normalizer_ema_alpha).powf(chunk_sec / Self::ALPHA_REF_CHUNK_SEC);
+            let alpha = 1.0
+                - (1.0 - self.cfg.normalizer_ema_alpha).powf(chunk_sec / Self::ALPHA_REF_CHUNK_SEC);
             self.ema_rms += alpha * (rms - self.ema_rms);
         }
 
@@ -203,7 +206,8 @@ impl RmsNormalizer {
                 let x = audio[i] as f64;
                 if i < ramp_len {
                     let t = i as f64 / ramp_len as f64;
-                    let ramp = self.prev_gain + (gain - self.prev_gain) * 0.5 * (1.0 - (std::f64::consts::PI * t).cos());
+                    let ramp = self.prev_gain
+                        + (gain - self.prev_gain) * 0.5 * (1.0 - (std::f64::consts::PI * t).cos());
                     *o = (x * ramp) as f32;
                 } else {
                     *o = (x * gain) as f32;
@@ -230,7 +234,8 @@ pub struct LookaheadLimiter {
 
 impl LookaheadLimiter {
     pub fn new(sample_rate: u32, cfg: &PostprocessConfig) -> Self {
-        let lookahead = ((cfg.limiter_lookahead_ms * sample_rate as f64 / 1000.0) as usize).clamp(1, 256);
+        let lookahead =
+            ((cfg.limiter_lookahead_ms * sample_rate as f64 / 1000.0) as usize).clamp(1, 256);
         let release_samples = cfg.limiter_release_ms * sample_rate as f64 / 1000.0;
         Self {
             lookahead,
@@ -282,18 +287,18 @@ impl LookaheadLimiter {
         let mut gain = vec![1.0f32; n];
         for i in 0..n {
             let v = audio[i].abs() as f64;
-            env = if v > env { v } else { rc * env + (1.0 - rc) * v };
+            env = if v > env {
+                v
+            } else {
+                rc * env + (1.0 - rc) * v
+            };
             if env > self.threshold {
                 gain[i] = (self.threshold / env) as f32;
             }
         }
         self.envelope_state = env;
 
-        delayed
-            .iter()
-            .zip(&gain)
-            .map(|(d, g)| d * g)
-            .collect()
+        delayed.iter().zip(&gain).map(|(d, g)| d * g).collect()
     }
 }
 

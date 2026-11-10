@@ -28,9 +28,14 @@ fn firwin_kaiser(numtaps: usize, fc: f64, beta: f64) -> Vec<f64> {
     let mut sum = 0.0f64;
     for (n, slot) in h.iter_mut().enumerate() {
         let m = n as f64 - alpha;
-        let sinc = if m == 0.0 { 1.0 } else { (fc * m * std::f64::consts::PI).sin() / (fc * m * std::f64::consts::PI) };
-        let w = bessel_i0(beta * (1.0 - (2.0 * n as f64 / (numtaps as f64 - 1.0) - 1.0).powi(2)).sqrt())
-            / bessel_i0(beta);
+        let sinc = if m == 0.0 {
+            1.0
+        } else {
+            (fc * m * std::f64::consts::PI).sin() / (fc * m * std::f64::consts::PI)
+        };
+        let w = bessel_i0(
+            beta * (1.0 - (2.0 * n as f64 / (numtaps as f64 - 1.0) - 1.0).powi(2)).sqrt(),
+        ) / bessel_i0(beta);
         let v = sinc * w;
         *slot = v;
         sum += v;
@@ -101,10 +106,7 @@ pub fn resample_poly(x: &[f32], up: usize, down: usize) -> Vec<f32> {
     let xd: Vec<f64> = x.iter().map(|v| *v as f64).collect();
     let y = upfirdn(&h_pad, &xd, up, down);
     let end = (n_pre_remove + n_out).min(y.len());
-    y[n_pre_remove..end]
-        .iter()
-        .map(|v| *v as f32)
-        .collect()
+    y[n_pre_remove..end].iter().map(|v| *v as f32).collect()
 }
 
 fn gcd(a: usize, b: usize) -> usize {

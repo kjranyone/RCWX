@@ -62,12 +62,20 @@ fn highpass_filter(x: &[f32], _sr: u32, _cutoff: f64) -> Vec<f32> {
         return x.to_vec();
     }
     const B: [f64; 6] = [
-        0.9699606451838447, -4.849803225919223, 9.699606451838447,
-        -9.699606451838447, 4.849803225919223, -0.9699606451838447,
+        0.9699606451838447,
+        -4.849803225919223,
+        9.699606451838447,
+        -9.699606451838447,
+        4.849803225919223,
+        -0.9699606451838447,
     ];
     const A: [f64; 6] = [
-        1.0, -4.939001819168364, 9.757863526739543,
-        -9.639544849413458, 4.761506797356209, -0.9408236532054606,
+        1.0,
+        -4.939001819168364,
+        9.757863526739543,
+        -9.639544849413458,
+        4.761506797356209,
+        -0.9408236532054606,
     ];
 
     // direct form IIR (scipy lfilter と同一出力)
@@ -258,7 +266,9 @@ fn parse_args() -> Result<Args> {
         i += 1;
     }
     if a.input.is_empty() {
-        bail!("usage: rcwx-cli run input.wav [-o output.wav] [--pitch N] [--moe 0.45] [--index-rate 0.15]");
+        bail!(
+            "usage: rcwx-cli run input.wav [-o output.wav] [--pitch N] [--moe 0.45] [--index-rate 0.15]"
+        );
     }
     Ok(a)
 }
@@ -291,8 +301,8 @@ fn main() -> Result<()> {
     }
 
     // ---- wav 読み込み ----
-    let mut reader = hound::WavReader::open(&args.input)
-        .with_context(|| format!("open {}", args.input))?;
+    let mut reader =
+        hound::WavReader::open(&args.input).with_context(|| format!("open {}", args.input))?;
     let sr = reader.spec().sample_rate;
     let ch = reader.spec().channels;
     let samples: Vec<f32> = reader
@@ -323,7 +333,10 @@ fn main() -> Result<()> {
     audio = resample_linear(&audio, sr, 16000);
     audio = highpass_filter(&audio, 16000, 48.0);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_hp.bin", bytemuck::cast_slice(&audio));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_hp.bin",
+            bytemuck::cast_slice(&audio),
+        );
     }
 
     // ---- padding (batch 相当) ----
@@ -346,11 +359,16 @@ fn main() -> Result<()> {
     }
     wav_pad[t_pad..t_pad + input_length].copy_from_slice(&audio);
     for i in 0..(t_pad + extra_pad) {
-        let src = input_length.saturating_sub(2 + i).min(input_length.saturating_sub(1));
+        let src = input_length
+            .saturating_sub(2 + i)
+            .min(input_length.saturating_sub(1));
         wav_pad[t_pad + input_length + i] = audio[src];
     }
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_wavpad.bin", bytemuck::cast_slice(&wav_pad));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_wavpad.bin",
+            bytemuck::cast_slice(&wav_pad),
+        );
     }
     let t50 = (n_total / hubert_hop).saturating_sub(1);
     let t100 = t50 * 2;
@@ -374,7 +392,10 @@ fn main() -> Result<()> {
     let feats = hubert.features(&eng, &wav_t, n_total as u32);
     let mut feats_data = eng.readback_f32(&feats);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_feats.bin", bytemuck::cast_slice(&feats_data));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_feats.bin",
+            bytemuck::cast_slice(&feats_data),
+        );
     }
     // ---- IVF index ブレンド (補間前・Python と同じ位置) ----
     if args.index_rate > 0.0 {
@@ -394,18 +415,19 @@ fn main() -> Result<()> {
     let mut f0v = match args.f0_method.as_str() {
         "rmvpe" => rmvpe.infer(&eng, &wav_pad),
         "swiftf0" => {
-            let sf0 = rcwx_nn::swiftf0::SwiftF0::load(
-                &eng,
-                &rcwx_nn::swiftf0::default_swiftf0_path(),
-            )
-            .context("SwiftF0 load")?;
+            let sf0 =
+                rcwx_nn::swiftf0::SwiftF0::load(&eng, &rcwx_nn::swiftf0::default_swiftf0_path())
+                    .context("SwiftF0 load")?;
             sf0.detect(&eng, &wav_pad)
         }
         _ => vec![0.0f32; t100],
     };
     f0v.resize(t100, 0.0);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_f0raw.bin", bytemuck::cast_slice(&f0v));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_f0raw.bin",
+            bytemuck::cast_slice(&f0v),
+        );
     }
     condition_f0(&mut f0v, args.pitch);
     if args.moe > 0.0 {
@@ -414,12 +436,25 @@ fn main() -> Result<()> {
     f0::apply_f0_filter_chain(&mut f0v, 16.0, true, true, 3.6, 30.0);
     stabilize_f0_boundaries(&mut f0v, 10);
     let pitch = f0::quantize_f0_to_pitch(&f0v);
-    println!("f0: {} frames (voiced {})", t100, f0v.iter().filter(|v| **v > 0.0).count());
+    println!(
+        "f0: {} frames (voiced {})",
+        t100,
+        f0v.iter().filter(|v| **v > 0.0).count()
+    );
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
         let dump_dir = "target/golden";
-        let _ = std::fs::write(format!("{dump_dir}/cli_rust_f0.bin"), bytemuck::cast_slice(&f0v));
-        let _ = std::fs::write(format!("{dump_dir}/cli_rust_pitch.bin"), bytemuck::cast_slice(&pitch));
-        let _ = std::fs::write(format!("{dump_dir}/cli_rust_ntotal.bin"), bytemuck::cast_slice(&[n_total as u32]));
+        let _ = std::fs::write(
+            format!("{dump_dir}/cli_rust_f0.bin"),
+            bytemuck::cast_slice(&f0v),
+        );
+        let _ = std::fs::write(
+            format!("{dump_dir}/cli_rust_pitch.bin"),
+            bytemuck::cast_slice(&pitch),
+        );
+        let _ = std::fs::write(
+            format!("{dump_dir}/cli_rust_ntotal.bin"),
+            bytemuck::cast_slice(&[n_total as u32]),
+        );
     }
 
     // ---- HuBERT (v2: layer 12) → [T50, 768] → 100fps ----
@@ -427,7 +462,10 @@ fn main() -> Result<()> {
     let feats = hubert.features(&eng, &wav_t, n_total as u32);
     let feats_data = eng.readback_f32(&feats);
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_feats.bin", bytemuck::cast_slice(&feats_data));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_feats.bin",
+            bytemuck::cast_slice(&feats_data),
+        );
     }
     let mut feats100 = vec![0.0f32; t100 * 768];
     for r in 0..t100 {
@@ -457,7 +495,10 @@ fn main() -> Result<()> {
     };
     println!("synth out: {} samples", out.len());
     if std::env::var("RCWX_CLI_DUMP").is_ok() {
-        let _ = std::fs::write("target/golden/cli_rust_synthout.bin", bytemuck::cast_slice(&out));
+        let _ = std::fs::write(
+            "target/golden/cli_rust_synthout.bin",
+            bytemuck::cast_slice(&out),
+        );
     }
 
     // ---- trim & 長さ補正 ----

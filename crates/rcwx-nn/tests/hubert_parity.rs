@@ -35,13 +35,19 @@ fn hubert_parity_wgsl() {
 
         let out_v2 = model.features(&eng, &wav_t, n);
         let got_v2 = eng.readback_f32(&out_v2);
-        let (want_v2, _) = rcwx_nn::read_safetensor_f32(&golden_path(), &format!("{name}.v2")).unwrap();
-        eprintln!("dbg {name}: got_v2 len={} want len={}", got_v2.len(), want_v2.len());
+        let (want_v2, _) =
+            rcwx_nn::read_safetensor_f32(&golden_path(), &format!("{name}.v2")).unwrap();
+        eprintln!(
+            "dbg {name}: got_v2 len={} want len={}",
+            got_v2.len(),
+            want_v2.len()
+        );
         let c2 = rcwx_nn::cosine(&got_v2, &want_v2);
 
         let out_v1 = model.extract(&eng, &wav_t, n, 9, 256);
         let got_v1 = eng.readback_f32(&out_v1);
-        let (want_v1, _) = rcwx_nn::read_safetensor_f32(&golden_path(), &format!("{name}.v1")).unwrap();
+        let (want_v1, _) =
+            rcwx_nn::read_safetensor_f32(&golden_path(), &format!("{name}.v1")).unwrap();
         let c1 = rcwx_nn::cosine(&got_v1, &want_v1);
 
         println!("{name}: v2 cosine={c2:.7}  v1 cosine={c1:.7}");

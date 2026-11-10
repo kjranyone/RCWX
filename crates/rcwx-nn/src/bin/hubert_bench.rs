@@ -1,7 +1,7 @@
 //! HuBERT 実重みベンチ (独自 wgpu エンジン)。Issue #6 の報告形式: p50/p95/p99/p99.9/max。
 
 use rcwx_nn::engine::{Backend, Engine};
-use rcwx_nn::hubert::{default_weights_path, Hubert};
+use rcwx_nn::hubert::{Hubert, default_weights_path};
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {

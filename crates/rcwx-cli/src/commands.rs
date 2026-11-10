@@ -1,8 +1,8 @@
 //! rcwx-cli サブコマンド: info / devices / download / logs。
 
-use anyhow::{bail, Context, Result};
-use std::io::Read as _;
+use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait};
+use std::io::Read as _;
 
 pub fn cmd_info(args: &[String]) -> Result<()> {
     let model = match args.first() {
@@ -23,11 +23,7 @@ pub fn cmd_info(args: &[String]) -> Result<()> {
             2
         }
     } else if let Some(in_ch) = info.enc_pre_in {
-        if in_ch == 768 {
-            2
-        } else {
-            1
-        }
+        if in_ch == 768 { 2 } else { 1 }
     } else if info.config.len() > 18 {
         2
     } else {
@@ -42,7 +38,11 @@ pub fn cmd_info(args: &[String]) -> Result<()> {
     );
     println!(
         "  F0 Support: {}",
-        if has_f0 { "Yes (NSF decoder)" } else { "No (standard decoder)" }
+        if has_f0 {
+            "Yes (NSF decoder)"
+        } else {
+            "No (standard decoder)"
+        }
     );
     println!(
         "  Speaker Embedding: {} speakers",
@@ -104,10 +104,8 @@ pub fn cmd_devices() -> Result<()> {
 
 const HUBERT_URL: &str =
     "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt";
-const RMVPE_URL: &str =
-    "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt";
-const GTCRN_URL: &str =
-    "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/main/stream/onnx_models/gtcrn_simple.onnx";
+const RMVPE_URL: &str = "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt";
+const GTCRN_URL: &str = "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/main/stream/onnx_models/gtcrn_simple.onnx";
 
 fn models_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
@@ -143,10 +141,15 @@ pub fn cmd_download(args: &[String]) -> Result<()> {
             std::fs::create_dir_all(parent)?;
         }
         download_file(url, path).with_context(|| format!("download {name} from {url}"))?;
-        println!("  {name} done. ({} bytes)", path.metadata().map(|m| m.len()).unwrap_or(0));
+        println!(
+            "  {name} done. ({} bytes)",
+            path.metadata().map(|m| m.len()).unwrap_or(0)
+        );
     }
     println!("\nAll models downloaded successfully!");
-    println!("Note: Rust 推論用の重み変換 (tools/convert_*.py) は dev 環境で別途実行してください。");
+    println!(
+        "Note: Rust 推論用の重み変換 (tools/convert_*.py) は dev 環境で別途実行してください。"
+    );
     Ok(())
 }
 
@@ -199,7 +202,8 @@ pub fn cmd_logs(args: &[String]) -> Result<()> {
             name.starts_with("rcwx_") && name.ends_with(".log")
         })
         .collect();
-    files.sort_by_key(|e| std::cmp::Reverse(e.metadata().map(|m| m.modified().ok()).ok().flatten()));
+    files
+        .sort_by_key(|e| std::cmp::Reverse(e.metadata().map(|m| m.modified().ok()).ok().flatten()));
 
     if files.is_empty() {
         println!("No log files found.");
@@ -214,14 +218,21 @@ pub fn cmd_logs(args: &[String]) -> Result<()> {
         return Ok(());
     }
     if let Some(pos) = args.iter().position(|a| a == "--tail") {
-        let n: usize = args
-            .get(pos + 1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(50);
+        let n: usize = args.get(pos + 1).and_then(|v| v.parse().ok()).unwrap_or(50);
         let latest = &files[0].path();
-        println!("=== {} (last {n} lines) ===\n", latest.file_name().unwrap().to_string_lossy());
+        println!(
+            "=== {} (last {n} lines) ===\n",
+            latest.file_name().unwrap().to_string_lossy()
+        );
         let content = std::fs::read_to_string(latest)?;
-        for line in content.lines().rev().take(n).collect::<Vec<_>>().iter().rev() {
+        for line in content
+            .lines()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             println!("{line}");
         }
         return Ok(());

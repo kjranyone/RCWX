@@ -19,8 +19,8 @@ const N_BLOCKS: u32 = 4;
 
 pub struct Rmvpe {
     w: std::collections::HashMap<String, GpuTensor>,
-    pub mel_basis: Vec<f32>,   // [128, 513]
-    pub hann: Vec<f32>,        // [1024]
+    pub mel_basis: Vec<f32>,     // [128, 513]
+    pub hann: Vec<f32>,          // [1024]
     pub cents_mapping: Vec<f32>, // [360]
 }
 
@@ -120,13 +120,28 @@ impl Rmvpe {
         let ic = eng.tensor_uninit((cin * k * k * h * w) as usize);
         g.im2col2d(x, &ic, cin, h, w);
         g.matmul_ex(
-            self.g(&format!("{wname}.weight")), &ic,
-            Some(self.g(&format!("{wname}.bias"))), out,
-            cout, h * w, cin * k * k, 1,
-            cin * k * k, 1, 0, 0,
-            1, h * w, 0, 0,
-            h * w, 1, 0, 0,
-            1.0, 1,
+            self.g(&format!("{wname}.weight")),
+            &ic,
+            Some(self.g(&format!("{wname}.bias"))),
+            out,
+            cout,
+            h * w,
+            cin * k * k,
+            1,
+            cin * k * k,
+            1,
+            0,
+            0,
+            1,
+            h * w,
+            0,
+            0,
+            h * w,
+            1,
+            0,
+            0,
+            1.0,
+            1,
         );
     }
 
@@ -148,19 +163,45 @@ impl Rmvpe {
         self.conv2d3(g, eng, x, &format!("{pfx}.conv.0"), &t1, cin, cout, h, w, 3);
         g.relu(&t1, cout * h * w);
         let t2 = eng.tensor_uninit((cout * h * w) as usize);
-        self.conv2d3(g, eng, &t1, &format!("{pfx}.conv.3"), &t2, cout, cout, h, w, 3);
+        self.conv2d3(
+            g,
+            eng,
+            &t1,
+            &format!("{pfx}.conv.3"),
+            &t2,
+            cout,
+            cout,
+            h,
+            w,
+            3,
+        );
         g.relu(&t2, cout * h * w);
         // shortcut
         if cin != cout {
             let sc = eng.tensor_uninit((cout * h * w) as usize);
             g.matmul_ex(
-                self.g(&format!("{pfx}.shortcut.weight")), x,
-                Some(self.g(&format!("{pfx}.shortcut.bias"))), &sc,
-                cout, h * w, cin, 1,
-                cin, 1, 0, 0,
-                1, h * w, 0, 0,
-                h * w, 1, 0, 0,
-                1.0, 1,
+                self.g(&format!("{pfx}.shortcut.weight")),
+                x,
+                Some(self.g(&format!("{pfx}.shortcut.bias"))),
+                &sc,
+                cout,
+                h * w,
+                cin,
+                1,
+                cin,
+                1,
+                0,
+                0,
+                1,
+                h * w,
+                0,
+                0,
+                h * w,
+                1,
+                0,
+                0,
+                1.0,
+                1,
             );
             g.add(&t2, &sc, out, cout * h * w);
         } else {
@@ -169,7 +210,15 @@ impl Rmvpe {
     }
 
     /// 平均プール (2,2) [C, H, W] → [C, H/2, W/2]
-    fn avg_pool2x2(&self, g: &mut Graph<'_>, x: &GpuTensor, out: &GpuTensor, c: u32, h: u32, w: u32) {
+    fn avg_pool2x2(
+        &self,
+        g: &mut Graph<'_>,
+        x: &GpuTensor,
+        out: &GpuTensor,
+        c: u32,
+        h: u32,
+        w: u32,
+    ) {
         g.avg_pool2x2(x, out, c, h, w);
     }
 
@@ -193,9 +242,22 @@ impl Rmvpe {
         out_pad_h: u32,
         out_pad_w: u32,
     ) {
-        g.conv_transpose2d(x, self.g(&format!("{wname}.weight")),
-            Some(self.g(&format!("{wname}.bias"))), out,
-            cin, cout, h_in, w_in, h_out, w_out, stride_h, stride_w, out_pad_h, out_pad_w);
+        g.conv_transpose2d(
+            x,
+            self.g(&format!("{wname}.weight")),
+            Some(self.g(&format!("{wname}.bias"))),
+            out,
+            cin,
+            cout,
+            h_in,
+            w_in,
+            h_out,
+            w_out,
+            stride_h,
+            stride_w,
+            out_pad_h,
+            out_pad_w,
+        );
     }
 
     pub fn infer(&self, eng: &Engine, audio: &[f32]) -> Vec<f32> {
@@ -213,11 +275,13 @@ impl Rmvpe {
 
         // 簡易: encoder BN を CPU で適用した mel を作る
         let (w_arr, b_arr, m_arr, v_arr) = {
-            let read = |n: &str| -> Vec<f32> {
-                eng.readback_f32(self.w.get(n).unwrap())
-            };
-            (read("unet.encoder.bn.weight"), read("unet.encoder.bn.bias"),
-             read("unet.encoder.bn.running_mean"), read("unet.encoder.bn.running_var"))
+            let read = |n: &str| -> Vec<f32> { eng.readback_f32(self.w.get(n).unwrap()) };
+            (
+                read("unet.encoder.bn.weight"),
+                read("unet.encoder.bn.bias"),
+                read("unet.encoder.bn.running_mean"),
+                read("unet.encoder.bn.running_var"),
+            )
         };
 
         // mel [128, T] → x は [1(チャネル), frames, 128]... E2E への入力は
@@ -251,15 +315,38 @@ impl Rmvpe {
             let pfx = format!("unet.encoder.layers.{i}");
             // n_blocks=4 の ConvBlockRes
             let mut xx = eng.tensor_uninit((ch_out * h * wdim) as usize);
-            self.conv_block_res(&mut g, eng, &cur, &format!("{pfx}.conv.0"), &xx, ch, ch_out, h, wdim);
+            self.conv_block_res(
+                &mut g,
+                eng,
+                &cur,
+                &format!("{pfx}.conv.0"),
+                &xx,
+                ch,
+                ch_out,
+                h,
+                wdim,
+            );
             for b in 1..N_BLOCKS {
                 let nx = eng.tensor_uninit((ch_out * h * wdim) as usize);
-                self.conv_block_res(&mut g, eng, &xx, &format!("{pfx}.conv.{b}"), &nx, ch_out, ch_out, h, wdim);
+                self.conv_block_res(
+                    &mut g,
+                    eng,
+                    &xx,
+                    &format!("{pfx}.conv.{b}"),
+                    &nx,
+                    ch_out,
+                    ch_out,
+                    h,
+                    wdim,
+                );
                 xx = nx;
             }
             let pooled = eng.tensor_uninit((ch_out * (h / 2) * (wdim / 2)) as usize);
             self.avg_pool2x2(&mut g, &xx, &pooled, ch_out, h, wdim);
-            dbg.push((Box::leak(format!("enc{i}").into_boxed_str()), pooled.clone_handle()));
+            dbg.push((
+                Box::leak(format!("enc{i}").into_boxed_str()),
+                pooled.clone_handle(),
+            ));
             skips.push((xx.clone_handle(), ch_out, h, wdim));
             cur = pooled;
             ch = ch_out;
@@ -269,16 +356,46 @@ impl Rmvpe {
         }
         // intermediate: 各 layer は n_blocks=4 の ConvBlockRes (conv.0: in→out, conv.1-3: out→out)
         let mut xx = eng.tensor_uninit((512 * h * wdim) as usize);
-        self.conv_block_res(&mut g, eng, &cur, "unet.intermediate.layers.0.conv.0", &xx, 256, 512, h, wdim);
+        self.conv_block_res(
+            &mut g,
+            eng,
+            &cur,
+            "unet.intermediate.layers.0.conv.0",
+            &xx,
+            256,
+            512,
+            h,
+            wdim,
+        );
         for b in 1..N_BLOCKS {
             let nx = eng.tensor_uninit((512 * h * wdim) as usize);
-            self.conv_block_res(&mut g, eng, &xx, &format!("unet.intermediate.layers.0.conv.{b}"), &nx, 512, 512, h, wdim);
+            self.conv_block_res(
+                &mut g,
+                eng,
+                &xx,
+                &format!("unet.intermediate.layers.0.conv.{b}"),
+                &nx,
+                512,
+                512,
+                h,
+                wdim,
+            );
             xx = nx;
         }
         for l in 1..INTER_LAYERS {
             for b in 0..N_BLOCKS {
                 let nx = eng.tensor_uninit((512 * h * wdim) as usize);
-                self.conv_block_res(&mut g, eng, &xx, &format!("unet.intermediate.layers.{l}.conv.{b}"), &nx, 512, 512, h, wdim);
+                self.conv_block_res(
+                    &mut g,
+                    eng,
+                    &xx,
+                    &format!("unet.intermediate.layers.{l}.conv.{b}"),
+                    &nx,
+                    512,
+                    512,
+                    h,
+                    wdim,
+                );
                 xx = nx;
             }
         }
@@ -297,17 +414,35 @@ impl Rmvpe {
             let h_o = *s_h;
             let w_o = *s_w;
             let up_raw = eng.tensor_uninit((d_out * h_ct * w_ct) as usize);
-            self.conv_transpose2d(&mut g, &xx, &format!("unet.decoder.layers.{i}.conv1.0"), &up_raw,
-                dch, d_out, h, wdim, h_ct, w_ct, stride_h, stride_w, out_pad.0, out_pad.1);
+            self.conv_transpose2d(
+                &mut g,
+                &xx,
+                &format!("unet.decoder.layers.{i}.conv1.0"),
+                &up_raw,
+                dch,
+                d_out,
+                h,
+                wdim,
+                h_ct,
+                w_ct,
+                stride_h,
+                stride_w,
+                out_pad.0,
+                out_pad.1,
+            );
             g.relu(&up_raw, d_out * h_ct * w_ct);
             let up = if h_ct != h_o || w_ct != w_o {
-                let padded = eng.tensor_from_f32(&vec![0.0f32; (d_out * h_o * w_o) as usize], vec![]);
+                let padded =
+                    eng.tensor_from_f32(&vec![0.0f32; (d_out * h_o * w_o) as usize], vec![]);
                 g.pad2d(&up_raw, &padded, d_out, h_ct, w_ct, h_o, w_o);
                 padded
             } else {
                 up_raw
             };
-            dbg.push((Box::leak(format!("dec{i}_up").into_boxed_str()), up.clone_handle()));
+            dbg.push((
+                Box::leak(format!("dec{i}_up").into_boxed_str()),
+                up.clone_handle(),
+            ));
             // concat [up, skip] → conv2 ×4
             let cat = eng.tensor_uninit((d_out * 2 * h_o * w_o) as usize);
             g.concat_ch(&up, skip, &cat, d_out, d_out, h_o * w_o);
@@ -315,17 +450,40 @@ impl Rmvpe {
                 dbg.push(("dec0_cat", cat.clone_handle()));
             }
             let mut cc = eng.tensor_uninit((d_out * h_o * w_o) as usize);
-            self.conv_block_res(&mut g, eng, &cat, &format!("unet.decoder.layers.{i}.conv2.0"), &cc, d_out * 2, d_out, h_o, w_o);
+            self.conv_block_res(
+                &mut g,
+                eng,
+                &cat,
+                &format!("unet.decoder.layers.{i}.conv2.0"),
+                &cc,
+                d_out * 2,
+                d_out,
+                h_o,
+                w_o,
+            );
             if i == 0 {
                 dbg.push(("dec0_c2b0", cc.clone_handle()));
             }
             for b in 1..N_BLOCKS {
                 let nx = eng.tensor_uninit((d_out * h_o * w_o) as usize);
-                self.conv_block_res(&mut g, eng, &cc, &format!("unet.decoder.layers.{i}.conv2.{b}"), &nx, d_out, d_out, h_o, w_o);
+                self.conv_block_res(
+                    &mut g,
+                    eng,
+                    &cc,
+                    &format!("unet.decoder.layers.{i}.conv2.{b}"),
+                    &nx,
+                    d_out,
+                    d_out,
+                    h_o,
+                    w_o,
+                );
                 cc = nx;
             }
             xx = cc;
-            dbg.push((Box::leak(format!("dec{i}").into_boxed_str()), xx.clone_handle()));
+            dbg.push((
+                Box::leak(format!("dec{i}").into_boxed_str()),
+                xx.clone_handle(),
+            ));
             dch = d_out;
             h = h_o;
             wdim = w_o;
@@ -342,7 +500,10 @@ impl Rmvpe {
         if std::env::var("RCWX_RMVPE_DUMP").is_ok() {
             for (n, b) in &dbg {
                 let v = eng.readback_f32(b);
-                let _ = std::fs::write(format!("../../target/golden/rmvpe_{n}_got.bin"), bytemuck::cast_slice(&v));
+                let _ = std::fs::write(
+                    format!("../../target/golden/rmvpe_{n}_got.bin"),
+                    bytemuck::cast_slice(&v),
+                );
             }
         }
         let hidden_in = eng.readback_f32(&flat);
@@ -362,45 +523,52 @@ impl Rmvpe {
         let t_n = t as usize;
         let hsize = 256usize;
         // 双方向をまとめて: fwd は上の順、bwd は時刻逆順
-        let run_dir = |reverse: bool, w_ih: &[f32], w_hh: &[f32], b_ih: &[f32], b_hh: &[f32]| -> Vec<f32> {
-            let mut hst = vec![0.0f64; hsize];
-            let mut outs = vec![0.0f32; t_n * hsize];
-            let order: Vec<usize> = if reverse { (0..t_n).rev().collect() } else { (0..t_n).collect() };
-            let mut g_all = vec![vec![0.0f64; hsize]; 3];
-            for &tt in &order {
-                let xt = &hidden_in[tt * 384..(tt + 1) * 384];
-                for gate in 0..3 {
+        let run_dir =
+            |reverse: bool, w_ih: &[f32], w_hh: &[f32], b_ih: &[f32], b_hh: &[f32]| -> Vec<f32> {
+                let mut hst = vec![0.0f64; hsize];
+                let mut outs = vec![0.0f32; t_n * hsize];
+                let order: Vec<usize> = if reverse {
+                    (0..t_n).rev().collect()
+                } else {
+                    (0..t_n).collect()
+                };
+                let mut g_all = vec![vec![0.0f64; hsize]; 3];
+                for &tt in &order {
+                    let xt = &hidden_in[tt * 384..(tt + 1) * 384];
+                    for gate in 0..3 {
+                        for hh in 0..hsize {
+                            let mut acc =
+                                (b_ih[gate * hsize + hh] + b_hh[gate * hsize + hh]) as f64;
+                            for k in 0..384 {
+                                acc += w_ih[(gate * hsize + hh) * 384 + k] as f64 * xt[k] as f64;
+                            }
+                            for k in 0..hsize {
+                                acc += w_hh[(gate * hsize + hh) * hsize + k] as f64 * hst[k];
+                            }
+                            g_all[gate][hh] = acc;
+                        }
+                    }
                     for hh in 0..hsize {
-                        let mut acc = (b_ih[gate * hsize + hh] + b_hh[gate * hsize + hh]) as f64;
-                        for k in 0..384 {
-                            acc += w_ih[(gate * hsize + hh) * 384 + k] as f64 * xt[k] as f64;
-                        }
+                        let r = 1.0 / (1.0 + (-g_all[0][hh]).exp());
+                        let z = 1.0 / (1.0 + (-g_all[1][hh]).exp());
+                        // n = tanh(W_in·x + b_in + r * (W_hn·h + b_hn)) — g_all[2] は (W_in·x + b_in + W_hn·h + b_hn)
+                        let n_raw = g_all[2][hh]; // = in + hh (r 未適用) → in 部分 = n_raw - hh_part
+                        // hh_part を分離再計算
+                        let mut hh_part = 0.0f64;
                         for k in 0..hsize {
-                            acc += w_hh[(gate * hsize + hh) * hsize + k] as f64 * hst[k];
+                            hh_part += w_hh[(2 * hsize + hh) * hsize + k] as f64 * hst[k];
                         }
-                        g_all[gate][hh] = acc;
+                        hh_part += b_hh[2 * hsize + hh] as f64;
+                        let in_part = n_raw - hh_part;
+                        let n = (in_part + r * hh_part).tanh();
+                        hst[hh] = (1.0 - z) * n + z * hst[hh];
                     }
+                    let _ = hst;
+                    outs[tt * hsize..(tt + 1) * hsize]
+                        .copy_from_slice(&hst.iter().map(|v| *v as f32).collect::<Vec<_>>());
                 }
-                for hh in 0..hsize {
-                    let r = 1.0 / (1.0 + (-g_all[0][hh]).exp());
-                    let z = 1.0 / (1.0 + (-g_all[1][hh]).exp());
-                    // n = tanh(W_in·x + b_in + r * (W_hn·h + b_hn)) — g_all[2] は (W_in·x + b_in + W_hn·h + b_hn)
-                    let n_raw = g_all[2][hh]; // = in + hh (r 未適用) → in 部分 = n_raw - hh_part
-                    // hh_part を分離再計算
-                    let mut hh_part = 0.0f64;
-                    for k in 0..hsize {
-                        hh_part += w_hh[(2 * hsize + hh) * hsize + k] as f64 * hst[k];
-                    }
-                    hh_part += b_hh[2 * hsize + hh] as f64;
-                    let in_part = n_raw - hh_part;
-                    let n = (in_part + r * hh_part).tanh();
-                    hst[hh] = (1.0 - z) * n + z * hst[hh];
-                }
-                let _ = hst;
-                outs[tt * hsize..(tt + 1) * hsize].copy_from_slice(&hst.iter().map(|v| *v as f32).collect::<Vec<_>>());
-            }
-            outs
-        };
+                outs
+            };
         let fwd = run_dir(false, &w_ih_f, &w_hh_f, &b_ih_f, &b_hh_f);
         let bwd = run_dir(true, &w_ih_b, &w_hh_b, &b_ih_b, &b_hh_b);
 
@@ -417,8 +585,16 @@ impl Rmvpe {
             }
         }
         if std::env::var("RCWX_RMVPE_DUMP").is_ok() {
-            std::fs::write("../../target/golden/rmvpe_hidden_got.bin", bytemuck::cast_slice(&hidden)).unwrap();
-            std::fs::write("../../target/golden/rmvpe_flat_got.bin", bytemuck::cast_slice(&hidden_in)).unwrap();
+            std::fs::write(
+                "../../target/golden/rmvpe_hidden_got.bin",
+                bytemuck::cast_slice(&hidden),
+            )
+            .unwrap();
+            std::fs::write(
+                "../../target/golden/rmvpe_flat_got.bin",
+                bytemuck::cast_slice(&hidden_in),
+            )
+            .unwrap();
         }
         self.decode(&hidden, t_n, 0.03)
     }
@@ -442,8 +618,16 @@ impl Rmvpe {
                 sum_sal += frame[idx] as f64;
                 sum_cents += frame[idx] as f64 * self.cents_mapping[idx] as f64;
             }
-            let cents = if sum_sal > 1e-8 { sum_cents / sum_sal } else { 0.0 };
-            let cents = if max_sal(frame) > threshold { cents } else { 0.0 };
+            let cents = if sum_sal > 1e-8 {
+                sum_cents / sum_sal
+            } else {
+                0.0
+            };
+            let cents = if max_sal(frame) > threshold {
+                cents
+            } else {
+                0.0
+            };
             if cents > 0.0 {
                 f0[tt] = 10.0 * 2.0f64.powf(cents / 1200.0) as f32;
             }

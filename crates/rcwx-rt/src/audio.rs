@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rcwx_dsp::drift::{compute_shed_policy, FloorTracker};
+use rcwx_dsp::drift::{FloorTracker, compute_shed_policy};
 
 use crate::config::{LiveParams, RtConfig, RtReport};
 use crate::engine::RtEngine;
@@ -102,7 +102,11 @@ pub fn run_virtual(
         let ok = wall <= audio_dur * 1.02 + batch_period;
         println!(
             "realtime pacing: audio {audio_dur:.2}s / wall {wall:.2}s → {}",
-            if ok { "追従OK (underrun 相当ゼロ)" } else { "遅延蓄積" }
+            if ok {
+                "追従OK (underrun 相当ゼロ)"
+            } else {
+                "遅延蓄積"
+            }
         );
     }
     let s = &engine.stats;
@@ -152,7 +156,9 @@ pub fn run_realtime(
 
     let host = open_host(&cfg.host_name);
     let out_device = pick_device(&host, output_name, false)?;
-    let out_cfg = out_device.default_output_config().context("output config")?;
+    let out_cfg = out_device
+        .default_output_config()
+        .context("output config")?;
     eprintln!(
         "output: {} @ {}Hz {}ch ({:?})",
         out_device,
@@ -165,7 +171,8 @@ pub fn run_realtime(
     cfg.output_sample_rate = sample_rate_hz(out_cfg.sample_rate());
 
     let wav_pcm = if let Some(path) = cfg.input_wav.clone() {
-        let (sr, mono) = read_wav_mono(Path::new(&path)).with_context(|| format!("wav input {path}"))?;
+        let (sr, mono) =
+            read_wav_mono(Path::new(&path)).with_context(|| format!("wav input {path}"))?;
         eprintln!("input: wav {path} @ {sr}Hz (loop)");
         cfg.mic_sample_rate = sr;
         Some(mono)
@@ -420,7 +427,11 @@ fn feed_wav(
     }
 }
 
-fn live_channel(live: &Option<Arc<Mutex<LiveParams>>>, input: bool, fallback: Option<usize>) -> Option<usize> {
+fn live_channel(
+    live: &Option<Arc<Mutex<LiveParams>>>,
+    input: bool,
+    fallback: Option<usize>,
+) -> Option<usize> {
     let Some(live) = live else {
         return fallback;
     };
@@ -520,7 +531,12 @@ pub fn record_seconds(
 }
 
 /// WAV を出力デバイスへ再生する。デバイスのレートが違えばリサンプルする。
-pub fn play_wav(host_name: &str, device: Option<&str>, path: &Path, stop: &AtomicBool) -> Result<()> {
+pub fn play_wav(
+    host_name: &str,
+    device: Option<&str>,
+    path: &Path,
+    stop: &AtomicBool,
+) -> Result<()> {
     let (file_rate, mono) = read_wav_mono(path)?;
     let host = open_host(host_name);
     let device = pick_device(&host, device, false)?;
@@ -563,7 +579,10 @@ fn read_wav_mono(path: &Path) -> Result<(u32, Vec<f32>)> {
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
     let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|sample| sample.unwrap_or(0.0)).collect(),
+        hound::SampleFormat::Float => reader
+            .samples::<f32>()
+            .map(|sample| sample.unwrap_or(0.0))
+            .collect(),
         hound::SampleFormat::Int => {
             let shift = spec.bits_per_sample.saturating_sub(1).min(31);
             let denom = (1u32 << shift) as f32;
@@ -614,9 +633,11 @@ fn pick_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Result<cpa
         anyhow::bail!("device matching '{want}' not found");
     }
     if input {
-        host.default_input_device().context("no default input device")
+        host.default_input_device()
+            .context("no default input device")
     } else {
-        host.default_output_device().context("no default output device")
+        host.default_output_device()
+            .context("no default output device")
     }
 }
 
@@ -628,12 +649,9 @@ fn build_input_stream(
     let err = |e: cpal::Error| eprintln!("input stream error: {e}");
     let conf = config.config();
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            conf,
-            move |data: &[f32], _| cb(data),
-            err,
-            None,
-        )?,
+        cpal::SampleFormat::F32 => {
+            device.build_input_stream(conf, move |data: &[f32], _| cb(data), err, None)?
+        }
         cpal::SampleFormat::I16 => device.build_input_stream(
             conf,
             move |data: &[i16], _| {
@@ -656,12 +674,9 @@ fn build_output_stream(
     let err = |e: cpal::Error| eprintln!("output stream error: {e}");
     let conf = config.config();
     let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => device.build_output_stream(
-            conf,
-            move |data: &mut [f32], _| cb(data),
-            err,
-            None,
-        )?,
+        cpal::SampleFormat::F32 => {
+            device.build_output_stream(conf, move |data: &mut [f32], _| cb(data), err, None)?
+        }
         cpal::SampleFormat::I16 => device.build_output_stream(
             conf,
             move |data: &mut [i16], _| {

@@ -20,11 +20,7 @@ pub enum Value {
 }
 
 fn get_str(v: &Value) -> Option<&str> {
-    if let Value::Str(s) = v {
-        Some(s)
-    } else {
-        None
-    }
+    if let Value::Str(s) = v { Some(s) } else { None }
 }
 
 pub struct PthInfo {
@@ -132,10 +128,9 @@ fn parse_pickle(buf: &[u8]) -> anyhow::Result<Value> {
         memo: Vec::new(),
     };
     loop {
-        let op = *r
-            .b
-            .get(r.pos)
-            .ok_or_else(|| anyhow::anyhow!("pickle truncated"))?;
+        let op =
+            *r.b.get(r.pos)
+                .ok_or_else(|| anyhow::anyhow!("pickle truncated"))?;
         r.pos += 1;
         match op {
             0x80 => {
@@ -148,9 +143,18 @@ fn parse_pickle(buf: &[u8]) -> anyhow::Result<Value> {
             b'N' => r.stack.push(Value::None),
             0x88 => r.stack.push(Value::Bool),
             0x89 => r.stack.push(Value::Bool),
-            b'K' => { let v = r.take_u8()? as i64; r.stack.push(Value::Int(v)); }
-            b'M' => { let v = r.take_u16()? as i64; r.stack.push(Value::Int(v)); }
-            b'J' => { let v = r.take_i32()? as i64; r.stack.push(Value::Int(v)); }
+            b'K' => {
+                let v = r.take_u8()? as i64;
+                r.stack.push(Value::Int(v));
+            }
+            b'M' => {
+                let v = r.take_u16()? as i64;
+                r.stack.push(Value::Int(v));
+            }
+            b'J' => {
+                let v = r.take_i32()? as i64;
+                r.stack.push(Value::Int(v));
+            }
             0x8a => {
                 // LONG1
                 let n = r.take_u8()? as usize;
@@ -349,9 +353,7 @@ fn parse_pickle(buf: &[u8]) -> anyhow::Result<Value> {
             }
         }
     }
-    r.stack
-        .pop()
-        .ok_or_else(|| anyhow::anyhow!("empty pickle"))
+    r.stack.pop().ok_or_else(|| anyhow::anyhow!("empty pickle"))
 }
 
 impl<'a> Reader<'a> {

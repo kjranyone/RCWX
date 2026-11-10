@@ -155,7 +155,11 @@ impl NoiseGate {
                         if self.floor_hist.len() > self.window_blocks {
                             self.floor_hist.pop_front();
                         }
-                        self.hist_min = self.floor_hist.iter().cloned().fold(f64::INFINITY, f64::min);
+                        self.hist_min = self
+                            .floor_hist
+                            .iter()
+                            .cloned()
+                            .fold(f64::INFINITY, f64::min);
                     }
                     self.blocks_seen += 1;
                     self.block_min = f64::INFINITY;

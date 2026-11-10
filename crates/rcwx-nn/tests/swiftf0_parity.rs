@@ -62,7 +62,11 @@ fn swiftf0_matches_onnxruntime() {
     assert_eq!(f0.len(), f0_ref.len(), "target frame count");
     let voiced_ref: Vec<bool> = f0_ref.iter().map(|v| *v > 0.0).collect();
     let voiced: Vec<bool> = f0.iter().map(|v| *v > 0.0).collect();
-    let agree = voiced.iter().zip(&voiced_ref).filter(|(a, b)| a == b).count();
+    let agree = voiced
+        .iter()
+        .zip(&voiced_ref)
+        .filter(|(a, b)| a == b)
+        .count();
     let cos = rcwx_nn::cosine(&f0, &f0_ref);
     let voiced_diff = f0
         .iter()

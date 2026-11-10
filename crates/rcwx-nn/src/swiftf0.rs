@@ -350,12 +350,7 @@ impl SwiftF0 {
             }
         }
 
-        resolve_octave_from_waveform(
-            &mut f0_out,
-            &voiced_r,
-            audio,
-            &conf_r,
-        );
+        resolve_octave_from_waveform(&mut f0_out, &voiced_r, audio, &conf_r);
         f0_out
     }
 }
@@ -380,7 +375,12 @@ fn voiced_segments(mask: &[bool]) -> Vec<(usize, usize)> {
 }
 
 /// 反射パディング付き解析フレーム抽出 (64ms, hop 160, 平均除去)。
-fn reflected_frames(audio: &[f32], frame_count: usize, frame_size: usize, hop: usize) -> Vec<Vec<f32>> {
+fn reflected_frames(
+    audio: &[f32],
+    frame_count: usize,
+    frame_size: usize,
+    hop: usize,
+) -> Vec<Vec<f32>> {
     let n = audio.len();
     let half = frame_size / 2;
     let mut out = Vec::with_capacity(frame_count);
@@ -437,7 +437,12 @@ fn normalized_periodicity(frame: &[f32], lag: usize) -> f64 {
 }
 
 /// 波形周期性 + Viterbi によるオクターブ誤検出の解決。
-fn resolve_octave_from_waveform(f0: &mut [f32], voiced: &[bool], audio: &[f32], confidence: &[f32]) {
+fn resolve_octave_from_waveform(
+    f0: &mut [f32],
+    voiced: &[bool],
+    audio: &[f32],
+    confidence: &[f32],
+) {
     let n_frames = f0.len();
     if n_frames == 0 {
         return;
@@ -454,11 +459,7 @@ fn resolve_octave_from_waveform(f0: &mut [f32], voiced: &[bool], audio: &[f32], 
     let frame_size = {
         let fs = (16000.0f64 * 0.064).round() as usize;
         let fs = fs.max(256);
-        if fs % 2 != 0 {
-            fs + 1
-        } else {
-            fs
-        }
+        if fs % 2 != 0 { fs + 1 } else { fs }
     };
     let analysis = reflected_frames(audio, n_frames, frame_size, TARGET_HOP);
 

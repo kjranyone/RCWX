@@ -1,12 +1,12 @@
 //! RCWX 独自 wgpu+WGSL 推論エンジン (Issue #6)。
 
 pub mod engine;
+pub mod f0;
 pub mod hubert;
-pub mod synth;
+pub mod ivf;
 pub mod rmvpe;
 pub mod swiftf0;
-pub mod ivf;
-pub mod f0;
+pub mod synth;
 
 /// safetensors から名前付きテンソルを f32 の平坦配列 + shape で読むヘルパ。
 pub fn read_safetensor_f32(

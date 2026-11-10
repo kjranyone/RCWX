@@ -3,7 +3,7 @@
 //!         uv run python tools/dump_synth_stages.py
 
 use rcwx_nn::engine::{Backend, Engine};
-use rcwx_nn::synth::{default_synth_dir, Synth};
+use rcwx_nn::synth::{Synth, default_synth_dir};
 
 #[test]
 fn synth_parity_wgsl() {
@@ -42,7 +42,11 @@ fn synth_parity_wgsl() {
                         // with_cond [384, T] の前半 192 行 = acts
                         let t = 33usize;
                         let mut acts = Vec::with_capacity(want_s.len());
-                        for c in 0..192usize { for r in 0..t { acts.push(got_s[c * t + r]); } }
+                        for c in 0..192usize {
+                            for r in 0..t {
+                                acts.push(got_s[c * t + r]);
+                            }
+                        }
                         println!("{name:<12}: cos={:.7}", rcwx_nn::cosine(&acts, &want_s));
                         continue;
                     }
@@ -51,27 +55,52 @@ fn synth_parity_wgsl() {
                 }
                 // python 側 [B, C, T] → engine [C, T]: flat 同一 (B=1)
                 if name == "p_attn0" {
-                    std::fs::write("../../target/golden/p_attn_got.bin", bytemuck::cast_slice(&got_s)).unwrap();
+                    std::fs::write(
+                        "../../target/golden/p_attn_got.bin",
+                        bytemuck::cast_slice(&got_s),
+                    )
+                    .unwrap();
                 }
                 if name == "ffn0" {
                     // want との差分パターン
-                    let mut bad = 0; let mut first_bad = usize::MAX;
+                    let mut bad = 0;
+                    let mut first_bad = usize::MAX;
                     for i in 0..got_s.len().min(want_s.len()) {
-                        if (got_s[i] - want_s[i]).abs() > 1e-3 { bad += 1; first_bad = first_bad.min(i); }
+                        if (got_s[i] - want_s[i]).abs() > 1e-3 {
+                            bad += 1;
+                            first_bad = first_bad.min(i);
+                        }
                     }
                     println!("ffn0 bad={bad}/{} first_bad={first_bad}", got_s.len());
                     if first_bad < usize::MAX {
                         let ch = first_bad / 33;
-                        println!("bad starts ch={ch} t={} got={:?} want={:?}", first_bad % 33, got_s[first_bad], want_s[first_bad]);
+                        println!(
+                            "bad starts ch={ch} t={} got={:?} want={:?}",
+                            first_bad % 33,
+                            got_s[first_bad],
+                            want_s[first_bad]
+                        );
                     }
                 }
                 if name == "wn6_rs0" {
                     let t = 33usize;
-                    println!("rs got[ch0,t0..2]={:?} want={:?}", &got_s[0..3], &want_s[0..3]);
-                    println!("rs got[ch1,t0..2]={:?} want={:?}", &got_s[t..t+3], &want_s[t..t+3]);
+                    println!(
+                        "rs got[ch0,t0..2]={:?} want={:?}",
+                        &got_s[0..3],
+                        &want_s[0..3]
+                    );
+                    println!(
+                        "rs got[ch1,t0..2]={:?} want={:?}",
+                        &got_s[t..t + 3],
+                        &want_s[t..t + 3]
+                    );
                 }
                 if name == "wn6_skip0" {
-                    println!("skip0 got[0..3]={:?} want[0..3]={:?}", &got_s[0..3], &want_s[0..3]);
+                    println!(
+                        "skip0 got[0..3]={:?} want[0..3]={:?}",
+                        &got_s[0..3],
+                        &want_s[0..3]
+                    );
                 }
                 println!("{name:<12}: cos={:.7}", rcwx_nn::cosine(&got_s, &want_s));
             }

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use rcwx_dsp::noise_gate::{NoiseGate, Sensitivity};
 use rcwx_dsp::postprocess::{PostprocessConfig, Postprocessor};
 use rcwx_dsp::resample::StatefulResampler;
-use rcwx_dsp::sola::{sola_crossfade, SolaState};
+use rcwx_dsp::sola::{SolaState, sola_crossfade};
 use rcwx_dsp::spectral::StreamingSpectralGate;
 
 use crate::config::{LiveParams, RtConfig, RtStats};
@@ -139,8 +139,7 @@ impl RtEngine {
                             break;
                         }
                     }
-                })
-            {
+                }) {
                 Ok(_) => (Some(job_tx), Some(res_rx)),
                 Err(_) => (None, None),
             }
@@ -281,14 +280,10 @@ impl RtEngine {
         let sensitivity = self.cfg.noise_gate_sensitivity;
         let post = post_config_from(&self.cfg);
         drop(params);
-        if strength_changed
-            && let Some(spectral) = self.spectral.as_mut()
-        {
+        if strength_changed && let Some(spectral) = self.spectral.as_mut() {
             spectral.configure(6.0, -24.0 * strength.clamp(0.5, 2.0));
         }
-        if sens_changed
-            && let Some(gate) = self.gate.as_mut()
-        {
+        if sens_changed && let Some(gate) = self.gate.as_mut() {
             gate.set_sensitivity(sensitivity_of(sensitivity));
         }
         self.post.update_config(post);
@@ -322,7 +317,10 @@ impl RtEngine {
         let priming = self.priming;
         let stage = |name: &str, t: &mut std::time::Instant| {
             if !priming && std::env::var("RCWX_RT_STAGES").is_ok() {
-                eprintln!("  [stage] {name}: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  [stage] {name}: {:.2}ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
             }
             *t = std::time::Instant::now();
         };
@@ -400,7 +398,7 @@ impl RtEngine {
         if t50_win > new50 {
             let (feat_win, _) = feats_data.split_at(t50_win * 768);
             stage("hubert+blend", &mut stage_t);
-        let cache_t50 = self.feat_cache.len() / 768;
+            let cache_t50 = self.feat_cache.len() / 768;
             // 窓先頭の (t50_win - new50) フレームがキャッシュ末尾と同一時刻
             let overlap = (t50_win - new50).min(cache_t50);
             let blend = sigmoid_blend(overlap);
@@ -417,7 +415,8 @@ impl RtEngine {
             self.feat_cache
                 .extend_from_slice(&feat_win[new_off..t50_win * 768]);
         } else {
-            self.warn.push(format!("HuBERT window too short: {t50_win} <= {new50}"));
+            self.warn
+                .push(format!("HuBERT window too short: {t50_win} <= {new50}"));
         }
         let cache_cap50 = (CACHE_SEC * 50.0) as usize * 768;
         if self.feat_cache.len() > cache_cap50 {
@@ -479,8 +478,7 @@ impl RtEngine {
             self.cfg.f0_slew_max_step,
             self.cfg.f0_hole_fill_ms,
         );
-        self.f0_filt
-            .extend_from_slice(&f0_to_filter[filter_ctx..]);
+        self.f0_filt.extend_from_slice(&f0_to_filter[filter_ctx..]);
         if self.f0_filt.len() > cap100 {
             self.f0_filt.drain(..self.f0_filt.len() - cap100);
         }
@@ -544,10 +542,7 @@ impl RtEngine {
         let har = self.synth.sinegen(&f0_dec, n_dec as u32);
         let mut audio48: Vec<f32> = {
             let RtEngine {
-                eng,
-                synth,
-                plans,
-                ..
+                eng, synth, plans, ..
             } = self;
             // 形状が変わったらプラン再構築 (ウォームアップ中のみ)
             if plans.as_ref().map(|p| (p.n100, p.n_dec)) != Some((n100, n_dec)) {
@@ -561,7 +556,8 @@ impl RtEngine {
                 let har_in = eng.tensor_uninit(har.len());
                 let z_link = z_out.clone_handle();
                 let mut g = eng.graph();
-                let audio = synth.decode_graph(eng, &mut g, &z_link, &har_in, n100 as u32, n_dec as u32);
+                let audio =
+                    synth.decode_graph(eng, &mut g, &z_link, &har_in, n100 as u32, n_dec as u32);
                 let decode_plan = g.into_plan().expect("decode plan");
                 *plans = Some(Box::new(SynthPlans {
                     n100,
@@ -591,7 +587,12 @@ impl RtEngine {
                 // 計算と読み戻しを 1 submit に統合 (submit 数・fence 境界を削減)
                 let tt = std::time::Instant::now();
                 let out = eng.run_plans_readback(&[&p.encode_plan, &p.decode_plan], &p.audio_out);
-                if dbg { eprintln!("    [synth] encode+decode+rb: {:.2}ms", tt.elapsed().as_secs_f64()*1000.0); }
+                if dbg {
+                    eprintln!(
+                        "    [synth] encode+decode+rb: {:.2}ms",
+                        tt.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 out
             }
         };
@@ -664,7 +665,8 @@ impl RtEngine {
                         let _ = tx.try_send((out.clone(), hay));
                     }
                     None => {
-                        let corr = rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&out, &hay);
+                        let corr =
+                            rcwx_dsp::feedback::max_normalized_lag_correlation_fft(&out, &hay);
                         self.stats.feedback_corr = corr as f64;
                     }
                 }

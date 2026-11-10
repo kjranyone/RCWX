@@ -8,22 +8,20 @@ use anyhow::{Context, Result};
 use crate::engine::{Engine, GpuTensor, Graph};
 
 pub struct SynthConfig {
-    pub inter_channels: u32,   // 192
-    pub hidden_channels: u32,  // 192
-    pub filter_channels: u32,  // 768
-    pub n_heads: u32,          // 2
-    pub n_layers: u32,         // 6
-    pub kernel_size: u32,      // 3
+    pub inter_channels: u32,  // 192
+    pub hidden_channels: u32, // 192
+    pub filter_channels: u32, // 768
+    pub n_heads: u32,         // 2
+    pub n_layers: u32,        // 6
+    pub kernel_size: u32,     // 3
     pub upsample_rates: Vec<u32>,
     pub upsample_initial_channel: u32, // 512
     pub upsample_kernel_sizes: Vec<u32>,
     pub resblock_kernel_sizes: Vec<u32>,
-    pub gin_channels: u32,     // 256
+    pub gin_channels: u32, // 256
     pub sr: u32,
     pub n_speakers: u32,
 }
-
-
 
 /// ストリーミング sinegen の持ち越し位相状態。
 #[derive(Default, Clone)]
@@ -66,7 +64,10 @@ impl Synth {
             }
             if matches!(
                 name,
-                "emb_g.weight" | "enc_p.emb_pitch.weight" | "dec.m_source.l_linear.weight" | "dec.m_source.l_linear.bias"
+                "emb_g.weight"
+                    | "enc_p.emb_pitch.weight"
+                    | "dec.m_source.l_linear.weight"
+                    | "dec.m_source.l_linear.bias"
             ) {
                 cpu.insert(name.to_string(), out.clone());
             }
@@ -150,7 +151,10 @@ impl Synth {
             cfg,
             debug_keep: std::cell::RefCell::new(None),
             emb_g_row0: emb_g[..gin].to_vec(),
-            emb_pitch: cpu.get("enc_p.emb_pitch.weight").context("emb_pitch")?.clone(),
+            emb_pitch: cpu
+                .get("enc_p.emb_pitch.weight")
+                .context("emb_pitch")?
+                .clone(),
             l_linear_w: cpu.get("dec.m_source.l_linear.weight").unwrap()[0],
             l_linear_b: cpu.get("dec.m_source.l_linear.bias").unwrap()[0],
             w,
@@ -189,13 +193,28 @@ impl Synth {
         scale: f32,
     ) {
         g.matmul_ex(
-            self.g(&format!("{wname}.weight")), x,
-            Some(self.g(&format!("{wname}.bias"))), out,
-            cout, t, cin, 1,
-            cin, 1, 0, 0,
-            1, t, x_base, 0,
-            t, 1, 0, 0,
-            scale, 1,
+            self.g(&format!("{wname}.weight")),
+            x,
+            Some(self.g(&format!("{wname}.bias"))),
+            out,
+            cout,
+            t,
+            cin,
+            1,
+            cin,
+            1,
+            0,
+            0,
+            1,
+            t,
+            x_base,
+            0,
+            t,
+            1,
+            0,
+            0,
+            scale,
+            1,
         );
     }
 
@@ -251,23 +270,59 @@ impl Synth {
         let w = self.g(&format!("{wname}.weight"));
         let b = self.g(&format!("{wname}.bias"));
         if std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm") {
-            g.matmul_conv(w, x, Some(b), out, cout, t, cin * k, k, dil, (k - 1) * dil / 2, t, 0);
+            g.matmul_conv(
+                w,
+                x,
+                Some(b),
+                out,
+                cout,
+                t,
+                cin * k,
+                k,
+                dil,
+                (k - 1) * dil / 2,
+                t,
+                0,
+            );
             g.add_off(out, residual, out, cout * t, 0, 0, false);
             return;
         }
         if (cin * k * t) as usize * 4 > 96_000_000 {
-            g.conv1d(x, w, Some(b), out, cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1);
+            g.conv1d(
+                x,
+                w,
+                Some(b),
+                out,
+                cout,
+                cin,
+                k,
+                1,
+                dil,
+                (k - 1) * dil / 2,
+                t,
+                t,
+                1,
+            );
             g.add_off(out, residual, out, cout * t, 0, 0, false);
             return;
         }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
         g.im2col_off(x, 0, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
         g.matmul_ex_res(
-            w, &ic, Some(b), residual, out,
-            cout, t, cin * k,
-            cin * k, 1,
-            1, t,
-            t, 1,
+            w,
+            &ic,
+            Some(b),
+            residual,
+            out,
+            cout,
+            t,
+            cin * k,
+            cin * k,
+            1,
+            1,
+            t,
+            t,
+            1,
         );
     }
 
@@ -292,17 +347,36 @@ impl Synth {
         let use_gemm = x_base == 0 && std::env::var("RCWX_CONV").ok().as_deref() == Some("gemm");
         if use_gemm {
             g.matmul_conv(
-                self.g(&format!("{wname}.weight")), x,
-                Some(self.g(&format!("{wname}.bias"))), out,
-                cout, t, cin * k, k, dil, (k - 1) * dil / 2, t, post,
+                self.g(&format!("{wname}.weight")),
+                x,
+                Some(self.g(&format!("{wname}.bias"))),
+                out,
+                cout,
+                t,
+                cin * k,
+                k,
+                dil,
+                (k - 1) * dil / 2,
+                t,
+                post,
             );
             return;
         }
         if x_base == 0 && (cin * k * t) as usize * 4 > 96_000_000 {
             g.conv1d(
-                x, self.g(&format!("{wname}.weight")),
-                Some(self.g(&format!("{wname}.bias"))), out,
-                cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1,
+                x,
+                self.g(&format!("{wname}.weight")),
+                Some(self.g(&format!("{wname}.bias"))),
+                out,
+                cout,
+                cin,
+                k,
+                1,
+                dil,
+                (k - 1) * dil / 2,
+                t,
+                t,
+                1,
             );
             if post == 1 {
                 g.pointwise(out, None, cout * t, 1, 0.1, 0, 0, 0);
@@ -313,23 +387,47 @@ impl Synth {
         g.im2col_off(x, x_base, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
         if post == 0 {
             g.matmul_ex(
-                self.g(&format!("{wname}.weight")), &ic,
-                Some(self.g(&format!("{wname}.bias"))), out,
-                cout, t, cin * k, 1,
-                cin * k, 1, 0, 0,
-                1, t, 0, 0,
-                t, 1, 0, 0,
-                1.0, 1,
+                self.g(&format!("{wname}.weight")),
+                &ic,
+                Some(self.g(&format!("{wname}.bias"))),
+                out,
+                cout,
+                t,
+                cin * k,
+                1,
+                cin * k,
+                1,
+                0,
+                0,
+                1,
+                t,
+                0,
+                0,
+                t,
+                1,
+                0,
+                0,
+                1.0,
+                1,
             );
         } else {
             g.matmul_ex_x(
-                self.g(&format!("{wname}.weight")), &ic,
-                Some(self.g(&format!("{wname}.bias"))), None, out,
-                cout, t, cin * k,
-                cin * k, 1,
-                1, t,
-                t, 1,
-                1.0, post,
+                self.g(&format!("{wname}.weight")),
+                &ic,
+                Some(self.g(&format!("{wname}.bias"))),
+                None,
+                out,
+                cout,
+                t,
+                cin * k,
+                cin * k,
+                1,
+                1,
+                t,
+                t,
+                1,
+                1.0,
+                post,
             );
         }
     }
@@ -376,7 +474,11 @@ impl Synth {
             }
             prev_rem = rem;
             phase += rad[(i / upp as usize).min(l - 1)];
-            let uv = if f0[(i / upp as usize).min(l - 1)] > 0.0 { 1.0 } else { 0.0 };
+            let uv = if f0[(i / upp as usize).min(l - 1)] > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
             let sine = (phase * two_pi).sin() * 0.1 * uv;
             out[i] = (self.l_linear_w * sine + self.l_linear_b).tanh();
         }
@@ -517,8 +619,7 @@ impl Synth {
         for r in 0..t as usize {
             let idx = pitch_idx.get(r).copied().unwrap_or(0).clamp(0, 255) as usize;
             for c in 0..h {
-                out[c * t as usize + r] =
-                    self.emb_pitch[idx * h + c] * (h as f32).sqrt();
+                out[c * t as usize + r] = self.emb_pitch[idx * h + c] * (h as f32).sqrt();
             }
         }
         out
@@ -546,13 +647,28 @@ impl Synth {
         // x[ch, t] = (Σ_k feats[t,k]·W_phone[ch,k])·√h + emb_pitch[pitch[t]][ch]
         let x0 = eng.tensor_uninit((h * t) as usize);
         g.matmul_ex(
-            self.g("enc_p.emb_phone.weight"), feats,
-            Some(self.g("enc_p.emb_phone.bias")), &x0,
-            h, t, 768, 1,
-            768, 1, 0, 0,
-            768, 1, 0, 0,
-            t, 1, 0, 0,
-            (h as f32).sqrt(), 1,
+            self.g("enc_p.emb_phone.weight"),
+            feats,
+            Some(self.g("enc_p.emb_phone.bias")),
+            &x0,
+            h,
+            t,
+            768,
+            1,
+            768,
+            1,
+            0,
+            0,
+            768,
+            1,
+            0,
+            0,
+            t,
+            1,
+            0,
+            0,
+            (h as f32).sqrt(),
+            1,
         );
         let mut x = eng.tensor_uninit((h * t) as usize);
         g.add(&x0, pitch_emb, &x, h * t);
@@ -566,25 +682,64 @@ impl Synth {
             let p = format!("enc_p.encoder.attn_layers.{l}");
             let qkv = eng.tensor_uninit((3 * h * t) as usize);
             g.matmul_ex(
-                self.g(&format!("{p}.qkv.weight")), &x,
-                Some(self.g(&format!("{p}.qkv.bias"))), &qkv,
-                3 * h, t, h, 1,
-                h, 1, 0, 0,
-                1, t, 0, 0,
-                t, 1, 0, 0,
-                1.0, 1,
+                self.g(&format!("{p}.qkv.weight")),
+                &x,
+                Some(self.g(&format!("{p}.qkv.bias"))),
+                &qkv,
+                3 * h,
+                t,
+                h,
+                1,
+                h,
+                1,
+                0,
+                0,
+                1,
+                t,
+                0,
+                0,
+                t,
+                1,
+                0,
+                0,
+                1.0,
+                1,
             );
             // scores[heads, T, T] = (q·k^T)/√dk + rel (q = qkv[0:h], k = qkv[h:2h])
             let scores = eng.tensor_uninit((heads * t * t) as usize);
             g.matmul(
-                &qkv, &qkv, None, &scores,
-                t, t, dk, heads,
-                1, t, 0, dk * t,
-                1, t, h * t, dk * t,
-                t, 1, 0, t * t,
+                &qkv,
+                &qkv,
+                None,
+                &scores,
+                t,
+                t,
+                dk,
+                heads,
+                1,
+                t,
+                0,
+                dk * t,
+                1,
+                t,
+                h * t,
+                dk * t,
+                t,
+                1,
+                0,
+                t * t,
                 1.0 / (dk as f32).sqrt(),
             );
-            g.rel_attn_scores(&qkv, self.g(&format!("{p}.emb_rel_k")), &scores, t, dk, ws, heads, 1.0 / (dk as f32).sqrt());
+            g.rel_attn_scores(
+                &qkv,
+                self.g(&format!("{p}.emb_rel_k")),
+                &scores,
+                t,
+                dk,
+                ws,
+                heads,
+                1.0 / (dk as f32).sqrt(),
+            );
 
             if l == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
@@ -595,11 +750,26 @@ impl Synth {
             // ctx = p·v + p·rel_v (v = qkv[2h:3h])
             let ctx = eng.tensor_uninit((h * t) as usize);
             g.matmul(
-                &scores, &qkv, None, &ctx,
-                t, dk, t, heads,
-                t, 1, 0, t * t,
-                t, 1, 2 * h * t, dk * t,
-                1, t, 0, dk * t,   // C: channel-major [ch=h*96+d, i] — ch*T + i
+                &scores,
+                &qkv,
+                None,
+                &ctx,
+                t,
+                dk,
+                t,
+                heads,
+                t,
+                1,
+                0,
+                t * t,
+                t,
+                1,
+                2 * h * t,
+                dk * t,
+                1,
+                t,
+                0,
+                dk * t, // C: channel-major [ch=h*96+d, i] — ch*T + i
                 1.0,
             );
             if l == 0 {
@@ -608,7 +778,15 @@ impl Synth {
                     kk.push(("ctx0", ctx.clone_handle()));
                 }
             }
-            g.rel_attn_values(&scores, self.g(&format!("{p}.emb_rel_v")), &ctx, t, dk, ws, heads);
+            g.rel_attn_values(
+                &scores,
+                self.g(&format!("{p}.emb_rel_v")),
+                &ctx,
+                t,
+                dk,
+                ws,
+                heads,
+            );
             let attn = eng.tensor_uninit((h * t) as usize);
             self.conv1x1(&mut g, &ctx, 0, &format!("{p}.conv_o"), &attn, h, h, t, 1.0);
             if l == 0 {
@@ -617,10 +795,20 @@ impl Synth {
                 }
             }
             let xn = eng.tensor_uninit((h * t) as usize);
-            g.add_layer_norm(&x, &attn,
+            g.add_layer_norm(
+                &x,
+                &attn,
                 self.g(&format!("enc_p.encoder.norm_layers_1.{l}.gamma")),
-                self.g(&format!("enc_p.encoder.norm_layers_1.{l}.beta")), &xn,
-                t, h, 1, t, 1, t, 1e-5);
+                self.g(&format!("enc_p.encoder.norm_layers_1.{l}.beta")),
+                &xn,
+                t,
+                h,
+                1,
+                t,
+                1,
+                t,
+                1e-5,
+            );
             x = xn;
 
             if l == 0 {
@@ -632,24 +820,57 @@ impl Synth {
             let f = format!("enc_p.encoder.ffn_layers.{l}");
             let ff1 = eng.tensor_uninit((filt * t) as usize);
             // FFN conv1 の relu は matmul 出力に fuse
-            self.conv_k_post(&mut g, &x, 0, &format!("{f}.conv_1"), &ff1, h, filt, cfg.kernel_size, 1, t, 2);
+            self.conv_k_post(
+                &mut g,
+                &x,
+                0,
+                &format!("{f}.conv_1"),
+                &ff1,
+                h,
+                filt,
+                cfg.kernel_size,
+                1,
+                t,
+                2,
+            );
             if l == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
                     kk.push(("ffn0_gelu_mid", ff1.clone_handle()));
                 }
             }
             let ff2 = eng.tensor_uninit((h * t) as usize);
-            self.conv_k(&mut g, &ff1, 0, &format!("{f}.conv_2"), &ff2, filt, h, cfg.kernel_size, 1, t);
+            self.conv_k(
+                &mut g,
+                &ff1,
+                0,
+                &format!("{f}.conv_2"),
+                &ff2,
+                filt,
+                h,
+                cfg.kernel_size,
+                1,
+                t,
+            );
             if l == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
                     kk.push(("ffn0", ff2.clone_handle()));
                 }
             }
             let xn2 = eng.tensor_uninit((h * t) as usize);
-            g.add_layer_norm(&x, &ff2,
+            g.add_layer_norm(
+                &x,
+                &ff2,
                 self.g(&format!("enc_p.encoder.norm_layers_2.{l}.gamma")),
-                self.g(&format!("enc_p.encoder.norm_layers_2.{l}.beta")), &xn2,
-                t, h, 1, t, 1, t, 1e-5);
+                self.g(&format!("enc_p.encoder.norm_layers_2.{l}.beta")),
+                &xn2,
+                t,
+                h,
+                1,
+                t,
+                1,
+                t,
+                1e-5,
+            );
             x = xn2;
         }
         // proj → stats [384, T]
@@ -679,20 +900,51 @@ impl Synth {
                 z = zf;
             }
             let fp = format!("flow.flows.{}", i * 2);
-            let x0_base = 0u32;       // z rows [0:96]
-            let x1_base = 96 * t;     // z rows [96:192]
+            let x0_base = 0u32; // z rows [0:96]
+            let x1_base = 96 * t; // z rows [96:192]
             // pre(x0) [192, T]
             let hbuf = eng.tensor_uninit((h * t) as usize);
-            self.conv1x1(&mut g, &z, x0_base, &format!("{fp}.pre"), &hbuf, inter / 2, h, t, 1.0);
+            self.conv1x1(
+                &mut g,
+                &z,
+                x0_base,
+                &format!("{fp}.pre"),
+                &hbuf,
+                inter / 2,
+                h,
+                t,
+                1.0,
+            );
             let hbuf_keep = hbuf.clone_handle();
             // cond(g) [3*2h, T]
             let cond = eng.tensor_uninit((h * 6) as usize * t as usize);
-            self.conv1x1(&mut g, &gt, 0, &format!("{fp}.enc.cond_layer"), &cond, cfg.gin_channels, h * 6, t, 1.0);
+            self.conv1x1(
+                &mut g,
+                &gt,
+                0,
+                &format!("{fp}.enc.cond_layer"),
+                &cond,
+                cfg.gin_channels,
+                h * 6,
+                t,
+                1.0,
+            );
             let mut skip: Option<GpuTensor> = None;
             let mut hh = hbuf;
             for l in 0..3u32 {
                 let lin = eng.tensor_uninit((h * 2 * t) as usize);
-                self.conv_k(&mut g, &hh, 0, &format!("{fp}.enc.in_layers.{l}"), &lin, h, h * 2, 5, 1, t);
+                self.conv_k(
+                    &mut g,
+                    &hh,
+                    0,
+                    &format!("{fp}.enc.in_layers.{l}"),
+                    &lin,
+                    h,
+                    h * 2,
+                    5,
+                    1,
+                    t,
+                );
                 // acts = gating(lin + cond[l*2h : l*2h+2h])
                 let gated = eng.tensor_uninit((h * t) as usize);
                 let with_cond = eng.tensor_uninit((h * 2 * t) as usize);
@@ -714,13 +966,28 @@ impl Synth {
                     }
                 }
                 g.matmul_ex(
-                    self.g(&format!("{fp}.enc.res_skip_layers.{l}.weight")), &with_cond,
-                    Some(self.g(&format!("{fp}.enc.res_skip_layers.{l}.bias"))), &rs,
-                    rs_out_ch, t, h, 1,
-                    h, 1, 0, 0,
-                    1, t, 0, 0,
-                    t, 1, 0, 0,
-                    1.0, 1,
+                    self.g(&format!("{fp}.enc.res_skip_layers.{l}.weight")),
+                    &with_cond,
+                    Some(self.g(&format!("{fp}.enc.res_skip_layers.{l}.bias"))),
+                    &rs,
+                    rs_out_ch,
+                    t,
+                    h,
+                    1,
+                    h,
+                    1,
+                    0,
+                    0,
+                    1,
+                    t,
+                    0,
+                    0,
+                    t,
+                    1,
+                    0,
+                    0,
+                    1.0,
+                    1,
                 );
                 let _ = gated;
                 if i == 3 && l == 0 {
@@ -737,15 +1004,22 @@ impl Synth {
                     let skipn = eng.tensor_uninit((h * t) as usize);
                     match &skip {
                         None => {
-                            let zeros = eng.tensor_from_f32(&vec![0.0f32; (h * t) as usize], vec![]);
+                            let zeros =
+                                eng.tensor_from_f32(&vec![0.0f32; (h * t) as usize], vec![]);
                             g.add_off(&rs, &zeros, &skipn, h * t, h * t, 0, false);
                         }
                         Some(sk) => g.add_off(sk, &rs, &skipn, h * t, 0, h * t, false),
                     }
                     if i == 3 {
                         if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
-                            kk.push((Box::leak(format!("wn6_h{l}").into_boxed_str()), hn.clone_handle()));
-                            kk.push((Box::leak(format!("wn6_skip{l}").into_boxed_str()), skipn.clone_handle()));
+                            kk.push((
+                                Box::leak(format!("wn6_h{l}").into_boxed_str()),
+                                hn.clone_handle(),
+                            ));
+                            kk.push((
+                                Box::leak(format!("wn6_skip{l}").into_boxed_str()),
+                                skipn.clone_handle(),
+                            ));
                         }
                     }
                     hh = hn;
@@ -758,7 +1032,10 @@ impl Synth {
                             g.add_off(sk, &rs, &skipn, h * t, 0, 0, false);
                             if i == 3 {
                                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
-                                    kk.push((Box::leak(format!("wn6_skip{l}").into_boxed_str()), skipn.clone_handle()));
+                                    kk.push((
+                                        Box::leak(format!("wn6_skip{l}").into_boxed_str()),
+                                        skipn.clone_handle(),
+                                    ));
                                 }
                             }
                             skip = Some(skipn);
@@ -770,7 +1047,17 @@ impl Synth {
             }
             let m = eng.tensor_uninit((inter / 2 * t) as usize);
             let skip_t = skip.unwrap();
-            self.conv1x1(&mut g, &skip_t, 0, &format!("{fp}.post"), &m, h, inter / 2, t, 1.0);
+            self.conv1x1(
+                &mut g,
+                &skip_t,
+                0,
+                &format!("{fp}.post"),
+                &m,
+                h,
+                inter / 2,
+                t,
+                1.0,
+            );
             if i == 3 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
                     kk.push(("flow6_wn", skip_t.clone_handle()));
@@ -778,15 +1065,21 @@ impl Synth {
                 }
             }
             if let Some(k) = self.debug_keep.borrow_mut().as_mut() {
-                k.push((Box::leak(format!("flow{}_pre", i * 2).into_boxed_str()), hbuf_keep.clone_handle()));
+                k.push((
+                    Box::leak(format!("flow{}_pre", i * 2).into_boxed_str()),
+                    hbuf_keep.clone_handle(),
+                ));
             }
             // zn = [x0 (copy), x1 - m]
             let zn = eng.tensor_uninit((inter * t) as usize);
             let zeros = eng.tensor_from_f32(&vec![0.0f32; (inter / 2 * t) as usize], vec![]);
-            g.add_off3(&z, &zeros, &zn, inter / 2 * t, 0, 0, 0, false);          // zn[0:96t] = x0 + 0
+            g.add_off3(&z, &zeros, &zn, inter / 2 * t, 0, 0, 0, false); // zn[0:96t] = x0 + 0
             g.add_off3(&z, &m, &zn, inter / 2 * t, x1_base, 0, x1_base, true); // zn[96t:] = x1-m
             if let Some(k) = self.debug_keep.borrow_mut().as_mut() {
-                k.push((Box::leak(format!("flow{}_out", i * 2).into_boxed_str()), zn.clone_handle()));
+                k.push((
+                    Box::leak(format!("flow{}_out", i * 2).into_boxed_str()),
+                    zn.clone_handle(),
+                ));
             }
             z = zn;
         }
@@ -886,7 +1179,17 @@ impl Synth {
         let mut dx = eng.tensor_uninit((chs[0] * t) as usize);
         self.conv_k(&mut g, z, 0, "dec.conv_pre", &dx, inter, chs[0], 7, 1, t);
         let gcond = eng.tensor_uninit((chs[0] * t) as usize);
-        self.conv1x1(&mut g, &gt, 0, "dec.cond", &gcond, cfg.gin_channels, chs[0], t, 1.0);
+        self.conv1x1(
+            &mut g,
+            &gt,
+            0,
+            "dec.cond",
+            &gcond,
+            cfg.gin_channels,
+            chs[0],
+            t,
+            1.0,
+        );
         if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
             kk.push(("dec_conv_pre", dx.clone_handle()));
         }
@@ -917,22 +1220,54 @@ impl Synth {
             g.lrelu(&dx, cin * len);
             let up = eng.tensor_uninit((cout * len * u) as usize);
             g.conv_transpose1d(
-                &dx, self.g(&format!("dec.ups.{i}.weight")),
-                Some(self.g(&format!("dec.ups.{i}.bias"))), &up,
-                cout, cin, kk, u, (kk - u) / 2, len, len * u,
+                &dx,
+                self.g(&format!("dec.ups.{i}.weight")),
+                Some(self.g(&format!("dec.ups.{i}.bias"))),
+                &up,
+                cout,
+                cin,
+                kk,
+                u,
+                (kk - u) / 2,
+                len,
+                len * u,
             );
             // noise_conv on har
             let ns = eng.tensor_uninit((cout * len * u) as usize);
             let stride_f0: u32 = ups[i + 1..].iter().product::<u32>().max(1);
             let nk = if stride_f0 > 1 { stride_f0 * 2 } else { 1 };
             if nk == 1 {
-                g.conv1d(&har_t, self.g(&format!("dec.noise_convs.{i}.weight")),
-                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))), &ns,
-                    cout, 1, 1, 1, 1, 0, har_t.len as u32, len * u, 1);
+                g.conv1d(
+                    &har_t,
+                    self.g(&format!("dec.noise_convs.{i}.weight")),
+                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
+                    &ns,
+                    cout,
+                    1,
+                    1,
+                    1,
+                    1,
+                    0,
+                    har_t.len as u32,
+                    len * u,
+                    1,
+                );
             } else {
-                g.conv1d(&har_t, self.g(&format!("dec.noise_convs.{i}.weight")),
-                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))), &ns,
-                    cout, 1, nk, stride_f0, 1, stride_f0 / 2, har_t.len as u32, len * u, 1);
+                g.conv1d(
+                    &har_t,
+                    self.g(&format!("dec.noise_convs.{i}.weight")),
+                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
+                    &ns,
+                    cout,
+                    1,
+                    nk,
+                    stride_f0,
+                    1,
+                    stride_f0 / 2,
+                    har_t.len as u32,
+                    len * u,
+                    1,
+                );
             }
             let summed = eng.tensor_uninit((cout * len * u) as usize);
             g.add(&up, &ns, &summed, cout * len * u);
@@ -957,10 +1292,31 @@ impl Synth {
 
                     // conv1 の lrelu は GEMM のストアに融合する。別カーネルだと p99 が 20ms を超える。
                     let c1 = eng.tensor_uninit((cout * len * u) as usize);
-                    self.conv_k_post(&mut g, &lr, 0, &format!("{rb}1.{m}"), &c1, cout, cout, k_j, dil, len * u, 1);
+                    self.conv_k_post(
+                        &mut g,
+                        &lr,
+                        0,
+                        &format!("{rb}1.{m}"),
+                        &c1,
+                        cout,
+                        cout,
+                        k_j,
+                        dil,
+                        len * u,
+                        1,
+                    );
                     let c2 = eng.tensor_uninit((cout * len * u) as usize);
                     self.conv_k_res(
-                        &mut g, &c1, &bx, &format!("{rb}2.{m}"), &c2, cout, cout, k_j, 1, len * u,
+                        &mut g,
+                        &c1,
+                        &bx,
+                        &format!("{rb}2.{m}"),
+                        &c2,
+                        cout,
+                        cout,
+                        k_j,
+                        1,
+                        len * u,
                     );
                     bx = c2;
                 }
@@ -979,14 +1335,33 @@ impl Synth {
                 });
             }
             let avg = eng.tensor_uninit((cout * len * u) as usize);
-            g.pointwise(&acc.unwrap(), Some(&avg), cout * len * u, 4, 1.0 / 3.0, 0, 0, 0);
+            g.pointwise(
+                &acc.unwrap(),
+                Some(&avg),
+                cout * len * u,
+                4,
+                1.0 / 3.0,
+                0,
+                0,
+                0,
+            );
             dx = avg;
             len *= u;
         }
         // 最終: lrelu → conv_post (bias 無し) → tanh
         g.lrelu(&dx, chs[ups.len()] * len);
         let audio = eng.tensor_uninit(len as usize);
-        self.conv_k_nobias(g, &dx, "dec.conv_post.weight", &audio, chs[ups.len()], 1, 7, 1, len);
+        self.conv_k_nobias(
+            g,
+            &dx,
+            "dec.conv_post.weight",
+            &audio,
+            chs[ups.len()],
+            1,
+            7,
+            1,
+            len,
+        );
         g.tanh_inplace(&audio, len);
 
         audio
@@ -1007,19 +1382,45 @@ impl Synth {
     ) {
         if (cin * k * t) as usize * 4 > 96_000_000 {
             g.conv1d(
-                x, self.g(wname), None, out,
-                cout, cin, k, 1, dil, (k - 1) * dil / 2, t, t, 1,
+                x,
+                self.g(wname),
+                None,
+                out,
+                cout,
+                cin,
+                k,
+                1,
+                dil,
+                (k - 1) * dil / 2,
+                t,
+                t,
+                1,
             );
             return;
         }
         let ic = g.engine_tensor_uninit((cin * k * t) as usize);
         g.im2col_off(x, 0, &ic, cin, k, 1, dil, (k - 1) * dil / 2, t, t);
         g.matmul(
-            self.g(wname), &ic, None, out,
-            cout, t, cin * k, 1,
-            cin * k, 1, 0, 0,
-            1, t, 0, 0,
-            t, 1, 0, 0,
+            self.g(wname),
+            &ic,
+            None,
+            out,
+            cout,
+            t,
+            cin * k,
+            1,
+            cin * k,
+            1,
+            0,
+            0,
+            1,
+            t,
+            0,
+            0,
+            t,
+            1,
+            0,
+            0,
             1.0,
         );
     }
@@ -1061,7 +1462,8 @@ impl Synth {
             let har = self.sinegen_range(pitchf, w_start, n as usize);
             let har_t = eng.tensor_from_f32(&har, vec![]);
             let mut g = eng.graph();
-            let audio = self.decode_graph_off(eng, &mut g, &z_full_t, &har_t, t as u32, w_start as u32, n);
+            let audio =
+                self.decode_graph_off(eng, &mut g, &z_full_t, &har_t, t as u32, w_start as u32, n);
             g.submit().expect("submit");
             let samples = eng.readback_f32(&audio);
             let s_off = start - w_start;

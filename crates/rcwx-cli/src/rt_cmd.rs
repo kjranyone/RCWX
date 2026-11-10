@@ -1,8 +1,8 @@
 //! `rcwx-cli rt` — リアルタイムエンジンのCLIフロント。
 
-use anyhow::{bail, Context, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use anyhow::{Context, Result, bail};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub fn cmd_rt(args: &[String]) -> Result<()> {
     let mut input: Option<String> = None;
@@ -24,13 +24,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--virtual" => {
-                input = Some(
-                    it.next()
-                        .context("--virtual <input.wav>")?
-                        .clone(),
-                )
-            }
+            "--virtual" => input = Some(it.next().context("--virtual <input.wav>")?.clone()),
             "-o" | "--output" => output = it.next().context("-o")?.clone(),
             "--chunk" => chunk = it.next().context("--chunk")?.parse()?,
             "--pitch" => pitch = it.next().context("--pitch")?.parse()?,

@@ -4,8 +4,8 @@ use rcwx_dsp::feedback::max_normalized_lag_correlation;
 use rcwx_dsp::moe::apply_moe_f0_style;
 use rcwx_dsp::noise_gate::{NoiseGate, Sensitivity};
 use rcwx_dsp::postprocess::{PostprocessConfig, Postprocessor};
-use rcwx_dsp::resample::{resample_linear, resample_poly, StatefulResampler};
-use rcwx_dsp::sola::{sola_crossfade, sola_flush, SolaState};
+use rcwx_dsp::resample::{StatefulResampler, resample_linear, resample_poly};
+use rcwx_dsp::sola::{SolaState, sola_crossfade, sola_flush};
 use rcwx_dsp::spectral::StreamingSpectralGate;
 
 fn golden_path() -> String {
@@ -16,15 +16,21 @@ fn golden_path() -> String {
 }
 
 fn read_npz_f32(path: &str, name: &str) -> Vec<f32> {
-    read_npz_raw(path, name, 4, |c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    read_npz_raw(path, name, 4, |c| {
+        f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+    })
 }
 
 fn read_npz_i64(path: &str, name: &str) -> Vec<i64> {
-    read_npz_raw(path, name, 8, |c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+    read_npz_raw(path, name, 8, |c| {
+        i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+    })
 }
 
 fn read_npz_f64(path: &str, name: &str) -> Vec<f64> {
-    read_npz_raw(path, name, 8, |c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+    read_npz_raw(path, name, 8, |c| {
+        f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])
+    })
 }
 
 fn read_npz_raw<T: Copy>(path: &str, name: &str, width: usize, cv: impl Fn(&[u8]) -> T) -> Vec<T> {
@@ -68,7 +74,11 @@ fn resample_poly_matches_scipy() {
     let lin_ref = read_npz_f32(&gp, "rs_batch_48_16_lin");
     let lin = resample_linear(&in48, 48000, 16000);
     assert_eq!(lin.len(), lin_ref.len());
-    assert!(maxdiff(&lin, &lin_ref) < 1e-5, "linear diff {}", maxdiff(&lin, &lin_ref));
+    assert!(
+        maxdiff(&lin, &lin_ref) < 1e-5,
+        "linear diff {}",
+        maxdiff(&lin, &lin_ref)
+    );
 
     // ストリーミング (overlap-save)
     let mut sr = StatefulResampler::new(48000, 16000);
@@ -78,7 +88,10 @@ fn resample_poly_matches_scipy() {
     }
     let ref_stream = read_npz_f32(&gp, "rs_stream_48_16");
     assert_eq!(stream.len(), ref_stream.len());
-    println!("48→16 stream maxdiff: {:.3e}", maxdiff(&stream, &ref_stream));
+    println!(
+        "48→16 stream maxdiff: {:.3e}",
+        maxdiff(&stream, &ref_stream)
+    );
     assert!(maxdiff(&stream, &ref_stream) < 1e-5);
 
     let mut sr = StatefulResampler::new(16000, 48000);
@@ -88,7 +101,10 @@ fn resample_poly_matches_scipy() {
     }
     let ref_stream = read_npz_f32(&gp, "rs_stream_16_48");
     assert_eq!(stream.len(), ref_stream.len());
-    println!("16→48 stream maxdiff: {:.3e}", maxdiff(&stream, &ref_stream));
+    println!(
+        "16→48 stream maxdiff: {:.3e}",
+        maxdiff(&stream, &ref_stream)
+    );
     assert!(maxdiff(&stream, &ref_stream) < 1e-5);
 }
 
@@ -227,9 +243,7 @@ fn feedback_corr_matches_python() {
     println!("fb fft corr: {fft1:.9} vs {mine1:.9} | {fft2:.9} vs {mine2:.9}");
     assert!((fft1 - mine1).abs() < 1e-6, "fft corr1 mismatch");
     assert!((fft2 - mine2).abs() < 1e-6, "fft corr2 mismatch");
-    println!(
-        "fb corr: {mine1:.12} vs {ref1:.12} | {mine2:.12} vs {ref2:.12}"
-    );
+    println!("fb corr: {mine1:.12} vs {ref1:.12} | {mine2:.12} vs {ref2:.12}");
     assert!((mine1 - ref1).abs() < 1e-7);
     assert!((mine2 - ref2).abs() < 1e-7);
 }

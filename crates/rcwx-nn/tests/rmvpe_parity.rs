@@ -2,7 +2,7 @@
 //! 事前に: uv run python tools/convert_rmvpe.py (folded 版は別スクリプトで生成済み)
 
 use rcwx_nn::engine::{Backend, Engine};
-use rcwx_nn::rmvpe::{default_rmvpe_dir, Rmvpe};
+use rcwx_nn::rmvpe::{Rmvpe, default_rmvpe_dir};
 
 fn home_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("USERPROFILE").expect("USERPROFILE"))

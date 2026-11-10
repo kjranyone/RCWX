@@ -262,7 +262,9 @@ impl RtStats {
         }
         let mut v = self.inference_ms.clone();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((p / 100.0 * v.len() as f64).ceil() as usize).saturating_sub(1).min(v.len() - 1);
+        let idx = ((p / 100.0 * v.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(v.len() - 1);
         v[idx]
     }
 }

@@ -1,6 +1,6 @@
 //! drift_control の手計算値検証 (tests/integration/test_realtime_drift_control.py 相当)。
 
-use rcwx_dsp::drift::{compute_shed_policy, FloorTracker};
+use rcwx_dsp::drift::{FloorTracker, compute_shed_policy};
 
 #[test]
 fn normal_mode_policy() {

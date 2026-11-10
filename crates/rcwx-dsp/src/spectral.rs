@@ -101,7 +101,8 @@ impl StreamingSpectralGate {
         let ms = self.mag_smooth.as_deref().unwrap();
         match &mut self.noise_profile {
             None => {
-                self.noise_profile = Some(ms.iter().map(|v| v.max(self.noise_floor_seed)).collect());
+                self.noise_profile =
+                    Some(ms.iter().map(|v| v.max(self.noise_floor_seed)).collect());
             }
             Some(np) => {
                 for i in 0..N_BINS {
@@ -147,7 +148,10 @@ impl StreamingSpectralGate {
             spec[i].re = (frame[i] * self.window[i]) as f64;
         }
         fft.process(&mut spec);
-        let magnitude: Vec<f64> = spec[..N_BINS].iter().map(|c| (c.re * c.re + c.im * c.im).sqrt()).collect();
+        let magnitude: Vec<f64> = spec[..N_BINS]
+            .iter()
+            .map(|c| (c.re * c.re + c.im * c.im).sqrt())
+            .collect();
         if learn {
             self.update_profile(&magnitude);
         }
@@ -255,11 +259,7 @@ impl StreamingSpectralGate {
             self.prev_gain = gain_snapshot;
             let lo = spec_lo - self.pos;
             for j in 0..spec_len {
-                let coverage = spec_win
-                    .get(lo + j)
-                    .copied()
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0) as f64;
+                let coverage = spec_win.get(lo + j).copied().unwrap_or(0.0).clamp(0.0, 1.0) as f64;
                 let wet = spec_ola.get(lo + j).copied().unwrap_or(0.0) as f64;
                 let dry = self.buf.get(lo + j).copied().unwrap_or(0.0) as f64;
                 spec[j] = (wet * coverage + dry * (1.0 - coverage)) as f32;

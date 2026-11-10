@@ -132,9 +132,19 @@ mod tests {
     fn strict_keeps_silence_and_passes_voiced() {
         // 16 kHz の 5ms 平滑は 80 サンプル。無声側と有声側の中央が残る長さにする。
         let mut audio = vec![1.0; 1600];
-        apply_voice_gate(&mut audio, &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0], "strict", 0.2, 16_000);
+        apply_voice_gate(
+            &mut audio,
+            &[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            "strict",
+            0.2,
+            16_000,
+        );
         assert!(audio[..400].iter().all(|v| *v < 0.05), "{:?}", &audio[..8]);
-        assert!(audio[1000..1400].iter().all(|v| *v > 0.9), "{:?}", &audio[1000..1008]);
+        assert!(
+            audio[1000..1400].iter().all(|v| *v > 0.9),
+            "{:?}",
+            &audio[1000..1008]
+        );
     }
 
     #[test]
@@ -159,6 +169,10 @@ mod tests {
         let mut audio = vec![1.0; 2000];
         apply_voice_gate(&mut audio, &[1.0, 1.0, 1.0, 1.0], "strict", 0.2, 48_000);
         assert_eq!(audio.len(), 2000);
-        assert!(audio[400..1600].iter().all(|v| *v > 0.95), "{}", audio[1000]);
+        assert!(
+            audio[400..1600].iter().all(|v| *v > 0.95),
+            "{}",
+            audio[1000]
+        );
     }
 }

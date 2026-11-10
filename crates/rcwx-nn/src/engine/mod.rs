@@ -238,8 +238,7 @@ impl Engine {
         }
         // map は走行中 submit の完了を内部で待つ仕様。未ドレンなら従来の
         // write_buffer へ (rt は毎バッチ完全ドレンなので常にリングを使う)。
-        if self.submit_epoch.load(Ordering::Acquire) > self.drained_epoch.load(Ordering::Acquire)
-        {
+        if self.submit_epoch.load(Ordering::Acquire) > self.drained_epoch.load(Ordering::Acquire) {
             return false;
         }
         let bytes = bytemuck::cast_slice(data);
@@ -271,10 +270,9 @@ impl Engine {
     /// 正規 map_async → 書き込み → unmap。ドレン済みなので即時完了する。
     fn map_write_bytes(&self, buf: &wgpu::Buffer, off: u64, bytes: &[u8]) -> bool {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
-        buf.slice(..)
-            .map_async(wgpu::MapMode::Write, move |_| {
-                let _ = tx.send(());
-            });
+        buf.slice(..).map_async(wgpu::MapMode::Write, move |_| {
+            let _ = tx.send(());
+        });
         let started = std::time::Instant::now();
         loop {
             let _ = self.device.poll(wgpu::PollType::Wait {
@@ -365,10 +363,7 @@ impl Engine {
             (want, got) => bail!("backend mismatch: requested {want:?}, got {got:?}"),
         }
         // SHADER_F16 が使えるなら要求 (fp16 compute カーネル用)
-        let mut features = if adapter
-            .features()
-            .contains(wgpu::Features::SHADER_F16)
-        {
+        let mut features = if adapter.features().contains(wgpu::Features::SHADER_F16) {
             wgpu::Features::SHADER_F16
         } else {
             wgpu::Features::empty()
@@ -394,7 +389,9 @@ impl Engine {
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
             size: UNIFORM_SLOT_SIZE * UNIFORM_SLOTS as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let mut e = Self {
@@ -479,7 +476,8 @@ unsafe fn install_dx12_queue_hook() {
         riid: *const u8,
         out: *mut *mut core::ffi::c_void,
     ) -> i32 {
-        let orig: CreateQueueFn = unsafe { std::mem::transmute(ORIG_CREATE_QUEUE.load(Ordering::Acquire)) };
+        let orig: CreateQueueFn =
+            unsafe { std::mem::transmute(ORIG_CREATE_QUEUE.load(Ordering::Acquire)) };
         if desc.is_null() {
             return unsafe { orig(this, desc, riid, out) };
         }
@@ -534,7 +532,8 @@ unsafe fn install_dx12_queue_hook() {
         module: *mut core::ffi::c_void,
         name: *const u8,
     ) -> *mut core::ffi::c_void {
-        let orig: GetProcAddressFn = unsafe { std::mem::transmute(ORIG_GPA.load(Ordering::Acquire)) };
+        let orig: GetProcAddressFn =
+            unsafe { std::mem::transmute(ORIG_GPA.load(Ordering::Acquire)) };
         let result = unsafe { orig(module, name) };
         if result.is_null() || name.is_null() || (name as usize) <= 0xFFFF {
             return result;
@@ -583,7 +582,8 @@ unsafe fn install_dx12_queue_hook() {
             let int_rva = if original != 0 { original } else { first_thunk };
             let mut index = 0usize;
             loop {
-                let thunk = (base_b.add(int_rva as usize + index * 8) as *const u64).read_unaligned();
+                let thunk =
+                    (base_b.add(int_rva as usize + index * 8) as *const u64).read_unaligned();
                 if thunk == 0 {
                     break;
                 }
@@ -769,10 +769,12 @@ unsafe fn pin_mmcss_thread() {
 
 impl Engine {
     fn compile(&mut self, name: &'static str, src: &str, n_storage: u32) -> Result<()> {
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(name),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
-        });
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(src)),
+            });
         let mut entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -795,10 +797,12 @@ impl Engine {
                 count: None,
             });
         }
-        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(name),
-            entries: &entries,
-        });
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(name),
+                entries: &entries,
+            });
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -893,7 +897,10 @@ impl Engine {
     }
 
     fn take_staging(&self, size: wgpu::BufferAddress) -> wgpu::Buffer {
-        let mut pool = self.staging_pool.lock().unwrap_or_else(|err| err.into_inner());
+        let mut pool = self
+            .staging_pool
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if let Some(i) = pool.iter().position(|(cached, _)| *cached == size) {
             return pool.swap_remove(i).1;
         }
@@ -1120,10 +1127,12 @@ impl Engine {
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        let tiny = plans
-            .first()
-            .and_then(|p| p.cmds.first())
-            .map(|cmd| (self.kernels.get(cmd.kernel).unwrap().pipeline.clone(), cmd.bind_group.clone()));
+        let tiny = plans.first().and_then(|p| p.cmds.first()).map(|cmd| {
+            (
+                self.kernels.get(cmd.kernel).unwrap().pipeline.clone(),
+                cmd.bind_group.clone(),
+            )
+        });
         if let (Some(qs), Some((pipe, bg))) = (&qs, &tiny) {
             // pass A: 微小 dispatch (1 workgroup)。後段の全 dispatch が上書きする。
             let mut apass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1256,11 +1265,18 @@ impl Engine {
         let (idx, epoch) = self.submit_flushed2(enc.finish());
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None }).unwrap();
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(idx),
+                timeout: None,
+            })
+            .unwrap();
         self.mark_drained(epoch);
         let data = slice.get_mapped_range().unwrap().to_vec();
         staging.unmap();
-        data.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        data.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 
     /// 1 forward 分の記録。uniform は submit 時に一括書き込み。
@@ -1311,7 +1327,10 @@ pub struct Plan {
 
 impl<'a> Graph<'a> {
     fn alloc_slot(&mut self, words: [u32; 32]) -> u32 {
-        let slot = self.engine.next_uniform.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let slot = self
+            .engine
+            .next_uniform
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         assert!(slot < UNIFORM_SLOTS, "uniform slot overflow");
         self.uniform_writes.push((slot, words));
         slot
@@ -1397,11 +1416,28 @@ impl<'a> Graph<'a> {
         scale: f32,
     ) {
         self.matmul_ex(
-            a, w, bias, c, m, n, k, batch,
-            a_row_stride, a_k_stride, a_base, a_batch_stride,
-            w_row_stride, w_k_stride, w_base, w_batch_stride,
-            c_row_stride, c_n_stride, c_base, c_batch_stride,
-            scale, 0,
+            a,
+            w,
+            bias,
+            c,
+            m,
+            n,
+            k,
+            batch,
+            a_row_stride,
+            a_k_stride,
+            a_base,
+            a_batch_stride,
+            w_row_stride,
+            w_k_stride,
+            w_base,
+            w_batch_stride,
+            c_row_stride,
+            c_n_stride,
+            c_base,
+            c_batch_stride,
+            scale,
+            0,
         );
     }
 
@@ -1491,7 +1527,15 @@ impl<'a> Graph<'a> {
     }
 
     /// per-channel GroupNorm (groups == channels) over T。in-place。
-    pub fn group_norm(&mut self, x: &GpuTensor, gamma: &GpuTensor, beta: &GpuTensor, c: u32, t: u32, eps: f32) {
+    pub fn group_norm(
+        &mut self,
+        x: &GpuTensor,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        c: u32,
+        t: u32,
+        eps: f32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[c, t, eps.to_bits(), 0]);
         self.dispatch("groupnorm", &[x, gamma, beta, x], words, c, 1, 1);
@@ -1521,7 +1565,17 @@ impl<'a> Graph<'a> {
     }
 
     /// pointwise: op 0=copy 1=lrelu 2=tanh 3=gelu_approx 4=mul_scalar 5=gating 6=flip_ch(out へ)
-    pub fn pointwise(&mut self, x: &GpuTensor, out: Option<&GpuTensor>, len: u32, op: u32, param: f32, t_len: u32, ch: u32, h: u32) {
+    pub fn pointwise(
+        &mut self,
+        x: &GpuTensor,
+        out: Option<&GpuTensor>,
+        len: u32,
+        op: u32,
+        param: f32,
+        t_len: u32,
+        ch: u32,
+        h: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[len, op, param.to_bits(), ch]);
         words[4] = t_len;
@@ -1552,7 +1606,15 @@ impl<'a> Graph<'a> {
     }
 
     /// チャネル major [ch, n_in] の [off, off+n_out) フレームを [ch, n_out] へ (GPU 直結)。
-    pub fn slice_ch(&mut self, src: &GpuTensor, dst: &GpuTensor, ch: u32, n_in: u32, off: u32, n_out: u32) {
+    pub fn slice_ch(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        ch: u32,
+        n_in: u32,
+        off: u32,
+        n_out: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[n_out, n_in, ch, off]);
         let total = ch * n_out;
@@ -1597,7 +1659,14 @@ impl<'a> Graph<'a> {
         let bias_ref = bias.unwrap_or(dummy);
         let extra_ref = extra.unwrap_or(dummy);
         let (wx, wy) = (n.div_ceil(32), m.div_ceil(32));
-        self.dispatch("matmul_tiled_x", &[a, w, bias_ref, c, extra_ref], words, wx, wy, 1);
+        self.dispatch(
+            "matmul_tiled_x",
+            &[a, w, bias_ref, c, extra_ref],
+            words,
+            wx,
+            wy,
+            1,
+        );
     }
 
     /// LN(x + y) を 1 dispatch で (残差 + LayerNorm 融合)。
@@ -1620,7 +1689,14 @@ impl<'a> Graph<'a> {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[rows, cols, in_row_stride, in_k_stride]);
         words[4..7].copy_from_slice(&[out_row_stride, eps.to_bits(), out_k_stride]);
-        self.dispatch("add_layernorm", &[x, y, gamma, beta, out], words, rows, 1, 1);
+        self.dispatch(
+            "add_layernorm",
+            &[x, y, gamma, beta, out],
+            words,
+            rows,
+            1,
+            1,
+        );
     }
 
     /// matmul + 残差加算 (im2col 済み B を想定)。B5 = residual [m, n]。
@@ -1653,7 +1729,14 @@ impl<'a> Graph<'a> {
         let dummy = a;
         let bias_ref = bias.unwrap_or(dummy);
         let (wx, wy) = (n.div_ceil(32), m.div_ceil(32));
-        self.dispatch("matmul_tiled_res", &[a, w, bias_ref, c, residual], words, wx, wy, 1);
+        self.dispatch(
+            "matmul_tiled_res",
+            &[a, w, bias_ref, c, residual],
+            words,
+            wx,
+            wy,
+            1,
+        );
     }
 
     /// implicit-GEMM conv1d (stride 1・tiled matmul 構造・im2col 省略)。
@@ -1679,17 +1762,33 @@ impl<'a> Graph<'a> {
         let mut w = [0u32; 32];
         w[0..4].copy_from_slice(&[m, n, k_dim, 1]);
         w[4..8].copy_from_slice(&[k_dim, 1, 0, 0]); // a_row=k_dim, a_k=1
-        w[12..16].copy_from_slice(&[n, 1, 0, 0]);   // c_row=n, c_n=1
+        w[12..16].copy_from_slice(&[n, 1, 0, 0]); // c_row=n, c_n=1
         w[16..20].copy_from_slice(&[has_bias as u32, 1.0f32.to_bits(), 1, conv_k]);
         w[20..24].copy_from_slice(&[pad, dil, in_len, post_op]);
         let dummy = a;
         let bias_ref = bias.unwrap_or(dummy);
         // f16 版は現状 DXC が packed 命令を出さず速度劣化 + 数値劣化のため無効
-        self.dispatch("matmul_conv", &[a, x, bias_ref, c], w, n.div_ceil(16), m.div_ceil(16), 1);
+        self.dispatch(
+            "matmul_conv",
+            &[a, x, bias_ref, c],
+            w,
+            n.div_ceil(16),
+            m.div_ceil(16),
+            1,
+        );
     }
 
     /// 汎用 im2col2d (kernel k・pad p)。出力 [c*k*k, h*w]。
-    pub fn im2col2d_k(&mut self, x: &GpuTensor, ic: &GpuTensor, c: u32, h: u32, w: u32, k: u32, pad: u32) {
+    pub fn im2col2d_k(
+        &mut self,
+        x: &GpuTensor,
+        ic: &GpuTensor,
+        c: u32,
+        h: u32,
+        w: u32,
+        k: u32,
+        pad: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[c, h, w, k]);
         words[4] = pad;
@@ -1712,31 +1811,83 @@ impl<'a> Graph<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn conv_transpose2d(&mut self, x: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>, out: &GpuTensor,
-        cin: u32, cout: u32, h_in: u32, w_in: u32, h_out: u32, w_out: u32,
-        sh: u32, sw: u32, oph: u32, opw: u32) {
+    pub fn conv_transpose2d(
+        &mut self,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        out: &GpuTensor,
+        cin: u32,
+        cout: u32,
+        h_in: u32,
+        w_in: u32,
+        h_out: u32,
+        w_out: u32,
+        sh: u32,
+        sw: u32,
+        oph: u32,
+        opw: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[cin, cout, h_out, w_out]);
         words[4..8].copy_from_slice(&[h_in, w_in, sh, sw]);
         words[8..10].copy_from_slice(&[oph, opw]);
         let dummy = x;
         let bias_ref = bias.unwrap_or(dummy);
-        self.dispatch("conv_transpose2d", &[x, w, out, bias_ref], words, w_out.div_ceil(8), h_out.div_ceil(8), cout);
+        self.dispatch(
+            "conv_transpose2d",
+            &[x, w, out, bias_ref],
+            words,
+            w_out.div_ceil(8),
+            h_out.div_ceil(8),
+            cout,
+        );
     }
 
-    pub fn concat_ch(&mut self, a: &GpuTensor, b: &GpuTensor, out: &GpuTensor, ca: u32, cb: u32, n: u32) {
+    pub fn concat_ch(
+        &mut self,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        out: &GpuTensor,
+        ca: u32,
+        cb: u32,
+        n: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[n, ca, cb, 0]);
-        self.dispatch("concat_ch", &[a, b, out], words, ((ca + cb) * n).div_ceil(256), 1, 1);
+        self.dispatch(
+            "concat_ch",
+            &[a, b, out],
+            words,
+            ((ca + cb) * n).div_ceil(256),
+            1,
+            1,
+        );
     }
 
     pub fn transpose_flatten(&mut self, x: &GpuTensor, out: &GpuTensor, c: u32, t: u32, m: u32) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[c, t, m, 0]);
-        self.dispatch("transpose_flatten", &[x, out], words, (c * t * m).div_ceil(256), 1, 1);
+        self.dispatch(
+            "transpose_flatten",
+            &[x, out],
+            words,
+            (c * t * m).div_ceil(256),
+            1,
+            1,
+        );
     }
 
-    pub fn pad2d(&mut self, src: &GpuTensor, dst: &GpuTensor, c: u32, h: u32, w: u32, h2: u32, w2: u32) {
+    pub fn pad2d(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        c: u32,
+        h: u32,
+        w: u32,
+        h2: u32,
+        w2: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[c, h, w, 0]);
         words[4..6].copy_from_slice(&[w2, h2]);
@@ -1784,22 +1935,62 @@ impl<'a> Graph<'a> {
         words[4..8].copy_from_slice(&[pad_l, in_len, out_len, has_bias as u32]);
         let dummy = x;
         let bias_ref = bias.unwrap_or(dummy);
-        self.dispatch("conv_transpose1d", &[x, w, bias_ref, out], words, out_len.div_ceil(8), out_c.div_ceil(8), 1);
+        self.dispatch(
+            "conv_transpose1d",
+            &[x, w, bias_ref, out],
+            words,
+            out_len.div_ceil(8),
+            out_c.div_ceil(8),
+            1,
+        );
     }
 
     /// 相対位置 attention 補助。mode0: scores += (q·relk)*scale。mode1: out += p·relv。
-    pub fn rel_attn_scores(&mut self, q: &GpuTensor, relk: &GpuTensor, scores: &GpuTensor, length: u32, d: u32, ws: u32, heads: u32, scale: f32) {
+    pub fn rel_attn_scores(
+        &mut self,
+        q: &GpuTensor,
+        relk: &GpuTensor,
+        scores: &GpuTensor,
+        length: u32,
+        d: u32,
+        ws: u32,
+        heads: u32,
+        scale: f32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[0, length, d, ws]);
         words[4..6].copy_from_slice(&[scale.to_bits(), heads]);
-        self.dispatch("rel_attn", &[q, relk, scores], words, length.div_ceil(8), length.div_ceil(8), heads);
+        self.dispatch(
+            "rel_attn",
+            &[q, relk, scores],
+            words,
+            length.div_ceil(8),
+            length.div_ceil(8),
+            heads,
+        );
     }
 
-    pub fn rel_attn_values(&mut self, p: &GpuTensor, relv: &GpuTensor, out: &GpuTensor, length: u32, d: u32, ws: u32, heads: u32) {
+    pub fn rel_attn_values(
+        &mut self,
+        p: &GpuTensor,
+        relv: &GpuTensor,
+        out: &GpuTensor,
+        length: u32,
+        d: u32,
+        ws: u32,
+        heads: u32,
+    ) {
         let mut words = [0u32; 32];
         words[0..4].copy_from_slice(&[1, length, d, ws]);
         words[5] = heads;
-        self.dispatch("rel_attn", &[p, relv, out], words, d.div_ceil(8), length.div_ceil(8), heads);
+        self.dispatch(
+            "rel_attn",
+            &[p, relv, out],
+            words,
+            d.div_ceil(8),
+            length.div_ceil(8),
+            heads,
+        );
     }
 
     /// im2col: IC[c*k+j, t] = X[c, t*stride - pad + j*dil]。戻り値バッファは呼び出し側が用意。
@@ -1815,7 +2006,9 @@ impl<'a> Graph<'a> {
         in_len: u32,
         out_len: u32,
     ) {
-        self.im2col_off(x, 0, ic, c_in, kernel, stride, dilation, pad_l, in_len, out_len);
+        self.im2col_off(
+            x, 0, ic, c_in, kernel, stride, dilation, pad_l, in_len, out_len,
+        );
     }
 
     pub fn im2col_off(
@@ -1917,16 +2110,17 @@ impl<'a> Graph<'a> {
         self.engine.replay(plan, input_copy);
     }
 
-
     /// uniform を一括書き込みし、**単一の compute pass** に全 dispatch を記録して submit。
     pub fn submit(mut self) -> Result<()> {
         let eng = self.engine;
         eng.write_uniforms(&self.uniform_writes);
         {
-            let mut cpass = self.encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+            let mut cpass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
             for cmd in &self.cmds {
                 let k = eng.kernels.get(cmd.kernel).unwrap();
                 cpass.set_pipeline(&k.pipeline);

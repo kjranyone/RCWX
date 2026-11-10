@@ -12,11 +12,11 @@ pub struct IvfIndex {
     pub dim: usize,
     pub cap: usize,
     pub ntotal: usize,
-    centroids: Vec<f32>,        // [nlist, dim]
-    centroid_norms: Vec<f32>,   // [nlist]
-    packed: Vec<f32>,           // [N, dim]
-    packed_norms: Vec<f32>,     // [N]
-    slots: Vec<i64>,            // [nlist, cap]
+    centroids: Vec<f32>,      // [nlist, dim]
+    centroid_norms: Vec<f32>, // [nlist]
+    packed: Vec<f32>,         // [N, dim]
+    packed_norms: Vec<f32>,   // [N]
+    slots: Vec<i64>,          // [nlist, cap]
 }
 
 pub fn default_ivf_dir() -> std::path::PathBuf {
@@ -51,11 +51,19 @@ impl IvfIndex {
             .collect();
 
         let centroid_norms: Vec<f32> = (0..nlist)
-            .map(|i| (0..dim).map(|j| centroids[i * dim + j] * centroids[i * dim + j]).sum())
+            .map(|i| {
+                (0..dim)
+                    .map(|j| centroids[i * dim + j] * centroids[i * dim + j])
+                    .sum()
+            })
             .collect();
         let n_packed = packed.len() / dim;
         let packed_norms: Vec<f32> = (0..n_packed)
-            .map(|i| (0..dim).map(|j| packed[i * dim + j] * packed[i * dim + j]).sum())
+            .map(|i| {
+                (0..dim)
+                    .map(|j| packed[i * dim + j] * packed[i * dim + j])
+                    .sum()
+            })
             .collect();
 
         Ok(Self {

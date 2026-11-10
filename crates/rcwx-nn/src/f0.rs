@@ -116,9 +116,7 @@ fn filtfilt(b: &[f64; 3], a: &[f64; 3], x: &[f64]) -> Vec<f64> {
     let rev_in: Vec<f64> = fwd.iter().rev().copied().collect();
     let rev = lfilter(b, a, &rev_in);
     // un-reverse and trim
-    (0..n)
-        .map(|i| rev[rev.len() - 1 - (i + padlen)])
-        .collect()
+    (0..n).map(|i| rev[rev.len() - 1 - (i + padlen)]).collect()
 }
 
 /// zero-phase lowpass を有声 log2 輪郭に適用 (有声 < 10 は素通し)。

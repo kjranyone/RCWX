@@ -45,11 +45,7 @@ fn fill_short_unvoiced_gaps(row: &mut [f64], max_gap_frames: usize) {
 fn median(v: &mut Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = v.len();
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        v[n / 2 - 1]
-    }
+    if n % 2 == 1 { v[n / 2] } else { v[n / 2 - 1] }
 }
 
 /// F0 (Hz, 無声=0) に moe スタイルを適用。入力を破壊的に更新して返す。
@@ -78,7 +74,12 @@ pub fn apply_moe_f0_style(f0: &mut [f32], strength: f64) {
     let mut row: Vec<f64> = f0.iter().map(|v| *v as f64).collect();
     fill_short_unvoiced_gaps(&mut row, max_gap_frames);
 
-    let voiced_idx: Vec<usize> = row.iter().enumerate().filter(|(_, v)| **v > 0.0).map(|(i, _)| i).collect();
+    let voiced_idx: Vec<usize> = row
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| **v > 0.0)
+        .map(|(i, _)| i)
+        .collect();
     let n_voiced = voiced_idx.len();
     if n_voiced < 6 {
         for (i, v) in row.iter().enumerate() {
@@ -96,7 +97,10 @@ pub fn apply_moe_f0_style(f0: &mut [f32], strength: f64) {
         return;
     }
 
-    let raw_voiced: Vec<f64> = voiced_idx.iter().map(|&i| row[i].clamp(1e-5, 1400.0)).collect();
+    let raw_voiced: Vec<f64> = voiced_idx
+        .iter()
+        .map(|&i| row[i].clamp(1e-5, 1400.0))
+        .collect();
     let log2_f0: Vec<f64> = raw_voiced.iter().map(|v| v.log2()).collect();
 
     // ローカルトレンド: replicate pad + avg_pool1d(window)
@@ -125,7 +129,11 @@ pub fn apply_moe_f0_style(f0: &mut [f32], strength: f64) {
 
     for (k, &i) in voiced_idx.iter().enumerate() {
         let mut dev_st = (log2_f0[k] - trend[k]) * 12.0;
-        dev_st = if dev_st >= 0.0 { dev_st * up_gain } else { dev_st * down_gain };
+        dev_st = if dev_st >= 0.0 {
+            dev_st * up_gain
+        } else {
+            dev_st * down_gain
+        };
         let sat = 1.0 + sat_coef * dev_st.abs();
         dev_st = (dev_st / sat).clamp(-max_dev_st, max_dev_st);
 
