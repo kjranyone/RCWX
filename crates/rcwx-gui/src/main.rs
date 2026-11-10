@@ -65,6 +65,9 @@ struct App {
     running: Arc<AtomicBool>,
     stats: Arc<Mutex<LiveStats>>,
     error: Option<String>,
+    // 裏スレッドのエラーと終了検知
+    thread_err: Arc<Mutex<Option<String>>>,
+    done_flag: Arc<AtomicBool>,
 }
 
 fn models_dir() -> std::path::PathBuf {
@@ -156,9 +159,20 @@ fn save_settings(s: &GuiSettings) {
 
 impl App {
     fn new() -> Self {
-        let settings = load_settings();
+        let mut settings = load_settings();
         let models = scan_models(&settings.model);
         let (inputs, outputs) = scan_devices();
+        // config.json の ASIO 名など実在しないデバイス名は既定に戻す
+        if !settings.input_device.is_empty()
+            && !inputs.iter().any(|d| d.contains(&settings.input_device))
+        {
+            settings.input_device = String::new();
+        }
+        if !settings.output_device.is_empty()
+            && !outputs.iter().any(|d| d.contains(&settings.output_device))
+        {
+            settings.output_device = String::new();
+        }
         Self {
             settings,
             models,
@@ -167,6 +181,8 @@ impl App {
             running: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(Mutex::new(LiveStats::default())),
             error: None,
+            thread_err: Arc::new(Mutex::new(None)),
+            done_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -214,22 +230,26 @@ impl App {
                     last,
                 };
             });
-        let handle_err = Arc::new(Mutex::new(None::<String>));
+        let handle_err = Arc::clone(&self.thread_err);
+        let done = Arc::clone(&self.done_flag);
+        *handle_err.lock().unwrap() = None;
+        done.store(false, Ordering::Release);
         let h2 = Arc::clone(&handle_err);
         std::thread::spawn(move || {
-            if let Err(e) = rcwx_rt::audio::run_realtime(
+            let result = rcwx_rt::audio::run_realtime(
                 rcwx_nn::engine::Backend::Dx12,
                 cfg,
                 in_dev.as_deref(),
                 out_dev.as_deref(),
                 stop,
                 Some(stats_cb),
-            ) {
+            );
+            if let Err(e) = result {
                 *h2.lock().unwrap() = Some(format!("{e:#}"));
             }
+            done.store(true, Ordering::Release);
         });
         self.error = None;
-        let _ = &handle_err;
     }
 
     fn stop(&mut self) {
@@ -277,7 +297,11 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let st = self.stats.lock().unwrap().clone();
                 if running {
-                    ui.colored_label(egui::Color32::GREEN, "● Running");
+                    if st.hops == 0 {
+                        ui.colored_label(egui::Color32::YELLOW, "● モデル読込中...");
+                    } else {
+                        ui.colored_label(egui::Color32::GREEN, "● Running");
+                    }
                 } else {
                     ui.label("○ Stopped");
                 }
@@ -288,6 +312,15 @@ impl eframe::App for App {
                 ));
             });
         });
+        // 裏スレッドの終了/エラー反映
+        if self.done_flag.load(Ordering::Acquire) {
+            if self.running.load(Ordering::Acquire) {
+                self.running.store(false, Ordering::Release);
+            }
+            if let Some(err) = self.thread_err.lock().unwrap().take() {
+                self.error = Some(err);
+            }
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(err) = &self.error {
                 ui.colored_label(egui::Color32::RED, format!("error: {err}"));

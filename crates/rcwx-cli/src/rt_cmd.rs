@@ -86,11 +86,21 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
 
     // 物理デバイス実行
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_kb = Arc::clone(&stop);
-    ctrlc_handler(move || {
-        stop_kb.store(true, Ordering::Release);
-    })?;
-    println!("realtime: Ctrl-C で終了");
+    // --seconds N: N 秒後に自動停止 (動作確認用)。既定は Enter/Ctrl-C まで。
+    if let Some(sec) = seconds {
+        let timer_stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(sec));
+            timer_stop.store(true, Ordering::Release);
+        });
+        println!("realtime: {sec} 秒で自動停止");
+    } else {
+        println!("realtime: Enter または Ctrl-C で終了");
+        let stop_kb = Arc::clone(&stop);
+        ctrlc_handler(move || {
+            stop_kb.store(true, Ordering::Release);
+        })?;
+    }
     rcwx_rt::audio::run_realtime(
         backend,
         cfg,

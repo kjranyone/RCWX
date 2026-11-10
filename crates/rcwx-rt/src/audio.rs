@@ -207,7 +207,10 @@ pub fn run_realtime(
     let out_shared = Arc::clone(&shared);
     let out_ch = out_cfg.channels() as usize;
     let select_out = cfg.output_channel;
-    let prebuffer_samples = hop_out * cfg.prebuffer_chunks as usize;
+    // バースト書き込み (batch hop 分を一度に) を考慮したバッファ政策:
+    // prebuffer/trim はバッチサイズ基準。安全マージン = バッチ 1 個分。
+    let batch_out = hop_out * cfg.batch_hops as usize;
+    let prebuffer_samples = (hop_out * cfg.prebuffer_chunks as usize).max(batch_out + hop_out);
     let margin = cfg.buffer_margin;
     let out_sr = cfg.output_sample_rate;
     let chunk_sec = cfg.chunk_sec;
@@ -237,14 +240,14 @@ pub fn run_realtime(
         let post = s.ring.len();
         {
             let mut tr = tracker.borrow_mut();
-            tr.ensure_window(n.max(1), hop_out as i64);
+            tr.ensure_window(n.max(1), batch_out as i64);
             tr.record_post_read(post as i64);
             if tr.is_full() {
                 let policy = compute_shed_policy(
                     false,
-                    hop_out as i64,
+                    batch_out as i64,
                     out_sr,
-                    chunk_sec,
+                    chunk_sec * cfg.batch_hops as f64,
                     margin,
                     1000,
                     5.0,
