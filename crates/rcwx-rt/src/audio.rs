@@ -106,6 +106,7 @@ pub fn run_realtime(
     input_name: Option<&str>,
     output_name: Option<&str>,
     stop_flag: Arc<AtomicBool>,
+    on_stats: Option<Box<dyn Fn(&RtConfig, u64, u64, u64, f64, f64, f64) + Send>>,
 ) -> Result<()> {
     let host = cpal::default_host();
     let in_device = pick_device(&host, input_name, true)?;
@@ -274,6 +275,17 @@ pub fn run_realtime(
             eng.stats.feedback_corr,
             eng.stats.last_inference_ms
         );
+        if let Some(cb) = on_stats.as_ref() {
+            cb(
+                &cfg,
+                shared.hops.load(Ordering::Relaxed),
+                shared.underruns.load(Ordering::Relaxed),
+                shared.queue_full.load(Ordering::Relaxed),
+                eng.stats.percentile(50.0),
+                eng.stats.percentile(99.0),
+                eng.stats.last_inference_ms,
+            );
+        }
     }
     drop(input_stream);
     drop(out_stream);
