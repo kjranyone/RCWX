@@ -481,17 +481,42 @@ pub fn sidecar_index(model: &str) -> bool {
 pub struct BundleInfo {
     pub dir: String,
     pub hubert: bool,
+    /// synth バンドル。.pth 直読みでも代替可能 (model_ready 参照)。
     pub synth: bool,
+    pub rmvpe: bool,
+    pub swiftf0: bool,
     pub ivf: bool,
+    /// モデル (.pth) が選択済みで直読み可能
+    pub model_ready: bool,
+}
+
+impl BundleInfo {
+    /// 推論開始に必要な重みが揃っているか (synth はバンドル or .pth 直読み)。
+    pub fn common_ready(&self) -> bool {
+        self.hubert && self.rmvpe && self.swiftf0
+    }
+    pub fn synth_ready(&self) -> bool {
+        self.synth || self.model_ready
+    }
+    pub fn ready(&self) -> bool {
+        self.common_ready() && self.synth_ready()
+    }
 }
 
 pub fn bundle_info() -> BundleInfo {
     let dir = rcwx_nn::rmvpe::default_rmvpe_dir();
+    let model = {
+        let s = load_settings();
+        !s.model.is_empty() && std::path::Path::new(&s.model).exists()
+    };
     BundleInfo {
         dir: dir.display().to_string(),
         hubert: dir.join("hubert.safetensors").is_file(),
-        synth: dir.join("synth.safetensors").is_file(),
+        synth: dir.join("synth.safetensors").is_file() && dir.join("synth.json").is_file(),
+        rmvpe: dir.join("rmvpe_folded.safetensors").is_file(),
+        swiftf0: dir.join("swiftf0.safetensors").is_file(),
         ivf: dir.join("ivf.safetensors").is_file() && dir.join("ivf.json").is_file(),
+        model_ready: model,
     }
 }
 
@@ -667,6 +692,11 @@ impl GuiSettings {
                 None
             },
             host_name: self.host.clone(),
+            model_path: if self.model.is_empty() {
+                None
+            } else {
+                Some(self.model.clone())
+            },
             buffer_margin: if self.aggressive { 0.1 } else { 0.25 },
             prebuffer_chunks: if self.aggressive { 2 } else { 1 },
             batch_hops: if chunk_sec < 0.05 { 4 } else { 1 },
@@ -774,11 +804,11 @@ pub fn convert_wav(input: &str, cfg: &RtConfig) -> Result<String, String> {
     let out = convert_output_path(input);
     let cli = cli_path();
     let mut cmd = std::process::Command::new(&cli);
-    cmd.arg("run")
-        .arg(input)
-        .arg("-o")
-        .arg(&out)
-        .arg("--pitch")
+    cmd.arg("run").arg(input).arg("-o").arg(&out);
+    if let Some(m) = &cfg.model_path {
+        cmd.arg("--model").arg(m);
+    }
+    cmd.arg("--pitch")
         .arg(cfg.pitch.to_string())
         .arg("--f0-method")
         .arg(&cfg.f0_method)

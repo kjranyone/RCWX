@@ -86,12 +86,11 @@ function Invoke-RustBuild {
 }
 
 function Get-MissingWeights {
+    # 共通重みのみ (Synth は RVC .pth から実行時に直接ロードするため不要)
     $need = @(
         'hubert.safetensors',
         'rmvpe_folded.safetensors',
-        'swiftf0.safetensors',
-        'synth.safetensors',
-        'synth.json'
+        'swiftf0.safetensors'
     )
     $missing = @()
     foreach ($w in $need) {
@@ -119,15 +118,16 @@ function Invoke-EnvCheck {
     }
     Write-Host "[OK] rcwx-cli: $CliExe" -ForegroundColor Green
 
-    Write-Host "-- モデルバンドル ($ModelsRust) --"
+    Write-Host "-- 共通重み ($ModelsRust) --"
     $mw = Get-MissingWeights
     if ($mw.Count -eq 0) {
-        Write-Host '[OK] モデルバンドル配置済み。' -ForegroundColor Green
+        Write-Host '[OK] 共通重み配置済み。' -ForegroundColor Green
     } else {
         Write-Host "[!] 不足: $($mw -join ', ')" -ForegroundColor Yellow
-        Write-Host '     モデルバンドルが未生成です。開発ランチャーで生成してください:'
-        Write-Host '       .\dev.ps1 golden'
-        Write-Host '     (生成は開発環境での一回限りの作業です)'
+        Write-Host '     次でダウンロードと変換をまとめて実行できます (Python 不要):'
+        Write-Host '       .\rcwx.ps1 download'
+        Write-Host '     GUI の場合はモデル設定タブの「初回セットアップ」でも同じです。'
+        Write-Host '     Synth は RVC モデル (.pth) から実行時に直接ロードされます (変換不要)。'
     }
     Write-Host '=======================================' -ForegroundColor Cyan
     return $true

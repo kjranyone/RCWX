@@ -38,6 +38,10 @@ fn parity(dir: &std::path::Path, label: &str, stage_debug: bool) {
     }
     let out = synth.infer(&eng, &feats_t, &pitch_idx, &pitchf, t);
     let got = eng.readback_f32(&out);
+    // RCWX_SYNTH_DUMP=<path> で Rust 出力 (f32 LE) を書き出す (品質診断用)
+    if let Ok(p) = std::env::var("RCWX_SYNTH_DUMP") {
+        std::fs::write(&p, bytemuck::cast_slice(&got)).expect("dump");
+    }
 
     // 段階検証 (あれば・既定ディレクトリのみ)
     if stage_debug {

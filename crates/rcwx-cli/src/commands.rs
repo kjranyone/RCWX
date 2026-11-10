@@ -105,32 +105,84 @@ pub fn cmd_devices() -> Result<()> {
 const HUBERT_URL: &str =
     "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/hubert_base.pt";
 const RMVPE_URL: &str = "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt";
-const GTCRN_URL: &str = "https://raw.githubusercontent.com/Xiaobin-Rong/gtcrn/main/stream/onnx_models/gtcrn_simple.onnx";
+/// swift-f0 は 0.1.2 の ONNX 図形式 (STFT ノード + onnx::Conv 初期化子) に
+/// 変換器が依存するためバージョンを固定する (0.3.x は STFT が分解された別形式)。
+const SWIFTF0_PYPI: &str = "https://pypi.org/pypi/swift-f0/0.1.2/json";
 
 fn models_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_default())
         .join(".cache/rcwx/models")
 }
 
+/// PyPI JSON API から swift-f0 の wheel URL を解決。
+fn swiftf0_wheel_url() -> Result<String> {
+    let resp = ureq::get(SWIFTF0_PYPI).call().context("pypi api")?;
+    let json: serde_json::Value =
+        serde_json::from_reader(resp.into_body().into_reader()).context("pypi json")?;
+    let url = json["urls"]
+        .as_array()
+        .and_then(|urls| {
+            urls.iter()
+                .filter(|u| u["packagetype"].as_str() == Some("bdist_wheel"))
+                .find_map(|u| u["url"].as_str().map(|s| s.to_string()))
+        })
+        .context("swift-f0 wheel url not found")?;
+    Ok(url)
+}
+
+/// SwiftF0: wheel をダウンロードして zip から model.onnx を抽出。
+fn fetch_swiftf0_onnx(cache_dir: &std::path::Path, force: bool) -> Result<std::path::PathBuf> {
+    let onnx = cache_dir.join("swiftf0/model.onnx");
+    if onnx.exists() && !force {
+        return Ok(onnx);
+    }
+    println!("  Downloading swift-f0 wheel...");
+    let url = swiftf0_wheel_url()?;
+    let wheel = cache_dir.join("swiftf0/swift_f0.whl");
+    if let Some(parent) = wheel.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    download_file(&url, &wheel)?;
+    println!("  Extracting model.onnx from wheel...");
+    let file = std::fs::File::open(&wheel)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut entry = zip
+        .by_name("swift_f0/model.onnx")
+        .context("model.onnx not found in swift-f0 wheel")?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut buf)?;
+    drop(entry);
+    std::fs::write(&onnx, &buf)?;
+    let _ = std::fs::remove_file(&wheel);
+    Ok(onnx)
+}
+
 pub fn cmd_download(args: &[String]) -> Result<()> {
     let force = args.iter().any(|a| a == "--force");
     let dir = models_dir();
+    let rust_dir = rcwx_nn::rust_models_dir();
     println!("Models directory: {}", dir.display());
     let targets = [
         ("hubert", dir.join("hubert/hubert_base.pt"), HUBERT_URL),
         ("rmvpe", dir.join("rmvpe/rmvpe.pt"), RMVPE_URL),
-        ("gtcrn", dir.join("gtcrn/gtcrn_simple.onnx"), GTCRN_URL),
     ];
     println!("\nCurrent status:");
     for (name, path, _) in &targets {
         let symbol = if path.exists() { "o" } else { "x" };
         println!("  [{symbol}] {name}");
     }
-    if targets.iter().all(|(_, p, _)| p.exists()) && !force {
-        println!("\nAll models already downloaded. Use --force to re-download.");
+    let rust_done = [
+        "hubert.safetensors",
+        "rmvpe_folded.safetensors",
+        "swiftf0.safetensors",
+    ]
+    .iter()
+    .all(|w| rust_dir.join(w).exists());
+    if rust_done && !force {
+        println!("\nAll weights already prepared. Use --force to re-download.");
         return Ok(());
     }
-    println!("\nDownloading models...");
+    println!("\nDownloading source models...");
     for (name, path, url) in &targets {
         if path.exists() && !force {
             println!("  {name} already exists.");
@@ -146,10 +198,24 @@ pub fn cmd_download(args: &[String]) -> Result<()> {
             path.metadata().map(|m| m.len()).unwrap_or(0)
         );
     }
-    println!("\nAll models downloaded successfully!");
-    println!(
-        "Note: Rust 推論用の重み変換 (tools/convert_*.py) は dev 環境で別途実行してください。"
-    );
+    let onnx = fetch_swiftf0_onnx(&dir, force)?;
+
+    // ---- Rust 推論用重みへの変換 (Python 不要・バイナリ内蔵) ----
+    println!("\nConverting weights for Rust inference...");
+    if force || !rust_dir.join("hubert.safetensors").exists() {
+        rcwx_nn::convert::convert_hubert(&dir.join("hubert/hubert_base.pt"), &rust_dir)
+            .context("convert hubert")?;
+    }
+    if force || !rust_dir.join("rmvpe_folded.safetensors").exists() {
+        rcwx_nn::convert::convert_rmvpe(&dir.join("rmvpe/rmvpe.pt"), &rust_dir)
+            .context("convert rmvpe")?;
+    }
+    if force || !rust_dir.join("swiftf0.safetensors").exists() {
+        rcwx_nn::convert::convert_swiftf0_onnx(&onnx, &rust_dir).context("convert swiftf0")?;
+    }
+
+    println!("\nAll weights ready in {}", rust_dir.display());
+    println!("Synth は RVC .pth から実行時に直接ロードされます (変換不要)。");
     Ok(())
 }
 

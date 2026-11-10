@@ -1,0 +1,11 @@
+[package]
+name = "rcwx-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+rcwx-nn = { path = "../rcwx-nn" }
+safetensors = "0.8.0"
+serde_json = "1.0.154"

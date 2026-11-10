@@ -2,9 +2,10 @@
 //! 見た目は theme.rs (トワイライト・オーロラのグラスモーフィズム) に一任。
 
 use crate::settings::{
-    BundleInfo, GuiSettings, LiveStats, ModelEntry, bundle_info, convert_wav, device_rate,
-    host_names, load_settings, models_root, pick_file, pick_folder, pick_save, recommended_gain_db,
-    resolve_device, save_settings, scan_devices, scan_models, sidecar_index,
+    BundleInfo, GuiSettings, LiveStats, ModelEntry, bundle_info, cli_path, convert_wav,
+    device_rate, hide_window, host_names, load_settings, models_root, pick_file, pick_folder,
+    pick_save, recommended_gain_db, resolve_device, save_settings, scan_devices, scan_models,
+    sidecar_index,
 };
 use crate::theme::{self, HeroKind, PillTab};
 use gpui_kit::assets::IconName;
@@ -802,6 +803,14 @@ impl RcwxApp {
         if self.session_live.load(Ordering::Acquire) {
             return;
         }
+        self.bundle = bundle_info();
+        if !self.bundle.ready() {
+            *self.thread_err.lock().expect("err") = Some(
+                "共通重みが未準備です。モデル設定タブの「初回セットアップ」(ダウンロード+変換) を実行してください。".into(),
+            );
+            cx.notify();
+            return;
+        }
         self.play_stop.store(true, Ordering::Release);
         self.sync_chunk_slider(window, cx);
         let typed = self.wav_in.read(cx).value().to_string();
@@ -1129,6 +1138,48 @@ impl RcwxApp {
                     Err(err) => format!("{err:#}"),
                 };
                 busy.store(false, Ordering::Release);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 共通重みの初回セットアップ: rcwx-cli download (ダウンロード+変換) を実行。
+    fn setup_weights(&mut self, cx: &mut Context<Self>) {
+        if self.test_busy.load(Ordering::Acquire) {
+            return;
+        }
+        self.test_busy.store(true, Ordering::Release);
+        self.test_label = "共通重みを準備中... (ダウンロード+変換・数分かかります)".into();
+        let cli = cli_path();
+        self.ensure_poll(cx);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let mut cmd = std::process::Command::new(&cli);
+                    cmd.arg("download");
+                    hide_window(&mut cmd);
+                    match cmd.output() {
+                        Ok(o) if o.status.success() => Ok(()),
+                        Ok(o) => {
+                            let msg = String::from_utf8_lossy(&o.stderr);
+                            Err(format!(
+                                "失敗: {}",
+                                msg.chars().take(200).collect::<String>()
+                            ))
+                        }
+                        Err(e) => Err(format!("起動失敗: {e} (rcwx-cli.exe を確認)")),
+                    }
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.test_label = match result {
+                    Ok(()) => "共通重みの準備が完了しました".into(),
+                    Err(e) => format!("初回セットアップ: {e}"),
+                };
+                view.bundle = bundle_info();
+                view.test_busy.store(false, Ordering::Release);
                 cx.notify();
             })
             .ok();
@@ -1599,12 +1650,20 @@ impl RcwxApp {
                     .child(note(format!("実行バンドル: {}", self.bundle.dir)))
                     .child(note(
                         format!(
-                            "HuBERT {} / Synth {} / Index {}",
+                            "HuBERT {} / RMVPE {} / SwiftF0 {} / Synth {} (モデル .pth で代替 {}) / Index {}",
                             mark(self.bundle.hubert),
+                            mark(self.bundle.rmvpe),
+                            mark(self.bundle.swiftf0),
                             mark(self.bundle.synth),
+                            mark(self.bundle.model_ready),
                             mark(self.bundle.ivf)
                         ),
                     ))
+                    .child(if self.bundle.common_ready() {
+                        note("共通重みの準備は完了しています。".to_string())
+                    } else {
+                        note("共通重みが未準備です。下の「初回セットアップ」でダウンロードと変換を実行します。".to_string())
+                    })
                     .child(note(format!("RVC モデルフォルダ: {dir}")))
                     .child(
                         h_flex()
@@ -1614,6 +1673,18 @@ impl RcwxApp {
                                     .label("フォルダ")
                                     .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx, "dir"))),
                             )
+                            .child(if self.bundle.common_ready() {
+                                Button::new("setup-weights")
+                                    .label("初回セットアップ")
+                                    .on_click(cx.listener(|this, _, _, cx| this.setup_weights(cx)))
+                                    .into_any_element()
+                            } else {
+                                Button::new("setup-weights")
+                                    .primary()
+                                    .label("初回セットアップ (ダウンロード+変換)")
+                                    .on_click(cx.listener(|this, _, _, cx| this.setup_weights(cx)))
+                                    .into_any_element()
+                            })
                             .child(
                                 Button::new("apply-settings")
                                     .primary()

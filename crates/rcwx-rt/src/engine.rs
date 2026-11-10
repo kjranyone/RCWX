@@ -118,7 +118,11 @@ impl RtEngine {
         let dir = rcwx_nn::rmvpe::default_rmvpe_dir();
         let eng = Engine::new(backend)?;
         let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors"))?;
-        let synth = Synth::load(&eng, &dir)?;
+        let synth = match &cfg.model_path {
+            Some(p) => Synth::load_from_pth(&eng, std::path::Path::new(p))
+                .map_err(|e| e.context(format!("モデル {p} の読み込み (RVC .pth)")))?,
+            None => Synth::load(&eng, &dir)?,
+        };
         let model_version = synth.cfg.version;
         let feat_dim = synth.cfg.in_channels as usize;
         let model_sr = if synth.cfg.sr > 0 {

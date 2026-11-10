@@ -30,8 +30,9 @@ Issue #6 として **完全 Rust シングルバイナリ化** を計画 (M0〜M
 - **ランチャー分離** — `rcwx.ps1` = 製品 (純 Rust・Python 非依存)、`dev.ps1` = 開発検証
   (golden 生成・E2E 比較のみ uv/Python を使用)。旧 Python ランチャーは git 履歴
   (`git show 84a75fe:rcwx.ps1`) に保存
-- **重み形式** — 実行時は `~/.cache/rcwx/models/rust/*.safetensors` (変換済み)。
-  変換は `tools/convert_*.py` で開発時に一回実行
+- **重み形式** — 共通重みは `~/.cache/rcwx/models/rust/*.safetensors`。
+  生成は `rcwx-cli download` が **Rust 内蔵の変換器**で実行 (tools/convert_*.py 不要)。
+  Synth は RVC `.pth` を実行時に直接ロード
 - **カーネル研究の知見** (30 秒 1500 hop 持続 A/B) は後述のセクションに集約
 - **GUI フレームワーク**: 現行 **egui**。**GPUI (Zed) 移行が方針として確定**
   (ユーザー指定) — egui 実装は機能 Parity 済みのため、GPUI 化は描画層置換として
@@ -54,6 +55,7 @@ Python/torch 依存ゼロの完全 Rust 実装。`crates/` ワークスペース
 ```text
 crates/
 ├── rcwx-nn/     # 独自 wgpu+WGSL 推論エンジン (burn/ort 不使用)
+│   │   # pth.rs: torch zip+pickle 完全リーダ / convert.rs: .pt・ONNX→safetensors 変換器
 │   ├── engine/  #   matmul(tiled)/conv1d/conv2d/softmax/graph/plan 再生
 │   ├── hubert.rs / synth.rs / rmvpe.rs / swiftf0.rs / ivf.rs / f0.rs
 ├── rcwx-dsp/    # scipy 厳密一致ポリフェーズ resample / SOLA / spectral gate /
@@ -98,9 +100,15 @@ crates/
   スプライスなし、バッチ境界のみ SOLA。
   fp16 (SHADER_F16) は DXC が packed 命令を出さず効果なし (検証済み・無効化)。
   単発 (バッチなし) では p50 ≈ 45ms/hop — さらなる単発高速化は今後の課題
-- 既知の制限: `rmvpe_folded.safetensors` を生成するスクリプトが現行ツリーに無い
-  (`convert_rmvpe.py` は未 fold の `rmvpe.safetensors` のみ出力・旧開発機の残存
-  ファイルに依存)。SwiftF0 のオフライン `run` は長尺入力で GPU のバッファバインド
+- **重みの実行時調達 (頒布対応)**: 共通重み (HuBERT/RMVPE/SwiftF0) は
+  `rcwx-cli download` が公式配布元から .pt/wheel を落とし **バイナリ内蔵の変換器**
+  (`rcwx-nn/src/convert.rs` + `pth.rs` の torch zip+pickle 完全リーダ) で
+  safetensors 化する — Python 不要。**Synth は RVC .pth を実行時に直接ロード**
+  (`Synth::load_from_pth`・weight_norm fold・enc_q 除外・v1/v2/Nono 対応)。
+  GUI のモデル選択は `RtConfig.model_path` 経由で実際の声に反映される
+  (cli は `run`/`rt` の `--model`)。`dev.ps1 golden` はパリティ検証用の
+  参照生成が主目的に。
+- SwiftF0 のオフライン `run` は長尺入力で GPU のバッファバインド
   上限 (アダプタにより 128MB) を超える場合あり (rt の hop 窓経路では問題なし)。
 
 
@@ -113,16 +121,19 @@ crates/
 .\rcwx.ps1                    # 環境チェック (Rust) → 対話メニュー
 .\rcwx.ps1 gui                # GUI 直接起動
 .\rcwx.ps1 rt --seconds 10    # リアルタイム 10 秒実機確認
-.\rcwx.ps1 run in.wav -o out.wav --pitch 5
-.\rcwx.ps1 devices / info model/kurumi/kurumi.pth / logs --tail 50
+.\rcwx.ps1 run in.wav --model rvc_models/voice.pth -o out.wav --pitch 5
+.\rcwx.ps1 devices / info rvc_models/voice.pth / logs --tail 50
 ```
 
-初回のみ、モデルバンドル (変換済み重み) の生成が開発環境で必要:
+初回のみ、共通重み (HuBERT/RMVPE/SwiftF0) のダウンロードと変換
+(バイナリ内蔵・Python 不要):
 
 ```powershell
-.\dev.ps1 check               # 不足物確認 (cargo / 重み / golden)
-.\dev.ps1 golden              # 重み変換 + golden 生成 → ~/.cache/rcwx/models/rust/
+.\rcwx.ps1 download           # 公式配布元から取得 → ~/.cache/rcwx/models/rust/ へ変換
 ```
+
+RVC モデル (.pth) は配置して GUI/CLI で選ぶだけで動く (変換不要)。GUI は
+モデル設定タブの「初回セットアップ」ボタンでも同じ処理を行う。
 
 ### リリース (タグ → 配布アーカイブ自動生成)
 

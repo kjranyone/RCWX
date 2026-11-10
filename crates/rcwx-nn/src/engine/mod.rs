@@ -7,6 +7,8 @@
 //! - uniform は動的 offset 付きの共有バッファ (submit 前に一括 write_buffer)
 
 pub mod shaders;
+pub mod tape;
+pub mod train_shaders;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -74,6 +76,9 @@ pub struct Engine {
     drained_epoch: std::sync::atomic::AtomicU64,
     /// プランごとにユニークな uniform スロット。ホップ毎の上書きをしない。
     next_uniform: std::sync::atomic::AtomicU32,
+    /// 学習経路で使い捨て Graph が返却したスロットのフリーリスト。
+    /// プラン (into_plan) 化されたスロットはここへ戻らない = rt 経路は影響なし。
+    free_uniform: Mutex<Vec<u32>>,
 }
 
 /// `Queue::write_buffer` は呼び出しごとに transient placed resource を
@@ -139,6 +144,31 @@ struct PendingUpload {
 impl Engine {
     fn uniform_buf_get(&self) -> wgpu::Buffer {
         self.uniform_buf.clone()
+    }
+
+    /// uniform スロット確保。フリーリスト優先、無ければ単調カウンタ。
+    fn alloc_uniform_slot(&self) -> u32 {
+        if let Some(s) = self
+            .free_uniform
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop()
+        {
+            return s;
+        }
+        let s = self.next_uniform.fetch_add(1, Ordering::Relaxed);
+        assert!(s < UNIFORM_SLOTS, "uniform slot overflow");
+        s
+    }
+
+    /// 使い捨て Graph のスロットを回収。直前 submit との競合は queue の FIFO 順で
+    /// 保証される (書き戻しは次回 submit 先頭の write_buffer として適用される)。
+    fn recycle_uniform_slots(&self, slots: impl Iterator<Item = u32>) {
+        let mut free = self
+            .free_uniform
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        free.extend(slots);
     }
 
     /// プランを再生: 入力 copy (任意) + 単一 compute pass + submit。
@@ -407,6 +437,7 @@ impl Engine {
             submit_epoch: std::sync::atomic::AtomicU64::new(0),
             drained_epoch: std::sync::atomic::AtomicU64::new(0),
             next_uniform: std::sync::atomic::AtomicU32::new(0),
+            free_uniform: Mutex::new(Vec::new()),
         };
         disable_d3d12_background_work(&e.queue);
         e.compile_all()?;
@@ -856,6 +887,57 @@ impl Engine {
         self.compile("concat_ch", &shaders::concat_ch_src(), 3)?;
         self.compile("transpose_flatten", &shaders::transpose_flatten_src(), 2)?;
         self.compile("pad2d", &shaders::pad2d_src(), 2)?;
+        // 学習 (Issue #8) 用 kernel 群
+        self.compile("t_fill", &train_shaders::T_FILL, 1)?;
+        self.compile("t_copy", &train_shaders::T_COPY, 2)?;
+        self.compile("t_mul2", &train_shaders::T_MUL2, 3)?;
+        self.compile("t_pw_fwd", &train_shaders::T_PW_FWD, 2)?;
+        self.compile("t_pw_bwd", &train_shaders::T_PW_BWD, 4)?;
+        self.compile("t_softmax_bwd", &train_shaders::T_SOFTMAX_BWD, 3)?;
+        self.compile("t_layernorm_bwd", &train_shaders::T_LAYERNORM_BWD, 5)?;
+        self.compile("t_ln_param_grad", &train_shaders::T_LN_PARAM_GRAD, 4)?;
+        self.compile("t_colsum", &train_shaders::T_COLSUM, 2)?;
+        self.compile("t_reduce_partials", &train_shaders::T_REDUCE_PARTIALS, 3)?;
+        self.compile("t_reduce_final", &train_shaders::T_REDUCE_FINAL, 2)?;
+        self.compile("t_adamw", &train_shaders::T_ADAMW, 4)?;
+        self.compile("t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
+        self.compile("t_wn_bwd", &train_shaders::T_WN_BWD, 7)?;
+        self.compile("t_im2col", &train_shaders::T_IM2COL, 2)?;
+        self.compile("t_col2im", &train_shaders::T_COL2IM, 2)?;
+        self.compile("t_add_ch_bias", &train_shaders::T_ADD_CH_BIAS, 2)?;
+        self.compile("t_l1_sign", &train_shaders::T_L1_SIGN, 4)?;
+        self.compile("t_mse_bwd", &train_shaders::T_MSE_BWD, 3)?;
+        self.compile("t_chslice", &train_shaders::T_CHSLICE, 2)?;
+        self.compile("t_chslice_bwd", &train_shaders::T_CHSLICE_BWD, 2)?;
+        self.compile("t_gating", &train_shaders::T_GATING, 2)?;
+        self.compile("t_gating_bwd", &train_shaders::T_GATING_BWD, 3)?;
+        self.compile("t_skew", &train_shaders::T_SKEW, 2)?;
+        self.compile("t_skew_bwd", &train_shaders::T_SKEW_BWD, 2)?;
+        self.compile("t_add_bias2d", &train_shaders::T_ADD_BIAS2D, 3)?;
+        self.compile("t_mask_fill", &train_shaders::T_MASK_FILL, 3)?;
+        self.compile("t_mask_fill_bwd", &train_shaders::T_MASK_FILL_BWD, 3)?;
+        self.compile("t_reflect_pad", &train_shaders::T_REFLECT_PAD, 2)?;
+        self.compile("t_mul_window", &train_shaders::T_MUL_WINDOW, 3)?;
+        self.compile("t_mag", &train_shaders::T_MAG, 3)?;
+        self.compile("t_mag_bwd", &train_shaders::T_MAG_BWD, 6)?;
+        self.compile("t_log_clamp", &train_shaders::T_LOG_CLAMP, 2)?;
+        self.compile("t_log_clamp_bwd", &train_shaders::T_LOG_CLAMP_BWD, 3)?;
+        self.compile("t_kl_elem", &train_shaders::T_KL_ELEM, 6)?;
+        self.compile("t_kl_bwd_a", &train_shaders::T_KL_BWD_A, 8)?;
+        self.compile("t_kl_bwd_b", &train_shaders::T_KL_BWD_B, 3)?;
+        self.compile("t_gather_frames", &train_shaders::T_GATHER_FRAMES, 3)?;
+        self.compile(
+            "t_gather_frames_bwd",
+            &train_shaders::T_GATHER_FRAMES_BWD,
+            3,
+        )?;
+        self.compile("t_transpose", &train_shaders::T_TRANSPOSE, 2)?;
+        self.compile("t_mul_frame_mask", &train_shaders::T_MUL_FRAME_MASK, 3)?;
+        self.compile("t_im2col2d", &train_shaders::T_IM2COL2D, 2)?;
+        self.compile("t_col2im2d", &train_shaders::T_COL2IM2D, 2)?;
+        self.compile("t_reflect_pad_bwd", &train_shaders::T_REFLECT_PAD_BWD, 2)?;
+        self.compile("t_add_bcast_t", &train_shaders::T_ADD_BCAST_T, 3)?;
+        self.compile("t_chcat", &train_shaders::T_CHCAT, 3)?;
         Ok(())
     }
 
@@ -1283,9 +1365,10 @@ impl Engine {
     pub fn graph(&self) -> Graph<'_> {
         Graph {
             engine: self,
-            encoder: self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+            encoder: Some(
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None }),
+            ),
             uniform_writes: Vec::new(),
             cmds: Vec::new(),
         }
@@ -1297,11 +1380,24 @@ impl<'a> Graph<'a> {
     pub fn engine_tensor_uninit(&self, len: usize) -> GpuTensor {
         self.engine.tensor_uninit(len)
     }
+
+    /// 学習 tape からの直接 dispatch (カーネル名・バッファ列・uniform 語)。
+    pub(crate) fn dispatch_raw(
+        &mut self,
+        kernel: &'static str,
+        bufs: &[&GpuTensor],
+        words: [u32; 32],
+        wx: u32,
+        wy: u32,
+        wz: u32,
+    ) {
+        self.dispatch(kernel, bufs, words, wx, wy, wz);
+    }
 }
 
 pub struct Graph<'a> {
     pub engine: &'a Engine,
-    encoder: wgpu::CommandEncoder,
+    encoder: Option<wgpu::CommandEncoder>,
     uniform_writes: Vec<(u32, [u32; 32])>, // (slot, words)
     cmds: Vec<Cmd>,
 }
@@ -1325,13 +1421,24 @@ pub struct Plan {
     pub uniform_writes: Vec<(u32, [u32; 32])>,
 }
 
+impl Drop for Graph<'_> {
+    /// submit されず破棄された Graph の uniform スロットを回収する。
+    /// into_plan/submit は uniform_writes を move 済みなのでここでは空。
+    fn drop(&mut self) {
+        if !self.uniform_writes.is_empty() {
+            let slots = self
+                .uniform_writes
+                .iter()
+                .map(|(s, _)| *s)
+                .collect::<Vec<_>>();
+            self.engine.recycle_uniform_slots(slots.into_iter());
+        }
+    }
+}
+
 impl<'a> Graph<'a> {
     fn alloc_slot(&mut self, words: [u32; 32]) -> u32 {
-        let slot = self
-            .engine
-            .next_uniform
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert!(slot < UNIFORM_SLOTS, "uniform slot overflow");
+        let slot = self.engine.alloc_uniform_slot();
         self.uniform_writes.push((slot, words));
         slot
     }
@@ -2111,16 +2218,16 @@ impl<'a> Graph<'a> {
     }
 
     /// uniform を一括書き込みし、**単一の compute pass** に全 dispatch を記録して submit。
+    /// (Graph は Drop で uniform slot を回収するため、encoder は mem::take で取り出す)
     pub fn submit(mut self) -> Result<()> {
         let eng = self.engine;
         eng.write_uniforms(&self.uniform_writes);
+        let mut encoder = self.encoder.take().expect("graph already submitted");
         {
-            let mut cpass = self
-                .encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
+            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
             for cmd in &self.cmds {
                 let k = eng.kernels.get(cmd.kernel).unwrap();
                 cpass.set_pipeline(&k.pipeline);
@@ -2129,7 +2236,7 @@ impl<'a> Graph<'a> {
                 cpass.dispatch_workgroups(cmd.wx, cmd.wy, cmd.wz);
             }
         }
-        eng.submit_flushed(self.encoder.finish());
+        eng.submit_flushed(encoder.finish());
         Ok(())
     }
 }

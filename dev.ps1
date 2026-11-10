@@ -116,7 +116,7 @@ function Get-MissingWeights {
         'rmvpe_folded.safetensors',
         'swiftf0.safetensors',
         'synth.safetensors',
-        'synth.json'
+        'synth.json'  # 製品経路は .pth 直読みで代替可 (テスト用 golden 生成にのみ必要)
     )
     $missing = @()
     foreach ($w in $need) {
@@ -191,14 +191,50 @@ function Invoke-Check {
     Write-Host "==========================================" -ForegroundColor Cyan
 }
 
+function Resolve-SynthModel {
+    <# Synthesizer 変換に使う RVC モデルを解決:
+         1. config (~/.config/rcwx/config.json) の last_model_path
+         2. rvc_models\ 配下の最初の .pth (名前順・決定論的)
+         3. model\kurumi\kurumi.pth (従来の既定)
+       Rust 側は ~/.cache/rcwx/models/rust/synth.safetensors を共有するため、
+       「今使いたいモデル」をここで選んで変換する。 #>
+    $candidates = @()
+    $cfg = Join-Path $HOME '.config\rcwx\config.json'
+    if (Test-Path $cfg) {
+        try {
+            $j = Get-Content $cfg -Raw | ConvertFrom-Json
+            if ($j -and $j.last_model_path) { $candidates += [string]$j.last_model_path }
+        } catch {}
+    }
+    $rvcDir = Join-Path $PSScriptRoot 'rvc_models'
+    if (Test-Path $rvcDir) {
+        $first = Get-ChildItem $rvcDir -Recurse -Filter '*.pth' -File |
+            Sort-Object FullName | Select-Object -First 1
+        if ($first) { $candidates += $first.FullName }
+    }
+    $candidates += Join-Path $PSScriptRoot 'model\kurumi\kurumi.pth'
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path $c)) { return $c }
+    }
+    return $null
+}
+
 function Invoke-Golden {
     <# 重み変換 + golden 生成 (数分・GPU/CPU それなりに使う)。 #>
     if (-not (Test-Uv)) { return }
+    $synthModel = Resolve-SynthModel
+    if (-not $synthModel) {
+        Write-Host "[NG] Synthesizer 変換に使う RVC モデル (.pth) が見つかりません。" -ForegroundColor Red
+        Write-Host "     rvc_models\ に .pth を置くか config の last_model_path を設定してください。"
+        return
+    }
+    Write-Host "[i] Synthesizer 変換モデル: $synthModel" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "-- 重み変換 + golden 生成 (tools/*.py) --" -ForegroundColor Cyan
+    # Cmd の [0] がスクリプト、[1..] はそのまま引数として渡す。
     $steps = @(
-        @{ Name = 'HuBERT 変換';       Cmd = @('convert_weights.py') },
-        @{ Name = 'Synthesizer 変換';  Cmd = @('convert_synth.py') },
+        @{ Name = 'HuBERT 変換';       Cmd = @('convert_weights.py', 'hubert') },
+        @{ Name = 'Synthesizer 変換';  Cmd = @('convert_synth.py', $synthModel) },
         @{ Name = 'RMVPE 変換 (BN fold)'; Cmd = @('convert_rmvpe.py') },
         @{ Name = 'SwiftF0 変換';      Cmd = @('convert_swiftf0.py') },
         @{ Name = 'F0 golden';         Cmd = @('dump_f0_ref.py') },
@@ -212,8 +248,9 @@ function Invoke-Golden {
     }
     $failed = $false
     foreach ($s in $steps) {
-        Write-Host "-- $($s.Name): tools\$($s.Cmd[0]) --"
-        & uv run --no-sync python (Join-Path 'tools' $s.Cmd[0])
+        $extra = @($s.Cmd | Select-Object -Skip 1)
+        Write-Host "-- $($s.Name): tools\$($s.Cmd[0]) $($extra -join ' ') --"
+        & uv run --no-sync python (Join-Path 'tools' $s.Cmd[0]) @extra
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[NG] $($s.Name) に失敗。" -ForegroundColor Red
             $failed = $true

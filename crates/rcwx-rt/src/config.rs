@@ -67,6 +67,8 @@ pub struct RtConfig {
     pub input_wav: Option<String>,
     /// cpal ホスト名。空なら既定ホスト。
     pub host_name: String,
+    /// RVC モデル .pth。Some なら synth.safetensors の代わりに直接ロード。
+    pub model_path: Option<String>,
 }
 
 impl Default for RtConfig {
@@ -111,6 +113,7 @@ impl Default for RtConfig {
             f0_hole_fill_ms: 30.0,
             input_wav: None,
             host_name: String::new(),
+            model_path: None,
         }
     }
 }

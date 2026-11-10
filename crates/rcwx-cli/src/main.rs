@@ -205,6 +205,8 @@ struct Args {
     moe: f64,
     index_rate: f64,
     index_k: usize,
+    /// RVC モデル .pth (指定時は synth.safetensors の代わりに直接ロード)
+    model: Option<String>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -218,6 +220,7 @@ fn parse_args() -> Result<Args> {
         moe: 0.0,
         index_rate: 0.0,
         index_k: 4,
+        model: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -227,6 +230,10 @@ fn parse_args() -> Result<Args> {
             "--pitch" | "-p" => {
                 i += 1;
                 a.pitch = args.get(i).context("--pitch value")?.parse()?;
+            }
+            "--model" | "-m" => {
+                i += 1;
+                a.model = Some(args.get(i).context("--model value")?.to_string());
             }
             "--noise" => {
                 i += 1;
@@ -263,7 +270,7 @@ fn parse_args() -> Result<Args> {
     }
     if a.input.is_empty() {
         bail!(
-            "usage: rcwx-cli run input.wav [-o output.wav] [--pitch N] [--moe 0.45] [--index-rate 0.15]"
+            "usage: rcwx-cli run input.wav [--model voice.pth] [-o output.wav] [--pitch N] [--moe 0.45] [--index-rate 0.15]"
         );
     }
     Ok(a)
@@ -282,17 +289,26 @@ fn main() -> Result<()> {
     }
     let args = parse_args()?;
     let dir = weights_dir();
-    for f in [
-        "hubert.safetensors",
-        "rmvpe_folded.safetensors",
-        "synth.safetensors",
-        "synth.json",
-    ] {
-        if !dir.join(f).exists() {
-            bail!(
-                "missing {f} in {} — run converters first (tools/convert_*.py)",
-                dir.display()
-            );
+    // 共通重み (.pth 直読み時は synth バンドル不要)
+    let mut need = vec!["hubert.safetensors", "rmvpe_folded.safetensors"];
+    if args.model.is_none() {
+        need.extend(["synth.safetensors", "synth.json"]);
+    }
+    let missing: Vec<&str> = need
+        .iter()
+        .filter(|f| !dir.join(f).exists())
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "共通重みが未準備です: {} ({})\n  `rcwx-cli download` でダウンロードと変換を実行してください。",
+            missing.join(", "),
+            dir.display()
+        );
+    }
+    if let Some(m) = &args.model {
+        if !std::path::Path::new(m).exists() {
+            bail!("モデルファイルがありません: {m}");
         }
     }
 
@@ -381,7 +397,11 @@ fn main() -> Result<()> {
     );
     let hubert = Hubert::load(&eng, &dir.join("hubert.safetensors")).context("HuBERT load")?;
     let rmvpe = Rmvpe::load(&eng, &dir).context("RMVPE load")?;
-    let synth = Synth::load(&eng, &dir).context("Synth load")?;
+    let synth = match &args.model {
+        Some(m) => Synth::load_from_pth(&eng, std::path::Path::new(m))
+            .with_context(|| format!("モデル {m} の読み込み"))?,
+        None => Synth::load(&eng, &dir).context("Synth load")?,
+    };
     let model_version = synth.cfg.version;
     let fd = synth.cfg.in_channels as usize;
     println!(

@@ -20,11 +20,13 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
     let mut dev_out: Option<String> = None;
     let mut seconds: Option<u64> = None;
     let mut backend = "dx12".to_string();
+    let mut model: Option<String> = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--virtual" => input = Some(it.next().context("--virtual <input.wav>")?.clone()),
+            "--model" | "-m" => model = Some(it.next().context("--model <voice.pth>")?.clone()),
             "-o" | "--output" => output = it.next().context("-o")?.clone(),
             "--chunk" => chunk = it.next().context("--chunk")?.parse()?,
             "--pitch" => pitch = it.next().context("--pitch")?.parse()?,
@@ -64,6 +66,7 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
         noise_gate,
         index_rate,
         moe_boost: moe,
+        model_path: model,
         ..Default::default()
     };
 

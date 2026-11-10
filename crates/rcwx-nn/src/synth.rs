@@ -13,6 +13,8 @@ pub struct SynthConfig {
     pub in_channels: u32, // emb_phone 入力次元: 256 (v1) / 768 (v2) = HuBERT 特徴次元
     /// make_test_model.py 由来のランダム重みモデル (パリティ gate が 0.995 に緩和される)
     pub random_test: bool,
+    /// f0=0 (Nono) モデル: emb_pitch / m_source / noise_convs を持たない。
+    pub has_f0: bool,
     pub inter_channels: u32,  // 192
     pub hidden_channels: u32, // 192
     pub filter_channels: u32, // 768
@@ -55,29 +57,18 @@ impl Synth {
     pub fn load(eng: &Engine, dir: &std::path::Path) -> Result<Self> {
         let raw = std::fs::read(dir.join("synth.safetensors"))?;
         let st = safetensors::SafeTensors::deserialize(&raw)?;
-        let mut w = std::collections::HashMap::new();
-        let mut cpu: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        let mut tensors: Vec<(String, Vec<f32>, Vec<usize>)> = Vec::new();
         for name in st.names() {
             let name: &str = name;
             let v = st.tensor(name)?;
             let shape = v.shape().to_vec();
-            let n: usize = shape.iter().product();
-            let mut out = Vec::with_capacity(n);
+            let mut out = Vec::with_capacity(v.data().len() / 4);
             for c in v.data().chunks_exact(4) {
                 out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
             }
-            if matches!(
-                name,
-                "emb_g.weight"
-                    | "enc_p.emb_pitch.weight"
-                    | "dec.m_source.l_linear.weight"
-                    | "dec.m_source.l_linear.bias"
-            ) {
-                cpu.insert(name.to_string(), out.clone());
-            }
-            w.insert(name.to_string(), eng.tensor_from_f32(&out, shape));
+            tensors.push((name.to_string(), out, shape));
         }
-        // 先に synth.json を解釈 (QKV fusion の層数・次元が version 依存のため)
+        // synth.json (QKV fusion の層数・次元が version 依存のため先に解釈)
         let cfg_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("synth.json"))?)?;
         let gu = |k: &str, d: u64| cfg_json[k].as_u64().unwrap_or(d) as u32;
@@ -92,6 +83,7 @@ impl Synth {
             version,
             in_channels: if version == 1 { 256 } else { 768 },
             random_test: cfg_json["random_test"].as_bool().unwrap_or(false),
+            has_f0: cfg_json["has_f0"].as_bool().unwrap_or(true),
             inter_channels: gu("inter_channels", 192),
             hidden_channels: gu("hidden_channels", 192),
             filter_channels: gu("filter_channels", 768),
@@ -106,6 +98,37 @@ impl Synth {
             sr: gu("sr", 40000),
             n_speakers: gu("n_speakers", 1),
         };
+        Self::build(eng, tensors, cfg)
+    }
+
+    /// RVC .pth から直接ロード (Python 変換不要・頒布バイナリ経路)。
+    /// detect_model_type (rcwx/models/synthesizer.py) と同一の判定で
+    /// version/has_f0/sr を決定し、weight_norm fold と enc_q 除外を行う。
+    pub fn load_from_pth(eng: &Engine, pth_path: &std::path::Path) -> Result<Self> {
+        let (tensors, cfg) = crate::convert::synth_tensors_from_pth(pth_path)?;
+        Self::build(eng, tensors, cfg)
+    }
+
+    /// 名前付きテンソル群 + config から Synth を組み立てる (safetensors/.pth 共通)。
+    fn build(
+        eng: &Engine,
+        tensors: Vec<(String, Vec<f32>, Vec<usize>)>,
+        cfg: SynthConfig,
+    ) -> Result<Self> {
+        let mut w = std::collections::HashMap::new();
+        let mut cpu: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+        for (name, out, shape) in tensors {
+            if matches!(
+                name.as_str(),
+                "emb_g.weight"
+                    | "enc_p.emb_pitch.weight"
+                    | "dec.m_source.l_linear.weight"
+                    | "dec.m_source.l_linear.bias"
+            ) {
+                cpu.insert(name.clone(), out.clone());
+            }
+            w.insert(name, eng.tensor_from_f32(&out, shape));
+        }
         // TextEncoder QKV fusion: conv_q/k/v (hidden x hidden) を連結して 1 matmul 化
         // (層数は v1 で 3・v2 で 6)
         {
@@ -158,16 +181,26 @@ impl Synth {
         }
         let emb_g = cpu.get("emb_g.weight").context("emb_g")?;
         let gin = cfg.gin_channels as usize;
+        // Nono (has_f0=false) は emb_pitch / m_source を持たない
+        let (emb_pitch, l_linear_w, l_linear_b) = if cfg.has_f0 {
+            (
+                cpu.get("enc_p.emb_pitch.weight")
+                    .context("emb_pitch")?
+                    .clone(),
+                cpu.get("dec.m_source.l_linear.weight")
+                    .context("m_source")?[0],
+                cpu.get("dec.m_source.l_linear.bias").context("m_source")?[0],
+            )
+        } else {
+            (Vec::new(), 0.0, 0.0)
+        };
         Ok(Self {
             cfg,
             debug_keep: std::cell::RefCell::new(None),
             emb_g_row0: emb_g[..gin].to_vec(),
-            emb_pitch: cpu
-                .get("enc_p.emb_pitch.weight")
-                .context("emb_pitch")?
-                .clone(),
-            l_linear_w: cpu.get("dec.m_source.l_linear.weight").unwrap()[0],
-            l_linear_b: cpu.get("dec.m_source.l_linear.bias").unwrap()[0],
+            emb_pitch,
+            l_linear_w,
+            l_linear_b,
             w,
         })
     }
@@ -624,9 +657,13 @@ impl Synth {
     }
 
     /// pitch 埋め込み行 [h, t] (ch-major) を CPU で構築。
+    /// Nono (f0 無し) は emb_pitch を持たないためゼロを返す (加算しても影響なし)。
     pub fn pitch_embedding(&self, pitch_idx: &[u32], t: u32) -> Vec<f32> {
         let h = self.cfg.hidden_channels as usize;
         let mut out = vec![0.0f32; h * t as usize];
+        if self.emb_pitch.is_empty() {
+            return out;
+        }
         for r in 0..t as usize {
             let idx = pitch_idx.get(r).copied().unwrap_or(0).clamp(0, 255) as usize;
             for c in 0..h {
@@ -1245,49 +1282,53 @@ impl Synth {
                 len,
                 len * u,
             );
-            // noise_conv on har
-            let ns = eng.tensor_uninit((cout * len * u) as usize);
-            let stride_f0: u32 = ups[i + 1..].iter().product::<u32>().max(1);
-            let nk = if stride_f0 > 1 { stride_f0 * 2 } else { 1 };
-            if nk == 1 {
-                g.conv1d(
-                    &har_t,
-                    self.g(&format!("dec.noise_convs.{i}.weight")),
-                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
-                    &ns,
-                    cout,
-                    1,
-                    1,
-                    1,
-                    1,
-                    0,
-                    har_t.len as u32,
-                    len * u,
-                    1,
-                );
+            // noise_conv on har (NSF モデルのみ。Nono は励振経路なし)
+            let summed = if cfg.has_f0 {
+                let ns = eng.tensor_uninit((cout * len * u) as usize);
+                let stride_f0: u32 = ups[i + 1..].iter().product::<u32>().max(1);
+                let nk = if stride_f0 > 1 { stride_f0 * 2 } else { 1 };
+                if nk == 1 {
+                    g.conv1d(
+                        &har_t,
+                        self.g(&format!("dec.noise_convs.{i}.weight")),
+                        Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
+                        &ns,
+                        cout,
+                        1,
+                        1,
+                        1,
+                        1,
+                        0,
+                        har_t.len as u32,
+                        len * u,
+                        1,
+                    );
+                } else {
+                    g.conv1d(
+                        &har_t,
+                        self.g(&format!("dec.noise_convs.{i}.weight")),
+                        Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
+                        &ns,
+                        cout,
+                        1,
+                        nk,
+                        stride_f0,
+                        1,
+                        stride_f0 / 2,
+                        har_t.len as u32,
+                        len * u,
+                        1,
+                    );
+                }
+                let summed = eng.tensor_uninit((cout * len * u) as usize);
+                g.add(&up, &ns, &summed, cout * len * u);
+                summed
             } else {
-                g.conv1d(
-                    &har_t,
-                    self.g(&format!("dec.noise_convs.{i}.weight")),
-                    Some(self.g(&format!("dec.noise_convs.{i}.bias"))),
-                    &ns,
-                    cout,
-                    1,
-                    nk,
-                    stride_f0,
-                    1,
-                    stride_f0 / 2,
-                    har_t.len as u32,
-                    len * u,
-                    1,
-                );
-            }
-            let summed = eng.tensor_uninit((cout * len * u) as usize);
-            g.add(&up, &ns, &summed, cout * len * u);
+                up
+            };
             if i == 0 {
                 if let Some(kk) = self.debug_keep.borrow_mut().as_mut() {
-                    kk.push(("ups0", up.clone_handle()));
-                    kk.push(("noise0", ns.clone_handle()));
+                    kk.push(("ups0", summed.clone_handle()));
                 }
             }
             // resblocks ×3 → 平均

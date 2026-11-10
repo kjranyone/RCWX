@@ -1,9 +1,11 @@
 //! RCWX 独自 wgpu+WGSL 推論エンジン (Issue #6)。
 
+pub mod convert;
 pub mod engine;
 pub mod f0;
 pub mod hubert;
 pub mod ivf;
+pub mod pth;
 pub mod rmvpe;
 pub mod swiftf0;
 pub mod synth;

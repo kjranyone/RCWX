@@ -25,15 +25,20 @@ GUI は GPUI 製。グラスモーフィズム「トワイライト・オーロ�
 .\rcwx.ps1                    # 環境チェック (Rust) → 対話メニュー
 .\rcwx.ps1 gui                # GUI 直接起動
 .\rcwx.ps1 rt --seconds 10    # リアルタイム変換を 10 秒実機確認
-.\rcwx.ps1 run in.wav -o out.wav --pitch 5
+.\rcwx.ps1 run in.wav --model rvc_models/voice.pth -o out.wav --pitch 5
 ```
 
-初回のみ、モデルバンドル (変換済み重み) の生成が開発環境で必要です:
+初回のみ、共通重み (HuBERT / RMVPE / SwiftF0) をダウンロードします。
+変換はバイナリ内蔵 (Python 不要) — 公式配布元から取得してその場で
+safetensors に変換します:
 
 ```powershell
-.\dev.ps1 check               # 不足物の確認
-.\dev.ps1 golden              # tools/convert_*.py で重み変換 + golden 生成
+.\rcwx.ps1 download           # ダウンロード + 変換 → ~/.cache/rcwx/models/rust/
 ```
+
+RVC モデル (`.pth`) はフォルダに置いて GUI のドロップダウンで選ぶだけです
+(実行時に直接ロード・変換不要。GUI の「初回セットアップ」ボタンでも
+ダウンロード+変換を実行できます)。
 
 `rcwx.ps1` は cargo ビルド後にバイナリを起動します (cargo が無い環境では
 `target/release/*.exe` を直接使用)。実行経路に Python は登場しません。
@@ -109,14 +114,15 @@ rcwx.ps1         # 製品ランチャー (純 Rust・Python 非依存)
 .\dev.ps1 test                # 全テスト (golden パリティ 17 件)
 .\dev.ps1 bench               # 30 秒持続ベンチ (batch 1/4)
 .\dev.ps1 e2e                 # Python 実装との E2E corr 比較
-.\dev.ps1 golden              # 重み変換 + golden 再生成
+.\dev.ps1 golden              # パリティ検証用 golden 再生成 (実行時変換はこれに非依存)
 ```
 
 詳細な開発ガイドは [AGENTS.md](AGENTS.md) を参照してください。
 
 ## モデルとライセンス
 
-- 必須モデル: HuBERT (`hubert_base.pt`) / RMVPE (`rmvpe.pt`) — `rcwx.ps1 download` が取得
+- 必須モデル: HuBERT (`hubert_base.pt`) / RMVPE (`rmvpe.pt`) / SwiftF0 (PyPI wheel) —
+  `rcwx.ps1 download` が公式配布元から取得し、バイナリ内蔵の変換器で safetensors 化
 - RVC モデル (`.pth`) と FAISS index は各自の権利範囲でご利用ください
   (音声モデルの権利と本人同意を必ず確認してください)
 - 本体 MIT。GTCRN (MIT) は Python 参照実装側、ML Denoiser (CC BY-NC 4.0) は
