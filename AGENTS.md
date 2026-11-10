@@ -26,6 +26,12 @@ crates/
 └── rcwx-gui/    # egui GUI (モデル/デバイス/レイテンシ/pitch/denoise/統計)
 ```
 
+- 開発ランチャー `dev.ps1` (rcwx.ps1 の Rust 版・同じ流儀):
+  `check` 環境チェック / `build` / `test` パリティ一式 / `golden` 重み変換+golden 再生成 /
+  `bench` 30 秒持続ベンチ (batch 1/4・bench30s.wav 自動生成) / `e2e` Python との corr 比較 /
+  `fmt`・`clippy`・`clean` / `rt ...`・`run ...` 等は rcwx-cli へ転送 / 引数なしで対話メニュー。
+  例: `.\dev.ps1 bench` / `.\dev.ps1 e2e` / `.\dev.ps1 rt --seconds 10` (UTF-8 BOM 必須・
+  引数は `$args` で生受取し、`-o` 等の共通パラメータ衝突を回避)
 - 重み変換は dev ツール (`tools/convert_*.py`) で `~/.cache/rcwx/models/rust/` へ
 - パリティ: HuBERT cosine 1.0 / synth 0.9996 / RMVPE 0.9999 / swift-f0 0.999 /
   DSP 全モジュール golden 一致 / オフライン E2E corr 0.983 (>0.95)
