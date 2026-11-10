@@ -8,6 +8,17 @@ RVC v2 モデルによるリアルタイムボイスチェンジャー。**製�
 コンピュートエンジンで Intel Arc 上に直接実装しています (burn / ort /
 ONNX Runtime 不使用、CUDA は未検証)。
 
+## スクリーンショット
+
+GUI は GPUI 製。グラスモーフィズム「トワイライト・オーロラ」テーマ
+(デザインは [`crates/rcwx-gui/src/theme.rs`](crates/rcwx-gui/src/theme.rs) に一元化):
+
+![メインタブ (モデル / Pitch・F0 / レイテンシ / オーディオテスト)](docs/images/gui-main.png)
+
+| オーディオ | 詳細設定 |
+|---|---|
+| ![オーディオタブ (デバイス / 入力レベル / ゲイン)](docs/images/gui-audio.png) | ![詳細設定タブ (推論 / ポスト処理 / WAV 変換)](docs/images/gui-settings.png) |
+
 ## Quick Start
 
 ```powershell
@@ -31,11 +42,12 @@ ONNX Runtime 不使用、CUDA は未検証)。
 
 - **リアルタイム変換** — 20ms hop (Aggressive) で全 hop 予算内の推論レイテンシ
   (p50 16.7ms / p99 18.2ms、hop バッチング方式、30 秒 1500 hop 実測)
-- **GUI (egui)** — モデル / オーディオデバイス (入力ch選択) / レイテンシ
-  (自動設定+推定表示) / Pitch・F0 (F0なし対応) / Index 検索 / ノイズ
-  キャンセリング (spectral + 強度) / 入力ノイズゲート (感度) / ポスト処理
-  (高域ブースト・リミッター・正規化) / 入力レベルメーター / 統計表示 /
-  WAV 変換テスト
+- **GUI (GPUI)** — グラスモーフィズム「トワイライト・オーロラ」テーマの
+  3 タブ構成 (メイン / オーディオ / 詳細設定)。モデル / オーディオデバイス
+  (入力ch選択) / レイテンシ (自動設定+推定表示) / Pitch・F0 (F0なし対応) /
+  Index 検索 / ノイズキャンセリング (spectral + 強度) / 入力ノイズゲート
+  (感度) / ポスト処理 (高域ブースト・リミッター・正規化) / 入力レベルメーター /
+  統計表示 / WAV 変換テスト
 - **CLI** — `run` (オフライン変換) / `rt` (リアルタイム、`--virtual` は
   デバイスなし検証モード) / `info` (自前 .pth リーダ) / `devices` /
   `download` / `logs`
@@ -65,13 +77,15 @@ DSP 各モジュール (resample・SOLA・spectral gate・noise gate・postproce
 20ms hop を全 hop 予算内に収めました。fp16 (SHADER_F16) は DXC が packed
 命令を生成しないため不採用 (検証記録あり)。
 
-## GUI フレームワークの方針
+## GUI フレームワーク
 
-現行の GUI は **egui (eframe)** 実装です (単一バイナリ・Windows 安定性を
-優先)。**GPUI (Zed) への移行が方針として確定しています** — egui 実装は
-旧 Python GUI に対する機能 Parity に到達しているため、GPUI 移行は描画層の
-置き換えとして次期作業で実施します (エンジン層 `rcwx-nn` / `rcwx-rt` への
-影響なし)。
+GUI は **GPUI (gpui-kit)** 実装です。M7 で旧 Python GUI との機能 Parity を
+持つ egui 版として作成後、描画層を GPUI へ置き換え済みです (エンジン層
+`rcwx-nn` / `rcwx-rt` には影響なし)。見た目はグラスモーフィズム
+「トワイライト・オーロラ」テーマとして `crates/rcwx-gui/src/theme.rs` に
+一元化しています — DWM アクリルの Blurred 背景 + 呼吸するオーロラ、
+グラデーション縁の半透明ガラスカード、ピル型タブ。`view.rs` はロジックのみを
+持ち、描画は theme.rs の部品を組み立てるだけです。
 
 ## ディレクトリ構成
 
@@ -81,7 +95,7 @@ crates/
 ├── rcwx-dsp/    # resample/SOLA/spectral gate/noise gate/postprocess/drift/feedback
 ├── rcwx-rt/     # リアルタイムエンジン (ストリーミング推論 + cpal + SPSC ring)
 ├── rcwx-cli/    # run / rt / info / devices / download / logs
-└── rcwx-gui/    # egui GUI
+└── rcwx-gui/    # GPUI GUI (グラスモーフィズムテーマは theme.rs)
 tools/           # 重み変換 + golden 生成 (dev 専用・Python)
 rcwx/            # 旧 Python 実装 (パリティ検証のリファレンス)
 dev.ps1          # 開発ランチャー (check/build/test/golden/bench/e2e/fmt/clippy)
