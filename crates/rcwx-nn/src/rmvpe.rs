@@ -169,7 +169,7 @@ impl Rmvpe {
     }
 
     /// 平均プール (2,2) [C, H, W] → [C, H/2, W/2]
-    fn avg_pool2x2(&self, g: &mut Graph<'_>, eng: &Engine, x: &GpuTensor, out: &GpuTensor, c: u32, h: u32, w: u32) {
+    fn avg_pool2x2(&self, g: &mut Graph<'_>, x: &GpuTensor, out: &GpuTensor, c: u32, h: u32, w: u32) {
         g.avg_pool2x2(x, out, c, h, w);
     }
 
@@ -206,7 +206,7 @@ impl Rmvpe {
 
         // [B,1,frames,128] → engine では [1, frames, 128] 平坦
         let mut g = eng.graph();
-        let x0 = eng.tensor_from_f32(&mel, vec![]);
+
         // encoder.bn (fold なし・独立): y = (x-mean)/sqrt(var+eps)*w+b — pointwise mul/add で
         let bn_w = self.w.get("unet.encoder.bn.weight").unwrap();
         let _ = bn_w;
@@ -219,13 +219,7 @@ impl Rmvpe {
             (read("unet.encoder.bn.weight"), read("unet.encoder.bn.bias"),
              read("unet.encoder.bn.running_mean"), read("unet.encoder.bn.running_var"))
         };
-        let mut xbuf = mel.clone();
-        for f in 0..t as usize {
-            for c in 0..N_MEL as usize {
-                let i = c * t as usize + f; // mel は [128, T] 平坦
-                let _ = i;
-            }
-        }
+
         // mel [128, T] → x は [1(チャネル), frames, 128]... E2E への入力は
         // mel.transpose → [frames, 128] で channel 1。engine では [1, T, 128]。
         let mut x = vec![0.0f32; (t * N_MEL) as usize];
@@ -264,7 +258,7 @@ impl Rmvpe {
                 xx = nx;
             }
             let pooled = eng.tensor_uninit((ch_out * (h / 2) * (wdim / 2)) as usize);
-            self.avg_pool2x2(&mut g, eng, &xx, &pooled, ch_out, h, wdim);
+            self.avg_pool2x2(&mut g, &xx, &pooled, ch_out, h, wdim);
             dbg.push((Box::leak(format!("enc{i}").into_boxed_str()), pooled.clone_handle()));
             skips.push((xx.clone_handle(), ch_out, h, wdim));
             cur = pooled;
@@ -292,7 +286,7 @@ impl Rmvpe {
         // decoder
         let mut dch = 512u32;
         for i in 0..EN_DE_LAYERS {
-            let (skip, s_c, s_h, s_w) = &skips[EN_DE_LAYERS as usize - 1 - i as usize];
+            let (skip, _s_c, s_h, s_w) = &skips[EN_DE_LAYERS as usize - 1 - i as usize];
             let d_out = dch / 2;
             let stride_h = 2u32;
             let stride_w = 2u32;

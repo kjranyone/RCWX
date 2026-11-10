@@ -134,8 +134,8 @@ pub fn lowpass_f0(f0: &mut [f32], cutoff_hz: f64, sample_rate: f64) {
     // log2 輪郭を有声区間で補間
     let n = f0.len();
     let mut contour = vec![0.0f64; n];
-    let mut last_v = 0.0f64;
-    let mut next_v = 0.0f64;
+    let last_v = 0.0f64;
+    let next_v = 0.0f64;
     // np.interp 相当: 有声 index で線形補間
     let vidx: Vec<usize> = (0..n).filter(|&i| f0[i] > 0.0).collect();
     for (k, &i) in vidx.iter().enumerate() {

@@ -836,7 +836,7 @@ impl Synth {
     pub fn decode_graph(
         &self,
         eng: &Engine,
-        mut g: &mut Graph<'_>,
+        g: &mut Graph<'_>,
         z_full: &GpuTensor,
         har_t: &GpuTensor,
         n_in: u32,
@@ -863,7 +863,6 @@ impl Synth {
         n: u32,
     ) -> GpuTensor {
         let cfg = &self.cfg;
-        let h = cfg.hidden_channels;
         let inter = cfg.inter_channels;
         let t = n;
         // cond(g) 行列
@@ -877,7 +876,6 @@ impl Synth {
 
         // ---- Decoder ----
         let ups = &cfg.upsample_rates;
-        let zc: u32 = ups.iter().product();
         let chs: Vec<u32> = (0..=ups.len())
             .map(|i| cfg.upsample_initial_channel / (1u32 << i))
             .collect();
@@ -1047,7 +1045,6 @@ impl Synth {
         let cfg = &self.cfg;
         let ups = &cfg.upsample_rates;
         let zc: u32 = ups.iter().product();
-        let inter = cfg.inter_channels;
         let t = t as usize;
         let chunk = chunk as usize;
         let margin = margin as usize;

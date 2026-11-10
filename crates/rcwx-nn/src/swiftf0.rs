@@ -234,7 +234,7 @@ impl SwiftF0 {
         }
 
         // voicing (モデル域 + RCWX 域の積)
-        let mut voiced: Vec<bool> = pitch
+        let voiced: Vec<bool> = pitch
             .iter()
             .zip(&conf)
             .map(|(&p, &c)| {

@@ -42,7 +42,6 @@ struct SynthPlans {
     n_dec: usize,
     feats_in: GpuTensor,
     pitch_emb_in: GpuTensor,
-    z_out: GpuTensor,
     har_in: GpuTensor,
     encode_plan: Plan,
     decode_plan: Plan,
@@ -114,7 +113,6 @@ impl RtEngine {
             None
         };
 
-        let hop = cfg.hop_16k();
         let ctx = cfg.hubert_ctx_samples();
         let spectral = if cfg.denoise == "spectral" {
             Some(StreamingSpectralGate::new(16000, 6.0, -24.0 * cfg.denoise_strength.clamp(0.5, 2.0)))
@@ -160,10 +158,6 @@ impl RtEngine {
             stats: RtStats::default(),
             warn: Vec::new(),
         })
-        .map(|mut e| {
-            let _ = hop;
-            e
-        })
     }
 
     /// hop (mic レート) → 変換音声 (出力レート)。
@@ -189,7 +183,7 @@ impl RtEngine {
     fn process_batch(&mut self, hop_mic: &[f32], batch_n: usize) -> Vec<f32> {
         let t0 = std::time::Instant::now();
         let mut stage_t = std::time::Instant::now();
-        let mut stage = |name: &str, t: &mut std::time::Instant| {
+        let stage = |name: &str, t: &mut std::time::Instant| {
             if std::env::var("RCWX_RT_STAGES").is_ok() {
                 eprintln!("  [stage] {name}: {:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -393,7 +387,6 @@ impl RtEngine {
                     n_dec,
                     feats_in,
                     pitch_emb_in,
-                    z_out,
                     har_in,
                     encode_plan,
                     decode_plan,
@@ -416,8 +409,6 @@ impl RtEngine {
         };
 
         stage("synth", &mut stage_t);
-        // 末尾 decoder overlap 2 フレームは未確定 → SOLA で消費
-        let out_frames = n100 - DECODER_OVERLAP_FRAMES;
         // 出力対象はこの hop の新規分 = 末尾から new100+overlap 手前 ... 実際は
         // 「前 hop で未確定だった分 + 新規」だが、hold-back 設計では
         // 各 hop の確定出力 = 末尾 (new100 + overlap) フレーム分の音声から

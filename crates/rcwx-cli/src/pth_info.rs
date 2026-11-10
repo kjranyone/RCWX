@@ -7,7 +7,7 @@
 pub enum Value {
     Mark,
     None,
-    Bool(bool),
+    Bool,
     Int(i64),
     Float(f64),
     Str(String),
@@ -146,8 +146,8 @@ fn parse_pickle(buf: &[u8]) -> anyhow::Result<Value> {
             }
             b'.' => break,
             b'N' => r.stack.push(Value::None),
-            0x88 => r.stack.push(Value::Bool(true)),
-            0x89 => r.stack.push(Value::Bool(false)),
+            0x88 => r.stack.push(Value::Bool),
+            0x89 => r.stack.push(Value::Bool),
             b'K' => { let v = r.take_u8()? as i64; r.stack.push(Value::Int(v)); }
             b'M' => { let v = r.take_u16()? as i64; r.stack.push(Value::Int(v)); }
             b'J' => { let v = r.take_i32()? as i64; r.stack.push(Value::Int(v)); }

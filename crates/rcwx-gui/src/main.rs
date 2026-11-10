@@ -276,7 +276,7 @@ fn scan_models(current: &str) -> Vec<String> {
 }
 
 fn scan_devices() -> (Vec<String>, Vec<String>) {
-    use cpal::traits::{DeviceTrait, HostTrait};
+    use cpal::traits::HostTrait;
     let host = cpal::default_host();
     let mut ins = Vec::new();
     let mut outs = Vec::new();

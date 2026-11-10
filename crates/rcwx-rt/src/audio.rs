@@ -214,7 +214,7 @@ pub fn run_realtime(
     let margin = cfg.buffer_margin;
     let out_sr = cfg.output_sample_rate;
     let chunk_sec = cfg.chunk_sec;
-    let mut tracker = FloorTracker::new();
+    let tracker = FloorTracker::new();
     let tracker = std::cell::RefCell::new(tracker);
     let out_stream = build_output_stream(&out_device, &out_cfg, move |data: &mut [f32]| {
         let s = &*out_shared;
