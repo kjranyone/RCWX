@@ -21,11 +21,16 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
     let mut moe = 0.0f64;
     let mut realtime_pacing = false;
     let mut batch_hops = 1u32;
+    let mut dec_overlap = 3u32;
     let mut dev_in: Option<String> = None;
     let mut dev_out: Option<String> = None;
     let mut seconds: Option<u64> = None;
     let mut backend = "dx12".to_string();
     let mut model: Option<String> = None;
+    let mut wav_in: Option<String> = None;
+    let mut out_gain = 0.0f64;
+    let mut crossfade = 0.012f64;
+    let mut margin = 0.25f64;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -47,10 +52,15 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
             "--moe" => moe = it.next().context("--moe")?.parse()?,
             "--realtime" => realtime_pacing = true,
             "--batch" => batch_hops = it.next().context("--batch")?.parse()?,
+            "--dec-overlap" => dec_overlap = it.next().context("--dec-overlap")?.parse()?,
             "--in" => dev_in = Some(it.next().context("--in")?.clone()),
             "--out" => dev_out = Some(it.next().context("--out")?.clone()),
             "--seconds" => seconds = Some(it.next().context("--seconds")?.parse()?),
             "--backend" => backend = it.next().context("--backend")?.clone(),
+            "--wav-in" => wav_in = Some(it.next().context("--wav-in <wav>")?.clone()),
+            "--out-gain" => out_gain = it.next().context("--out-gain <db>")?.parse()?,
+            "--crossfade" => crossfade = it.next().context("--crossfade <sec>")?.parse()?,
+            "--margin" => margin = it.next().context("--margin <f64>")?.parse()?,
             other => bail!("unknown rt arg: {other}"),
         }
     }
@@ -70,6 +80,11 @@ pub fn cmd_rt(args: &[String]) -> Result<()> {
     let cfg = rcwx_rt::RtConfig {
         chunk_sec: chunk,
         batch_hops,
+        decoder_overlap_frames: dec_overlap,
+        crossfade_sec: crossfade,
+        buffer_margin: margin,
+        output_gain_db: out_gain,
+        input_wav: wav_in.clone(),
         pitch,
         formant_shift: formant,
         protect,

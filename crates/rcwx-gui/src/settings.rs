@@ -18,6 +18,9 @@ pub struct GuiSettings {
     pub output_channel: String,
     pub chunk_sec: f64,
     pub aggressive: bool,
+    /// Aggressive 之上の低遅延 (実験): batch 2 hop + overlap 2 + crossfade 6ms + margin 0.05。
+    /// 実行中トグルで即時反映。
+    pub ultra: bool,
     pub pitch: f64,
     pub use_f0: bool,
     pub f0_method: String,
@@ -74,6 +77,7 @@ impl Default for GuiSettings {
             output_channel: "all".into(),
             chunk_sec: 0.06,
             aggressive: true,
+            ultra: false,
             pitch: 0.0,
             use_f0: true,
             f0_method: "swiftf0".into(),
@@ -121,6 +125,8 @@ pub struct LiveStats {
     pub p95: f64,
     pub p99: f64,
     pub last_ms: f64,
+    /// 実測 RTL (5 秒ごとにサンプル)。None = 未計測
+    pub rtl_ms: Option<f64>,
     pub trims: u64,
 }
 
@@ -211,6 +217,9 @@ fn settings_from_value(v: &serde_json::Value) -> GuiSettings {
     }
     if let Some(x) = a["latency_mode"].as_str() {
         s.aggressive = x == "aggressive";
+    }
+    if let Some(x) = a["latency_ultra"].as_i64() {
+        s.ultra = x != 0;
     }
     if let Some(x) = a["input_gain_db"].as_f64() {
         s.input_gain_db = x;
@@ -371,6 +380,7 @@ pub fn save_settings(s: &GuiSettings) {
     v["audio"]["chunk_sec"] = serde_json::json!(s.chunk_sec);
     v["audio"]["latency_mode"] =
         serde_json::json!(if s.aggressive { "aggressive" } else { "normal" });
+    v["audio"]["latency_ultra"] = serde_json::json!(if s.ultra { 1 } else { 0 });
     v["audio"]["input_gain_db"] = serde_json::json!(s.input_gain_db);
     v["audio"]["output_gain_db"] = serde_json::json!(s.output_gain_db);
     v["inference"]["use_f0"] = serde_json::json!(s.use_f0);
@@ -729,29 +739,46 @@ impl GuiSettings {
             } else {
                 Some(self.model.clone())
             },
-            buffer_margin: if self.aggressive { 0.1 } else { 0.25 },
+// ultra は ring floor も攻める (間引き margin を半減)
+            buffer_margin: if self.ultra {
+                0.05
+            } else if self.aggressive {
+                0.1
+            } else {
+                0.25
+            },
             prebuffer_chunks: if self.aggressive { 2 } else { 1 },
-            batch_hops: if chunk_sec < 0.05 { 4 } else { 1 },
+            // SOLA クロスフェード: 既定 12ms → ultra は 6ms (ホールドバック削減)
+            crossfade_sec: if self.ultra { 0.006 } else { 0.012 },
+            batch_hops: if chunk_sec < 0.05 {
+                if self.ultra {
+                    2
+                } else {
+                    4
+                }
+            } else {
+                1
+            },
+            decoder_overlap_frames: if self.ultra { 2 } else { 3 },
             ..Default::default()
         }
     }
 
     pub fn latency_line(&self) -> String {
         let chunk_sec = self.snapped_chunk_sec();
-        let ov_ms = (chunk_sec * 1000.0).clamp(60.0, 300.0);
-        let cf_ms = (ov_ms * 0.1).clamp(10.0, 20.0);
-        let pre = if self.aggressive { 2 } else { 1 };
-        let batch = if chunk_sec < 0.05 { 4 } else { 1 };
+        // SOLA クロスフェードと decode overlap はエンジン側の実値
+        let cf_ms = if self.ultra { 6.0 } else { 12.0 };
+        let ov_fr = if self.ultra { 2 } else { 3 };
+        let batch = if chunk_sec < 0.05 {
+            if self.ultra { 2 } else { 4 }
+        } else {
+            1
+        };
         format!(
-            "自動設定: オーバーラップ {ov_ms:.0}ms / クロスフェード {cf_ms:.0}ms / プリバッファ {pre} / SOLA探索 10ms / 推論バッチ {batch} hop"
+            "自動設定: クロスフェード {cf_ms:.0}ms / SOLA探索 10ms / decode余白 {ov_fr}fr / 推論バッチ {batch} hop (実行中切替可)"
         )
     }
 
-    pub fn estimate_ms(&self) -> f64 {
-        let chunk_sec = self.snapped_chunk_sec();
-        let batch = if chunk_sec < 0.05 { 4.0 } else { 1.0 };
-        batch * chunk_sec * 1000.0 + 35.0
-    }
 
     pub fn to_live(&self) -> rcwx_rt::LiveParams {
         rcwx_rt::LiveParams::from_config(&self.to_rt_config())

@@ -879,8 +879,21 @@ impl RcwxApp {
         let adapter = Arc::clone(&self.adapter_src);
         let thread_err = Arc::clone(&self.thread_err);
         let done = Arc::clone(&self.done_flag);
+        let rtl_sample = Arc::new(Mutex::new((
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10)),
+            None::<f64>,
+        )));
+        let rtl_sample_cb = Arc::clone(&rtl_sample);
         let stats_cb = Box::new(move |_: &rcwx_rt::RtConfig, report: RtReport| {
             if let Ok(mut slot) = stats_src.lock() {
+                // RTL は 5 秒ごとにサンプル (予測値ではなく実測のみ表示)
+                let mut samp = rtl_sample_cb.lock().unwrap_or_else(|err| err.into_inner());
+                if samp.0.map(|t| t.elapsed().as_secs() >= 5).unwrap_or(true)
+                    && report.rtl_ms.is_some()
+                {
+                    samp.0 = Some(std::time::Instant::now());
+                    samp.1 = report.rtl_ms;
+                }
                 *slot = LiveStats {
                     hops: report.hops,
                     underruns: report.underruns,
@@ -890,6 +903,7 @@ impl RcwxApp {
                     p95: report.p95,
                     p99: report.p99,
                     last_ms: report.last_ms,
+                    rtl_ms: samp.1,
                 };
             }
         });
@@ -1317,6 +1331,7 @@ impl Render for RcwxApp {
                     .relative()
                     .size_full()
                     .text_color(cx.theme().foreground)
+                    .child(theme::titlebar())
                     .child(self.header(session, cx))
                     .child(self.tabs(cx))
                     .child(self.body(cx))
@@ -1326,6 +1341,18 @@ impl Render for RcwxApp {
 }
 
 impl RcwxApp {
+    /// 実測 RTL の表示ラベル。実行中はサンプル値、未計測は「計測中」、
+    /// 停止中はダッシュ (予測式は使わない)。
+    fn rtl_label(&self, session: bool) -> String {
+        if !session {
+            return "レイテンシ —".into();
+        }
+        match self.stats.rtl_ms {
+            Some(ms) => format!("実測 {ms:.0} ms"),
+            None => "計測中…".into(),
+        }
+    }
+
     fn status_note(&self) -> (&'static str, Hsla, bool) {
         if self.running && self.stats.hops == 0 {
             ("モデル読込中", theme::amber(), true)
@@ -1797,9 +1824,24 @@ impl RcwxApp {
                         .on_change(cx.listener(|this, checked, window, cx| {
                             this.s.aggressive = *checked;
                             this.sync_chunk_slider(window, cx);
+                            // 実行中に即時反映 (リング閾値など)
+                            this.push_live();
                             cx.notify();
                         })),
                 )
+                .when(self.s.aggressive, |el| {
+                    el.child(
+                        Checkbox::new("ultra")
+                            .label("さらに攻める (実験: バッチ 2・即時反映)")
+                            .checked(self.s.ultra)
+                            .on_change(cx.listener(|this, checked, _window, cx| {
+                                this.s.ultra = *checked;
+                                // バッチ数/オーバーラップを実行中に即時反映
+                                this.push_live();
+                                cx.notify();
+                            })),
+                    )
+                })
                 .child(note(format!("範囲 {lo:.0}–{hi:.0} ms（20 ms 刻み）")))
                 .child(note(self.s.latency_line()))
                 .child(
@@ -1810,9 +1852,11 @@ impl RcwxApp {
                             div()
                                 .text_sm()
                                 .text_color(theme::muted_lilac())
-                                .child("推定レイテンシ"),
+                                .child("実測レイテンシ (5s 更新)"),
                         )
-                        .child(value_text(format!("~{:.0} ms", self.s.estimate_ms()))),
+                        .child(value_text(
+                            self.rtl_label(self.session_live.load(Ordering::Acquire)),
+                        )),
                 ),
         )
     }
@@ -2365,7 +2409,7 @@ impl RcwxApp {
                     )
                     .child(theme::stat_chip(format!("GPU: {gpu}"), theme::lavender()))
                     .child(theme::stat_chip(
-                        format!("遅延 ~{:.0} ms", self.s.estimate_ms()),
+                        self.rtl_label(session).to_string(),
                         theme::sakura_light(),
                     ))
                     .child(theme::stat_chip(

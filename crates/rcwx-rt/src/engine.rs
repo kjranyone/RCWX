@@ -34,7 +34,8 @@ use rcwx_nn::swiftf0::SwiftF0;
 use rcwx_nn::synth::Synth;
 
 const MODEL_SR: u32 = 48000; // フォールバック (通常は synth.json の sr を使用)
-const DECODER_OVERLAP_FRAMES: usize = 3;
+/// decode/SOLA の右側オーバーラップ (受容野)。既定 3・低遅延設定では 2。
+/// cfg.decoder_overlap_frames を使用。
 /// decoder 窓の左マージン (受容野ウォームアップ分)。出力は末尾 new100+overlap
 /// のみなので左端は捨て枠。4→2 を実測したら整相 corr 0.19 / スペクトル差
 /// -14.9dB と品質が大幅劣化したため 4 を維持する (ref15 との比較)。
@@ -117,6 +118,10 @@ pub struct RtEngine {
     /// 起動時の形状プライム中。統計と stage ログに載せない。
     priming: bool,
     pub stats: RtStats,
+    /// hop 到着時刻 (RTL 実測用・flush した batch_n 分だけ消費)
+    arrival_q: std::collections::VecDeque<std::time::Instant>,
+    /// 直近の flush で出力した音声の最古 hop の年齢 (ms)。flush 時のみ更新
+    pub last_emit_age_ms: f64,
     pub warn: Vec<String>,
     /// フィードバック相関 FFT 用ワーカー (try_send・キューは最新 1 件)。
     /// 10 hop ごとの FFT (~3.6ms) を推論タイマーと出力レイテンシの両方から外す。
@@ -252,6 +257,8 @@ impl RtEngine {
             cfg,
             live: None,
             stats: RtStats::default(),
+            arrival_q: std::collections::VecDeque::new(),
+            last_emit_age_ms: 0.0,
             warn: Vec::new(),
             fb_jobs,
             fb_results,
@@ -279,7 +286,8 @@ impl RtEngine {
             // 無音だと SwiftF0 がプランを作らない。小さい正弦で形状だけ通す。
             *s = (i as f32 * 0.02).sin() * 0.05;
         }
-        let target = 28 * 2 + new100 + DECODER_OVERLAP_FRAMES;
+        let ov = self.cfg.decoder_overlap_frames as usize;
+        let target = 28 * 2 + new100 + ov;
         let batches = target.div_ceil(new100) + 3;
         self.priming = true;
         for _ in 0..batches {
@@ -361,20 +369,45 @@ impl RtEngine {
     /// hop (mic レート) → 変換音声 (出力レート)。
     /// batch_hops > 1 のときは貯めてから一括推論し、非最終 hop は空 Vec を返す。
     /// 戻り値の平均長は hop あたり new100*zc (出力レート)。
-    pub fn process_hop(&mut self, hop_mic: &[f32]) -> Vec<f32> {
+    /// `arrived` は hop の**最古サンプルが入力に現れた時刻**。hop は chunk 分の
+    /// 蓄積が完了した瞬間に渡されるため、送出時刻ではなくこの時刻から年齢を
+    /// 測らないと蓄積時間 (chunk 600ms なら 600ms) が RTL から漏れる。
+    pub fn process_hop(&mut self, hop_mic: &[f32], arrived: std::time::Instant) -> Vec<f32> {
+        // live パラメータを先頭で反映 (batch_hops の実行時切替)
+        self.pull_live();
+        self.arrival_q.push_back(arrived);
         if self.cfg.batch_hops > 1 {
             self.batch_pending.extend_from_slice(hop_mic);
             self.batch_count += 1;
+            // live で batch_hops が縮んだ場合、貯めた分が新しき値を超えていれば
+            // その時点の実数で flush する (n を cfg から取ると長さ不整合で壊れる)
             if self.batch_count < self.cfg.batch_hops {
                 return Vec::new();
             }
             let batched = std::mem::take(&mut self.batch_pending);
+            let n = self.batch_count as usize;
             self.batch_count = 0;
-            let n = self.cfg.batch_hops as usize;
+            let oldest = self.arrival_q.front().copied();
             let out = self.process_batch(&batched, n);
+            for _ in 0..n {
+                self.arrival_q.pop_front();
+            }
+            if let Some(t) = oldest {
+                if !out.is_empty() {
+                    self.last_emit_age_ms = t.elapsed().as_secs_f64() * 1000.0;
+                }
+            }
             return out;
         }
-        self.process_batch(hop_mic, 1)
+        let oldest = self.arrival_q.front().copied();
+        let out = self.process_batch(hop_mic, 1);
+        self.arrival_q.pop_front();
+        if let Some(t) = oldest {
+            if !out.is_empty() {
+                self.last_emit_age_ms = t.elapsed().as_secs_f64() * 1000.0;
+            }
+        }
+        out
     }
 
     /// hop_mic: (batch_n hop 分を連結した) 入力。batch_n=1 で単一 hop。
@@ -573,7 +606,7 @@ impl RtEngine {
         let n100 = {
             let avail100 = self.f0_filt.len();
             let enc_ctx100 = enc_ctx50 * 2;
-            (enc_ctx100 + new100 + DECODER_OVERLAP_FRAMES).min(avail100)
+            (enc_ctx100 + new100 + self.cfg.decoder_overlap_frames as usize).min(avail100)
         };
         let win100_start = self.f0_filt.len().saturating_sub(n100);
         let f0_synth_win = self.f0_filt[win100_start..].to_vec();
@@ -639,7 +672,10 @@ impl RtEngine {
         // 6) encode → decode → SOLA (固定形状はプランをキャッシュして再生)
         //    TextEncoder/Flow は全窓で attention コンテキストを取るが、
         //    デコーダは受容野マージン分 (8fr) の z で十分 → 計算量 1/5 に削減
-        let n_dec = (new100 + DECODER_LEFT_MARGIN_FRAMES + DECODER_OVERLAP_FRAMES).min(n100);
+        let n_dec = (new100
+            + DECODER_LEFT_MARGIN_FRAMES
+            + self.cfg.decoder_overlap_frames as usize)
+            .min(n100);
         // formant: z/har を factor 倍に時間伸長して decode し、出力をリサンプル戻し
         // (upstream return_length2 経路と同一数学)
         let factor = if self.cfg.formant_shift != 0.0 {
@@ -777,7 +813,7 @@ impl RtEngine {
         // 「前 hop で未確定だった分 + 新規」だが、hold-back 設計では
         // 各 hop の確定出力 = 末尾 (new100 + overlap) フレーム分の音声から
         // SOLA で target_len = new100*zc を取り出す。
-        let tail_frames = (new100 + DECODER_OVERLAP_FRAMES).min(n100);
+        let tail_frames = (new100 + self.cfg.decoder_overlap_frames as usize).min(n100);
         let take_from = audio48.len() - tail_frames * self.zc;
         let raw: Vec<f32> = audio48[take_from..].to_vec();
         audio48.clear();

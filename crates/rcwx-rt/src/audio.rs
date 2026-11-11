@@ -67,17 +67,42 @@ pub fn run_virtual(
     // ウォームアップ: 最初の 2 バッチ分は時計・出力から除外 (プラン構築)
     let warmup_hops = (engine.cfg.batch_hops * 2) as usize;
     let chunks: Vec<&[f32]> = mono.chunks(hop).filter(|c| c.len() == hop).collect();
-    for c in chunks.iter().take(warmup_hops) {
-        let _ = engine.process_hop(c);
+    let v_start = std::time::Instant::now();
+    for (i, c) in chunks.iter().take(warmup_hops).enumerate() {
+        // 実時間では暖機は一瞬だが、RTL 実測の整合のため音声時間で遡る
+        let anchor = v_start
+            .checked_sub(hop_dur * (i as u32 + 1))
+            .unwrap_or(v_start);
+        let _ = engine.process_hop(c, anchor);
     }
     let start = std::time::Instant::now();
     let mut n_hops = warmup_hops;
+    // 診断: RCWX_LIVE_FLIP=N で hop N 到達時にバッチ数を 4→2 へ実行中切替
+    // (GUI の「さらに攻める」チェックと同じ経路の効果検証用)
+    let live_flip: Option<usize> = std::env::var("RCWX_LIVE_FLIP")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let inter_sleep_ms: u64 = std::env::var("RCWX_INTER_BATCH_SLEEP_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     for chunk in chunks.iter().skip(warmup_hops) {
-        let out = engine.process_hop(chunk);
+        if live_flip == Some(n_hops) {
+            engine.cfg.batch_hops = 2;
+            eprintln!("[live] batch_hops -> 2 at hop {n_hops}");
+        }
+        // hop の音声は chunk 秒前から入力に現れ始めている (実デバイスの蓄積と同様)
+        let anchor = if realtime_pacing {
+            std::time::Instant::now()
+                .checked_sub(hop_dur)
+                .unwrap_or_else(std::time::Instant::now)
+        } else {
+            std::time::Instant::now()
+        };
+        let out = engine.process_hop(chunk, anchor);
+        if live_flip.is_some() && !out.is_empty() && std::env::var_os("RCWX_LIVE_DEBUG").is_some() {
+            eprintln!("[dbg] hop {n_hops}: out {} samples", out.len());
+        }
         for v in &out {
             writer.write_sample((v.clamp(-1.0, 1.0) * 32767.0) as i16)?;
         }
@@ -111,11 +136,12 @@ pub fn run_virtual(
     }
     let s = &engine.stats;
     println!(
-        "virtual run: {n_hops} hops, inference p50={:.2}ms p99={:.2}ms max={:.2}ms (budget {:.1}ms)",
+        "virtual run: {n_hops} hops, inference p50={:.2}ms p99={:.2}ms max={:.2}ms (budget {:.1}ms) rtl_base={:.0}ms",
         s.percentile(50.0),
         s.percentile(99.0),
         s.inference_ms.iter().cloned().fold(0.0f64, f64::max),
-        cfg.chunk_sec * 1000.0
+        cfg.chunk_sec * 1000.0,
+        engine.last_emit_age_ms
     );
     let bad = s
         .inference_ms
@@ -136,6 +162,13 @@ struct Shared {
     hops: AtomicU64,
     armed: AtomicBool,
     queue_full: Arc<AtomicU64>,
+    /// 実測 RTL (f64 bits)。0 = 未測定
+    rtl_ms: AtomicU64,
+    /// live 反映 (出力 callback はロックせず atomics のみ読む):
+    /// arm に必要なプリバッファ出力サンプル数 / 間引き margin / policy 用バッチ出力長
+    prebuffer: AtomicUsize,
+    shed_margin: AtomicU64,
+    policy_batch: AtomicUsize,
 }
 
 /// 実デバイス実行。stop_flag が立つまで実行。
@@ -209,6 +242,10 @@ pub fn run_realtime(
         hops: AtomicU64::new(0),
         armed: AtomicBool::new(false),
         queue_full: Arc::new(AtomicU64::new(0)),
+        rtl_ms: AtomicU64::new(0),
+        prebuffer: AtomicUsize::new(0),
+        shed_margin: AtomicU64::new(0),
+        policy_batch: AtomicUsize::new(0),
     });
 
     let mut built = RtEngine::new(backend, cfg.clone())?;
@@ -221,7 +258,7 @@ pub fn run_realtime(
     }
     let engine = Arc::new(Mutex::new(built));
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(8);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<f32>, std::time::Instant)>(8);
     let qf = Arc::clone(&shared.queue_full);
 
     let (input_stream, wav_handle) = if let Some(mono) = wav_pcm {
@@ -240,17 +277,34 @@ pub fn run_realtime(
         let live_in = live.clone();
         let level = input_level.clone();
         let peak = input_peak.clone();
-        let acc = Arc::new(Mutex::new(Vec::<f32>::with_capacity(hop_mic * 2)));
+        let acc = Arc::new(Mutex::new((
+            Vec::<f32>::with_capacity(hop_mic * 2),
+            None::<std::time::Instant>,
+        )));
+        let hop_dur_cb = std::time::Duration::from_secs_f64(cfg.chunk_sec);
         let stream = build_input_stream(&in_device, &in_cfg, move |data: &[f32]| {
             let select_ch = live_channel(&live_in, true, fallback_ch);
             let mono = downmix(data, in_ch, select_ch);
             observe_level(&mono, &level, &peak);
             let mut acc = acc.lock().unwrap_or_else(|err| err.into_inner());
-            acc.extend_from_slice(&mono);
-            while acc.len() >= hop_mic {
-                let hop: Vec<f32> = acc.drain(..hop_mic).collect();
-                if tx.try_send(hop).is_err() {
+            let was_empty = acc.0.is_empty();
+            acc.0.extend_from_slice(&mono);
+            if was_empty && !acc.0.is_empty() {
+                // hop の最古サンプルが現れた時刻 (RTL 実測の錨)
+                acc.1 = Some(std::time::Instant::now());
+            }
+            while acc.0.len() >= hop_mic {
+                let hop: Vec<f32> = acc.0.drain(..hop_mic).collect();
+                // drain した hop の最古サンプル時刻 = 蓄積開始時刻
+                let anchor = acc.1.unwrap_or_else(std::time::Instant::now);
+                if tx.try_send((hop, anchor)).is_err() {
                     qf.fetch_add(1, Ordering::Relaxed);
+                }
+                if acc.0.is_empty() {
+                    acc.1 = None;
+                } else {
+                    // 残りは hop 1 個分だけ新しい
+                    acc.1 = anchor.checked_add(hop_dur_cb).or(acc.1);
                 }
             }
         })?;
@@ -263,17 +317,38 @@ pub fn run_realtime(
     let infer_shared = Arc::clone(&shared);
     let infer_engine = Arc::clone(&engine);
     let infer_stop = Arc::clone(&stop_flag);
+    let live_inf = live.clone();
+    let out_sr_inf = cfg.output_sample_rate as usize;
+    let hop_out_inf = hop_out;
     let infer_handle = std::thread::spawn(move || {
-        while let Ok(hop) = rx.recv() {
+        while let Ok((hop, arrived)) = rx.recv() {
             if infer_stop.load(Ordering::Acquire) {
                 break;
             }
-            let out = {
+            let (out, emit_age_ms) = {
                 let mut guard = infer_engine.lock().unwrap_or_else(|err| err.into_inner());
-                guard.process_hop(&hop)
+                let out = guard.process_hop(&hop, arrived);
+                (out, guard.last_emit_age_ms)
             };
             infer_shared.ring.write(&out);
             infer_shared.hops.fetch_add(1, Ordering::Relaxed);
+            if !out.is_empty() && emit_age_ms > 0.0 {
+                // 実測 RTL = 最古 hop の年齢 (蓄積+推論+ホールドバック) + ring 深さ
+                let rtl = emit_age_ms + infer_shared.ring.len() as f64 / out_sr_inf as f64 * 1000.0;
+                infer_shared.rtl_ms.store(rtl.to_bits(), Ordering::Relaxed);
+            }
+            // live のレイテンシ系ノブを出力側へ反映
+            if let Some(l) = live_inf.as_ref().and_then(|l| l.lock().ok()) {
+                let pb = (hop_out_inf * l.prebuffer_chunks as usize)
+                    .max(hop_out_inf * l.batch_hops as usize + hop_out_inf);
+                infer_shared.prebuffer.store(pb, Ordering::Relaxed);
+                infer_shared
+                    .shed_margin
+                    .store(l.buffer_margin.to_bits(), Ordering::Relaxed);
+                infer_shared
+                    .policy_batch
+                    .store(hop_out_inf * l.batch_hops as usize, Ordering::Relaxed);
+            }
         }
     });
 
@@ -284,6 +359,11 @@ pub fn run_realtime(
     let batch_out = hop_out * cfg.batch_hops as usize;
     let prebuffer_samples = (hop_out * cfg.prebuffer_chunks as usize).max(batch_out + hop_out);
     let margin = cfg.buffer_margin;
+    shared.prebuffer.store(prebuffer_samples, Ordering::Relaxed);
+    shared
+        .shed_margin
+        .store(margin.to_bits(), Ordering::Relaxed);
+    shared.policy_batch.store(batch_out, Ordering::Relaxed);
     let out_sr = cfg.output_sample_rate;
     let chunk_sec = cfg.chunk_sec;
     let batch_hops = cfg.batch_hops;
@@ -292,7 +372,7 @@ pub fn run_realtime(
         let s = &*out_shared;
         let n = data.len() / out_ch;
         if !s.armed.load(Ordering::Acquire) {
-            if s.ring.len() >= prebuffer_samples {
+            if s.ring.len() >= s.prebuffer.load(Ordering::Relaxed) {
                 s.armed.store(true, Ordering::Release);
             } else {
                 data.fill(0.0);
@@ -310,15 +390,15 @@ pub fn run_realtime(
         let post = s.ring.len();
         {
             let mut tr = tracker.borrow_mut();
-            tr.ensure_window(n.max(1), batch_out as i64);
+            tr.ensure_window(n.max(1), s.policy_batch.load(Ordering::Relaxed) as i64);
             tr.record_post_read(post as i64);
             if tr.is_full() {
                 let policy = compute_shed_policy(
                     false,
-                    batch_out as i64,
+                    s.policy_batch.load(Ordering::Relaxed) as i64,
                     out_sr,
                     chunk_sec * batch_hops as f64,
-                    margin,
+                    f64::from_bits(s.shed_margin.load(Ordering::Relaxed)),
                     1000,
                     5.0,
                     8.0,
@@ -358,14 +438,15 @@ pub fn run_realtime(
         std::thread::sleep(std::time::Duration::from_secs(1));
         let eng = engine.lock().unwrap_or_else(|err| err.into_inner());
         eprintln!(
-            "[RT] hops={} ring={} underruns={} trims={} queue_full={} corr={:.2} last={:.1}ms",
+            "[RT] hops={} ring={} underruns={} trims={} queue_full={} corr={:.2} last={:.1}ms rtl={:.0}ms",
             shared.hops.load(Ordering::Relaxed),
             shared.ring.len(),
             shared.underruns.load(Ordering::Relaxed),
             shared.trims.load(Ordering::Relaxed),
             shared.queue_full.load(Ordering::Relaxed),
             eng.stats.feedback_corr,
-            eng.stats.last_inference_ms
+            eng.stats.last_inference_ms,
+            f64::from_bits(shared.rtl_ms.load(Ordering::Relaxed))
         );
         if let Some(cb) = on_stats.as_ref() {
             cb(
@@ -379,6 +460,10 @@ pub fn run_realtime(
                     p95: eng.stats.percentile(95.0),
                     p99: eng.stats.percentile(99.0),
                     last_ms: eng.stats.last_inference_ms,
+                    rtl_ms: {
+                        let bits = shared.rtl_ms.load(Ordering::Relaxed);
+                        (bits != 0).then(|| f64::from_bits(bits))
+                    },
                 },
             );
         }
@@ -396,7 +481,7 @@ fn feed_wav(
     mono: Vec<f32>,
     hop: usize,
     hop_dur: std::time::Duration,
-    tx: std::sync::mpsc::SyncSender<Vec<f32>>,
+    tx: std::sync::mpsc::SyncSender<(Vec<f32>, std::time::Instant)>,
     stop: Arc<AtomicBool>,
     queue_full: Arc<AtomicU64>,
     meters: (Option<Arc<AtomicU32>>, Option<Arc<AtomicU32>>),
@@ -415,7 +500,10 @@ fn feed_wav(
         let chunk = mono[pos..pos + hop].to_vec();
         pos += hop;
         observe_level(&chunk, &level, &peak);
-        if tx.try_send(chunk).is_err() {
+        let anchor = std::time::Instant::now()
+            .checked_sub(hop_dur)
+            .unwrap_or_else(std::time::Instant::now);
+        if tx.try_send((chunk, anchor)).is_err() {
             queue_full.fetch_add(1, Ordering::Relaxed);
         }
         n += 1;

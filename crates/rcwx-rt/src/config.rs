@@ -63,6 +63,10 @@ pub struct RtConfig {
     /// 1 推論あたりにまとめる hop 数 (入力 hop 粒度は変わらず推論をバッチ。
     /// decoder マージンを償却し GPU 形状を大きくして持続レートを稼ぐ)
     pub batch_hops: u32,
+    /// decode/SOLA の受容野オーバーラップ (100fps フレーム)。既定 3。
+    /// 低遅延設定では 2 に縮めることでホールドバックが 10ms 減る
+    /// (Python 版 Aggressive の実行時 2 扱いと同じ)。
+    pub decoder_overlap_frames: u32,
     /// 変換後ボイスゲート: off / strict / expand / energy
     pub voice_gate_mode: String,
     pub energy_threshold: f64,
@@ -117,6 +121,7 @@ impl Default for RtConfig {
             normalizer_enabled: true,
             normalizer_target_rms: 0.1,
             batch_hops: 1,
+            decoder_overlap_frames: 3,
             voice_gate_mode: "off".into(),
             energy_threshold: 0.2,
             octave_suppress: true,
@@ -161,6 +166,14 @@ pub struct LiveParams {
     pub energy_threshold: f64,
     pub input_channel: Option<usize>,
     pub output_channel: Option<usize>,
+    /// 以下はレイテンシ系の実行時切替 (Aggressive / さらに攻める チェックの即時反映)。
+    /// hop バッチ数・decode/SOLA オーバーラップ・出力リングの arm/間引き閾値。
+    pub batch_hops: u32,
+    pub decoder_overlap_frames: u32,
+    pub buffer_margin: f64,
+    pub prebuffer_chunks: u32,
+    /// SOLA クロスフェード長 (秒)。CPU 側スプライスなので即時反映
+    pub crossfade_sec: f64,
 }
 
 impl LiveParams {
@@ -194,6 +207,11 @@ impl LiveParams {
             energy_threshold: cfg.energy_threshold,
             input_channel: cfg.input_channel,
             output_channel: cfg.output_channel,
+            batch_hops: cfg.batch_hops,
+            decoder_overlap_frames: cfg.decoder_overlap_frames,
+            buffer_margin: cfg.buffer_margin,
+            prebuffer_chunks: cfg.prebuffer_chunks,
+            crossfade_sec: cfg.crossfade_sec,
         }
     }
 }
@@ -228,6 +246,11 @@ impl RtConfig {
         self.energy_threshold = live.energy_threshold;
         self.input_channel = live.input_channel;
         self.output_channel = live.output_channel;
+        self.batch_hops = live.batch_hops.max(1);
+        self.decoder_overlap_frames = live.decoder_overlap_frames.clamp(1, 8);
+        self.buffer_margin = live.buffer_margin;
+        self.prebuffer_chunks = live.prebuffer_chunks.max(1);
+        self.crossfade_sec = live.crossfade_sec.clamp(0.002, 0.05);
     }
 }
 
@@ -260,6 +283,9 @@ pub struct RtReport {
     pub p95: f64,
     pub p99: f64,
     pub last_ms: f64,
+    /// 実測 RTL (hop 到着 → スピーカー到達相当)。emit 時の最古 hop 年齢 + 出力
+    ///リング深さ。未測定 (まだ flush していない) は None。
+    pub rtl_ms: Option<f64>,
 }
 
 /// 統計 (表示/テレメトリ用)。

@@ -284,6 +284,40 @@ fn orb(spec: &Orb) -> AnyElement {
 
 /// 窓の下地: トワイライトのグラデーション + 漂うオーロラ。
 /// アクリル窓 (DWM blur) の上に半透明で重ねる。
+/// クライアント側タイトルバー: オーロラ背景を透かし、右端にテーマ色の
+/// 最小化/最大化/閉じるボタン (ネイティブヒットテスト駆動) が載る。
+/// DWM のキャプション色がシステム外見 (ライト) 固定でダーク背景に消える問題の
+/// 回避として、ウィンドウ全体を TitleBar::window_options で開いた上でこれを置く。
+/// タイトルバー下端の縁 — ガラス縁と同じ淡い桜
+fn border_glow() -> Hsla {
+    sakura().opacity(0.18)
+}
+
+pub fn titlebar() -> gpui_kit::component::TitleBar {
+    use gpui_kit::component::TitleBar;
+    TitleBar::new()
+        // 既定のタイトルバー用グラデーションを打ち消して背景のオーロラを透かす
+        .bg(clear())
+        .border_color(border_glow())
+        .pl_5()
+        .child(
+            h_flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::Sparkles)
+                        .with_size(px(14.))
+                        .text_color(sakura_light()),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(muted_lilac())
+                        .child("RCWX — Realtime Voice Changer"),
+                ),
+        )
+}
+
 pub fn aurora_backdrop() -> AnyElement {
     let base = linear_gradient(
         175.,

@@ -21,10 +21,13 @@ fn main() {
             gpui_kit::init(cx);
             theme::apply(cx);
             let bounds = Bounds::centered(None, size(px(1180.), px(860.)), cx);
+            // TitleBar (クライアント側描画) を使う: システムのキャプションボタンは
+            // DWM のシステム外見 (ライト) に従って描かれ、ダークな背景に溶けて
+            // 見えなくなるため、テーマ色で自前描画 + ネイティブヒットテストで動かす
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_background: WindowBackgroundAppearance::Blurred,
-                ..Default::default()
+                ..gpui_kit::component::TitleBar::window_options()
             };
             gpui_kit::open_window(options, cx, |window, cx| {
                 window.set_window_title("RCWX");

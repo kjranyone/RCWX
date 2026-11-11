@@ -41,7 +41,11 @@ Issue #6 として **完全 Rust シングルバイナリ化** を計画 (M0〜M
   `crates/rcwx-gui/src/theme.rs` に集約 — (1) `apply()` で `Theme::global` を桜/ラベンダー
   配色に塗り替え (gpui-kit コンポーネントは自動追従)、(2) 窓は
   `WindowBackgroundAppearance::Blurred` (DWM アクリル) + 半透明グラデーション + 
-  呼吸するオーロラオーブ (`with_animation`)、(3) カードはグラデーション縁 + 
+  呼吸するオーロラオーブ (`with_animation`)、(2.5) **タイトルバーは gpui-component
+  の `TitleBar` (クライアント側描画) を `theme::titlebar()` で透明化して配置 —
+  システムキャプション (DWM) はシステム外見=ライトのまま描かれてダーク背景に
+  消えるため、最小化/最大化/閉じるはテーマ色で自前描画 (ネイティブヒットテスト
+  駆動・`TitleBar::window_options()` ベースで開窓)、(3) カードはグラデーション縁 + 
   半透明ガラス + ソフトシャドウ (`glass_panel`)、(4) ピル型タブ・VU メーター・
   チップ等の部品も theme.rs。view.rs はロジックのみ持ち、描画は theme.rs の部品を
   組むだけ。アイコンは `gpui_kit::assets::AllAssets` (Lucide 全カタログ)。
@@ -422,6 +426,35 @@ GUI 既定起動時の代表値:
 |------|----------------|------|-------|
 | Normal | ≥ 40ms（〜600ms、20ms 刻み） | ≥ 100ms | ≥ 320ms |
 | Aggressive | 20–100ms（20ms 刻み） | ≥ 100ms | ≥ 320ms |
+| Ultra (実験) | Aggressive + `batch_hops=2` + `decoder_overlap_frames=2` | — | — |
+
+**Ultra (低遅延・実験)**: Rust 版の追加設定 (`latency_ultra`・GUI の「さらに攻める」
+チェック)。hop バッチを 4→2 に縮め入力蓄積 80→40ms、decode/SOLA の右側
+オーバーラップを 3→2 フレーム (Python 版 Aggressive の実行時 2 と同じ)。
+実測 (仮想ベンチ): 推論償却 p50 10.6ms (良い状態)〜16.7ms (ドライバ低下時・
+p99 22ms で一時予算超過あり)。負荷余裕が小さくなるため実験扱い。既定
+(batch 4 + overlap 3) は p50 7.1-10.7ms で全 hop 予算内を維持。CLI は
+`rt --batch 2 --dec-overlap 2` で同等 (`RCWX_LIVE_FLIP=N` で実行中切替の検証も可)。
+
+**レイテンシ系設定の実行中反映と実測 RTL 表示**: Aggressive / さらに攻める の
+両チェックは実行中に即時反映する — `LiveParams` が `batch_hops` /
+`decoder_overlap_frames` / `buffer_margin` / `prebuffer_chunks` を運び、engine は
+hop ごとに pull (バッチ縮小時は貯めた実数で flush して長さ不整合を回避)。
+出力リングの arm/間引き閾値は `Shared` の atomics 経由で callback をロック
+フリーに反映。RTL 表示は予測式を廃止し**実測値のみ**: hop の**最古サンプルが
+入力に現れた時刻** (hop は chunk 分の蓄積完了時に渡されるため、単純に送出時刻
+から測ると蓄積時間 — 600ms chunk なら 600ms — が漏れて過小に出る。入力
+callback は蓄積開始時刻を追跡し hop ごとに錨を進める) からの年齢
+(蓄積+推論+ホールドバック) + 出力リング深さを毎バッチ計算し、GUI は
+**5 秒ごとにサンプル**して表示 (未計測は「計測中…」・停止中は「—」)。
+paced 実測: rtl_base = 20ms chunk で ~100ms / 600ms chunk で ~672ms。
+実デバイス実測 (WAV 入力・出力 -60dB・8s): 既定 (batch4/cf12ms/margin0.25) で
+**RTL 209ms** → ultra (batch2/ov2/cf6ms/margin0.05) で **RTL 111ms** (underrun 0・
+ring floor ~46ms)。hop 10ms 化は不可 (HuBERT の 320 sample フレーミング下限で
+new50=0 になりバインド長 0 で落ちる)。ultra のクロスフェード 6ms は Python 版の
+下限 10ms を割る実験値 (エンベロープ corr 0.9997・クリック 0 は確認済み・
+試聴推奨)。CLI: `rt --wav-in x.wav --out-gain -60 --seconds 8 --batch 2
+--dec-overlap 2 --crossfade 0.006 --margin 0.05` で再現。
 
 ### runtime 挙動 (`realtime_unified.py`)
 
