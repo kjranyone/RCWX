@@ -1023,7 +1023,12 @@ impl Engine {
             try_compile(self, "flash_attn", &shaders::flash_attn_src(), 2)?;
         }
         try_compile(self, "matmul_tiled", &shaders::matmul_tiled_src(), 4)?;
-        try_compile(self, "matmul_tiled_kahan", &shaders::matmul_tiled_kahan_src(), 5)?;
+        try_compile(
+            self,
+            "matmul_tiled_kahan",
+            &shaders::matmul_tiled_kahan_src(),
+            5,
+        )?;
         try_compile(self, "conv1d", &shaders::CONV1D, 4)?;
         try_compile(self, "groupnorm", &shaders::groupnorm_src(), 4)?;
         try_compile(self, "layernorm", &shaders::layernorm_src(), 4)?;
@@ -1092,7 +1097,12 @@ impl Engine {
             try_compile(self, "t_rfft2048", &train_shaders::T_RFFT2048, 3)?;
             try_compile(self, "t_rfft2048_bwd", &train_shaders::T_RFFT2048_BWD, 3)?;
             try_compile(self, "t_rfft2048_ds", &train_shaders::T_RFFT2048_DS, 5)?;
-            try_compile(self, "t_rfft2048_ds_bwd", &train_shaders::T_RFFT2048_DS_BWD, 5)?;
+            try_compile(
+                self,
+                "t_rfft2048_ds_bwd",
+                &train_shaders::T_RFFT2048_DS_BWD,
+                5,
+            )?;
             try_compile(self, "t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
             try_compile(self, "t_wn_fold_rows", &train_shaders::T_WN_FOLD_ROWS, 4)?;
             try_compile(self, "t_wn_bwd_rows", &train_shaders::T_WN_BWD_ROWS, 6)?;

@@ -749,7 +749,15 @@ fn main() -> Result<()> {
             synth.infer_formant(&eng, &feats_t, &pitch, &f0_sine, t100 as u32, factor)
         }
     } else if t100 > 96 || force_chunk {
-        synth.infer_chunked(&eng, &feats_t, &pitch, &f0v, t100 as u32, dec_chunk, dec_margin)
+        synth.infer_chunked(
+            &eng,
+            &feats_t,
+            &pitch,
+            &f0v,
+            t100 as u32,
+            dec_chunk,
+            dec_margin,
+        )
     } else {
         let audio_out = synth.infer(&eng, &feats_t, &pitch, &f0v, t100 as u32);
         eng.readback_f32(&audio_out)

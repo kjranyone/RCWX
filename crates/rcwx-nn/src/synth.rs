@@ -1768,104 +1768,105 @@ impl Synth {
         let mut start = 0usize;
         while start < t {
             if factor == 1.0 {
-            let ts = std::time::Instant::now();
-            let mut group: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, w_start)
-            let mut plan_refs: Vec<&Plan> = Vec::new();
-            for (idx, (z_st, har_st, _a, plan)) in sets.iter().enumerate() {
-                let s = start + idx * chunk;
-                if s >= t {
+                let ts = std::time::Instant::now();
+                let mut group: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, w_start)
+                let mut plan_refs: Vec<&Plan> = Vec::new();
+                for (idx, (z_st, har_st, _a, plan)) in sets.iter().enumerate() {
+                    let s = start + idx * chunk;
+                    if s >= t {
+                        break;
+                    }
+                    let end = (s + chunk).min(t);
+                    let w_start = s.saturating_sub(margin);
+                    let w_end = (end + margin).min(t);
+                    let n = w_end - w_start;
+                    for c in 0..inter {
+                        let base = c * nf;
+                        zw[base..base + n].copy_from_slice(&z_cpu[c * t + w_start..c * t + w_end]);
+                        zw[base + n..base + nf].fill(0.0);
+                    }
+                    eng.write_f32(z_st, &zw);
+                    let har = self.sinegen_range(pitchf, w_start, n);
+                    har_full[..har.len()].copy_from_slice(&har);
+                    har_full[har.len()..].fill(0.0);
+                    eng.write_f32(har_st, &har_full);
+                    group.push((s, end, w_start));
+                    plan_refs.push(plan);
+                }
+                if plan_refs.is_empty() {
                     break;
                 }
-                let end = (s + chunk).min(t);
-                let w_start = s.saturating_sub(margin);
+                eng.replay_plans(&plan_refs);
+                acc_sub += ts.elapsed().as_secs_f64();
+                let tr = std::time::Instant::now();
+                let trace = std::env::var_os("RCWX_DEC_RB_TRACE").is_some();
+                let mut ti = std::time::Instant::now();
+                for (i, set) in sets.iter().enumerate().take(group.len()) {
+                    let (s, end, w_start) = group[i];
+                    let samples = eng.readback_f32(&set.2);
+                    if trace {
+                        eprintln!(
+                            "[dec] chunk {s}: rb {:.1}ms",
+                            ti.elapsed().as_secs_f64() * 1000.0
+                        );
+                        ti = std::time::Instant::now();
+                    }
+                    let s_off = s - w_start;
+                    let take = end - s;
+                    let row = zc as usize * take;
+                    out[s * zc as usize..s * zc as usize + row]
+                        .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
+                }
+                acc_rb += tr.elapsed().as_secs_f64();
+                start = group.last().unwrap().1;
+            } else {
+                let end = (start + chunk).min(t);
+                let w_start = start.saturating_sub(margin);
                 let w_end = (end + margin).min(t);
-                let n = w_end - w_start;
-                for c in 0..inter {
-                    let base = c * nf;
-                    zw[base..base + n].copy_from_slice(&z_cpu[c * t + w_start..c * t + w_end]);
-                    zw[base + n..base + nf].fill(0.0);
-                }
-                eng.write_f32(z_st, &zw);
-                let har = self.sinegen_range(pitchf, w_start, n);
-                har_full[..har.len()].copy_from_slice(&har);
-                har_full[har.len()..].fill(0.0);
-                eng.write_f32(har_st, &har_full);
-                group.push((s, end, w_start));
-                plan_refs.push(plan);
-            }
-            if plan_refs.is_empty() {
-                break;
-            }
-            eng.replay_plans(&plan_refs);
-            acc_sub += ts.elapsed().as_secs_f64();
-            let tr = std::time::Instant::now();
-            let trace = std::env::var_os("RCWX_DEC_RB_TRACE").is_some();
-            let mut ti = std::time::Instant::now();
-            for (i, set) in sets.iter().enumerate().take(group.len()) {
-                let (s, end, w_start) = group[i];
-                let samples = eng.readback_f32(&set.2);
-                if trace {
-                    eprintln!(
-                        "[dec] chunk {s}: rb {:.1}ms",
-                        ti.elapsed().as_secs_f64() * 1000.0
+                let n = (w_end - w_start) as u32;
+                // z の末尾抽出は GPU 内で (slice_ch) — 全 z を一度アップロード
+                let z_full_t = eng.tensor_from_f32(&z_cpu, vec![]);
+                let har = self.sinegen_range(pitchf, w_start, n as usize);
+                let samples = if factor == 1.0 {
+                    let har_t = eng.tensor_from_f32(&har, vec![]);
+                    let mut g = eng.graph();
+                    let audio = self.decode_graph_off(
+                        eng,
+                        &mut g,
+                        &z_full_t,
+                        &har_t,
+                        t as u32,
+                        w_start as u32,
+                        n,
                     );
-                    ti = std::time::Instant::now();
-                }
-                let s_off = s - w_start;
-                let take = end - s;
+                    g.submit().expect("submit");
+                    eng.readback_f32(&audio)
+                } else {
+                    let n2 = (((n as f64) * factor).ceil() as u32).max(1);
+                    let har2 =
+                        stretch_time(&har, n as usize * zc as usize, n2 as usize * zc as usize);
+                    let har_t = eng.tensor_from_f32(&har2, vec![]);
+                    let mut g = eng.graph();
+                    let audio = self.decode_graph_off_formant(
+                        eng,
+                        &mut g,
+                        &z_full_t,
+                        &har_t,
+                        t as u32,
+                        w_start as u32,
+                        n,
+                        n2,
+                    );
+                    g.submit().expect("submit");
+                    let stretched = eng.readback_f32(&audio);
+                    formant_resample_back(&stretched, n as usize, zc as usize, factor)
+                };
+                let s_off = start - w_start;
+                let take = end - start;
                 let row = zc as usize * take;
-                out[s * zc as usize..s * zc as usize + row]
+                out[start * zc as usize..start * zc as usize + row]
                     .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
-            }
-            acc_rb += tr.elapsed().as_secs_f64();
-            start = group.last().unwrap().1;
-            } else {
-            let end = (start + chunk).min(t);
-            let w_start = start.saturating_sub(margin);
-            let w_end = (end + margin).min(t);
-            let n = (w_end - w_start) as u32;
-            // z の末尾抽出は GPU 内で (slice_ch) — 全 z を一度アップロード
-            let z_full_t = eng.tensor_from_f32(&z_cpu, vec![]);
-            let har = self.sinegen_range(pitchf, w_start, n as usize);
-            let samples = if factor == 1.0 {
-                let har_t = eng.tensor_from_f32(&har, vec![]);
-                let mut g = eng.graph();
-                let audio = self.decode_graph_off(
-                    eng,
-                    &mut g,
-                    &z_full_t,
-                    &har_t,
-                    t as u32,
-                    w_start as u32,
-                    n,
-                );
-                g.submit().expect("submit");
-                eng.readback_f32(&audio)
-            } else {
-                let n2 = (((n as f64) * factor).ceil() as u32).max(1);
-                let har2 = stretch_time(&har, n as usize * zc as usize, n2 as usize * zc as usize);
-                let har_t = eng.tensor_from_f32(&har2, vec![]);
-                let mut g = eng.graph();
-                let audio = self.decode_graph_off_formant(
-                    eng,
-                    &mut g,
-                    &z_full_t,
-                    &har_t,
-                    t as u32,
-                    w_start as u32,
-                    n,
-                    n2,
-                );
-                g.submit().expect("submit");
-                let stretched = eng.readback_f32(&audio);
-                formant_resample_back(&stretched, n as usize, zc as usize, factor)
-            };
-            let s_off = start - w_start;
-            let take = end - start;
-            let row = zc as usize * take;
-            out[start * zc as usize..start * zc as usize + row]
-                .copy_from_slice(&samples[s_off * zc as usize..s_off * zc as usize + row]);
-            start = end;
+                start = end;
             }
         }
         if timing {
