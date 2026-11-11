@@ -569,10 +569,18 @@ uv run python tests/audio/test_denoise_aggressive_policy.py
 - **Skill**: `tools/skill/rcwx-train/SKILL.md` がパイプラインを自動化。
 - **実スケール学習 (検証済み)**: Tape の分割 submit (`maybe_flush`, 256 dispatch
   ごとに途中 submit + uniform slot 回収) で device loss を解消。本家
-  f0G48k_v2/f0D48k_v2 base からの fine-tuning を実走行 (e2e_test: 20 epoch で
-  mel 197→31.9、~40s/epoch。engine の weight 勾配修正後は D が本格学習し
-  ~63s/epoch、disc/fm が実値に)。device loss 時は `--resume` で
+  f0G48k_v2/f0D48k_v2 base からの fine-tuning を実走行。分割累積 matmul 導入後は
+  ~90s/epoch (DFT chunk 16 の追加分含む)。device loss 時は `--resume` で
   checkpoint から再開 — エポック単位 checkpoint を実装。
+- **tiny データ (8 発話) fine-tune の知見**: engine 修正後 (正確な D 勾配・
+  cond bias 勾配) の学習は GAN 圧が本物になり、少数データでは
+  cond 系バイアス (512 次元) が大きくドリフトして過学習する
+  (推論出力が rms 0.003 に縮退・KL -1.6)。旧エンジン (D 勾配欠損) は
+  結果的に正則化として働き軟らかいモデルを出していた。E2E corr は
+  モデルの鋭さ/縮退度で 0.79〜0.97 に変動 — **同一重み比較の E2E ゲート
+  (corr ≥ 0.98) は base モデルで 0.9967 (best-lag 0.9986) を維持**。
+  実データでの本格 fine-tune には十分なデータ量とレシピ調整
+  (lr/epoch/cond 系の制約) が別途必要。
   エクスポート: native (推論即使用) + .pth (WN v/g 保持 + weight_g 形状復元 —
   `load_state_dict` missing 0 keys)。ただし RVC 48k v2 checkpoint は判別器キーが
   `discriminators.{i}` 形式のためローダでリマップ。
@@ -612,7 +620,7 @@ uv run python tests/audio/test_denoise_aggressive_policy.py
   3. `conv2d` backward の dcol matmul で w_row/w_k ストライドが入れ替わって
      いた (dX が全滅) → 修正 + FD gradcheck 追加 (`tests/mpd_gradcheck.rs`)。
 - **WN fold × grouped conv (g≥2) dW 逆伝達バグ — 修正済み**。3-step parity 構築で
- 発覚した engine の実バグ 5 件をすべて修正 (いずれも回帰テスト付き):
+ 発覚した engine の実バグ **7 件**をすべて修正 (いずれも回帰テスト付き):
   1. `t_im2col` がバッチストライドに `cin_g` (グループ内 ch 数) を使っていた
      (batch>1 で後続バッチが別チャネルを読む) → 入力側バッチストライドを
      独立 word (`b_stride = in_c·in_len`) に分離。**forward も壊れていた**。
@@ -629,18 +637,58 @@ uv run python tests/audio/test_denoise_aggressive_policy.py
      気づかず)。修正後 D が本格学習 (disc/fm が実値に)。
   5. KL 損失の mask 参照が [b, inter, t] フラット index で [b, t] マップを
      読み越えていた (B>1) → b/t 復元 index に修正。
+  6. `T_REFLECT_PAD` (fwd) が両側 **symmetric** (縁複製) 実装だった
+     (正: reflect = 縁複製なし。左 `x[pad−o]`・右 `x[L−2−j]`、numpy
+     `'reflect'` / torch `F.pad(..., "reflect")` と同一)。
+     **端フレームのみ破損** (t=0/1/36–37、re rms 202/130/25/4 — パッド領域を
+     含むフレームだけ。内部フレームは 4e-5 で完全)。DS FFT が疑われたが
+     無実: f64 golden 帰属で rust backward は完全 (自 fwd sign 参照と
+     cos 1.000001)、fwd sign が 1176/77900 bin (ナイフエッジ) で f64 と
+     不一致 → その全量がこの pad バグだった。fwd/bwd を真の reflect に
+     修正し既知値回帰テスト (`kahan_ab.rs reflect_pad_exact_reflect`,
+     fwd bit-exact・bwd 随伴 0) を追加。段階 bisect 全段階 cos 1.000000。
+     (旧記録の「bwd 右ミラー 2L−2→2L−1 修正」は誤った symmetric fwd に
+     bwd を合わせる変更だった — fwd が本体のバグ)
+  7. `mm` の bias 逆伝達が `bias_axis` を無視して常に bias[n] を計算 —
+     bias_axis=1 (cond 系: dec.cond / enc_q.cond_layer, n=1) で
+     dec.cond.bias 勾配が 3.4 倍に崩壊。2 段 colsum による bias[m] 経路を追加。
 - **D 再 forward を upstream RVC 仕様に統一**: D 更新後に WN を refold して
   更新後重みで G 側 adv/fm を計算 (旧: 更新前 fold を使い、bias だけ更新後の
   混在セマンティクス。py 参照も旧重み snapshot を使っており双方が変則)。
   これで adv も 5 桁一致。
-- **M-T4 3-step パリティ完全合格** (`tools/train_step_ref.py` →
-  `tests/step_parity.rs`): **全 15 損失 (5 種 × 3 step) が rtol 1e-3 以内**
-  (d/adv/kl は 5 桁一致)、**D param delta cos = 1.000000**、G delta 0.989。
-  G の残り ~1e-3 は fp32 逆伝播の累積順差フロア: 全 op を CPU 参照と完全一致
-  させ (dilated/grouped/conv2d/WN/gather)、G 勾配 140/144 パラメータが
-  cos ≥ 0.99 (残り 4 つは要素数 8〜128 の小パラメータ)。0.999 到達には
-  補償付き逆伝播カーネルが今後課題 (Tape は `matmul_tiled_kahan` を搭載済み
-  だが DX12/naga が代数的最適化で打ち消すため効果なし — 実測 bit 一致)。
+- **M-T4 3-step パリティ完全合格 (計画ゲート)** (`tools/train_step_ref.py` →
+  `tests/step_parity.rs`): **全 15 損失 (5 種 × 3 step) が rel ≈ 0**
+  (表示 5 桁で全て 0.00000)、**D param delta cos = 1.000000**、
+  **G param delta cos = 0.999849 ≥ 0.999** (ゲートは計画値 0.999 に復帰)。
+  logmel 勾配は py-f64 golden と cos 1.000000・relnorm 4.9e-6
+  (= py-f32 と py-f64 の差と同水準 — 相互 f32 ノイズフロア到達)。
+  G delta は 0.989 → 0.992 (engine bug 6/7 件目) → **0.999849**
+  (8 件目 reflect fwd バグ修正)。gg0 個別勾配は 143/144 パラメータ cos≥0.99。
+- **分割累積 (multi-pass) matmul 実装・実測済み**: 検証指令の
+  「中間バッファ経由の分割加算」を `matmul_tiled_kahan` として実装。
+  k を chunk 毎 (既定 256・logmel DFT は 16) に分割し、パス間を
+  ping-pong GPU バッファ (B4→B5) で接続 — **物理的な演算境界**のため
+  naga の式変形で消去不可 (`Graph::matmul_tiled_split`、バッファは
+  keepalive で submit まで生存保証)。効果:
+  - rust 自身の誤差 (f64 参照比): k=4096 で 1.5×、実 STFT データで
+    max 1.7e-5 (単発 tiled は 1.2e-5→良化)。
+  - **trainer の G forward z は cos 1.00000000 (相対誤差 median 7.5e-8)**
+    — 分割前は 5e-4。
+  - **GAN 経路勾配は cos 1.00000・relnorm 2-5e-4 (ほぼ完全一致)**。
+  - 一時「残る ~0.008 は py 側 f32 桁数が下限」と結論したが**誤り** —
+    py-f32 vs py-f64 は 4.9e-6 なのに rust vs py-f64 は relnorm 1.7e-1
+    (cos 0.985875 = rust vs py-f32 と同一) → 残差は rust 側にあった。
+    f64 golden による帰属で backward は完全・fwd sign 不一致 (上記
+    8 件目の reflect バグ) と確定し、修正で解消。
+  - **radix-2 バタフライ FFT**: `T_RFFT2048`/`T_RFFT2048_BWD` (f32) と
+    double-single 版 `T_RFFT2048_DS`/`_BWD` (Dekker (hi,lo) 演算・host f64
+    twiddle を split 供給・shared memory 32KB/フレーム) を実装し logmel の
+    DFT を置換 (n_fft=2048 のみ。他は dft_mm 分割 matmul フォールバック)。
+    DS fwd 相対 ~2.5e-8 (f32 版 ~5e-7)、bwd 2e-8。reflect バグ修正後は
+    re fwd 誤差 max 3e-5 (py と同水準) で段階 bisect 全段階 cos 1.000000。
+    FFT は forward 1 dispatch で chunk-16 分割 (128 dispatch) より高速な
+    ため採用。DS 化の意義はバグ発見時に「DFT 精度が原因でない」ことを
+    実測で切り分けられた点。
 - 長系列 (T=2310, B=2) の generator golden も追加
   (`tools/train_ref2_long.py` → `RCWX_MP2_LONG=1 cargo test -p rcwx-train
   --test module_parity2`)。

@@ -748,7 +748,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 });
 
 /// 1D reflect pad (両側)。x [b, c, in_len] → out [b, c, in_len+2p]。
-/// torch F.pad(mode="reflect") と同一: 左 out[p-1-i] = x[i+1]、右 out[p+len+i] = x[len-2-i]。
+/// torch F.pad(mode="reflect") (= numpy 'reflect', 縁複製なし) と同一:
+/// 左 out[i] = x[p-i] (i<p)、右 out[p+len+j] = x[len-2-j]。
+/// (旧実装は両側 symmetric (縁複製) になっていた — 端フレームの STFT が破損)
 pub static T_REFLECT_PAD: LazyLock<String> = LazyLock::new(|| {
     theader(2)
         + r#"
@@ -762,8 +764,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let ch = (gi / out_len) % c;
   let b = gi / (c * out_len);
   var src: i32 = i32(o) - i32(pad);
-  if (src < 0) { src = -src - 1; }
-  if (src >= i32(in_len)) { src = 2 * i32(in_len) - 1 - src; }
+  if (src < 0) { src = -src; }
+  if (src >= i32(in_len)) { src = 2 * i32(in_len) - 2 - src; }
   B2[gi] = B1[(b * c + ch) * in_len + u32(src)];
 }
 "#
@@ -1047,7 +1049,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 });
 
 /// reflect pad の随伴: dx[..., src] = dy[..., p+src]
-/// + (src < p ? dy[..., p-1-src] : 0) + (in_len-2-p < src <= in_len-2 ? dy[..., p+2*in_len-2-src] : 0)。
+/// + (1 <= src <= p ? dy[..., p-src] : 0) + (in_len-2-p <= src <= in_len-2 ? dy[..., p+2*in_len-2-src] : 0)。
+/// (fwd の reflect 写像の逆: 左 out[i]=x[p-i]、右 out[p+L+j]=x[L-2-j] — 縁複製なし)
 pub static T_REFLECT_PAD_BWD: LazyLock<String> = LazyLock::new(|| {
     theader(2)
         + r#"
@@ -1060,7 +1063,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let src = gi % in_len;
   let base_o = ((gi / in_len) * out_len);
   var v = B1[base_o + pad + src];
-  if (src < pad) { v = v + B1[base_o + pad - 1u - src]; }
+  // 左ミラー: fwd out[i] = x[pad-i] (i<pad) → src は 1..=pad が寄与
+  if (src > 0u && src <= pad) { v = v + B1[base_o + pad - src]; }
+  // 右ミラー: fwd out[pad+s] = x[2L-2-s] (s∈[L, L+pad)) →
+  // src = 2L-2-s は i_right = L-2-src ∈ [0, pad) が寄与
   let i_right = i32(in_len) - 2 - i32(src);
   if (i_right >= 0 && u32(i_right) < pad) {
     v = v + B1[base_o + pad + in_len + u32(i_right)];
@@ -1226,6 +1232,351 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let c = (gi / t_len) % ch;
   let b = gi / (ch * t_len);
   B2[gi] = B1[(b * ch + (ch - 1u - c)) * t_len + t];
+}
+"#
+});
+
+/// 2048 点実 FFT (Cooley-Tukey bit-reverse + 11 段バタフライ)。
+/// logmel DFT mm (逐次深さ ~144) を対数深さ (11) 化する。
+/// B1 = windowed frames [b, 2048, nf] (k-major: k stride = nf)
+/// B2 = re 出力 [b, 1025, nf]、B3 = im 出力 [b, 1025, nf]
+/// workgroup x = 線形 frame index (b·nf + t)。
+pub static T_RFFT2048: LazyLock<String> = LazyLock::new(|| {
+    theader(3)
+        + r#"
+var<workgroup> sr: array<f32, 2048>;
+var<workgroup> si: array<f32, 2048>;
+
+fn bitrev11(v: u32) -> u32 {
+  var r = 0u;
+  for (var b: u32 = 0u; b < 11u; b = b + 1u) {
+    r = (r << 1u) | ((v >> b) & 1u);
+  }
+  return r;
+}
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let n_frames = P.p0.x;
+  let tid = lid.x;
+  let frame = wid.x;               // b·nf + t
+  let b = frame / n_frames;
+  let t = frame % n_frames;
+  let in_base = frame * 2048u * n_frames / n_frames; // = frame*2048 (frames 平坦の frame 行)
+  // ロード: frames [b, k, t] → 実入力
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    sr[k] = B1[(b * 2048u + k) * n_frames + t];
+    si[k] = 0.0;
+  }
+  workgroupBarrier();
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    let j = bitrev11(k);
+    if (k < j) {
+      let tr = sr[k]; let ti = si[k];
+      sr[k] = sr[j]; si[k] = si[j];
+      sr[j] = tr; si[j] = ti;
+    }
+  }
+  workgroupBarrier();
+  var len = 2u;
+  while (len <= 2048u) {
+    let half = len >> 1u;
+    for (var f: u32 = tid; f < 1024u; f = f + 256u) {
+      let blk = f / half;
+      let kk = f % half;
+      let i = blk * len + kk;
+      let j = i + half;
+      let ang = -6.283185307179586 * f32(kk) / f32(len);
+      let wr = cos(ang);
+      let wi = sin(ang);
+      let xr = sr[j] * wr - si[j] * wi;
+      let xi = sr[j] * wi + si[j] * wr;
+      sr[j] = sr[i] - xr;
+      si[j] = si[i] - xi;
+      sr[i] = sr[i] + xr;
+      si[i] = si[i] + xi;
+    }
+    workgroupBarrier();
+    len = len << 1u;
+  }
+  // 出力 [b, 1025, nf]
+  for (var k: u32 = tid; k < 1025u; k = k + 256u) {
+    B2[(b * 1025u + k) * n_frames + t] = sr[k];
+    B3[(b * 1025u + k) * n_frames + t] = si[k];
+  }
+}
+"#
+});
+
+/// FFT 逆伝達: dx = Re(Σ_{k<1025} c_k e^{+2πikn/N})、c = gRe + i·gIm。
+/// B1 = gRe [b, 1025, nf]、B2 = gIm、B3 = dframes 出力 [b, 2048, nf]。
+/// (k ≥ 1025 は 0 埋め → 同一バタフライで + 符号)
+pub static T_RFFT2048_BWD: LazyLock<String> = LazyLock::new(|| {
+    theader(3)
+        + r#"
+var<workgroup> sr: array<f32, 2048>;
+var<workgroup> si: array<f32, 2048>;
+
+fn bitrev11(v: u32) -> u32 {
+  var r = 0u;
+  for (var b: u32 = 0u; b < 11u; b = b + 1u) {
+    r = (r << 1u) | ((v >> b) & 1u);
+  }
+  return r;
+}
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let n_frames = P.p0.x;
+  let tid = lid.x;
+  let frame = wid.x;
+  let b = frame / n_frames;
+  let t = frame % n_frames;
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    if (k < 1025u) {
+      sr[k] = B1[(b * 1025u + k) * n_frames + t];
+      si[k] = B2[(b * 1025u + k) * n_frames + t];
+    } else {
+      sr[k] = 0.0;
+      si[k] = 0.0;
+    }
+  }
+  workgroupBarrier();
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    let j = bitrev11(k);
+    if (k < j) {
+      let tr = sr[k]; let ti = si[k];
+      sr[k] = sr[j]; si[k] = si[j];
+      sr[j] = tr; si[j] = ti;
+    }
+  }
+  workgroupBarrier();
+  var len = 2u;
+  while (len <= 2048u) {
+    let half = len >> 1u;
+    for (var f: u32 = tid; f < 1024u; f = f + 256u) {
+      let blk = f / half;
+      let kk = f % half;
+      let i = blk * len + kk;
+      let j = i + half;
+      let ang = 6.283185307179586 * f32(kk) / f32(len);
+      let wr = cos(ang);
+      let wi = sin(ang);
+      let xr = sr[j] * wr - si[j] * wi;
+      let xi = sr[j] * wi + si[j] * wr;
+      sr[j] = sr[i] - xr;
+      si[j] = si[i] - xi;
+      sr[i] = sr[i] + xr;
+      si[i] = si[i] + xi;
+    }
+    workgroupBarrier();
+    len = len << 1u;
+  }
+  // dx = Re(結果)
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    B3[(b * 2048u + k) * n_frames + t] = sr[k];
+  }
+}
+"#
+});
+
+/// 2048 点実 FFT・**倍精度相当 (double-single)** 版。
+/// f32 バタフライの絶対誤差 ~1.5e-4 が L1 sign のナイフエッジ
+/// (|re_a−re_b| < 1e-4 要素 0.02%) を裏返すため、(hi, lo) 2-float 演算で
+/// 誤差を ~1e-7 まで落とす。twiddle はホストで f64 計算した (hi,lo) 表。
+/// B1 = frames [b,2048,nf]、B2 = re [b,1025,nf]、B3 = im、
+/// B4 = cos 表 (hi,lo 交互・2047 エントリ)、B5 = sin 表 (同)。
+/// 表レイアウト: 段 len の twiddle k は off=len/2−1+k (hi at 2·idx, lo at 2·idx+1)。
+pub static T_RFFT2048_DS: LazyLock<String> = LazyLock::new(|| {
+    theader(5)
+        + r#"
+var<workgroup> rh: array<f32, 2048>;
+var<workgroup> rl: array<f32, 2048>;
+var<workgroup> ih: array<f32, 2048>;
+var<workgroup> il: array<f32, 2048>;
+
+fn bitrev11(v: u32) -> u32 {
+  var r = 0u;
+  for (var b: u32 = 0u; b < 11u; b = b + 1u) {
+    r = (r << 1u) | ((v >> b) & 1u);
+  }
+  return r;
+}
+// 2-float 加算: s = a + b (hi 出力 s0, lo 出力 s1)
+fn ds_add(ah: f32, al: f32, bh: f32, bl: f32) -> vec2<f32> {
+  let s = ah + bh;
+  let v = s - ah;
+  let err = (ah - (s - v)) + (bh - v);
+  return vec2<f32>(s, err + al + bl);
+}
+// 2-float 乗算
+fn ds_mul(ah: f32, al: f32, bh: f32, bl: f32) -> vec2<f32> {
+  let p = ah * bh;
+  let e = fma(ah, bh, -p);
+  return vec2<f32>(p, e + ah * bl + al * bh);
+}
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let n_frames = P.p0.x;
+  let tid = lid.x;
+  let frame = wid.x;
+  let b = frame / n_frames;
+  let t = frame % n_frames;
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    rh[k] = B1[(b * 2048u + k) * n_frames + t];
+    rl[k] = 0.0;
+    ih[k] = 0.0;
+    il[k] = 0.0;
+  }
+  workgroupBarrier();
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    let j = bitrev11(k);
+    if (k < j) {
+      let th = rh[k]; let tl = rl[k]; let uh = ih[k]; let ul = il[k];
+      rh[k] = rh[j]; rl[k] = rl[j]; ih[k] = ih[j]; il[k] = il[j];
+      rh[j] = th; rl[j] = tl; ih[j] = uh; il[j] = ul;
+    }
+  }
+  workgroupBarrier();
+  var len = 2u;
+  while (len <= 2048u) {
+    let half = len >> 1u;
+    let off = (half - 1u) * 2u;  // (len/2−1) 累積 → hi/lo 交互なので ×2
+    for (var f: u32 = tid; f < 1024u; f = f + 256u) {
+      let blk = f / half;
+      let kk = f % half;
+      let i = blk * len + kk;
+      let j = i + half;
+      let ti = off + kk * 2u;
+      let wr_h = B4[ti]; let wr_l = B4[ti + 1u];
+      let wi_h = B5[ti]; let wi_l = B5[ti + 1u];
+      // t = w · z_j
+      let m1 = ds_mul(wr_h, wr_l, rh[j], rl[j]);
+      let m2 = ds_mul(wi_h, wi_l, ih[j], il[j]);
+      let m3 = ds_mul(wr_h, wr_l, ih[j], il[j]);
+      let m4 = ds_mul(wi_h, wi_l, rh[j], rl[j]);
+      let xr2 = ds_add(m1.x, m1.y, -m2.x, -m2.y);
+      let xi2 = ds_add(m3.x, m3.y, m4.x, m4.y);
+      // z_j = z_i − t; z_i = z_i + t
+      let njr = ds_add(rh[i], rl[i], -xr2.x, -xr2.y);
+      let nji = ds_add(ih[i], il[i], -xi2.x, -xi2.y);
+      let nir = ds_add(rh[i], rl[i], xr2.x, xr2.y);
+      let nii = ds_add(ih[i], il[i], xi2.x, xi2.y);
+      rh[j] = njr.x; rl[j] = njr.y; ih[j] = nji.x; il[j] = nji.y;
+      rh[i] = nir.x; rl[i] = nir.y; ih[i] = nii.x; il[i] = nii.y;
+    }
+    workgroupBarrier();
+    len = len << 1u;
+  }
+  for (var k: u32 = tid; k < 1025u; k = k + 256u) {
+    B2[(b * 1025u + k) * n_frames + t] = rh[k] + rl[k];
+    B3[(b * 1025u + k) * n_frames + t] = ih[k] + il[k];
+  }
+}
+"#
+});
+
+/// 倍精度相当 FFT の逆伝達 (+ 符号)。B1 = gRe、B2 = gIm、B3 = dframes、
+/// B4/B5 = +符号 twiddle 表。
+pub static T_RFFT2048_DS_BWD: LazyLock<String> = LazyLock::new(|| {
+    theader(5)
+        + r#"
+var<workgroup> rh: array<f32, 2048>;
+var<workgroup> rl: array<f32, 2048>;
+var<workgroup> ih: array<f32, 2048>;
+var<workgroup> il: array<f32, 2048>;
+
+fn bitrev11(v: u32) -> u32 {
+  var r = 0u;
+  for (var b: u32 = 0u; b < 11u; b = b + 1u) {
+    r = (r << 1u) | ((v >> b) & 1u);
+  }
+  return r;
+}
+fn ds_add(ah: f32, al: f32, bh: f32, bl: f32) -> vec2<f32> {
+  let s = ah + bh;
+  let v = s - ah;
+  let err = (ah - (s - v)) + (bh - v);
+  return vec2<f32>(s, err + al + bl);
+}
+fn ds_mul(ah: f32, al: f32, bh: f32, bl: f32) -> vec2<f32> {
+  let p = ah * bh;
+  let e = fma(ah, bh, -p);
+  return vec2<f32>(p, e + ah * bl + al * bh);
+}
+
+@compute @workgroup_size(256)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let n_frames = P.p0.x;
+  let tid = lid.x;
+  let frame = wid.x;
+  let b = frame / n_frames;
+  let t = frame % n_frames;
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    if (k < 1025u) {
+      rh[k] = B1[(b * 1025u + k) * n_frames + t];
+      ih[k] = B2[(b * 1025u + k) * n_frames + t];
+    } else {
+      rh[k] = 0.0;
+      ih[k] = 0.0;
+    }
+    rl[k] = 0.0;
+    il[k] = 0.0;
+  }
+  workgroupBarrier();
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    let j = bitrev11(k);
+    if (k < j) {
+      let th = rh[k]; let tl = rl[k]; let uh = ih[k]; let ul = il[k];
+      rh[k] = rh[j]; rl[k] = rl[j]; ih[k] = ih[j]; il[k] = il[j];
+      rh[j] = th; rl[j] = tl; ih[j] = uh; il[j] = ul;
+    }
+  }
+  workgroupBarrier();
+  var len = 2u;
+  while (len <= 2048u) {
+    let half = len >> 1u;
+    let off = (half - 1u) * 2u;
+    for (var f: u32 = tid; f < 1024u; f = f + 256u) {
+      let blk = f / half;
+      let kk = f % half;
+      let i = blk * len + kk;
+      let j = i + half;
+      let ti = off + kk * 2u;
+      let wr_h = B4[ti]; let wr_l = B4[ti + 1u];
+      let wi_h = B5[ti]; let wi_l = B5[ti + 1u];
+      let m1 = ds_mul(wr_h, wr_l, rh[j], rl[j]);
+      let m2 = ds_mul(wi_h, wi_l, ih[j], il[j]);
+      let m3 = ds_mul(wr_h, wr_l, ih[j], il[j]);
+      let m4 = ds_mul(wi_h, wi_l, rh[j], rl[j]);
+      let xr2 = ds_add(m1.x, m1.y, -m2.x, -m2.y);
+      let xi2 = ds_add(m3.x, m3.y, m4.x, m4.y);
+      let njr = ds_add(rh[i], rl[i], -xr2.x, -xr2.y);
+      let nji = ds_add(ih[i], il[i], -xi2.x, -xi2.y);
+      let nir = ds_add(rh[i], rl[i], xr2.x, xr2.y);
+      let nii = ds_add(ih[i], il[i], xi2.x, xi2.y);
+      rh[j] = njr.x; rl[j] = njr.y; ih[j] = nji.x; il[j] = nji.y;
+      rh[i] = nir.x; rl[i] = nir.y; ih[i] = nii.x; il[i] = nii.y;
+    }
+    workgroupBarrier();
+    len = len << 1u;
+  }
+  for (var k: u32 = tid; k < 2048u; k = k + 256u) {
+    B3[(b * 2048u + k) * n_frames + t] = rh[k] + rl[k];
+  }
 }
 "#
 });

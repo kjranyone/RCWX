@@ -29,13 +29,14 @@ def mk(seed_a: bool) -> np.ndarray:
     return v.astype(np.float32)
 
 
-def logmel_torch(y: torch.Tensor) -> torch.Tensor:
+def logmel_torch(y: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """StftMel::logmel と同一式 (reflect pad → hann → |STFT|+2e-7 → slaney mel → log clamp 2e-6)。"""
     import torch.nn.functional as F
 
     pad = (N_FFT - HOP) // 2
-    yy = F.pad(y.unsqueeze(0), (pad, pad), mode="reflect").squeeze(0)
-    window = torch.hann_window(N_FFT)
+    y64 = y.to(dtype).view(BATCH, SAMPLES)
+    yy = F.pad(y64, (pad, pad), mode="reflect")
+    window = torch.hann_window(N_FFT).to(dtype)
     spec = torch.stft(
         yy, N_FFT, hop_length=HOP, win_length=N_FFT, window=window,
         center=False, return_complex=True,
@@ -45,7 +46,7 @@ def logmel_torch(y: torch.Tensor) -> torch.Tensor:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from librosa_mel import slaney_mel
 
-    basis = torch.from_numpy(slaney_mel(N_MELS, N_FFT // 2 + 1, SR, N_FFT)).float()
+    basis = torch.from_numpy(slaney_mel(N_MELS, N_FFT // 2 + 1, SR, N_FFT)).to(dtype)
     mel = torch.matmul(basis, mag)
     return torch.log(torch.clamp(mel, min=2e-6))
 
@@ -53,8 +54,16 @@ def logmel_torch(y: torch.Tensor) -> torch.Tensor:
 def main() -> None:
     ya = torch.from_numpy(mk(True)).requires_grad_(True)
     yb = torch.from_numpy(mk(False))
-    la = logmel_torch(ya)
-    lb = logmel_torch(yb)
+    # f64 参照 (同一コード・高精度) — 参照自身の f32 ノイズ測定用
+    ya64 = ya.detach().double().requires_grad_(True)
+    yb64 = yb.double()
+    la64 = logmel_torch(ya64, torch.float64)
+    lb64 = logmel_torch(yb64, torch.float64)
+    loss64 = torch.mean(torch.abs(la64 - lb64))
+    loss64.backward()
+    dy64 = ya64.grad.clone()
+    la = logmel_torch(ya, torch.float32)
+    lb = logmel_torch(yb, torch.float32)
     loss = torch.mean(torch.abs(la - lb))
     loss.backward()
 
@@ -64,9 +73,12 @@ def main() -> None:
 
     save_file(
         {
-            "ya": ya.detach().numpy(),
-            "yb": yb.numpy(),
-            "dy": ya.grad.numpy(),
+            "ya": ya.detach().float().numpy(),
+            "yb": yb.float().numpy(),
+            "dy": ya.grad.float().numpy(),
+            "dy64": dy64.float().numpy(),
+            "la": la.detach().float().numpy(),
+            "lb": lb.detach().float().numpy(),
         },
         os.path.join(out_dir, "logmel_bwd.safetensors"),
     )

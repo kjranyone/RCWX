@@ -414,12 +414,88 @@ fn three_step_parity() {
         }
         let cos = cos_of(&dr, &dw);
         println!("  {tag} param-delta cos = {cos:.6}");
-        // D: 計画ゲート 0.999 (実測 1.000000 — D 勾配 0/57 bad)。
-        // G: 残る ~1e-3 相対の逆伝播ノイズは fp32 累積順差のフロア
-        //     (全損失 5 桁一致・個別 op は CPU 完全一致・勾配 140/144
-        //     パラメータが cos≥0.99 — AGENTS.md 学習セクション参照)。
-        //     補償付き逆伝播カーネルの今後作業で 0.999 到達可。
-        let gate = if tag == "G" { 0.985 } else { 0.999 };
+        // 計画ゲート (M-T4): G/D とも 0.999。
+        // 実測: D 1.000000 / G 0.999849 (reflect pad symmetric バグ修正後 —
+        // logmel bwd vs py-f64 relnorm 4.9e-6)。
+        let gate = 0.999;
         assert!(cos >= gate, "{tag} delta cos {cos:.5} < {gate}");
     }
+}
+
+/// G 勾配のパラメータ別パリティ (gg0 golden)。事前条件:
+///   RCWX_DUMP_GSTAGES=1 RCWX_DUMP_GGRADS=1 cargo test --test step_parity
+/// で target/golden/ggrads/ に step 1 の勾配を書き出してから実行。
+#[test]
+fn gg0_param_grad_parity() {
+    // train_loop のダンプ先と同一の絶対パス (cargo test の cwd は crate dir)
+    let dir = std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/golden/ggrads"
+    ));
+    if !dir.exists() {
+        eprintln!("skipping: RCWX_DUMP_GGRADS run first");
+        return;
+    }
+    let raw = std::fs::read(
+        std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap())
+            .join(".cache/rcwx/train/golden/step3_golden.safetensors"),
+    )
+    .unwrap();
+    let st = safetensors::SafeTensors::deserialize(&raw).unwrap();
+    let mut n_bad = 0usize;
+    let mut n_cmp = 0usize;
+    for name in st.names() {
+        let Some(short) = name.strip_prefix("gg0.") else {
+            continue;
+        };
+        let p = dir.join(format!("{}.bin", short.replace('.', "_")));
+        let Ok(rbytes) = std::fs::read(&p) else {
+            continue;
+        };
+        let v = st.tensor(name).unwrap();
+        let py: Vec<f32> = v
+            .data()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let ru: Vec<f32> = rbytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let n = py.len().min(ru.len());
+        let dot: f64 = (0..n).map(|i| f64::from(py[i]) * f64::from(ru[i])).sum();
+        let na = (0..n).map(|i| f64::from(py[i]).powi(2)).sum::<f64>().sqrt();
+        let nb = (0..n).map(|i| f64::from(ru[i]).powi(2)).sum::<f64>().sqrt();
+        let c = if na * nb > 0.0 { dot / (na * nb) } else { 1.0 };
+        n_cmp += 1;
+        if c < 0.99 {
+            n_bad += 1;
+            println!("  gg0 bad: {short} cos={c:.4} n={n}");
+            if short == "enc_q.pre.weight" {
+                // 誤差の空間構造: 位置依存か
+                let n4 = n / 4;
+                for (tag, rng) in [
+                    ("q1", 0..n4),
+                    ("q2", n4..2 * n4),
+                    ("q3", 2 * n4..3 * n4),
+                    ("q4", 3 * n4..n),
+                ] {
+                    let d: f64 = (rng.clone())
+                        .map(|i| f64::from(py[i]) * f64::from(ru[i]))
+                        .sum();
+                    let na = (rng.clone())
+                        .map(|i| f64::from(py[i]).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    let nb = (rng.clone())
+                        .map(|i| f64::from(ru[i]).powi(2))
+                        .sum::<f64>()
+                        .sqrt();
+                    println!("    pre.w {tag}: cos={:.4}", d / (na * nb));
+                }
+            }
+        }
+    }
+    println!("gg0: {n_bad}/{n_cmp} params cos<0.99");
+    assert!(n_bad <= 2, "G 勾配不一致 {n_bad}/{n_cmp}");
 }

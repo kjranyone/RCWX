@@ -12,6 +12,7 @@ pub mod train_shaders;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result, bail};
@@ -77,6 +78,8 @@ pub struct Engine {
     pub has_ts: bool,
     /// MAP_READ の作り直しを避ける。サイズごとに 1 本。
     staging_pool: Mutex<Vec<(wgpu::BufferAddress, wgpu::Buffer)>>,
+    /// rfft2048_ds 用 twiddle 表 (cos/sin・hi/lo 交互 2047×2)。符号違いの 2 組。
+    ds_twiddles: OnceLock<(GpuTensor, GpuTensor, GpuTensor, GpuTensor)>,
     /// 常設 upload バッファ。write_f32 の transient resource churn を
     /// 正規 map_async/unmap + copy で除去する。
     upload: Mutex<UploadRing>,
@@ -534,6 +537,7 @@ impl Engine {
             has_f16,
             has_ts,
             staging_pool: Mutex::new(Vec::new()),
+            ds_twiddles: OnceLock::new(),
             upload: Mutex::new(UploadRing::new(use_upload_ring)),
             submit_epoch: std::sync::atomic::AtomicU64::new(0),
             drained_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -958,6 +962,46 @@ fn compile_kernel(
 }
 
 impl Engine {
+    /// rfft2048_ds 用 twiddle 表: 段 len=2..2048 の cos/sin を (hi,lo) で。
+    /// 表インデックス: 段 len の k 番目は off=len/2−1+k (hi/lo 交互 ×2)。
+    /// 戻り値: (cos_fwd, sin_fwd, cos_bwd(+符号は cos 同一), sin_bwd)
+    pub fn ds_fft_twiddles(&self) -> &(GpuTensor, GpuTensor, GpuTensor, GpuTensor) {
+        self.ds_twiddles.get_or_init(|| {
+            let n = 2047usize;
+            let mut cf = vec![0.0f32; n * 2];
+            let mut sf = vec![0.0f32; n * 2];
+            let mut cb = vec![0.0f32; n * 2];
+            let mut sb = vec![0.0f32; n * 2];
+            let mut len = 2usize;
+            while len <= 2048 {
+                let half = len / 2;
+                let off = half - 1;
+                for k in 0..half {
+                    let ang = 2.0 * std::f64::consts::PI * (k as f64) / (len as f64);
+                    let (c_hi, c_lo) = split_f64(ang.cos());
+                    let (s_hi, s_lo) = split_f64(ang.sin());
+                    let i = (off + k) * 2;
+                    // fwd (e^{−iθ}) は sin を negate、bwd (+符号) は sin 正
+                    cf[i] = c_hi;
+                    cf[i + 1] = c_lo;
+                    sf[i] = -s_hi;
+                    sf[i + 1] = -s_lo;
+                    cb[i] = c_hi;
+                    cb[i + 1] = c_lo;
+                    sb[i] = s_hi;
+                    sb[i + 1] = s_lo;
+                }
+                len *= 2;
+            }
+            (
+                self.tensor_from_f32(&cf, vec![n * 2]),
+                self.tensor_from_f32(&sf, vec![n * 2]),
+                self.tensor_from_f32(&cb, vec![n * 2]),
+                self.tensor_from_f32(&sb, vec![n * 2]),
+            )
+        })
+    }
+
     fn compile_all(&mut self) -> Result<()> {
         // RCWX_KERNELS=a,b — 指定カーネルのみコンパイル (コンパイル時間の研究用)
         let only: Option<Vec<String>> = std::env::var("RCWX_KERNELS")
@@ -979,7 +1023,7 @@ impl Engine {
             try_compile(self, "flash_attn", &shaders::flash_attn_src(), 2)?;
         }
         try_compile(self, "matmul_tiled", &shaders::matmul_tiled_src(), 4)?;
-        try_compile(self, "matmul_tiled_kahan", &shaders::matmul_tiled_kahan_src(), 4)?;
+        try_compile(self, "matmul_tiled_kahan", &shaders::matmul_tiled_kahan_src(), 5)?;
         try_compile(self, "conv1d", &shaders::CONV1D, 4)?;
         try_compile(self, "groupnorm", &shaders::groupnorm_src(), 4)?;
         try_compile(self, "layernorm", &shaders::layernorm_src(), 4)?;
@@ -1045,6 +1089,10 @@ impl Engine {
             )?;
             try_compile(self, "t_reduce_final", &train_shaders::T_REDUCE_FINAL, 2)?;
             try_compile(self, "t_adamw", &train_shaders::T_ADAMW, 4)?;
+            try_compile(self, "t_rfft2048", &train_shaders::T_RFFT2048, 3)?;
+            try_compile(self, "t_rfft2048_bwd", &train_shaders::T_RFFT2048_BWD, 3)?;
+            try_compile(self, "t_rfft2048_ds", &train_shaders::T_RFFT2048_DS, 5)?;
+            try_compile(self, "t_rfft2048_ds_bwd", &train_shaders::T_RFFT2048_DS_BWD, 5)?;
             try_compile(self, "t_wn_fold", &train_shaders::T_WN_FOLD, 4)?;
             try_compile(self, "t_wn_fold_rows", &train_shaders::T_WN_FOLD_ROWS, 4)?;
             try_compile(self, "t_wn_bwd_rows", &train_shaders::T_WN_BWD_ROWS, 6)?;
@@ -1624,6 +1672,8 @@ impl Engine {
             uniform_writes: Vec::new(),
             cmds: Vec::new(),
             kahan: false,
+            kahan_chunk: 256,
+            keepalive: Vec::new(),
         }
     }
 }
@@ -1653,9 +1703,14 @@ pub struct Graph<'a> {
     encoder: Option<wgpu::CommandEncoder>,
     uniform_writes: Vec<(u32, [u32; 32])>, // (slot, words)
     cmds: Vec<Cmd>,
-    /// 学習経路 (Tape) で有効化: tiled matmul を Kahan 補償付きに切替
-    /// (f32 累積誤差 ~1e-3 相対を抑え golden パリティ 1e-3 を通す)。
+    /// 学習経路 (Tape) で有効化: tiled matmul を分割累積に切替
+    /// (f32 逐次誤差を抑制)。分割チャンク長は kahan_chunk で調整。
     pub kahan: bool,
+    /// 分割累積のチャンク長 (既定 256 — logmel の DFT は 16 で FFT 並の
+    /// 誤差階数に)。小さいほど精度↑・dispatch 数↑。
+    pub kahan_chunk: u32,
+    /// dispatch 済みコマンドが参照する一時バッファの生存保証 (submit まで)。
+    keepalive: Vec<wgpu::Buffer>,
 }
 
 #[derive(Clone)]
@@ -1845,20 +1900,78 @@ impl<'a> Graph<'a> {
         let bias_ref = bias.unwrap_or(dummy);
         // K が短いデコーダ最終段 (例: 32ch×k3 → K=96) も SLM タイルで重みを再利用する。
         let use_tiled = k >= 32;
+        if use_tiled && self.kahan {
+            // 分割累積 (multi-pass): k を chunk 毎に分割し、パス間を物理
+            // バッファで接続 (naga の補償消去を回避する演算境界)。
+            self.matmul_tiled_split(a, w, bias, c, m, n, k, batch, words);
+            return;
+        }
         let (kernel, wx, wy) = if use_tiled {
-            (
-                if self.kahan {
-                    "matmul_tiled_kahan"
-                } else {
-                    "matmul_tiled"
-                },
-                n.div_ceil(32),
-                m.div_ceil(32),
-            )
+            ("matmul_tiled", n.div_ceil(32), m.div_ceil(32))
         } else {
             ("matmul", n.div_ceil(8), m.div_ceil(8))
         };
         self.dispatch(kernel, &[a, w, bias_ref, c], words, wx, wy, batch);
+    }
+
+    /// matmul_tiled_kahan の分割パス実行。ping-pong バッファで k チャンク
+    /// 毎の部分和を物理的に往復させ、最終パスが bias/scale を適用して c へ。
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_tiled_split(
+        &mut self,
+        a: &GpuTensor,
+        w: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        c: &GpuTensor,
+        m: u32,
+        n: u32,
+        k: u32,
+        batch: u32,
+        base_words: [u32; 32],
+    ) {
+        let dummy = a;
+        let bias_ref = bias.unwrap_or(dummy);
+        let chunk = self.kahan_chunk.min(k.max(16));
+        let passes = k.div_ceil(chunk);
+        let buf0 = self.engine.tensor_uninit(c.len as usize);
+        let buf1 = self.engine.tensor_uninit(c.len as usize);
+        // dispatch は submit まで実行されないため、ping-pong バッファは
+        // Graph が submit まで生存させる (早期 drop は UAF)
+        self.keepalive.push(buf0.buffer.clone());
+        self.keepalive.push(buf1.buffer.clone());
+        let wx = n.div_ceil(32);
+        let wy = m.div_ceil(32);
+        for p in 0..passes {
+            let k_lo = p * chunk;
+            let k_hi = (k_lo + chunk).min(k);
+            let is_last_u = (p + 1 == passes) as u32;
+            let has_prev = (p > 0) as u32;
+            let dst = if is_last_u == 1 {
+                c.clone_handle()
+            } else if p % 2 == 0 {
+                buf0.clone_handle()
+            } else {
+                buf1.clone_handle()
+            };
+            let prev = if p % 2 == 0 {
+                buf1.clone_handle()
+            } else {
+                buf0.clone_handle()
+            };
+            let mut words = base_words;
+            words[19] = has_prev; // P4.w
+            words[20] = k_lo; // P5.x
+            words[21] = k_hi; // P5.y
+            words[22] = is_last_u; // P5.z
+            self.dispatch(
+                "matmul_tiled_kahan",
+                &[a, w, bias_ref, &prev, &dst],
+                words,
+                wx,
+                wy,
+                batch,
+            );
+        }
     }
 
     /// 1D conv (zero padding, 任意 stride/dilation/groups, bias 任意)。
@@ -2561,6 +2674,7 @@ impl<'a> Graph<'a> {
         self.engine.recycle_uniform_slots(slots.into_iter());
         self.cmds.clear();
         self.uniform_writes.clear();
+        self.keepalive.clear();
         // 後続 dispatch 用に encoder を作り直す
         self.encoder = Some(
             self.engine
@@ -2574,4 +2688,11 @@ impl<'a> Graph<'a> {
     pub fn pending(&self) -> usize {
         self.cmds.len()
     }
+}
+
+/// f64 を (hi, lo) f32 ペアへ分割 (Dekker split)。
+fn split_f64(v: f64) -> (f32, f32) {
+    let hi = v as f32;
+    let lo = (v - f64::from(hi)) as f32;
+    (hi, lo)
 }

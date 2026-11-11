@@ -62,63 +62,15 @@ impl StftMel {
         let hann = tape.const_tensor(&self.hann, vec![self.n_fft as usize]);
         let frames = tape.mul_window(frames, hann, self.n_fft, n_frames);
         let bins = self.basis_re.len / self.n_fft as usize;
-        let re = {
-            let w = tape.const_tensor(&self.basis_re, vec![bins, self.n_fft as usize]);
-            let out_len = (batch * bins as u32 * n_frames) as usize;
-            tape.mm(
-                w,
-                frames,
-                None,
-                out_len,
-                bins as u32,
-                n_frames,
-                self.n_fft,
-                batch,
-                self.n_fft,
-                1,
-                0,
-                0,
-                1,
-                n_frames,
-                0,
-                self.n_fft * n_frames,
-                n_frames,
-                1,
-                bins as u32 * n_frames,
-                1.0,
-                0,
-            )
-        };
-        let im = {
-            let w = tape.const_tensor(&self.basis_im, vec![bins, self.n_fft as usize]);
-            let out_len = (batch * bins as u32 * n_frames) as usize;
-            tape.mm(
-                w,
-                frames,
-                None,
-                out_len,
-                bins as u32,
-                n_frames,
-                self.n_fft,
-                batch,
-                self.n_fft,
-                1,
-                0,
-                0,
-                1,
-                n_frames,
-                0,
-                self.n_fft * n_frames,
-                n_frames,
-                1,
-                bins as u32 * n_frames,
-                1.0,
-                0,
-            )
+        // DFT: バタフライ FFT (対数深さ・n_fft=2048 固定) — 逐次 matmul から
+        // 誤差 ~5e-7 相対 & forward 1 dispatch。n_fft≠2048 は mm フォールバック。
+        let (re, im) = if self.n_fft == 2048 {
+            tape.rfft2048_ds(frames, batch, n_frames)
+        } else {
+            self.dft_mm(tape, frames, batch, n_frames)
         };
         let len = (batch * bins as u32 * n_frames) as u32;
         let mag = tape.mag(re, im, len, 2e-7);
-        // mel = mel_basis · mag
         let mel = {
             let w = tape.const_tensor(&self.mel_basis, vec![self.n_mels as usize, bins]);
             let out_len = (batch * self.n_mels * n_frames) as usize;
@@ -147,6 +99,40 @@ impl StftMel {
             )
         };
         tape.log_clamp(mel, 2e-6)
+    }
+
+    /// 従来の DFT (basis matmul 2 本・n_fft≠2048 用フォールバック)。
+    fn dft_mm(&self, tape: &mut Tape<'_>, frames: Var, batch: u32, n_frames: u32) -> (Var, Var) {
+        let bins = self.basis_re.len / self.n_fft as usize;
+        let make = |tape: &mut Tape<'_>, w: &GpuTensor| {
+            let wv = tape.const_tensor(w, vec![bins, self.n_fft as usize]);
+            tape.mm(
+                wv,
+                frames,
+                None,
+                (batch * bins as u32 * n_frames) as usize,
+                bins as u32,
+                n_frames,
+                self.n_fft,
+                batch,
+                self.n_fft,
+                1,
+                0,
+                0,
+                1,
+                n_frames,
+                0,
+                self.n_fft * n_frames,
+                n_frames,
+                1,
+                bins as u32 * n_frames,
+                1.0,
+                0,
+            )
+        };
+        let re = make(tape, &self.basis_re);
+        let im = make(tape, &self.basis_im);
+        (re, im)
     }
 }
 

@@ -171,9 +171,18 @@ pub struct BwdCtx<'a, 'e> {
     g: &'a mut Graph<'e>,
     nodes: &'a HashMap<VarId, Node>,
     grads: &'a mut HashMap<VarId, GpuTensor>,
+    engine: &'e Engine,
 }
 
 impl BwdCtx<'_, '_> {
+    /// DS FFT 用 + 符号 twiddle 表 (cos_bwd, sin_bwd) — ハンドル複製で借用回避。
+    pub fn ds_twiddle_cb(&self) -> GpuTensor {
+        self.engine.ds_fft_twiddles().2.clone_handle()
+    }
+
+    pub fn ds_twiddle_sb(&self) -> GpuTensor {
+        self.engine.ds_fft_twiddles().3.clone_handle()
+    }
     pub fn node_tensor(&self, id: VarId) -> GpuTensor {
         self.nodes[&id].t.clone_handle()
     }
@@ -203,7 +212,9 @@ impl BwdCtx<'_, '_> {
         self.g.dispatch_raw(kernel, bufs, words, wx, wy, wz);
         if self.g.pending() >= tape_flush_every() {
             let _ = self.g.submit_ref();
+            let kahan = self.g.kahan;
             *self.g = self.g.engine.graph();
+            self.g.kahan = kahan;
         }
     }
     /// 勾配バッファの参照 (存在すれば)。
@@ -1381,16 +1392,35 @@ impl<'e> Tape<'e> {
                     ctx.accum(w_id, dw);
                 }
                 if let Some(b_id) = b_id {
-                    // bias[n] = Σ_{b,m} dy (out が [b, m, n] 連続前提)
+                    // bias_axis=0: bias[n] = Σ_{b,m} dy (out [b, m, n] 連続前提)
+                    // bias_axis=1: bias[m] = Σ_{b,n} dy — 2 段 colsum (旧実装は
+                    // axis を無視して常に bias[n] を計算し n=1 の cond mm で崩壊)
                     debug_assert!(c_row == n && c_n == 1);
-                    let db = ctx.alloc(n as usize);
-                    {
+                    if bias_axis == 0 {
+                        let db = ctx.alloc(n as usize);
                         let mut words = [0u32; 32];
                         words[0..4].copy_from_slice(&[0, batch * m, n, 0]);
                         ctx.g
                             .dispatch_raw("t_colsum", &[dy_ref, &db], words, n, 1, 1);
+                        ctx.accum(b_id, db);
+                    } else {
+                        // bt[b·m + m'] = Σ_n dy
+                        let bt = ctx.alloc((batch * m) as usize);
+                        {
+                            let mut words = [0u32; 32];
+                            words[0..4].copy_from_slice(&[1, batch * m, n, 0]);
+                            ctx.g
+                                .dispatch_raw("t_colsum", &[dy_ref, &bt], words, batch * m, 1, 1);
+                        }
+                        // db[m] = Σ_b bt[b·m + m]
+                        let db = ctx.alloc(m as usize);
+                        {
+                            let mut words = [0u32; 32];
+                            words[0..4].copy_from_slice(&[0, batch, m, 0]);
+                            ctx.g.dispatch_raw("t_colsum", &[&bt, &db], words, m, 1, 1);
+                        }
+                        ctx.accum(b_id, db);
                     }
-                    ctx.accum(b_id, db);
                 }
             }),
         });
@@ -2714,6 +2744,170 @@ impl<'e> Tape<'e> {
     }
 
     /// 既存 GpuTensor を定数ノード化 (アップロードなし・バッファ共有)。
+    /// 2048 点実 FFT (logmel DFT の対数深さ版)。
+    /// frames [batch, 2048, n_frames] → (re, im) 各 [batch, 1025, n_frames]。
+    /// 逆伝達は両出力の勾配から 1 回の + 符号バタフライで dframes を再構成。
+    pub fn rfft2048(&mut self, frames: Var, batch: u32, n_frames: u32) -> (Var, Var) {
+        assert_eq!(
+            self.numel(frames),
+            batch * 2048 * n_frames,
+            "rfft2048: frames size"
+        );
+        let total = (batch * 1025 * n_frames) as usize;
+        let re_t = self.eng.tensor_uninit(total);
+        let im_t = self.eng.tensor_uninit(total);
+        let re = self.push_node(
+            re_t,
+            vec![batch as usize, 1025usize, n_frames as usize],
+            true,
+        );
+        let im = self.push_node(
+            im_t,
+            vec![batch as usize, 1025usize, n_frames as usize],
+            true,
+        );
+        let re_ref = self.t(re);
+        let im_ref = self.t(im);
+        let fr_ref = self.t(frames);
+        {
+            let mut words = [0u32; 32];
+            words[0] = n_frames;
+            self.g.dispatch_raw(
+                "t_rfft2048",
+                &[&fr_ref, &re_ref, &im_ref],
+                words,
+                batch * n_frames,
+                1,
+                1,
+            );
+        }
+        let frames_id = frames.id;
+        let re_id = re.id;
+        let im_id = im.id;
+        let fr_len = self.numel(frames);
+        let re_len = total;
+        // 逆伝達 op は re 側に集約 (re は先に作られた node → 逆順走行で
+        // 後に発火し、その時点で mag 等が両方の勾配を作り済み)。
+        // 片方のみ勾配がある場合 (loss が re のみに依存等) は他方を 0 埋め。
+        self.ops.push(OpEntry {
+            out: re.id,
+            bwd: Box::new(move |ctx: &mut BwdCtx<'_, '_>| {
+                let Some(dre) = ctx.grad_of(re_id) else {
+                    return;
+                };
+                let dim = ctx.grad_of(im_id).unwrap_or_else(|| {
+                    let z = ctx.alloc(re_len);
+                    let mut w = [0u32; 32];
+                    w[0..4].copy_from_slice(&[re_len as u32, 0, 0.0f32.to_bits(), 0]);
+                    ctx.dispatch("t_fill", &[&z], w, (re_len as u32).div_ceil(256), 1, 1);
+                    z
+                });
+                let dx = ctx.alloc(fr_len as usize);
+                {
+                    let mut words = [0u32; 32];
+                    words[0] = n_frames;
+                    ctx.dispatch(
+                        "t_rfft2048_bwd",
+                        &[&dre, &dim, &dx],
+                        words,
+                        batch * n_frames,
+                        1,
+                        1,
+                    );
+                }
+                ctx.accum(frames_id, dx);
+            }),
+        });
+        (re, im)
+    }
+
+    /// 2048 点実 FFT・倍精度相当 (double-single) 版 — logmel DFT 用。
+    /// f32 版 (rfft2048) の絶対誤差 ~1.5e-4 が L1 sign ナイフエッジを
+    /// 裏返すため (FD 検証で py が正・rust が誤と確定済み)、twiddle を
+    /// ホスト f64 で作り (hi,lo) 演算で誤差を ~1e-7 に落とす。
+    pub fn rfft2048_ds(&mut self, frames: Var, batch: u32, n_frames: u32) -> (Var, Var) {
+        assert_eq!(
+            self.numel(frames),
+            batch * 2048 * n_frames,
+            "rfft2048_ds: frames size"
+        );
+        let total = (batch * 1025 * n_frames) as usize;
+        let re_t = self.eng.tensor_uninit(total);
+        let im_t = self.eng.tensor_uninit(total);
+        let re = self.push_node(re_t, vec![batch as usize, 1025, n_frames as usize], true);
+        let im = self.push_node(im_t, vec![batch as usize, 1025, n_frames as usize], true);
+        let re_ref = self.t(re);
+        let im_ref = self.t(im);
+        let fr_ref = self.t(frames);
+        let (cf, sf, _cb, _sb) = {
+            let t4 = self.eng.ds_fft_twiddles();
+            (
+                t4.0.clone_handle(),
+                t4.1.clone_handle(),
+                t4.2.clone_handle(),
+                t4.3.clone_handle(),
+            )
+        };
+        {
+            let mut words = [0u32; 32];
+            words[0] = n_frames;
+            self.g.dispatch_raw(
+                "t_rfft2048_ds",
+                &[&fr_ref, &re_ref, &im_ref, &cf, &sf],
+                words,
+                batch * n_frames,
+                1,
+                1,
+            );
+        }
+        let frames_id = frames.id;
+        let re_id = re.id;
+        let im_id = im.id;
+        let fr_len = self.numel(frames);
+        let re_len = total;
+        self.ops.push(OpEntry {
+            out: re.id,
+            bwd: Box::new(move |ctx: &mut BwdCtx<'_, '_>| {
+                let Some(dre) = ctx.grad_of(re_id) else {
+                    return;
+                };
+                let dim = ctx.grad_of(im_id).unwrap_or_else(|| {
+                    let z = ctx.alloc(re_len);
+                    let mut w = [0u32; 32];
+                    w[0..4].copy_from_slice(&[re_len as u32, 0, 0.0f32.to_bits(), 0]);
+                    ctx.dispatch("t_fill", &[&z], w, (re_len as u32).div_ceil(256), 1, 1);
+                    z
+                });
+                let dx = ctx.alloc(fr_len as usize);
+                let cb = ctx.ds_twiddle_cb();
+                let sb = ctx.ds_twiddle_sb();
+                {
+                    let mut words = [0u32; 32];
+                    words[0] = n_frames;
+                    ctx.dispatch(
+                        "t_rfft2048_ds_bwd",
+                        &[&dre, &dim, &dx, &cb, &sb],
+                        words,
+                        batch * n_frames,
+                        1,
+                        1,
+                    );
+                }
+                ctx.accum(frames_id, dx);
+            }),
+        });
+        (re, im)
+    }
+
+    /// 分割累積チャンク長の一時設定 (logmel の DFT 用)。
+    pub fn set_g_kahan_chunk(&mut self, chunk: u32) {
+        self.g.kahan_chunk = chunk;
+    }
+
+    pub fn g_kahan_chunk(&self) -> u32 {
+        self.g.kahan_chunk
+    }
+
     pub fn const_tensor(&mut self, t: &GpuTensor, shape: Vec<usize>) -> Var {
         self.push_node(t.clone_handle(), shape, false)
     }
@@ -2831,6 +3025,7 @@ impl<'e> Tape<'e> {
                     g: &mut self.g,
                     nodes: &self.nodes,
                     grads: &mut self.grads,
+                    engine: self.eng,
                 };
                 (op.bwd)(&mut ctx);
             } else {
@@ -2861,6 +3056,7 @@ impl<'e> Tape<'e> {
                     g: &mut self.g,
                     nodes: &self.nodes,
                     grads: &mut self.grads,
+                    engine: self.eng,
                 };
                 (op.bwd)(&mut ctx);
             } else {

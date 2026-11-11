@@ -168,35 +168,105 @@ fn main(
 
 /// 学習経路用 Kahan 補償付き tiled matmul (matmul_tiled と同一レイアウト)。
 /// f32 累積誤差 (~1e-3 相対) を ~100x 抑える。使い方: Graph::matmul_ex_kahan。
+/// 学習経路用 分割累積 (multi-pass) matmul。naga が補償項を代数的に消去する
+/// ため、k 方向を複数 dispatch に分割しパス間を物理バッファ (B4→B5) で繋ぐ。
+/// 1 スレッドの逐次加算長が chunk に制限され、逐次誤差が分散に対数オーダー化。
+/// B1=A B2=W B3=bias B4=前パス累積 B5=出力。
+/// P4 = [has_bias, scale, bias_axis, has_prev], P5 = [k_base, k_end, is_last, 0]
 pub fn matmul_tiled_kahan_src() -> String {
-    let base = matmul_tiled_src();
-    // accXX への加算を Kahan 補償に置換 + 最終的に補償項を加算戻す。
-    // (加算戻しがないと数学的にプレーン加算と恒等 — bit 一致になる)
-    base.replace(
-        "      acc00 = acc00 + a0 * b0;
+    header(5)
+        + r#"
+var<workgroup> ta: array<f32, 640>;
+var<workgroup> tb: array<f32, 640>;
+@compute @workgroup_size(16, 16)
+fn main(
+  @builtin(workgroup_id) wid: vec3<u32>,
+  @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+  let m_dim = P.p0.x; let n_dim = P.p0.y; let k_dim = P.p0.z; let batch = P.p0.w;
+  let a_row = P.p1.x; let a_k = P.p1.y; let a_base = P.p1.z; let a_bs = P.p1.w;
+  let w_row = P.p2.x; let w_k = P.p2.y; let w_base = P.p2.z; let w_bs = P.p2.w;
+  let c_row = P.p3.x; let c_n = P.p3.y; let c_base = P.p3.z; let c_bs = P.p3.w;
+  let has_bias = P.p4.x; let scale = f32_of(P.p4.y); let bias_axis = P.p4.z;
+  let has_prev = P.p4.w;
+  let k_base = P.p5.x; let k_end = P.p5.y; let is_last = P.p5.z;
+  let b_idx = wid.z;
+  let tile_m = wid.y * 32u;
+  let tile_n = wid.x * 32u;
+  let lx = lid.x * 2u;
+  let ly = lid.y * 2u;
+  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
+  let m0 = tile_m + lx;
+  let m1 = tile_m + lx + 1u;
+  let n0 = tile_n + ly;
+  let n1 = tile_n + ly + 1u;
+  let a_off = a_base + b_idx * a_bs;
+  let w_off = w_base + b_idx * w_bs;
+  let b_k_inner = (w_k == 1u);
+  let linear = lid.y * 16u + lid.x;
+  var kt: u32 = k_base;
+  while (kt < k_end) {
+    for (var rep: u32 = 0u; rep < 2u; rep = rep + 1u) {
+      let e = linear + rep * 256u;
+      let am = e >> 4u;
+      let ak = e & 15u;
+      let gm = tile_m + am;
+      let gk = kt + ak;
+      ta[am * 20u + ak] = select(0.0, B1[a_off + gm * a_row + gk * a_k], gm < m_dim && gk < k_end);
+      var bn: u32;
+      var bk: u32;
+      if (b_k_inner) {
+        bn = e >> 4u;
+        bk = e & 15u;
+      } else {
+        bn = e & 31u;
+        bk = e >> 5u;
+      }
+      let gn = tile_n + bn;
+      let gk2 = kt + bk;
+      tb[bn * 20u + bk] = select(0.0, B2[w_off + gn * w_row + gk2 * w_k], gn < n_dim && gk2 < k_end);
+    }
+    workgroupBarrier();
+    for (var kk: u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = ta[lx * 20u + kk];
+      let a1 = ta[(lx + 1u) * 20u + kk];
+      let b0 = tb[ly * 20u + kk];
+      let b1 = tb[(ly + 1u) * 20u + kk];
+      acc00 = acc00 + a0 * b0;
       acc01 = acc01 + a0 * b1;
       acc10 = acc10 + a1 * b0;
-      acc11 = acc11 + a1 * b1;",
-        "      var y = a0 * b0; var t = acc00 + y;
-      cc00 = cc00 + select((acc00 - t) + y, (y - t) + acc00, abs(acc00) >= abs(y)); acc00 = t;
-      y = a0 * b1; t = acc01 + y;
-      cc01 = cc01 + select((acc01 - t) + y, (y - t) + acc01, abs(acc01) >= abs(y)); acc01 = t;
-      y = a1 * b0; t = acc10 + y;
-      cc10 = cc10 + select((acc10 - t) + y, (y - t) + acc10, abs(acc10) >= abs(y)); acc10 = t;
-      y = a1 * b1; t = acc11 + y;
-      cc11 = cc11 + select((acc11 - t) + y, (y - t) + acc11, abs(acc11) >= abs(y)); acc11 = t;",
-    )
-    .replace(
-        "  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;",
-        "  var acc00 = 0.0; var acc01 = 0.0; var acc10 = 0.0; var acc11 = 0.0;
-  var cc00 = 0.0; var cc01 = 0.0; var cc10 = 0.0; var cc11 = 0.0;",
-    )
-    .replace(
-        "  if (has_bias == 1u) {",
-        "  acc00 = acc00 + cc00; acc01 = acc01 + cc01;
-  acc10 = acc10 + cc10; acc11 = acc11 + cc11;
-  if (has_bias == 1u) {",
-    )
+      acc11 = acc11 + a1 * b1;
+    }
+    workgroupBarrier();
+    kt = kt + 16u;
+  }
+  // 前パスの累積 (物理バッファ) を加算 — コンパイラは消去不可
+  let i00 = c_base + c_bs * b_idx + c_row * m0 + c_n * n0;
+  let i01 = c_base + c_bs * b_idx + c_row * m0 + c_n * n1;
+  let i10 = c_base + c_bs * b_idx + c_row * m1 + c_n * n0;
+  let i11 = c_base + c_bs * b_idx + c_row * m1 + c_n * n1;
+  if (m0 < m_dim && n0 < n_dim) {
+    var v = acc00 + select(0.0, B4[i00], has_prev == 1u);
+    if (is_last == 1u && has_bias == 1u) { v = v + select(B3[n0], B3[m0], bias_axis == 1u); }
+    B5[i00] = v * select(1.0, scale, is_last == 1u);
+  }
+  if (m0 < m_dim && n1 < n_dim) {
+    var v = acc01 + select(0.0, B4[i01], has_prev == 1u);
+    if (is_last == 1u && has_bias == 1u) { v = v + select(B3[n1], B3[m0], bias_axis == 1u); }
+    B5[i01] = v * select(1.0, scale, is_last == 1u);
+  }
+  if (m1 < m_dim && n0 < n_dim) {
+    var v = acc10 + select(0.0, B4[i10], has_prev == 1u);
+    if (is_last == 1u && has_bias == 1u) { v = v + select(B3[n0], B3[m1], bias_axis == 1u); }
+    B5[i10] = v * select(1.0, scale, is_last == 1u);
+  }
+  if (m1 < m_dim && n1 < n_dim) {
+    var v = acc11 + select(0.0, B4[i11], has_prev == 1u);
+    if (is_last == 1u && has_bias == 1u) { v = v + select(B3[n1], B3[m1], bias_axis == 1u); }
+    B5[i11] = v * select(1.0, scale, is_last == 1u);
+  }
+}
+"#
 }
 
 pub fn matmul_tiled_src() -> String {
@@ -881,7 +951,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#
 }
-
 
 /// チャネル major [ch, t_in] を [ch, t_out] へ時間方向 線形補間 (formant 用 z 伸長)。
 /// torch F.interpolate(mode="linear", align_corners=False) と同一式
